@@ -16,8 +16,13 @@ type chatRequest struct {
 	TopP                *float64        `json:"top_p,omitempty"`
 	Stop                json.RawMessage `json:"stop,omitempty"` // string or []string
 	Stream              bool            `json:"stream,omitempty"`
+	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
 	Tools               []chatTool      `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"` // string or object
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type chatMessage struct {

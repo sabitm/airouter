@@ -48,6 +48,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	started := false
 	var stopReason ir.StopReason = ir.StopEndTurn
+	inputTokens := 0
 	outputTokens := 0
 
 	for {
@@ -72,6 +73,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			started = true
 		}
 		if chunk.Usage != nil {
+			inputTokens = chunk.Usage.PromptTokens
 			outputTokens = chunk.Usage.CompletionTokens
 		}
 		for _, c := range chunk.Choices {
@@ -100,7 +102,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	if !started {
 		return nil
 	}
-	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, OutputTokens: outputTokens})
+	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, InputTokens: inputTokens, OutputTokens: outputTokens})
 }
 
 // StreamEncoder renders IR stream events as an OpenAI Chat Completions SSE

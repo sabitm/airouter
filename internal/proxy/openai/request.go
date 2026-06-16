@@ -171,6 +171,11 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 		TopP:        req.TopP,
 		Stream:      req.Stream,
 	}
+	// OpenAI omits the usage object from streaming responses unless asked, so
+	// request a trailing usage-only chunk to recover token counts for logging.
+	if req.Stream {
+		out.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
 	if req.MaxTokens > 0 {
 		mt := req.MaxTokens
 		out.MaxTokens = &mt

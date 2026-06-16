@@ -11,6 +11,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/sse"
+	"airouter/internal/store"
 )
 
 const openaiSSE = `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
@@ -91,6 +92,12 @@ func streamingUpstream(t *testing.T, anthropicBody string) *httptest.Server {
 
 func setupStreaming(t *testing.T, backend domain.Protocol, anthropicBody string) (string, string) {
 	t.Helper()
+	base, token, _ := setupStreamingWithStore(t, backend, anthropicBody)
+	return base, token
+}
+
+func setupStreamingWithStore(t *testing.T, backend domain.Protocol, anthropicBody string) (string, string, *store.Store) {
+	t.Helper()
 	st := newTestStore(t)
 	ctx := context.Background()
 	upstream := streamingUpstream(t, anthropicBody)
@@ -111,7 +118,7 @@ func setupStreaming(t *testing.T, backend domain.Protocol, anthropicBody string)
 	New(st, false).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
-	return ts.URL, key.Token
+	return ts.URL, key.Token, st
 }
 
 func TestStreamMatrix(t *testing.T) {
@@ -163,6 +170,36 @@ func TestStreamToolAnthropicToOpenAI(t *testing.T) {
 	}
 	if finish != "tool_calls" {
 		t.Errorf("finish_reason = %q", finish)
+	}
+}
+
+// TestStreamUsageRecorded verifies token counts are captured from streaming
+// responses across the matrix. Both mock streams report input 3 / output 2: the
+// translated paths read it through the IR stream events, and the passthrough
+// paths sniff it out of the relayed SSE without altering the bytes.
+func TestStreamUsageRecorded(t *testing.T) {
+	cases := []struct {
+		name    string
+		backend domain.Protocol
+		ingress string
+	}{
+		{"openai->openai", domain.ProtocolOpenAI, "/v1/chat/completions"},
+		{"openai->anthropic", domain.ProtocolAnthropic, "/v1/chat/completions"},
+		{"anthropic->anthropic", domain.ProtocolAnthropic, "/v1/messages"},
+		{"anthropic->openai", domain.ProtocolOpenAI, "/v1/messages"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, token, st := setupStreamingWithStore(t, tc.backend, anthropicSSE)
+			resp, body := postStream(t, base+tc.ingress, token, `{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			l := waitForLogs(t, st, 1)[0]
+			if l.InputTokens != 3 || l.OutputTokens != 2 {
+				t.Errorf("tokens = %d/%d, want 3/2", l.InputTokens, l.OutputTokens)
+			}
+		})
 	}
 }
 

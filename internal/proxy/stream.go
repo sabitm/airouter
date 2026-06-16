@@ -37,8 +37,8 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	if !ok {
 		return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
 	}
-	// Streaming passthrough relays raw events; token usage is not parsed out of
-	// the relayed SSE, so it stays at 0 in the log.
+	// Streaming passthrough relays raw events unchanged; usage is sniffed out of
+	// the relayed SSE without mutating it, so the log can record token counts.
 	res.status = http.StatusOK
 	w.WriteHeader(http.StatusOK)
 	reader := sse.NewReader(resp.Body)
@@ -51,8 +51,54 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 			log.Printf("stream passthrough read: %v", err)
 			return committed()
 		}
+		sniffStreamUsage(ev.Data, res)
 		if err := sw.WriteEvent(ev.Name, ev.Data); err != nil {
 			return committed() // client disconnected
+		}
+	}
+}
+
+// sniffStreamUsage extracts token counts from one raw SSE event's data,
+// accepting both OpenAI (prompt_tokens/completion_tokens, top-level usage) and
+// Anthropic (input_tokens/output_tokens, nested under message.usage at start or
+// usage at message_delta) shapes. Each field is only overwritten when present
+// and nonzero, so values reported on different events across the stream
+// accumulate rather than reset.
+func sniffStreamUsage(data []byte, res *reqResult) {
+	if len(data) == 0 || data[0] != '{' {
+		return
+	}
+	var u struct {
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			InputTokens      int `json:"input_tokens"`
+			OutputTokens     int `json:"output_tokens"`
+		} `json:"usage"`
+		Message *struct {
+			Usage *struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(data, &u) != nil {
+		return
+	}
+	if u.Usage != nil {
+		if in := u.Usage.PromptTokens + u.Usage.InputTokens; in != 0 {
+			res.inTok = in
+		}
+		if out := u.Usage.CompletionTokens + u.Usage.OutputTokens; out != 0 {
+			res.outTok = out
+		}
+	}
+	if u.Message != nil && u.Message.Usage != nil {
+		if u.Message.Usage.InputTokens != 0 {
+			res.inTok = u.Message.Usage.InputTokens
+		}
+		if u.Message.Usage.OutputTokens != 0 {
+			res.outTok = u.Message.Usage.OutputTokens
 		}
 	}
 }
@@ -94,12 +140,18 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 
 	enc := ingress.newStreamEncoder(upstreamModel)
 	err = backend.decodeStream(resp.Body, func(ev ir.StreamEvent) error {
-		// Token counts arrive on distinct events: input at message start, output
-		// at finish.
+		// Token counts arrive on distinct events depending on backend: Anthropic
+		// reports input at message start, OpenAI reports both at finish. Take
+		// input from whichever event carries a nonzero value.
 		switch ev.Kind {
 		case ir.EventMessageStart:
-			res.inTok = ev.InputTokens
+			if ev.InputTokens != 0 {
+				res.inTok = ev.InputTokens
+			}
 		case ir.EventFinish:
+			if ev.InputTokens != 0 {
+				res.inTok = ev.InputTokens
+			}
 			res.outTok = ev.OutputTokens
 		}
 		return enc.Encode(ev, sw)
