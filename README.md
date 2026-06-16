@@ -49,6 +49,11 @@ or `x-api-key: <key>`.
 | `POST /v1/responses` | OpenAI Responses | unary + streaming; always translates |
 | `GET /v1/models` | - | lists configured combos |
 
+Each endpoint is also served without the `/v1` prefix (e.g. `/messages`,
+`/models`), so a provider base URL configured with or without `/v1` resolves
+either way. This avoids a double prefix when a client hardcodes `/v1` onto the
+base it is given.
+
 Text, images, function/tool calling, and tool results are translated across all
 formats. Streaming reassembles tool-call argument fragments correctly.
 
@@ -86,7 +91,7 @@ precedence.
 | `-listen` | `AIROUTER_LISTEN` | `:8080` | HTTP listen address |
 | `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
 | `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys at rest |
-| `-debug` | `AIROUTER_DEBUG` | `false` | Log failed/error upstream exchanges to the terminal (may include prompt content) |
+| `-debug` | `AIROUTER_DEBUG` | `false` | Log request lines, client-facing failures, and upstream exchanges to the terminal (may include prompt content) |
 
 If `AIROUTER_SECRET` is unset, an insecure built-in key is used and a warning is
 logged. Set a real secret in any deployment you care about; rotating it makes

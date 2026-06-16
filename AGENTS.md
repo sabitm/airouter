@@ -44,7 +44,7 @@ Supporting packages:
 - `internal/store` - SQLite store, migrations, repos, JSON import/export.
 - `internal/crypto` - AES-256-GCM for provider API keys at rest.
 - `internal/config` - flags/env loading.
-- `internal/server` - HTTP wiring.
+- `internal/server` - HTTP wiring; request-logging middleware in debug mode.
 - `internal/web` - templ + HTMX dashboard. `.templ` files generate `*_templ.go`.
 - `cmd/airouter` - main: wires config, crypto, store, server; graceful shutdown.
 
