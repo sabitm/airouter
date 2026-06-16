@@ -1,0 +1,93 @@
+package web
+
+import (
+	"strconv"
+
+	"airouter/internal/domain"
+)
+
+templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
+	@Layout("Combos", "/dashboard/combos") {
+		<section class="panel">
+			<h1>Combos</h1>
+			<p class="hint">A custom model name clients call (e.g. "default"), bound to a provider and a real upstream model.</p>
+			if len(providers) == 0 {
+				<p class="empty">Add a provider first.</p>
+			} else {
+				@comboForm(providers)
+			}
+		</section>
+		<section class="panel">
+			@ComboList(combos)
+		</section>
+	}
+}
+
+templ comboForm(providers []*domain.Provider) {
+	<form class="row-form" hx-post="/dashboard/combos" hx-target="#combo-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+		<input name="name" placeholder="combo name (e.g. default)" required/>
+		<select name="provider_id">
+			for _, p := range providers {
+				<option value={ strconv.FormatInt(p.ID, 10) }>{ p.Name } ({ string(p.Protocol) })</option>
+			}
+		</select>
+		<input name="upstream_model" placeholder="upstream model id (e.g. gpt-4o)" required/>
+		<button type="submit">Add</button>
+	</form>
+}
+
+templ ComboList(combos []*domain.Combo) {
+	<div id="combo-list">
+		if len(combos) == 0 {
+			<p class="empty">No combos yet.</p>
+		} else {
+			<table>
+				<thead>
+					<tr><th>Combo</th><th>Provider</th><th>Upstream model</th><th></th></tr>
+				</thead>
+				<tbody>
+					for _, c := range combos {
+						@ComboRow(c)
+					}
+				</tbody>
+			</table>
+		}
+	</div>
+}
+
+templ ComboRow(c *domain.Combo) {
+	<tr id={ "combo-" + strconv.FormatInt(c.ID, 10) }>
+		<td class="mono">{ c.Name }</td>
+		<td>
+			{ c.Provider.Name }
+			<span class="tag">{ string(c.Provider.Protocol) }</span>
+		</td>
+		<td class="mono">{ c.UpstreamModel }</td>
+		<td class="actions">
+			<button class="link" hx-get={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/edit" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML">Edit</button>
+			<button class="link danger" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/delete" } hx-target="#combo-list" hx-swap="outerHTML" hx-confirm="Delete this combo?">Delete</button>
+		</td>
+	</tr>
+}
+
+templ ComboEditRow(c *domain.Combo, providers []*domain.Provider) {
+	<tr id={ "combo-" + strconv.FormatInt(c.ID, 10) }>
+		<td colspan="4">
+			<form class="row-form" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) } hx-target="#combo-list" hx-swap="outerHTML">
+				<input name="name" value={ c.Name } required/>
+				<select name="provider_id">
+					for _, p := range providers {
+						if p.ID == c.ProviderID {
+							<option value={ strconv.FormatInt(p.ID, 10) } selected>{ p.Name } ({ string(p.Protocol) })</option>
+						} else {
+							<option value={ strconv.FormatInt(p.ID, 10) }>{ p.Name } ({ string(p.Protocol) })</option>
+						}
+					}
+				</select>
+				<input name="upstream_model" value={ c.UpstreamModel } required/>
+				<button type="submit">Save</button>
+				<button type="button" class="link" hx-get={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/row" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML">Cancel</button>
+			</form>
+		</td>
+	</tr>
+}

@@ -1,0 +1,48 @@
+package web
+
+type NavItem struct {
+	Href  string
+	Label string
+}
+
+var navItems = []NavItem{
+	{"/dashboard/providers", "Providers"},
+	{"/dashboard/combos", "Combos"},
+	{"/dashboard/keys", "Access Keys"},
+	{"/dashboard/settings", "Import / Export"},
+}
+
+templ Layout(title, active string) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>{ title } - airouter</title>
+			<link rel="stylesheet" href="/static/styles.css"/>
+			<script src="/static/htmx.min.js"></script>
+		</head>
+		<body>
+			<header class="topbar">
+				<span class="brand">airouter</span>
+				<nav>
+					for _, item := range navItems {
+						if item.Href == active {
+							<a href={ templ.SafeURL(item.Href) } class="active">{ item.Label }</a>
+						} else {
+							<a href={ templ.SafeURL(item.Href) }>{ item.Label }</a>
+						}
+					}
+				</nav>
+			</header>
+			<main>
+				{ children... }
+			</main>
+		</body>
+	</html>
+}
+
+// flash renders a transient status message returned from an HTMX action.
+templ flash(kind, msg string) {
+	<div class={ "flash", kind } _="">{ msg }</div>
+}

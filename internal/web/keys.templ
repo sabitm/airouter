@@ -1,0 +1,57 @@
+package web
+
+import (
+	"strconv"
+
+	"airouter/internal/domain"
+)
+
+templ KeysPage(keys []*domain.AccessKey) {
+	@Layout("Access Keys", "/dashboard/keys") {
+		<section class="panel">
+			<h1>Access Keys</h1>
+			<p class="hint">Bearer tokens clients send to authenticate against the router proxy. The full token is shown only once at creation.</p>
+			<form class="row-form" hx-post="/dashboard/keys" hx-target="#key-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+				<input name="name" placeholder="label (e.g. my-laptop)" required/>
+				<button type="submit">Generate</button>
+			</form>
+		</section>
+		<section class="panel">
+			@KeyList(keys, nil)
+		</section>
+	}
+}
+
+// KeyList renders the key table. justCreated, when non-nil, surfaces the raw
+// token banner once.
+templ KeyList(keys []*domain.AccessKey, justCreated *domain.AccessKey) {
+	<div id="key-list">
+		if justCreated != nil {
+			<div class="flash created">
+				New token (copy now, it will not be shown again):
+				<code class="mono">{ justCreated.Token }</code>
+			</div>
+		}
+		if len(keys) == 0 {
+			<p class="empty">No access keys yet.</p>
+		} else {
+			<table>
+				<thead>
+					<tr><th>Label</th><th>Token</th><th>Created</th><th></th></tr>
+				</thead>
+				<tbody>
+					for _, k := range keys {
+						<tr>
+							<td>{ k.Name }</td>
+							<td class="mono">{ k.Prefix }</td>
+							<td>{ k.CreatedAt.Format("2006-01-02 15:04") }</td>
+							<td class="actions">
+								<button class="link danger" hx-post={ "/dashboard/keys/" + strconv.FormatInt(k.ID, 10) + "/delete" } hx-target="#key-list" hx-swap="outerHTML" hx-confirm="Revoke this access key?">Revoke</button>
+							</td>
+						</tr>
+					}
+				</tbody>
+			</table>
+		}
+	</div>
+}

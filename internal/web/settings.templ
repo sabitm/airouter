@@ -1,0 +1,20 @@
+package web
+
+templ SettingsPage() {
+	@Layout("Import / Export", "/dashboard/settings") {
+		<section class="panel">
+			<h1>Export</h1>
+			<p class="hint">Download all providers and combos as JSON. API keys are included in plaintext, so treat the file as a secret. Access keys are not exported.</p>
+			<a class="button" href="/dashboard/export" download="airouter-config.json">Download config</a>
+		</section>
+		<section class="panel">
+			<h1>Import</h1>
+			<p class="hint">Upsert providers and combos from a JSON file by name. Nothing is deleted.</p>
+			<form hx-post="/dashboard/import" hx-encoding="multipart/form-data" hx-target="#import-result" hx-swap="innerHTML">
+				<input type="file" name="config" accept="application/json" required/>
+				<button type="submit">Import</button>
+			</form>
+			<div id="import-result"></div>
+		</section>
+	}
+}
