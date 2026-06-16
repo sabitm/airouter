@@ -91,9 +91,9 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 
 	if ingress.id == backend.id {
 		if meta.Stream {
-			p.streamPassthrough(w, r.Context(), res, ingress, provider, combo.UpstreamModel, body)
+			p.streamPassthrough(w, r.Context(), res, ingress, provider, combo.UpstreamModel, body, r.Header)
 		} else {
-			p.servePassthrough(w, r.Context(), res, ingress, provider, combo.UpstreamModel, body)
+			p.servePassthrough(w, r.Context(), res, ingress, provider, combo.UpstreamModel, body, r.Header)
 		}
 		return
 	}
@@ -107,14 +107,14 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 // servePassthrough forwards the body unchanged except for the model rewrite,
 // preserving any provider-specific fields the IR does not model. The upstream
 // response is relayed as-is since its format already matches the ingress.
-func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte) {
+func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header) {
 	rewritten, err := rewriteModel(body, upstreamModel)
 	if err != nil {
 		res.fail(w, ingress, http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 		return
 	}
 
-	status, respBody, err := p.forward(ctx, provider, ingress.upstreamPath, rewritten)
+	status, respBody, err := p.forward(ctx, provider, ingress.upstreamPath, rewritten, clientHeaders)
 	if err != nil {
 		res.fail(w, ingress, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 		return
@@ -149,7 +149,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		return
 	}
 
-	status, respBody, err := p.forward(ctx, provider, backend.upstreamPath, upstreamBody)
+	status, respBody, err := p.forward(ctx, provider, backend.upstreamPath, upstreamBody, nil)
 	if err != nil {
 		res.fail(w, ingress, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 		return

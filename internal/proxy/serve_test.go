@@ -22,10 +22,12 @@ const (
 )
 
 type capturedUpstream struct {
-	path  string
-	auth  string
-	xkey  string
-	model string
+	path      string
+	auth      string
+	xkey      string
+	model     string
+	userAgent string
+	beta      string
 }
 
 // newUpstream returns a mock provider that answers in the format matching the
@@ -42,6 +44,8 @@ func newUpstream(t *testing.T, cap *capturedUpstream) *httptest.Server {
 		cap.auth = r.Header.Get("Authorization")
 		cap.xkey = r.Header.Get("x-api-key")
 		cap.model = m.Model
+		cap.userAgent = r.Header.Get("User-Agent")
+		cap.beta = r.Header.Get("anthropic-beta")
 
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/messages") {
@@ -208,6 +212,37 @@ func TestUnknownCombo(t *testing.T) {
 	resp, _ := post(t, base+"/v1/chat/completions", token, `{"model":"nope","messages":[]}`)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestPassthroughForwardsClientHeaders verifies passthrough relays caller
+// identity headers (User-Agent, anthropic-beta) to the upstream while still
+// substituting the provider's credential for the client's.
+func TestPassthroughForwardsClientHeaders(t *testing.T) {
+	var cap capturedUpstream
+	base, token := setup(t, domain.ProtocolAnthropic, &cap)
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/messages",
+		strings.NewReader(`{"model":"default","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", token)
+	req.Header.Set("User-Agent", "claude-cli/1.2.3")
+	req.Header.Set("anthropic-beta", "some-beta")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if cap.userAgent != "claude-cli/1.2.3" {
+		t.Errorf("upstream User-Agent = %q, want forwarded client value", cap.userAgent)
+	}
+	if cap.beta != "some-beta" {
+		t.Errorf("upstream anthropic-beta = %q, want forwarded", cap.beta)
+	}
+	// Client credential must be replaced by the provider's, not forwarded.
+	if cap.xkey != "up-key" {
+		t.Errorf("upstream x-api-key = %q, want provider key up-key", cap.xkey)
 	}
 }
 

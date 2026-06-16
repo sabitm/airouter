@@ -15,13 +15,13 @@ import (
 // streamPassthrough relays an upstream SSE response of the same protocol as the
 // ingress, rewriting only the request model. Events are re-emitted (preserving
 // names) so each is flushed to the client immediately.
-func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte) {
+func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header) {
 	rewritten, err := rewriteModel(body, upstreamModel)
 	if err != nil {
 		res.fail(w, ingress, http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 		return
 	}
-	resp, err := p.forwardStream(ctx, provider, ingress.upstreamPath, rewritten)
+	resp, err := p.forwardStream(ctx, provider, ingress.upstreamPath, rewritten, clientHeaders)
 	if err != nil {
 		res.fail(w, ingress, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 		return
@@ -76,7 +76,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		res.fail(w, ingress, http.StatusInternalServerError, "failed to encode upstream request", "api_error")
 		return
 	}
-	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody)
+	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil)
 	if err != nil {
 		res.fail(w, ingress, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 		return
