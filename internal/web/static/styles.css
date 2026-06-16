@@ -138,6 +138,15 @@ td.actions { text-align: right; white-space: nowrap; }
 
 .panel-head { display: flex; align-items: center; justify-content: space-between; }
 
+.check { font-size: 13px; }
+.check.ok { color: var(--ok); }
+.check.err { color: var(--danger); }
+
+.check-indicator { font-size: 13px; color: var(--muted); }
+.htmx-indicator { display: none; }
+.htmx-request .check-indicator.htmx-indicator,
+.htmx-request.check-indicator.htmx-indicator { display: inline; }
+
 .stats { display: flex; gap: 16px; margin-top: 12px; }
 .stat {
 	display: flex;

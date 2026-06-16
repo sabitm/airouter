@@ -41,6 +41,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/providers/{id}/delete", h.deleteProvider)
 
 	mux.HandleFunc("GET /dashboard/providers/models", h.providerModels)
+	mux.HandleFunc("POST /dashboard/providers/check", h.checkProvider)
 
 	// Combos
 	mux.HandleFunc("GET /dashboard/combos", h.combosPage)

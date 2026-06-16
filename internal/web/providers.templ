@@ -20,7 +20,7 @@ templ ProvidersPage(providers []*domain.Provider) {
 }
 
 templ providerForm() {
-	<form class="row-form" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+	<form class="row-form" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this) this.reset()">
 		<input name="name" placeholder="name (e.g. openrouter)" required/>
 		<input name="base_url" placeholder="https://api.example.com/v1" required/>
 		<input name="api_key" type="password" placeholder="api key" required/>
@@ -28,8 +28,20 @@ templ providerForm() {
 			<option value="openai">openai</option>
 			<option value="anthropic">anthropic</option>
 		</select>
+		<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+		<span class="check-indicator htmx-indicator">checking...</span>
 		<button type="submit">Add</button>
+		<span class="check-result"></span>
 	</form>
+}
+
+// CheckResult reports the outcome of a connectivity check inline.
+templ CheckResult(ok bool, msg string) {
+	if ok {
+		<span class="check ok">{ msg }</span>
+	} else {
+		<span class="check err">{ msg }</span>
+	}
 }
 
 templ ProviderList(providers []*domain.Provider) {
@@ -68,6 +80,7 @@ templ ProviderEditRow(p *domain.Provider) {
 	<tr id={ "provider-" + strconv.FormatInt(p.ID, 10) }>
 		<td colspan="5">
 			<form class="row-form" hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
+				<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 				<input name="name" value={ p.Name } required/>
 				<input name="base_url" value={ p.BaseURL } required/>
 				<input name="api_key" type="password" placeholder="leave blank to keep current"/>
@@ -80,8 +93,11 @@ templ ProviderEditRow(p *domain.Provider) {
 						<option value="anthropic" selected>anthropic</option>
 					}
 				</select>
+				<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+				<span class="check-indicator htmx-indicator">checking...</span>
 				<button type="submit">Save</button>
 				<button type="button" class="link" hx-get={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/row" } hx-target={ "#provider-" + strconv.FormatInt(p.ID, 10) } hx-swap="outerHTML">Cancel</button>
+				<span class="check-result"></span>
 			</form>
 		</td>
 	</tr>
