@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -158,6 +159,12 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		return enc.Encode(ev, sw)
 	})
 	if err != nil {
+		// A canceled context means the client disconnected after receiving the
+		// response; that is routine, not a server error, so do not log it as one.
+		if errors.Is(err, context.Canceled) {
+			p.debugf("stream translate %s -> %s: client disconnected", ingress.id, backend.id)
+			return committed()
+		}
 		// Already streaming; cannot switch to a unary error. Stop cleanly.
 		log.Printf("stream translate: %v", err)
 		p.debugf("stream translate %s -> %s: mid-stream error: %v", ingress.id, backend.id, err)
