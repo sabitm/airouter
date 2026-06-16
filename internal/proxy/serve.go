@@ -53,7 +53,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 	provider := combo.Provider
 	backend := backendCodec(provider.Protocol)
 
-	if ingress.protocol == backend.protocol {
+	if ingress.id == backend.id {
 		if meta.Stream {
 			p.streamPassthrough(w, r.Context(), ingress, provider, combo.UpstreamModel, body)
 		} else {

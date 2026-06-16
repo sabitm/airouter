@@ -13,6 +13,7 @@ import (
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/openai"
+	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/sse"
 	"airouter/internal/store"
 )
@@ -25,7 +26,14 @@ type streamEncoder interface {
 
 // codec bundles the translation directions plus error rendering and the upstream
 // request path for one wire format. It covers both unary and streaming.
+//
+// id identifies the wire format for the passthrough decision: a request passes
+// through only when the ingress and backend ids match. protocol selects the
+// backend codec from a provider's protocol. Ingress-only formats (responses)
+// share a protocol with a backend but have a distinct id, so they never pass
+// through and always translate.
 type codec struct {
+	id             string
 	protocol       domain.Protocol
 	decodeRequest  func([]byte) (*ir.Request, error)
 	encodeRequest  func(*ir.Request) ([]byte, error)
@@ -39,6 +47,7 @@ type codec struct {
 }
 
 var openaiCodec = codec{
+	id:               "oai-chat",
 	protocol:         domain.ProtocolOpenAI,
 	decodeRequest:    openai.DecodeRequest,
 	encodeRequest:    openai.EncodeRequest,
@@ -51,6 +60,7 @@ var openaiCodec = codec{
 }
 
 var anthropicCodec = codec{
+	id:               "anth-msg",
 	protocol:         domain.ProtocolAnthropic,
 	decodeRequest:    anthropic.DecodeRequest,
 	encodeRequest:    anthropic.EncodeRequest,
@@ -60,6 +70,18 @@ var anthropicCodec = codec{
 	upstreamPath:     "/messages",
 	decodeStream:     anthropic.DecodeStream,
 	newStreamEncoder: func(model string) streamEncoder { return anthropic.NewStreamEncoder(model) },
+}
+
+// responsesCodec is ingress-only: it has no backend directions (encodeRequest,
+// decodeResponse, decodeStream, upstreamPath) because a provider is never
+// reached over the Responses API. Its distinct id ensures it always translates.
+var responsesCodec = codec{
+	id:               "oai-responses",
+	protocol:         domain.ProtocolOpenAI,
+	decodeRequest:    responses.DecodeRequest,
+	encodeResponse:   responses.EncodeResponse,
+	encodeError:      responses.EncodeError,
+	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
 }
 
 func backendCodec(p domain.Protocol) codec {
@@ -93,4 +115,8 @@ func (p *Proxy) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		p.serve(w, r, anthropicCodec)
 	})
+	mux.HandleFunc("POST /v1/responses", func(w http.ResponseWriter, r *http.Request) {
+		p.serve(w, r, responsesCodec)
+	})
+	mux.HandleFunc("GET /v1/models", p.handleModels)
 }

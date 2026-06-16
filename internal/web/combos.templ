@@ -26,14 +26,26 @@ templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
 templ comboForm(providers []*domain.Provider) {
 	<form class="row-form" hx-post="/dashboard/combos" hx-target="#combo-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
 		<input name="name" placeholder="combo name (e.g. default)" required/>
-		<select name="provider_id">
+		<select name="provider_id" hx-get="/dashboard/providers/models" hx-trigger="change, load" hx-target="#model-options-wrap" hx-swap="innerHTML">
 			for _, p := range providers {
 				<option value={ strconv.FormatInt(p.ID, 10) }>{ p.Name } ({ string(p.Protocol) })</option>
 			}
 		</select>
-		<input name="upstream_model" placeholder="upstream model id (e.g. gpt-4o)" required/>
+		<input name="upstream_model" list="model-options" placeholder="upstream model id (e.g. gpt-4o)" required/>
+		<span id="model-options-wrap">@ModelDatalist(nil)</span>
 		<button type="submit">Add</button>
 	</form>
+}
+
+// ModelDatalist backs the upstream_model input's autocomplete with models
+// fetched live from the selected provider. An empty list just yields no
+// suggestions; the field stays free-text.
+templ ModelDatalist(models []string) {
+	<datalist id="model-options">
+		for _, m := range models {
+			<option value={ m }></option>
+		}
+	</datalist>
 }
 
 templ ComboList(combos []*domain.Combo) {
