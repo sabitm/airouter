@@ -129,16 +129,26 @@ func (p *Proxy) nextRoundRobin(comboID int64, n int) int {
 	return int(i % uint64(n))
 }
 
-// Mount registers the proxy ingress endpoints.
+// Mount registers the proxy ingress endpoints. Each is mounted under both the
+// canonical /v1 prefix and a bare path: clients disagree on whether the base URL
+// already includes /v1 (the Anthropic SDK hardcodes /v1/messages, while model
+// discovery appends a bare /models), so accepting both spares the user from
+// guessing which prefix to put in the provider URL.
 func (p *Proxy) Mount(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		p.serve(w, r, openaiCodec)
-	})
-	mux.HandleFunc("POST /v1/messages", func(w http.ResponseWriter, r *http.Request) {
-		p.serve(w, r, anthropicCodec)
-	})
-	mux.HandleFunc("POST /v1/responses", func(w http.ResponseWriter, r *http.Request) {
-		p.serve(w, r, responsesCodec)
-	})
-	mux.HandleFunc("GET /v1/models", p.handleModels)
+	serve := func(c codec) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) { p.serve(w, r, c) }
+	}
+	routes := []struct {
+		method, path string
+		handler      http.HandlerFunc
+	}{
+		{"POST", "/chat/completions", serve(openaiCodec)},
+		{"POST", "/messages", serve(anthropicCodec)},
+		{"POST", "/responses", serve(responsesCodec)},
+		{"GET", "/models", p.handleModels},
+	}
+	for _, rt := range routes {
+		mux.HandleFunc(rt.method+" /v1"+rt.path, rt.handler)
+		mux.HandleFunc(rt.method+" "+rt.path, rt.handler)
+	}
 }

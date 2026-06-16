@@ -352,6 +352,41 @@ func TestRequestLogPassthroughUsage(t *testing.T) {
 	}
 }
 
+// TestIngressPrefixVariants verifies each ingress endpoint resolves both with
+// the /v1 prefix and bare, so clients that disagree on whether the base URL
+// already contains /v1 both reach the router.
+func TestIngressPrefixVariants(t *testing.T) {
+	var cap capturedUpstream
+	base, token := setup(t, domain.ProtocolAnthropic, &cap)
+
+	for _, path := range []string{"/v1/messages", "/messages"} {
+		resp, out := post(t, base+path, token,
+			`{"model":"default","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("POST %s: status = %d, body = %s", path, resp.StatusCode, out)
+		}
+	}
+	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
+		resp, out := post(t, base+path, token,
+			`{"model":"default","messages":[{"role":"user","content":"hi"}]}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("POST %s: status = %d, body = %s", path, resp.StatusCode, out)
+		}
+	}
+	for _, path := range []string{"/v1/models", "/models"} {
+		req, _ := http.NewRequest(http.MethodGet, base+path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s: status = %d", path, resp.StatusCode)
+		}
+	}
+}
+
 func TestRequestLogUnknownCombo(t *testing.T) {
 	var cap capturedUpstream
 	base, token, st := setupWithStore(t, domain.ProtocolOpenAI, &cap)
