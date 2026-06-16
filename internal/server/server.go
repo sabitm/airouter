@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"airouter/internal/proxy"
 	"airouter/internal/store"
 	"airouter/internal/web"
 )
@@ -16,7 +17,7 @@ type Server struct {
 func New(s *store.Store) *Server {
 	mux := http.NewServeMux()
 	web.NewHandler(s).Mount(mux)
-	// Phase 2 will mount the proxy endpoints (/v1/*) here.
+	proxy.New(s).Mount(mux)
 	return &Server{mux: mux}
 }
 
