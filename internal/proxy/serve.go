@@ -40,12 +40,6 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		writeErr(w, ingress, http.StatusBadRequest, "missing 'model' field", "invalid_request_error")
 		return
 	}
-	// Streaming translation lands in phase 3; reject explicitly so SSE clients
-	// fail fast rather than receiving a unary body they cannot parse.
-	if meta.Stream {
-		writeErr(w, ingress, http.StatusNotImplemented, "streaming is not supported yet", "not_supported_error")
-		return
-	}
 
 	combo, err := p.store.GetComboByName(r.Context(), meta.Model)
 	if err != nil {
@@ -60,25 +54,27 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 	backend := backendCodec(provider.Protocol)
 
 	if ingress.protocol == backend.protocol {
-		p.servePassthrough(w, r.Context(), ingress, provider, combo.UpstreamModel, body)
+		if meta.Stream {
+			p.streamPassthrough(w, r.Context(), ingress, provider, combo.UpstreamModel, body)
+		} else {
+			p.servePassthrough(w, r.Context(), ingress, provider, combo.UpstreamModel, body)
+		}
 		return
 	}
-	p.serveTranslated(w, r.Context(), ingress, backend, provider, combo.UpstreamModel, body)
+	if meta.Stream {
+		p.streamTranslated(w, r.Context(), ingress, backend, provider, combo.UpstreamModel, body)
+	} else {
+		p.serveTranslated(w, r.Context(), ingress, backend, provider, combo.UpstreamModel, body)
+	}
 }
 
 // servePassthrough forwards the body unchanged except for the model rewrite,
 // preserving any provider-specific fields the IR does not model. The upstream
 // response is relayed as-is since its format already matches the ingress.
 func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, ingress codec, provider *domain.Provider, upstreamModel string, body []byte) {
-	var generic map[string]json.RawMessage
-	if err := json.Unmarshal(body, &generic); err != nil {
-		writeErr(w, ingress, http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
-		return
-	}
-	generic["model"], _ = json.Marshal(upstreamModel)
-	rewritten, err := json.Marshal(generic)
+	rewritten, err := rewriteModel(body, upstreamModel)
 	if err != nil {
-		writeErr(w, ingress, http.StatusInternalServerError, "failed to rewrite request", "api_error")
+		writeErr(w, ingress, http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 		return
 	}
 

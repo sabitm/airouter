@@ -40,3 +40,23 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 	}
 	return resp.StatusCode, respBody, nil
 }
+
+// forwardStream sends the body and returns the live response for streaming.
+// The caller owns closing resp.Body. Used for SSE responses.
+func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, path string, body []byte) (*http.Response, error) {
+	url := strings.TrimRight(provider.BaseURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	switch provider.Protocol {
+	case domain.ProtocolAnthropic:
+		req.Header.Set("x-api-key", provider.APIKey)
+		req.Header.Set("anthropic-version", anthropicVersion)
+	default:
+		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	}
+	return p.streamClient.Do(req)
+}

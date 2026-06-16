@@ -204,11 +204,3 @@ func TestUnknownCombo(t *testing.T) {
 	}
 }
 
-func TestStreamRejected(t *testing.T) {
-	var cap capturedUpstream
-	base, token := setup(t, domain.ProtocolOpenAI, &cap)
-	resp, _ := post(t, base+"/v1/chat/completions", token, `{"model":"default","stream":true,"messages":[]}`)
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Errorf("status = %d, want 501", resp.StatusCode)
-	}
-}
