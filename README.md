@@ -1,0 +1,122 @@
+# airouter
+
+A self-hosted, bidirectional AI inference router. Register OpenAI- or
+Anthropic-compatible upstreams, expose them under custom model names, and call
+them through whichever API format your client speaks. airouter translates
+between the OpenAI and Anthropic wire formats on the fly, in both directions,
+for unary and streaming requests.
+
+A single Go binary serves both the proxy and a web dashboard. State lives in an
+embedded SQLite database; there are no external service dependencies.
+
+## How it works
+
+Three concepts:
+
+- **Provider** - an upstream connection: a base URL, an API key, and the
+  protocol it speaks (`openai` or `anthropic`). The API key is encrypted at
+  rest.
+- **Combo** - a custom model name (e.g. `default`) bound to a provider and a
+  real upstream model id (e.g. `gpt-4o`). Clients put the combo name in the
+  request `model` field; airouter resolves it to the provider and rewrites the
+  model.
+- **Access key** - a bearer token clients use to authenticate against the
+  router. The full token is shown once at creation; only its hash is stored.
+
+A request arrives on one of the ingress endpoints (the *ingress format*) and is
+routed to a combo's provider (the *backend format*). When the two formats match,
+the request passes through with only the model rewritten, preserving any
+provider-specific fields. When they differ, the request and response are
+translated through a canonical intermediate representation. Streaming responses
+are translated event by event and flushed live.
+
+This means an OpenAI SDK can call an Anthropic model, an Anthropic SDK can call
+an OpenAI model, and the OpenAI Responses API can call either - all transparently.
+
+## Endpoints
+
+All proxy endpoints require an access key, sent as `Authorization: Bearer <key>`
+or `x-api-key: <key>`.
+
+| Endpoint | Ingress format | Notes |
+|----------|----------------|-------|
+| `POST /v1/chat/completions` | OpenAI Chat Completions | unary + streaming |
+| `POST /v1/messages` | Anthropic Messages | unary + streaming |
+| `POST /v1/responses` | OpenAI Responses | unary + streaming; always translates |
+| `GET /v1/models` | - | lists configured combos |
+
+Text, images, function/tool calling, and tool results are translated across all
+formats. Streaming reassembles tool-call argument fragments correctly.
+
+The dashboard is served at `/dashboard`.
+
+## Build and run
+
+Requires Go 1.26+. The dashboard uses [templ](https://templ.guide); if you edit
+any `.templ` file, regenerate the Go code first.
+
+```sh
+# install the templ CLI (only needed when editing .templ files)
+go install github.com/a-h/templ/cmd/templ@latest
+
+# regenerate templates (after editing .templ files)
+templ generate
+
+# build
+go build -o airouter ./cmd/airouter
+
+# run
+AIROUTER_SECRET=$(openssl rand -hex 32) ./airouter
+```
+
+Then open http://localhost:8080/dashboard, add a provider, create a combo, and
+generate an access key.
+
+## Configuration
+
+Each option is available as a flag or an environment variable. Flags take
+precedence.
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `-listen` | `AIROUTER_LISTEN` | `:8080` | HTTP listen address |
+| `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
+| `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys at rest |
+
+If `AIROUTER_SECRET` is unset, an insecure built-in key is used and a warning is
+logged. Set a real secret in any deployment you care about; rotating it makes
+existing encrypted provider keys unreadable.
+
+## Usage example
+
+After creating a combo named `default` and an access key:
+
+```sh
+# OpenAI-format client
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-air-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","messages":[{"role":"user","content":"hello"}]}'
+
+# Anthropic-format client hitting the same combo
+curl http://localhost:8080/v1/messages \
+  -H "x-api-key: sk-air-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","max_tokens":256,"messages":[{"role":"user","content":"hello"}]}'
+```
+
+The combo's provider protocol determines whether translation happens; the client
+does not need to know or care which backend serves the request.
+
+## Import / export
+
+The dashboard's Import / Export page round-trips all providers and combos as
+JSON. Exports include provider API keys in plaintext so config is portable
+across instances with different secrets - treat exported files as secrets.
+Import upserts by name and never deletes. Access keys are not exported (only
+their hashes exist).
+
+## Storage
+
+A single SQLite file (WAL mode, pure-Go driver, no CGO). Schema is created and
+migrated automatically on startup.
