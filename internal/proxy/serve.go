@@ -71,6 +71,13 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		rec.OutputTokens = res.outTok
 		rec.ErrMsg = res.errMsg
 		rec.LatencyMS = time.Since(start).Milliseconds()
+		// Surface the client-facing failure reason in the terminal. Upstream
+		// exchanges log their own detail; this covers pre-upstream rejections
+		// (auth, unknown combo, bad body) that otherwise leave only an access-log
+		// status with no reason.
+		if res.errMsg != "" {
+			p.debugf("request failed: %s %s %d: %s", ingress.id, r.Method, res.status, res.errMsg)
+		}
 		p.recordLog(rec)
 	}()
 
