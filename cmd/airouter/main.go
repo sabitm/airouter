@@ -23,6 +23,9 @@ func main() {
 	if isDev {
 		log.Println("WARNING: AIROUTER_SECRET not set; using insecure dev key. Stored API keys are not protected.")
 	}
+	if cfg.Debug {
+		log.Println("debug mode enabled; failed upstream exchanges will be logged (may include prompt content)")
+	}
 	cipher, err := crypto.New(secret)
 	if err != nil {
 		log.Fatalf("init cipher: %v", err)
@@ -36,7 +39,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: server.New(st).Handler(),
+		Handler: server.New(st, cfg.Debug).Handler(),
 	}
 
 	go func() {

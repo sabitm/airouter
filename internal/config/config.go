@@ -10,6 +10,8 @@ type Config struct {
 	DBPath     string
 	// Secret seeds the AES-GCM key used to encrypt provider API keys at rest.
 	Secret string
+	// Debug logs failed/error upstream exchanges to the terminal.
+	Debug bool
 }
 
 // devSecret is used only when no secret is supplied, so the binary runs out of
@@ -22,6 +24,7 @@ func Load() Config {
 	flag.StringVar(&c.ListenAddr, "listen", env("AIROUTER_LISTEN", ":8080"), "HTTP listen address")
 	flag.StringVar(&c.DBPath, "db", env("AIROUTER_DB", "airouter.db"), "SQLite database path")
 	flag.StringVar(&c.Secret, "secret", env("AIROUTER_SECRET", ""), "secret seeding the at-rest encryption key")
+	flag.BoolVar(&c.Debug, "debug", envBool("AIROUTER_DEBUG"), "log failed/error upstream exchanges to the terminal")
 	flag.Parse()
 	return c
 }
@@ -40,4 +43,12 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envBool(key string) bool {
+	switch os.Getenv(key) {
+	case "1", "true", "TRUE", "yes":
+		return true
+	}
+	return false
 }

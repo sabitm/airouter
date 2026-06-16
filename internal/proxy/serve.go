@@ -124,6 +124,7 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 	// body, which already matches the ingress format.
 	res.inTok, res.outTok = parseUsage(respBody)
 	if status < 200 || status >= 300 {
+		p.debugf("passthrough %s %s: upstream %d\nresponse: %s", ingress.id, ingress.upstreamPath, status, respBody)
 		res.errMsg = upstreamErrorMessage(respBody)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -155,12 +156,16 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	}
 	if status < 200 || status >= 300 {
 		// Surface the upstream error message in the ingress error envelope.
+		p.debugf("translate %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
+			ingress.id, backend.id, backend.upstreamPath, status, upstreamBody, respBody)
 		res.fail(w, ingress, status, upstreamErrorMessage(respBody), "api_error")
 		return
 	}
 
 	resp, err := backend.decodeResponse(respBody)
 	if err != nil {
+		p.debugf("translate %s -> %s: decode response failed: %v\nresponse: %s",
+			ingress.id, backend.id, err, respBody)
 		res.fail(w, ingress, http.StatusBadGateway, "failed to decode upstream response", "api_error")
 		return
 	}
@@ -209,6 +214,13 @@ func upstreamErrorMessage(body []byte) string {
 		return string(body)
 	}
 	return "upstream error"
+}
+
+// debugf logs an upstream error exchange when debug mode is on. No-op otherwise.
+func (p *Proxy) debugf(format string, args ...any) {
+	if p.debug {
+		log.Printf("[debug] "+format, args...)
+	}
 }
 
 // recordLog persists a request log fire-and-forget so a slow DB write never

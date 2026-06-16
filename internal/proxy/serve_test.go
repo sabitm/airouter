@@ -95,7 +95,7 @@ func setupWithStore(t *testing.T, backend domain.Protocol, cap *capturedUpstream
 	}
 
 	mux := http.NewServeMux()
-	New(st).Mount(mux)
+	New(st, false).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token, st

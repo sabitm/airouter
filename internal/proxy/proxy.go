@@ -97,13 +97,15 @@ type Proxy struct {
 	// SSE streams are governed by the request context instead.
 	client       *http.Client
 	streamClient *http.Client
+	debug        bool
 }
 
-func New(s *store.Store) *Proxy {
+func New(s *store.Store, debug bool) *Proxy {
 	return &Proxy{
 		store:        s,
 		client:       &http.Client{Timeout: 5 * time.Minute},
 		streamClient: &http.Client{},
+		debug:        debug,
 	}
 }
 

@@ -82,6 +82,7 @@ precedence.
 | `-listen` | `AIROUTER_LISTEN` | `:8080` | HTTP listen address |
 | `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
 | `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys at rest |
+| `-debug` | `AIROUTER_DEBUG` | `false` | Log failed/error upstream exchanges to the terminal (may include prompt content) |
 
 If `AIROUTER_SECRET` is unset, an insecure built-in key is used and a warning is
 logged. Set a real secret in any deployment you care about; rotating it makes

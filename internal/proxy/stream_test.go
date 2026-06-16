@@ -108,7 +108,7 @@ func setupStreaming(t *testing.T, backend domain.Protocol, anthropicBody string)
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st).Mount(mux)
+	New(st, false).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token
