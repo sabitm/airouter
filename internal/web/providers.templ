@@ -6,8 +6,9 @@ import (
 	"airouter/internal/domain"
 )
 
-templ ProvidersPage(providers []*domain.Provider) {
+templ ProvidersPage(providers []*domain.Provider, baseURL string) {
 	@Layout("Providers", "/dashboard/providers") {
+		@ConnectionPanel(baseURL)
 		<section class="panel">
 			<h1>Providers</h1>
 			<p class="hint">An upstream connection: a base URL, an API key, and the protocol it speaks.</p>
@@ -17,6 +18,27 @@ templ ProvidersPage(providers []*domain.Provider) {
 			@ProviderList(providers)
 		</section>
 	}
+}
+
+// ConnectionPanel shows the router's own ingress URLs for agent clients. The two
+// differ by design: the Anthropic SDK appends /v1/messages to its base URL, so
+// it must omit /v1; OpenAI clients append /chat/completions to a base that
+// already ends in /v1.
+templ ConnectionPanel(baseURL string) {
+	<section class="panel">
+		<h1>Connect an agent</h1>
+		<p class="hint">Point your agent at the router using its access key as the API key.</p>
+		<div class="conn-row">
+			<label>Claude Code (ANTHROPIC_BASE_URL)</label>
+			<input class="mono conn-url" readonly value={ baseURL }/>
+			<button type="button" class="link" onclick="navigator.clipboard.writeText(this.previousElementSibling.value)">Copy</button>
+		</div>
+		<div class="conn-row">
+			<label>Codex (OPENAI_BASE_URL)</label>
+			<input class="mono conn-url" readonly value={ baseURL + "/v1" }/>
+			<button type="button" class="link" onclick="navigator.clipboard.writeText(this.previousElementSibling.value)">Copy</button>
+		</div>
+	</section>
 }
 
 templ providerForm() {

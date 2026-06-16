@@ -93,7 +93,19 @@ func (h *Handler) providersPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	render(w, r, ProvidersPage(providers))
+	render(w, r, ProvidersPage(providers, routerBaseURL(r)))
+}
+
+// routerBaseURL reconstructs the router's externally visible origin from the
+// request, honoring X-Forwarded-Proto when behind a TLS-terminating proxy.
+func routerBaseURL(r *http.Request) string {
+	scheme := "http"
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {

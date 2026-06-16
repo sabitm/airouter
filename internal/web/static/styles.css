@@ -138,6 +138,10 @@ td.actions { text-align: right; white-space: nowrap; }
 
 .panel-head { display: flex; align-items: center; justify-content: space-between; }
 
+.conn-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.conn-row label { flex: 0 0 260px; font-size: 13px; color: var(--muted); }
+.conn-url { flex: 1; }
+
 .check { font-size: 13px; }
 .check.ok { color: var(--ok); }
 .check.err { color: var(--danger); }
