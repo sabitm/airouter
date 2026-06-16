@@ -7,6 +7,7 @@ package proxy
 import (
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"airouter/internal/domain"
@@ -98,6 +99,11 @@ type Proxy struct {
 	client       *http.Client
 	streamClient *http.Client
 	debug        bool
+
+	// rr holds per-combo round-robin counters, keyed by combo id. In-memory only:
+	// the rotation resets on restart, which is acceptable for load spreading.
+	rrMu sync.Mutex
+	rr   map[int64]uint64
 }
 
 func New(s *store.Store, debug bool) *Proxy {
@@ -106,7 +112,21 @@ func New(s *store.Store, debug bool) *Proxy {
 		client:       &http.Client{Timeout: 5 * time.Minute},
 		streamClient: &http.Client{},
 		debug:        debug,
+		rr:           map[int64]uint64{},
 	}
+}
+
+// nextRoundRobin returns the starting target index for a round-robin combo with
+// n targets, advancing the per-combo counter so successive requests rotate.
+func (p *Proxy) nextRoundRobin(comboID int64, n int) int {
+	if n <= 1 {
+		return 0
+	}
+	p.rrMu.Lock()
+	i := p.rr[comboID]
+	p.rr[comboID] = i + 1
+	p.rrMu.Unlock()
+	return int(i % uint64(n))
 }
 
 // Mount registers the proxy ingress endpoints.

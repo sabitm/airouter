@@ -8,92 +8,170 @@ import (
 	"airouter/internal/domain"
 )
 
-// listCombos joins providers so the combo list can display the bound provider.
-// The provider API key is decrypted here too, since combo resolution needs it.
+// ListCombos returns all combos with their ordered targets, each target's
+// provider hydrated (API key decrypted) for display and resolution.
 func (s *Store) ListCombos(ctx context.Context) ([]*domain.Combo, error) {
-	const q = `
-SELECT c.id, c.name, c.provider_id, c.upstream_model, c.created_at, c.updated_at,
-       p.id, p.name, p.base_url, p.api_key, p.protocol, p.created_at, p.updated_at
-FROM combos c JOIN providers p ON p.id = c.provider_id
-ORDER BY c.name`
-	rows, err := s.db.QueryContext(ctx, q)
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT id, name, strategy, created_at, updated_at FROM combos ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []*domain.Combo
+	byID := map[int64]*domain.Combo{}
 	for rows.Next() {
-		c, err := s.scanComboWithProvider(rows)
-		if err != nil {
+		var c domain.Combo
+		if err := rows.Scan(&c.ID, &c.Name, &c.Strategy, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
-		out = append(out, c)
+		out = append(out, &c)
+		byID[c.ID] = &c
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.hydrateTargets(ctx, byID); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-func (s *Store) scanComboWithProvider(row interface{ Scan(...any) error }) (*domain.Combo, error) {
-	var c domain.Combo
-	var p domain.Provider
-	var enc string
-	if err := row.Scan(
-		&c.ID, &c.Name, &c.ProviderID, &c.UpstreamModel, &c.CreatedAt, &c.UpdatedAt,
-		&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.CreatedAt, &p.UpdatedAt,
-	); err != nil {
-		return nil, err
+// hydrateTargets loads every combo_targets row whose combo is in byID, joins the
+// provider, decrypts its key, and appends the target in position order.
+func (s *Store) hydrateTargets(ctx context.Context, byID map[int64]*domain.Combo) error {
+	if len(byID) == 0 {
+		return nil
 	}
-	key, err := s.cipher.Decrypt(enc)
+	const q = `
+SELECT t.combo_id, t.id, t.provider_id, t.upstream_model, t.position,
+       p.id, p.name, p.base_url, p.api_key, p.protocol, p.created_at, p.updated_at
+FROM combo_targets t JOIN providers p ON p.id = t.provider_id
+ORDER BY t.combo_id, t.position, t.id`
+	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var comboID int64
+		var t domain.ComboTarget
+		var p domain.Provider
+		var enc string
+		if err := rows.Scan(
+			&comboID, &t.ID, &t.ProviderID, &t.UpstreamModel, &t.Position,
+			&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
+			return err
+		}
+		c, ok := byID[comboID]
+		if !ok {
+			continue
+		}
+		key, err := s.cipher.Decrypt(enc)
+		if err != nil {
+			return err
+		}
+		p.APIKey = key
+		t.Provider = &p
+		c.Targets = append(c.Targets, t)
+	}
+	return rows.Err()
+}
+
+// GetComboByName resolves a custom model name to its combo + ordered targets.
+// This is the hot path used by the proxy.
+func (s *Store) GetComboByName(ctx context.Context, name string) (*domain.Combo, error) {
+	var c domain.Combo
+	row := s.db.QueryRowContext(ctx,
+		"SELECT id, name, strategy, created_at, updated_at FROM combos WHERE name = ?", name)
+	if err := row.Scan(&c.ID, &c.Name, &c.Strategy, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
-	p.APIKey = key
-	c.Provider = &p
+	if err := s.hydrateTargets(ctx, map[int64]*domain.Combo{c.ID: &c}); err != nil {
+		return nil, err
+	}
 	return &c, nil
 }
 
-// GetComboByName resolves a custom model name to its combo + provider. This is
-// the hot path used by the proxy.
-func (s *Store) GetComboByName(ctx context.Context, name string) (*domain.Combo, error) {
-	const q = `
-SELECT c.id, c.name, c.provider_id, c.upstream_model, c.created_at, c.updated_at,
-       p.id, p.name, p.base_url, p.api_key, p.protocol, p.created_at, p.updated_at
-FROM combos c JOIN providers p ON p.id = c.provider_id
-WHERE c.name = ?`
-	row := s.db.QueryRowContext(ctx, q, name)
-	c, err := s.scanComboWithProvider(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	return c, err
-}
-
+// GetCombo loads a combo and its targets by id.
 func (s *Store) GetCombo(ctx context.Context, id int64) (*domain.Combo, error) {
-	row := s.db.QueryRowContext(ctx,
-		"SELECT id, name, provider_id, upstream_model, created_at, updated_at FROM combos WHERE id = ?", id)
 	var c domain.Combo
-	err := row.Scan(&c.ID, &c.Name, &c.ProviderID, &c.UpstreamModel, &c.CreatedAt, &c.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
+	row := s.db.QueryRowContext(ctx,
+		"SELECT id, name, strategy, created_at, updated_at FROM combos WHERE id = ?", id)
+	if err := row.Scan(&c.ID, &c.Name, &c.Strategy, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
 	}
-	return &c, err
+	if err := s.hydrateTargets(ctx, map[int64]*domain.Combo{c.ID: &c}); err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 func (s *Store) CreateCombo(ctx context.Context, c *domain.Combo) error {
-	res, err := s.db.ExecContext(ctx,
-		"INSERT INTO combos (name, provider_id, upstream_model) VALUES (?, ?, ?)",
-		c.Name, c.ProviderID, c.UpstreamModel)
+	if c.Strategy == "" {
+		c.Strategy = domain.StrategyFailover
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		"INSERT INTO combos (name, strategy) VALUES (?, ?)", c.Name, c.Strategy)
 	if err != nil {
 		return err
 	}
 	c.ID, err = res.LastInsertId()
-	return err
+	if err != nil {
+		return err
+	}
+	if err := insertTargets(ctx, tx, c.ID, c.Targets); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
+// UpdateCombo updates the combo metadata and replaces its target rows wholesale.
 func (s *Store) UpdateCombo(ctx context.Context, c *domain.Combo) error {
-	_, err := s.db.ExecContext(ctx,
-		"UPDATE combos SET name=?, provider_id=?, upstream_model=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		c.Name, c.ProviderID, c.UpstreamModel, c.ID)
-	return err
+	if c.Strategy == "" {
+		c.Strategy = domain.StrategyFailover
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE combos SET name=?, strategy=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		c.Name, c.Strategy, c.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM combo_targets WHERE combo_id=?", c.ID); err != nil {
+		return err
+	}
+	if err := insertTargets(ctx, tx, c.ID, c.Targets); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// insertTargets writes targets with position set to slice order, so the stored
+// position always reflects the caller's intended ordering.
+func insertTargets(ctx context.Context, tx *sql.Tx, comboID int64, targets []domain.ComboTarget) error {
+	for i, t := range targets {
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO combo_targets (combo_id, provider_id, upstream_model, position) VALUES (?, ?, ?, ?)",
+			comboID, t.ProviderID, t.UpstreamModel, i); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) DeleteCombo(ctx context.Context, id int64) error {

@@ -90,7 +90,7 @@ func setupWithStore(t *testing.T, backend domain.Protocol, cap *capturedUpstream
 	if err := st.CreateProvider(ctx, prov); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", ProviderID: prov.ID, UpstreamModel: "real-model"}); err != nil {
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "real-model"}}}); err != nil {
 		t.Fatal(err)
 	}
 	key, err := st.NewAccessKey(ctx, "test")
@@ -258,7 +258,7 @@ func TestOpenModeNoKeys(t *testing.T) {
 	if err := st.CreateProvider(ctx, prov); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", ProviderID: prov.ID, UpstreamModel: "real-model"}); err != nil {
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "real-model"}}}); err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()

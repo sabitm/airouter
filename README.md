@@ -16,10 +16,14 @@ Three concepts:
 - **Provider** - an upstream connection: a base URL, an API key, and the
   protocol it speaks (`openai` or `anthropic`). The API key is encrypted at
   rest.
-- **Combo** - a custom model name (e.g. `default`) bound to a provider and a
-  real upstream model id (e.g. `gpt-4o`). Clients put the combo name in the
-  request `model` field; airouter resolves it to the provider and rewrites the
-  model.
+- **Combo** - a custom model name (e.g. `default`) backed by one or more
+  targets, each a provider + real upstream model id (e.g. `gpt-4o`). Clients put
+  the combo name in the request `model` field; airouter resolves it to a target
+  and rewrites the model. With multiple targets, a strategy picks which to use:
+  `failover` tries them in order, `round-robin` spreads load and still fails over
+  past a dead target. The router advances to the next target on any upstream
+  failure that happens before the response starts streaming; targets may mix
+  protocols.
 - **Access key** - a bearer token clients use to authenticate against the
   router. The full token is shown once at creation; only its hash is stored.
 

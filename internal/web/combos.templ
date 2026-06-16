@@ -10,7 +10,7 @@ templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
 	@Layout("Combos", "/dashboard/combos") {
 		<section class="panel">
 			<h1>Combos</h1>
-			<p class="hint">A custom model name clients call (e.g. "default"), bound to a provider and a real upstream model.</p>
+			<p class="hint">A custom model name clients call (e.g. "default"), backed by one or more provider + upstream-model targets. With multiple targets, the strategy picks which to use: failover tries them in order, round-robin spreads load and still fails over.</p>
 			if len(providers) == 0 {
 				<p class="empty">Add a provider first.</p>
 			} else {
@@ -24,23 +24,69 @@ templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
 }
 
 templ comboForm(providers []*domain.Provider) {
-	<form class="row-form" hx-post="/dashboard/combos" hx-target="#combo-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
-		<input name="name" placeholder="combo name (e.g. default)" required/>
-		<select name="provider_id" hx-get="/dashboard/providers/models" hx-trigger="change, load" hx-target="#model-options-wrap" hx-swap="innerHTML">
+	<form class="combo-form" hx-post="/dashboard/combos" hx-target="#combo-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this) this.reset()">
+		<div class="row-form">
+			<input name="name" placeholder="combo name (e.g. default)" required/>
+			@strategySelect("")
+		</div>
+		<div class="targets">
+			@comboTargetRow("add-0", providers, 0, "")
+		</div>
+		@targetTemplate(providers)
+		<div class="row-form">
+			<button type="button" class="link" onclick="addComboTarget(this)">+ Add target</button>
+			<button type="submit">Add combo</button>
+		</div>
+	</form>
+}
+
+templ strategySelect(selected domain.ComboStrategy) {
+	<select name="strategy" title="selection strategy">
+		if selected == domain.StrategyRoundRobin {
+			<option value="failover">failover</option>
+			<option value="roundrobin" selected>round-robin</option>
+		} else {
+			<option value="failover" selected>failover</option>
+			<option value="roundrobin">round-robin</option>
+		}
+	</select>
+}
+
+// comboTargetRow renders one provider + upstream-model pair. uid must be unique
+// on the page so the datalist id and the htmx model-fetch target do not collide
+// across rows or across open forms.
+templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderID int64, model string) {
+	{{ listID := "model-options-" + uid }}
+	<div class="target-row row-form">
+		<select name="provider_id" hx-get={ "/dashboard/providers/models?list=" + listID } hx-trigger="change, load" hx-target={ "#model-options-wrap-" + uid } hx-swap="innerHTML">
 			for _, p := range providers {
-				<option value={ strconv.FormatInt(p.ID, 10) }>{ p.Name } ({ string(p.Protocol) })</option>
+				if p.ID == selectedProviderID {
+					<option value={ strconv.FormatInt(p.ID, 10) } selected>{ p.Name } ({ string(p.Protocol) })</option>
+				} else {
+					<option value={ strconv.FormatInt(p.ID, 10) }>{ p.Name } ({ string(p.Protocol) })</option>
+				}
 			}
 		</select>
-		<input name="upstream_model" list="model-options" placeholder="upstream model id (e.g. gpt-4o)" required/>
-		<span id="model-options-wrap">@ModelDatalist(nil, "model-options")</span>
-		<button type="submit">Add</button>
-	</form>
+		<input name="upstream_model" list={ listID } value={ model } placeholder="upstream model id (e.g. gpt-4o)" required/>
+		<span id={ "model-options-wrap-" + uid }>@ModelDatalist(nil, listID)</span>
+		<button type="button" class="link danger" onclick="removeComboTarget(this)" title="remove target">x</button>
+	</div>
+}
+
+// targetTemplate holds an inert prototype target row whose __IDX__ placeholders
+// addComboTarget() rewrites to a unique index when cloning. Rendered with no
+// selected provider so a fresh row starts blank. The <template> content is inert
+// so htmx does not wire it until it is cloned into the form.
+templ targetTemplate(providers []*domain.Provider) {
+	<template class="target-template">
+		@comboTargetRow("__IDX__", providers, 0, "")
+	</template>
 }
 
 // ModelDatalist backs an upstream_model input's autocomplete with models
 // fetched live from the selected provider. An empty list just yields no
 // suggestions; the field stays free-text. listID must be unique per page, so
-// the always-present add form and each open edit row use distinct ids.
+// the add form and each open edit row use distinct ids.
 templ ModelDatalist(models []string, listID string) {
 	<datalist id={ listID }>
 		for _, m := range models {
@@ -56,7 +102,7 @@ templ ComboList(combos []*domain.Combo) {
 		} else {
 			<table>
 				<thead>
-					<tr><th>Combo</th><th>Provider</th><th>Upstream model</th><th></th></tr>
+					<tr><th>Combo</th><th>Strategy</th><th>Targets</th><th></th></tr>
 				</thead>
 				<tbody>
 					for _, c := range combos {
@@ -72,10 +118,23 @@ templ ComboRow(c *domain.Combo) {
 	<tr id={ "combo-" + strconv.FormatInt(c.ID, 10) }>
 		<td class="mono">{ c.Name }</td>
 		<td>
-			{ c.Provider.Name }
-			<span class="tag">{ string(c.Provider.Protocol) }</span>
+			if len(c.Targets) > 1 {
+				<span class="tag">{ strategyLabel(c.Strategy) }</span>
+			} else {
+				<span class="muted">single</span>
+			}
 		</td>
-		<td class="mono">{ c.UpstreamModel }</td>
+		<td>
+			<ul class="target-list">
+				for _, t := range c.Targets {
+					<li>
+						{ t.Provider.Name }
+						<span class="tag">{ string(t.Provider.Protocol) }</span>
+						<span class="mono">{ t.UpstreamModel }</span>
+					</li>
+				}
+			</ul>
+		</td>
 		<td class="actions">
 			<button class="link" hx-get={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/edit" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML">Edit</button>
 			<button class="link danger" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/delete" } hx-target="#combo-list" hx-swap="outerHTML" hx-confirm="Delete this combo?">Delete</button>
@@ -83,26 +142,33 @@ templ ComboRow(c *domain.Combo) {
 	</tr>
 }
 
+func strategyLabel(s domain.ComboStrategy) string {
+	if s == domain.StrategyRoundRobin {
+		return "round-robin"
+	}
+	return "failover"
+}
+
 templ ComboEditRow(c *domain.Combo, providers []*domain.Provider) {
 	{{ id := strconv.FormatInt(c.ID, 10) }}
-	{{ listID := "model-options-" + id }}
 	<tr id={ "combo-" + id }>
 		<td colspan="4">
-			<form class="row-form" hx-post={ "/dashboard/combos/" + id } hx-target="#combo-list" hx-swap="outerHTML">
-				<input name="name" value={ c.Name } required/>
-				<select name="provider_id" hx-get={ "/dashboard/providers/models?list=" + listID } hx-trigger="change, load" hx-target={ "#model-options-wrap-" + id } hx-swap="innerHTML">
-					for _, p := range providers {
-						if p.ID == c.ProviderID {
-							<option value={ strconv.FormatInt(p.ID, 10) } selected>{ p.Name } ({ string(p.Protocol) })</option>
-						} else {
-							<option value={ strconv.FormatInt(p.ID, 10) }>{ p.Name } ({ string(p.Protocol) })</option>
-						}
+			<form class="combo-form" hx-post={ "/dashboard/combos/" + id } hx-target="#combo-list" hx-swap="outerHTML">
+				<div class="row-form">
+					<input name="name" value={ c.Name } required/>
+					@strategySelect(c.Strategy)
+				</div>
+				<div class="targets">
+					for i, t := range c.Targets {
+						@comboTargetRow("edit-"+id+"-"+strconv.Itoa(i), providers, t.ProviderID, t.UpstreamModel)
 					}
-				</select>
-				<input name="upstream_model" list={ listID } value={ c.UpstreamModel } required/>
-				<span id={ "model-options-wrap-" + id }>@ModelDatalist(nil, listID)</span>
-				<button type="submit">Save</button>
-				<button type="button" class="link" hx-get={ "/dashboard/combos/" + id + "/row" } hx-target={ "#combo-" + id } hx-swap="outerHTML">Cancel</button>
+				</div>
+				@targetTemplate(providers)
+				<div class="row-form">
+					<button type="button" class="link" onclick="addComboTarget(this)">+ Add target</button>
+					<button type="submit">Save</button>
+					<button type="button" class="link" hx-get={ "/dashboard/combos/" + id + "/row" } hx-target={ "#combo-" + id } hx-swap="outerHTML">Cancel</button>
+				</div>
 			</form>
 		</td>
 	</tr>

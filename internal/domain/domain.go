@@ -27,18 +27,45 @@ type Provider struct {
 	UpdatedAt time.Time
 }
 
-// Combo is a custom model name (e.g. "default") bound to a provider and a real
-// upstream model id. Clients call the combo name in the request `model` field
-// and the router resolves it to the provider + upstream model.
+// ComboStrategy selects which target a combo resolves to per request.
+type ComboStrategy string
+
+const (
+	// StrategyFailover always tries targets in position order, advancing to the
+	// next only when an upstream attempt fails before any bytes reach the client.
+	StrategyFailover ComboStrategy = "failover"
+	// StrategyRoundRobin rotates the starting target per request, then continues
+	// through the remaining targets so it still fails over past a dead provider.
+	StrategyRoundRobin ComboStrategy = "roundrobin"
+)
+
+func (s ComboStrategy) Valid() bool {
+	return s == StrategyFailover || s == StrategyRoundRobin
+}
+
+// Combo is a custom model name (e.g. "default") backed by one or more targets.
+// Clients call the combo name in the request `model` field and the router
+// resolves it to a provider + upstream model according to the strategy.
 type Combo struct {
+	ID        int64
+	Name      string
+	Strategy  ComboStrategy
+	CreatedAt time.Time
+	UpdatedAt time.Time
+
+	// Targets are ordered by Position. Hydrated for display/resolution.
+	Targets []ComboTarget
+}
+
+// ComboTarget binds a combo to one provider + upstream model at a position in
+// the combo's ordered target list.
+type ComboTarget struct {
 	ID            int64
-	Name          string
 	ProviderID    int64
 	UpstreamModel string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	Position      int
 
-	// Provider is optionally hydrated for display/resolution. Not persisted here.
+	// Provider is hydrated for display/resolution. Not a stored column here.
 	Provider *Provider
 }
 

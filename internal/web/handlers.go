@@ -2,8 +2,10 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/a-h/templ"
 
@@ -243,21 +245,55 @@ func (h *Handler) createCombo(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid form")
 		return
 	}
-	pid, err := strconv.ParseInt(r.FormValue("provider_id"), 10, 64)
+	c, err := parseComboForm(r)
 	if err != nil {
-		badRequest(w, "invalid provider")
+		badRequest(w, err.Error())
 		return
-	}
-	c := &domain.Combo{
-		Name:          r.FormValue("name"),
-		ProviderID:    pid,
-		UpstreamModel: r.FormValue("upstream_model"),
 	}
 	if err := h.store.CreateCombo(r.Context(), c); err != nil {
 		badRequest(w, err.Error())
 		return
 	}
 	h.renderComboList(w, r)
+}
+
+// parseComboForm builds a combo from the form's strategy plus the parallel
+// provider_id / upstream_model arrays (one pair per target row). Rows missing a
+// provider or model are skipped; at least one complete target is required.
+func parseComboForm(r *http.Request) (*domain.Combo, error) {
+	providerIDs := r.Form["provider_id"]
+	models := r.Form["upstream_model"]
+	var targets []domain.ComboTarget
+	for i, raw := range providerIDs {
+		var model string
+		if i < len(models) {
+			model = strings.TrimSpace(models[i])
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" || model == "" {
+			continue
+		}
+		pid, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid provider in target %d", i+1)
+		}
+		targets = append(targets, domain.ComboTarget{ProviderID: pid, UpstreamModel: model})
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("a combo needs at least one provider + model target")
+	}
+	strategy := domain.ComboStrategy(r.FormValue("strategy"))
+	if strategy == "" {
+		strategy = domain.StrategyFailover
+	}
+	if !strategy.Valid() {
+		return nil, fmt.Errorf("invalid strategy %q", r.FormValue("strategy"))
+	}
+	return &domain.Combo{
+		Name:     strings.TrimSpace(r.FormValue("name")),
+		Strategy: strategy,
+		Targets:  targets,
+	}, nil
 }
 
 func (h *Handler) editCombo(w http.ResponseWriter, r *http.Request) {
@@ -310,17 +346,12 @@ func (h *Handler) updateCombo(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid form")
 		return
 	}
-	pid, err := strconv.ParseInt(r.FormValue("provider_id"), 10, 64)
+	c, err := parseComboForm(r)
 	if err != nil {
-		badRequest(w, "invalid provider")
+		badRequest(w, err.Error())
 		return
 	}
-	c := &domain.Combo{
-		ID:            id,
-		Name:          r.FormValue("name"),
-		ProviderID:    pid,
-		UpstreamModel: r.FormValue("upstream_model"),
-	}
+	c.ID = id
 	if err := h.store.UpdateCombo(r.Context(), c); err != nil {
 		badRequest(w, err.Error())
 		return

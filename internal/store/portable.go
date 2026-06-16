@@ -21,10 +21,31 @@ type portableProvider struct {
 	Protocol string `json:"protocol"`
 }
 
-type portableCombo struct {
-	Name          string `json:"name"`
+type portableTarget struct {
 	Provider      string `json:"provider"` // provider name, not id, for portability
 	UpstreamModel string `json:"upstream_model"`
+}
+
+type portableCombo struct {
+	Name     string           `json:"name"`
+	Strategy string           `json:"strategy,omitempty"`
+	Targets  []portableTarget `json:"targets,omitempty"`
+
+	// Legacy single-target fields, accepted on import for backward compatibility.
+	Provider      string `json:"provider,omitempty"`
+	UpstreamModel string `json:"upstream_model,omitempty"`
+}
+
+// resolveTargets returns the combo's targets, folding the legacy single-provider
+// fields into one target when the new targets array is absent.
+func (pc portableCombo) resolveTargets() []portableTarget {
+	if len(pc.Targets) > 0 {
+		return pc.Targets
+	}
+	if pc.Provider != "" {
+		return []portableTarget{{Provider: pc.Provider, UpstreamModel: pc.UpstreamModel}}
+	}
+	return nil
 }
 
 type portableConfig struct {
@@ -49,9 +70,13 @@ func (s *Store) Export(ctx context.Context, w io.Writer) error {
 		})
 	}
 	for _, c := range combos {
-		cfg.Combos = append(cfg.Combos, portableCombo{
-			Name: c.Name, Provider: c.Provider.Name, UpstreamModel: c.UpstreamModel,
-		})
+		pc := portableCombo{Name: c.Name, Strategy: string(c.Strategy)}
+		for _, t := range c.Targets {
+			pc.Targets = append(pc.Targets, portableTarget{
+				Provider: t.Provider.Name, UpstreamModel: t.UpstreamModel,
+			})
+		}
+		cfg.Combos = append(cfg.Combos, pc)
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
@@ -104,18 +129,34 @@ func (s *Store) Import(ctx context.Context, r io.Reader) error {
 	}
 
 	for _, pc := range cfg.Combos {
-		prov, ok := byName[pc.Provider]
-		if !ok {
-			return fmt.Errorf("combo %q references unknown provider %q", pc.Name, pc.Provider)
+		var targets []domain.ComboTarget
+		for _, pt := range pc.resolveTargets() {
+			prov, ok := byName[pt.Provider]
+			if !ok {
+				return fmt.Errorf("combo %q references unknown provider %q", pc.Name, pt.Provider)
+			}
+			targets = append(targets, domain.ComboTarget{
+				ProviderID: prov.ID, UpstreamModel: pt.UpstreamModel,
+			})
+		}
+		if len(targets) == 0 {
+			return fmt.Errorf("combo %q has no targets", pc.Name)
+		}
+		strategy := domain.ComboStrategy(pc.Strategy)
+		if strategy == "" {
+			strategy = domain.StrategyFailover
+		}
+		if !strategy.Valid() {
+			return fmt.Errorf("combo %q: invalid strategy %q", pc.Name, pc.Strategy)
 		}
 		if cur, ok := comboByName[pc.Name]; ok {
-			cur.ProviderID, cur.UpstreamModel = prov.ID, pc.UpstreamModel
+			cur.Strategy, cur.Targets = strategy, targets
 			if err := s.UpdateCombo(ctx, cur); err != nil {
 				return err
 			}
 		} else {
 			if err := s.CreateCombo(ctx, &domain.Combo{
-				Name: pc.Name, ProviderID: prov.ID, UpstreamModel: pc.UpstreamModel,
+				Name: pc.Name, Strategy: strategy, Targets: targets,
 			}); err != nil {
 				return err
 			}
