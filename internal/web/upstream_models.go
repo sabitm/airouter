@@ -17,21 +17,25 @@ var upstreamClient = &http.Client{Timeout: 15 * time.Second}
 // as a datalist for the combo form's upstream_model autocomplete. Best-effort:
 // any failure yields an empty datalist so combo creation still works manually.
 func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
+	listID := r.URL.Query().Get("list")
+	if listID == "" {
+		listID = "model-options"
+	}
 	id, err := strconv.ParseInt(r.URL.Query().Get("provider_id"), 10, 64)
 	if err != nil {
-		render(w, r, ModelDatalist(nil))
+		render(w, r, ModelDatalist(nil, listID))
 		return
 	}
 	provider, err := h.store.GetProvider(r.Context(), id)
 	if err != nil {
-		render(w, r, ModelDatalist(nil))
+		render(w, r, ModelDatalist(nil, listID))
 		return
 	}
 	models, err := fetchUpstreamModels(r.Context(), provider)
 	if err != nil {
 		models = nil
 	}
-	render(w, r, ModelDatalist(models))
+	render(w, r, ModelDatalist(models, listID))
 }
 
 // fetchUpstreamModels queries the provider's /models endpoint. Both OpenAI and

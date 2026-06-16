@@ -32,16 +32,17 @@ templ comboForm(providers []*domain.Provider) {
 			}
 		</select>
 		<input name="upstream_model" list="model-options" placeholder="upstream model id (e.g. gpt-4o)" required/>
-		<span id="model-options-wrap">@ModelDatalist(nil)</span>
+		<span id="model-options-wrap">@ModelDatalist(nil, "model-options")</span>
 		<button type="submit">Add</button>
 	</form>
 }
 
-// ModelDatalist backs the upstream_model input's autocomplete with models
+// ModelDatalist backs an upstream_model input's autocomplete with models
 // fetched live from the selected provider. An empty list just yields no
-// suggestions; the field stays free-text.
-templ ModelDatalist(models []string) {
-	<datalist id="model-options">
+// suggestions; the field stays free-text. listID must be unique per page, so
+// the always-present add form and each open edit row use distinct ids.
+templ ModelDatalist(models []string, listID string) {
+	<datalist id={ listID }>
 		for _, m := range models {
 			<option value={ m }></option>
 		}
@@ -83,11 +84,13 @@ templ ComboRow(c *domain.Combo) {
 }
 
 templ ComboEditRow(c *domain.Combo, providers []*domain.Provider) {
-	<tr id={ "combo-" + strconv.FormatInt(c.ID, 10) }>
+	{{ id := strconv.FormatInt(c.ID, 10) }}
+	{{ listID := "model-options-" + id }}
+	<tr id={ "combo-" + id }>
 		<td colspan="4">
-			<form class="row-form" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) } hx-target="#combo-list" hx-swap="outerHTML">
+			<form class="row-form" hx-post={ "/dashboard/combos/" + id } hx-target="#combo-list" hx-swap="outerHTML">
 				<input name="name" value={ c.Name } required/>
-				<select name="provider_id">
+				<select name="provider_id" hx-get={ "/dashboard/providers/models?list=" + listID } hx-trigger="change, load" hx-target={ "#model-options-wrap-" + id } hx-swap="innerHTML">
 					for _, p := range providers {
 						if p.ID == c.ProviderID {
 							<option value={ strconv.FormatInt(p.ID, 10) } selected>{ p.Name } ({ string(p.Protocol) })</option>
@@ -96,9 +99,10 @@ templ ComboEditRow(c *domain.Combo, providers []*domain.Provider) {
 						}
 					}
 				</select>
-				<input name="upstream_model" value={ c.UpstreamModel } required/>
+				<input name="upstream_model" list={ listID } value={ c.UpstreamModel } required/>
+				<span id={ "model-options-wrap-" + id }>@ModelDatalist(nil, listID)</span>
 				<button type="submit">Save</button>
-				<button type="button" class="link" hx-get={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/row" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML">Cancel</button>
+				<button type="button" class="link" hx-get={ "/dashboard/combos/" + id + "/row" } hx-target={ "#combo-" + id } hx-swap="outerHTML">Cancel</button>
 			</form>
 		</td>
 	</tr>
