@@ -41,6 +41,12 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]*domain.Reque
 	return out, rows.Err()
 }
 
+// ClearRequestLogs deletes all recorded request logs.
+func (s *Store) ClearRequestLogs(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM request_logs")
+	return err
+}
+
 // RequestLogStats returns aggregate totals across all recorded requests.
 func (s *Store) RequestLogStats(ctx context.Context) (totalReqs, totalIn, totalOut int64, err error) {
 	row := s.db.QueryRowContext(ctx,

@@ -14,8 +14,21 @@ type LogStats struct {
 
 templ LogsPage(logs []*domain.RequestLog, stats LogStats) {
 	@Layout("Logs", "/dashboard/logs") {
+		@LogsBody(logs, stats)
+	}
+}
+
+// LogsBody is the swappable region: stats cards plus the log table. The clear
+// action re-renders this fragment so the page need not fully reload.
+templ LogsBody(logs []*domain.RequestLog, stats LogStats) {
+	<div id="logs-body">
 		<section class="panel">
-			<h1>Request Logs</h1>
+			<div class="panel-head">
+				<h1>Request Logs</h1>
+				if len(logs) > 0 {
+					<button class="link danger" hx-post="/dashboard/logs/clear" hx-target="#logs-body" hx-swap="outerHTML" hx-confirm="Delete all request logs?">Clear logs</button>
+				}
+			</div>
 			<p class="hint">One row per proxied request. Token counts are unavailable for streaming passthrough.</p>
 			<div class="stats">
 				<div class="stat">
@@ -75,5 +88,5 @@ templ LogsPage(logs []*domain.RequestLog, stats LogStats) {
 				</table>
 			}
 		</section>
-	}
+	</div>
 }

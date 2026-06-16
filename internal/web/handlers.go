@@ -57,6 +57,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	// Logs
 	mux.HandleFunc("GET /dashboard/logs", h.logsPage)
+	mux.HandleFunc("POST /dashboard/logs/clear", h.clearLogs)
 
 	// Settings
 	mux.HandleFunc("GET /dashboard/settings", h.settingsPage)
@@ -399,6 +400,14 @@ func (h *Handler) logsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	render(w, r, LogsPage(logs, LogStats{TotalReqs: reqs, TotalIn: in, TotalOut: out}))
+}
+
+func (h *Handler) clearLogs(w http.ResponseWriter, r *http.Request) {
+	if err := h.store.ClearRequestLogs(r.Context()); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	render(w, r, LogsBody(nil, LogStats{}))
 }
 
 // --- Settings / import-export ---

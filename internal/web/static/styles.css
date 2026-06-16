@@ -136,6 +136,8 @@ td.actions { text-align: right; white-space: nowrap; }
 	border: 1px solid var(--border);
 }
 
+.panel-head { display: flex; align-items: center; justify-content: space-between; }
+
 .stats { display: flex; gap: 16px; margin-top: 12px; }
 .stat {
 	display: flex;
