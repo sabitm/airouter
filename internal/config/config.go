@@ -12,6 +12,8 @@ type Config struct {
 	Secret string
 	// Debug logs failed/error upstream exchanges to the terminal.
 	Debug bool
+	// Version, when true, prints the build version and exits.
+	Version bool
 }
 
 // devSecret is used only when no secret is supplied, so the binary runs out of
@@ -25,6 +27,7 @@ func Load() Config {
 	flag.StringVar(&c.DBPath, "db", env("AIROUTER_DB", "airouter.db"), "SQLite database path")
 	flag.StringVar(&c.Secret, "secret", env("AIROUTER_SECRET", ""), "secret seeding the at-rest encryption key")
 	flag.BoolVar(&c.Debug, "debug", envBool("AIROUTER_DEBUG"), "log failed/error upstream exchanges to the terminal")
+	flag.BoolVar(&c.Version, "version", false, "print version and exit")
 	flag.Parse()
 	return c
 }

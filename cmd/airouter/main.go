@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -16,8 +17,16 @@ import (
 	"airouter/internal/store"
 )
 
+// version is overridden at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	cfg := config.Load()
+
+	if cfg.Version {
+		fmt.Printf("airouter %s\n", version)
+		return
+	}
 
 	secret, isDev := cfg.EffectiveSecret()
 	if isDev {
@@ -43,7 +52,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("airouter listening on %s (dashboard at /dashboard)", cfg.ListenAddr)
+		log.Printf("airouter %s listening on %s (dashboard at /dashboard)", version, cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("serve: %v", err)
 		}
