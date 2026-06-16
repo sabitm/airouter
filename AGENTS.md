@@ -44,7 +44,7 @@ Supporting packages:
 - `internal/store` - SQLite store, migrations, repos, JSON import/export.
 - `internal/crypto` - AES-256-GCM for provider API keys at rest.
 - `internal/config` - flags/env loading.
-- `internal/server` - HTTP wiring + logging middleware.
+- `internal/server` - HTTP wiring.
 - `internal/web` - templ + HTMX dashboard. `.templ` files generate `*_templ.go`.
 - `cmd/airouter` - main: wires config, crypto, store, server; graceful shutdown.
 
@@ -79,6 +79,13 @@ backend-capable format, also set its `protocol` and `upstreamPath` and add it to
 - Errors before the first streamed byte fall back to the ingress format's unary
   error envelope; mid-stream failures terminate the response cleanly.
 - Each ingress format renders its own error envelope shape (`encodeError`).
+- Token usage is recorded per request for the dashboard logs. Unary parses it
+  from the response body; streaming requires care: OpenAI backends omit usage
+  unless `stream_options.include_usage` is set on the request, OpenAI reports
+  both counts on the final chunk while Anthropic reports input at message start
+  and output at message delta, and the translate pump takes input from whichever
+  event carries it. Streaming passthrough sniffs usage out of the relayed SSE
+  without mutating the bytes. Preserve these when touching the streaming paths.
 
 ## Build, test, regenerate
 
