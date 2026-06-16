@@ -9,7 +9,7 @@ import (
 // Combo names are what clients put in the request `model` field, so this is the
 // set of models the router actually exposes. Access-key protected.
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
-	if !p.authenticate(r) {
+	if _, ok := p.authenticate(r); !ok {
 		writeErr(w, openaiCodec, http.StatusUnauthorized, "invalid or missing access key", "authentication_error")
 		return
 	}

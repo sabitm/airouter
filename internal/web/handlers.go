@@ -55,6 +55,9 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/keys", h.createKey)
 	mux.HandleFunc("POST /dashboard/keys/{id}/delete", h.deleteKey)
 
+	// Logs
+	mux.HandleFunc("GET /dashboard/logs", h.logsPage)
+
 	// Settings
 	mux.HandleFunc("GET /dashboard/settings", h.settingsPage)
 	mux.HandleFunc("GET /dashboard/export", h.exportConfig)
@@ -378,6 +381,24 @@ func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	render(w, r, KeyList(keys, nil))
+}
+
+// --- Logs ---
+
+const logsPageLimit = 200
+
+func (h *Handler) logsPage(w http.ResponseWriter, r *http.Request) {
+	logs, err := h.store.ListRequestLogs(r.Context(), logsPageLimit)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	reqs, in, out, err := h.store.RequestLogStats(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	render(w, r, LogsPage(logs, LogStats{TotalReqs: reqs, TotalIn: in, TotalOut: out}))
 }
 
 // --- Settings / import-export ---

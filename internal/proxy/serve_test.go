@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"airouter/internal/crypto"
 	"airouter/internal/domain"
@@ -69,6 +70,12 @@ func newTestStore(t *testing.T) *store.Store {
 // server in front of the mock upstream. Returns the proxy base URL and token.
 func setup(t *testing.T, backend domain.Protocol, cap *capturedUpstream) (string, string) {
 	t.Helper()
+	base, token, _ := setupWithStore(t, backend, cap)
+	return base, token
+}
+
+func setupWithStore(t *testing.T, backend domain.Protocol, cap *capturedUpstream) (string, string, *store.Store) {
+	t.Helper()
 	st := newTestStore(t)
 	ctx := context.Background()
 
@@ -91,7 +98,7 @@ func setup(t *testing.T, backend domain.Protocol, cap *capturedUpstream) (string
 	New(st).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
-	return ts.URL, key.Token
+	return ts.URL, key.Token, st
 }
 
 func post(t *testing.T, url, token, body string) (*http.Response, []byte) {
@@ -201,6 +208,77 @@ func TestUnknownCombo(t *testing.T) {
 	resp, _ := post(t, base+"/v1/chat/completions", token, `{"model":"nope","messages":[]}`)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// waitForLogs polls the store for the expected number of request logs, since
+// recording is fire-and-forget in a background goroutine.
+func waitForLogs(t *testing.T, st *store.Store, want int) []*domain.RequestLog {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		logs, err := st.ListRequestLogs(context.Background(), 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(logs) >= want {
+			return logs
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d request logs", want)
+	return nil
+}
+
+func TestRequestLogTranslated(t *testing.T) {
+	var cap capturedUpstream
+	base, token, st := setupWithStore(t, domain.ProtocolAnthropic, &cap)
+	resp, out := post(t, base+"/v1/chat/completions", token,
+		`{"model":"default","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	logs := waitForLogs(t, st, 1)
+	l := logs[0]
+	if l.Format != "oai-chat" || l.Combo != "default" || l.Provider != "p" || l.UpstreamModel != "real-model" {
+		t.Errorf("log metadata mismatch: %+v", l)
+	}
+	if l.Status != http.StatusOK {
+		t.Errorf("status = %d, want 200", l.Status)
+	}
+	// Translated path decodes usage from the upstream body.
+	if l.InputTokens != 3 || l.OutputTokens != 4 {
+		t.Errorf("tokens = %d/%d, want 3/4", l.InputTokens, l.OutputTokens)
+	}
+	if l.AccessKeyName != "test" {
+		t.Errorf("access key name = %q, want test", l.AccessKeyName)
+	}
+}
+
+func TestRequestLogPassthroughUsage(t *testing.T) {
+	var cap capturedUpstream
+	base, token, st := setupWithStore(t, domain.ProtocolOpenAI, &cap)
+	resp, _ := post(t, base+"/v1/chat/completions", token,
+		`{"model":"default","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	// Passthrough recovers usage from the raw OpenAI body.
+	if l.InputTokens != 3 || l.OutputTokens != 4 {
+		t.Errorf("tokens = %d/%d, want 3/4", l.InputTokens, l.OutputTokens)
+	}
+}
+
+func TestRequestLogUnknownCombo(t *testing.T) {
+	var cap capturedUpstream
+	base, token, st := setupWithStore(t, domain.ProtocolOpenAI, &cap)
+	post(t, base+"/v1/chat/completions", token, `{"model":"nope","messages":[]}`)
+	l := waitForLogs(t, st, 1)[0]
+	if l.Status != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", l.Status)
+	}
+	if l.Combo != "nope" || l.ErrMsg == "" {
+		t.Errorf("expected failed log for unknown combo, got %+v", l)
 	}
 }
 

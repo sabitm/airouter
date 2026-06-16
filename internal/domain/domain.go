@@ -55,3 +55,24 @@ type AccessKey struct {
 	// Token is populated only on creation, never loaded from the store.
 	Token string
 }
+
+// RequestLog is one proxied inference request, recorded after it completes.
+// Provider, combo, and access-key names are denormalized so a log survives
+// deletion of the entities it references. Token counts are 0 when the path did
+// not decode usage (streaming passthrough always; unary passthrough when the
+// upstream body omits a usage object).
+type RequestLog struct {
+	ID            int64
+	CreatedAt     time.Time
+	AccessKeyName string
+	Combo         string
+	Provider      string
+	UpstreamModel string
+	Format        string // ingress wire format id (oai-chat, anth-msg, oai-responses)
+	Stream        bool
+	Status        int
+	InputTokens   int
+	OutputTokens  int
+	LatencyMS     int64
+	ErrMsg        string
+}

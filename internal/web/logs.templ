@@ -1,0 +1,79 @@
+package web
+
+import (
+	"strconv"
+
+	"airouter/internal/domain"
+)
+
+type LogStats struct {
+	TotalReqs int64
+	TotalIn   int64
+	TotalOut  int64
+}
+
+templ LogsPage(logs []*domain.RequestLog, stats LogStats) {
+	@Layout("Logs", "/dashboard/logs") {
+		<section class="panel">
+			<h1>Request Logs</h1>
+			<p class="hint">One row per proxied request. Token counts are unavailable for streaming passthrough.</p>
+			<div class="stats">
+				<div class="stat">
+					<span class="stat-value">{ strconv.FormatInt(stats.TotalReqs, 10) }</span>
+					<span class="stat-label">Requests</span>
+				</div>
+				<div class="stat">
+					<span class="stat-value">{ strconv.FormatInt(stats.TotalIn, 10) }</span>
+					<span class="stat-label">Input tokens</span>
+				</div>
+				<div class="stat">
+					<span class="stat-value">{ strconv.FormatInt(stats.TotalOut, 10) }</span>
+					<span class="stat-label">Output tokens</span>
+				</div>
+			</div>
+		</section>
+		<section class="panel">
+			if len(logs) == 0 {
+				<p class="empty">No requests recorded yet.</p>
+			} else {
+				<table>
+					<thead>
+						<tr>
+							<th>Time</th>
+							<th>Key</th>
+							<th>Combo</th>
+							<th>Provider / model</th>
+							<th>Format</th>
+							<th>Status</th>
+							<th>In</th>
+							<th>Out</th>
+							<th>Latency</th>
+							<th>Error</th>
+						</tr>
+					</thead>
+					<tbody>
+						for _, l := range logs {
+							<tr>
+								<td>{ l.CreatedAt.Format("2006-01-02 15:04:05") }</td>
+								<td>{ l.AccessKeyName }</td>
+								<td>
+									{ l.Combo }
+									if l.Stream {
+										<span class="tag">stream</span>
+									}
+								</td>
+								<td>{ l.Provider } / { l.UpstreamModel }</td>
+								<td class="mono">{ l.Format }</td>
+								<td>{ strconv.Itoa(l.Status) }</td>
+								<td>{ strconv.Itoa(l.InputTokens) }</td>
+								<td>{ strconv.Itoa(l.OutputTokens) }</td>
+								<td>{ strconv.FormatInt(l.LatencyMS, 10) }ms</td>
+								<td class="err">{ l.ErrMsg }</td>
+							</tr>
+						}
+					</tbody>
+				</table>
+			}
+		</section>
+	}
+}

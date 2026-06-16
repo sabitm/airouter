@@ -15,29 +15,31 @@ import (
 // streamPassthrough relays an upstream SSE response of the same protocol as the
 // ingress, rewriting only the request model. Events are re-emitted (preserving
 // names) so each is flushed to the client immediately.
-func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, ingress codec, provider *domain.Provider, upstreamModel string, body []byte) {
+func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte) {
 	rewritten, err := rewriteModel(body, upstreamModel)
 	if err != nil {
-		writeErr(w, ingress, http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
+		res.fail(w, ingress, http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 		return
 	}
 	resp, err := p.forwardStream(ctx, provider, ingress.upstreamPath, rewritten)
 	if err != nil {
-		writeErr(w, ingress, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
+		res.fail(w, ingress, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(resp.Body)
-		writeErr(w, ingress, resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
+		res.fail(w, ingress, resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
 		return
 	}
 
 	sw, ok := sse.NewWriter(w)
 	if !ok {
-		writeErr(w, ingress, http.StatusInternalServerError, "streaming unsupported by server", "api_error")
+		res.fail(w, ingress, http.StatusInternalServerError, "streaming unsupported by server", "api_error")
 		return
 	}
+	// Streaming passthrough relays raw events; token usage is not parsed out of
+	// the relayed SSE, so it stays at 0 in the log.
 	w.WriteHeader(http.StatusOK)
 	reader := sse.NewReader(resp.Body)
 	for {
@@ -59,10 +61,10 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, in
 // protocol, then pumps backend SSE events through the IR into ingress-format
 // SSE. Errors before the first byte fall back to a unary error envelope; errors
 // mid-stream simply terminate the response.
-func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, ingress, backend codec, provider *domain.Provider, upstreamModel string, body []byte) {
+func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, body []byte) {
 	req, err := ingress.decodeRequest(body)
 	if err != nil {
-		writeErr(w, ingress, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		res.fail(w, ingress, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
 	req.Model = upstreamModel
@@ -70,30 +72,38 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, ing
 
 	upstreamBody, err := backend.encodeRequest(req)
 	if err != nil {
-		writeErr(w, ingress, http.StatusInternalServerError, "failed to encode upstream request", "api_error")
+		res.fail(w, ingress, http.StatusInternalServerError, "failed to encode upstream request", "api_error")
 		return
 	}
 	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody)
 	if err != nil {
-		writeErr(w, ingress, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
+		res.fail(w, ingress, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(resp.Body)
-		writeErr(w, ingress, resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
+		res.fail(w, ingress, resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
 		return
 	}
 
 	sw, ok := sse.NewWriter(w)
 	if !ok {
-		writeErr(w, ingress, http.StatusInternalServerError, "streaming unsupported by server", "api_error")
+		res.fail(w, ingress, http.StatusInternalServerError, "streaming unsupported by server", "api_error")
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 
 	enc := ingress.newStreamEncoder(upstreamModel)
 	err = backend.decodeStream(resp.Body, func(ev ir.StreamEvent) error {
+		// Token counts arrive on distinct events: input at message start, output
+		// at finish.
+		switch ev.Kind {
+		case ir.EventMessageStart:
+			res.inTok = ev.InputTokens
+		case ir.EventFinish:
+			res.outTok = ev.OutputTokens
+		}
 		return enc.Encode(ev, sw)
 	})
 	if err != nil {
