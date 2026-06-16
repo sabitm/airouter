@@ -29,7 +29,7 @@ data: [DONE]
 `
 
 const anthropicSSE = `event: message_start
-data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":3,"cache_creation_input_tokens":10,"cache_read_input_tokens":0,"output_tokens":0}}}
 
 event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
@@ -178,15 +178,19 @@ func TestStreamToolAnthropicToOpenAI(t *testing.T) {
 // translated paths read it through the IR stream events, and the passthrough
 // paths sniff it out of the relayed SSE without altering the bytes.
 func TestStreamUsageRecorded(t *testing.T) {
+	// Anthropic-backed cases see input 3 plus cache_creation 10 = 13; OpenAI-backed
+	// cases use the OpenAI mock stream which reports a flat input of 3.
 	cases := []struct {
 		name    string
 		backend domain.Protocol
 		ingress string
+		wantIn  int
+		wantOut int
 	}{
-		{"openai->openai", domain.ProtocolOpenAI, "/v1/chat/completions"},
-		{"openai->anthropic", domain.ProtocolAnthropic, "/v1/chat/completions"},
-		{"anthropic->anthropic", domain.ProtocolAnthropic, "/v1/messages"},
-		{"anthropic->openai", domain.ProtocolOpenAI, "/v1/messages"},
+		{"openai->openai", domain.ProtocolOpenAI, "/v1/chat/completions", 3, 2},
+		{"openai->anthropic", domain.ProtocolAnthropic, "/v1/chat/completions", 13, 2},
+		{"anthropic->anthropic", domain.ProtocolAnthropic, "/v1/messages", 13, 2},
+		{"anthropic->openai", domain.ProtocolOpenAI, "/v1/messages", 3, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -196,8 +200,8 @@ func TestStreamUsageRecorded(t *testing.T) {
 				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 			}
 			l := waitForLogs(t, st, 1)[0]
-			if l.InputTokens != 3 || l.OutputTokens != 2 {
-				t.Errorf("tokens = %d/%d, want 3/2", l.InputTokens, l.OutputTokens)
+			if l.InputTokens != tc.wantIn || l.OutputTokens != tc.wantOut {
+				t.Errorf("tokens = %d/%d, want %d/%d", l.InputTokens, l.OutputTokens, tc.wantIn, tc.wantOut)
 			}
 		})
 	}

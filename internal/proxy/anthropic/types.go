@@ -76,6 +76,16 @@ type messagesResponse struct {
 }
 
 type anthUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens int `json:"input_tokens"`
+	// Cache tokens are billed input that Anthropic reports separately: on a cache
+	// write input_tokens drops to the uncached remainder and the bulk lands in
+	// cache_creation; on a cache read it lands in cache_read. TotalInput folds all
+	// three so logged usage reflects the real input regardless of cache state.
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+}
+
+func (u anthUsage) TotalInput() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
 }

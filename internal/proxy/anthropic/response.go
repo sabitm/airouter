@@ -18,7 +18,7 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 		ID:         resp.ID,
 		Model:      resp.Model,
 		StopReason: stopReason(resp.StopReason),
-		Usage:      ir.Usage{InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens},
+		Usage:      ir.Usage{InputTokens: resp.Usage.TotalInput(), OutputTokens: resp.Usage.OutputTokens},
 	}
 	for _, b := range resp.Content {
 		switch b.Type {

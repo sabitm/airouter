@@ -258,13 +258,19 @@ func parseUsage(body []byte) (in, out int) {
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
 			InputTokens      int `json:"input_tokens"`
-			OutputTokens     int `json:"output_tokens"`
+			// Anthropic reports cached input separately; fold it in so the count
+			// reflects total input regardless of cache state.
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &u) != nil {
 		return 0, 0
 	}
-	return u.Usage.PromptTokens + u.Usage.InputTokens, u.Usage.CompletionTokens + u.Usage.OutputTokens
+	in = u.Usage.PromptTokens + u.Usage.InputTokens + u.Usage.CacheCreationInputTokens + u.Usage.CacheReadInputTokens
+	out = u.Usage.CompletionTokens + u.Usage.OutputTokens
+	return in, out
 }
 
 // upstreamErrorMessage extracts a human message from an upstream error body.

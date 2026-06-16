@@ -18,7 +18,7 @@ import (
 
 const (
 	openaiUpstreamBody    = `{"id":"chatcmpl-x","object":"chat.completion","model":"up","choices":[{"index":0,"message":{"role":"assistant","content":"hello from openai"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`
-	anthropicUpstreamBody = `{"id":"msg_x","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"hello from anthropic"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":4}}`
+	anthropicUpstreamBody = `{"id":"msg_x","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"hello from anthropic"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"cache_creation_input_tokens":10,"cache_read_input_tokens":0,"output_tokens":4}}`
 )
 
 type capturedUpstream struct {
@@ -328,9 +328,10 @@ func TestRequestLogTranslated(t *testing.T) {
 	if l.Status != http.StatusOK {
 		t.Errorf("status = %d, want 200", l.Status)
 	}
-	// Translated path decodes usage from the upstream body.
-	if l.InputTokens != 3 || l.OutputTokens != 4 {
-		t.Errorf("tokens = %d/%d, want 3/4", l.InputTokens, l.OutputTokens)
+	// Translated path decodes usage from the upstream body, folding the
+	// cache_creation tokens into the input total (3 + 10).
+	if l.InputTokens != 13 || l.OutputTokens != 4 {
+		t.Errorf("tokens = %d/%d, want 13/4", l.InputTokens, l.OutputTokens)
 	}
 	if l.AccessKeyName != "test" {
 		t.Errorf("access key name = %q, want test", l.AccessKeyName)

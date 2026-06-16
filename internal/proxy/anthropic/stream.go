@@ -69,7 +69,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			}
 			if err := emit(ir.StreamEvent{
 				Kind: ir.EventMessageStart, ID: m.Message.ID, Model: m.Message.Model,
-				InputTokens: m.Message.Usage.InputTokens,
+				InputTokens: m.Message.Usage.TotalInput(),
 			}); err != nil {
 				return err
 			}

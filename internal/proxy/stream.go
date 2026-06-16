@@ -68,38 +68,39 @@ func sniffStreamUsage(data []byte, res *reqResult) {
 	if len(data) == 0 || data[0] != '{' {
 		return
 	}
+	// Anthropic reports cached input under separate fields (cache_creation /
+	// cache_read); fold them into the input total so cache state does not skew it.
+	type usageFields struct {
+		PromptTokens             int `json:"prompt_tokens"`
+		CompletionTokens         int `json:"completion_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+	}
 	var u struct {
-		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			InputTokens      int `json:"input_tokens"`
-			OutputTokens     int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage   *usageFields `json:"usage"`
 		Message *struct {
-			Usage *struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
+			Usage *usageFields `json:"usage"`
 		} `json:"message"`
 	}
 	if json.Unmarshal(data, &u) != nil {
 		return
 	}
-	if u.Usage != nil {
-		if in := u.Usage.PromptTokens + u.Usage.InputTokens; in != 0 {
+	apply := func(f *usageFields) {
+		if f == nil {
+			return
+		}
+		if in := f.PromptTokens + f.InputTokens + f.CacheCreationInputTokens + f.CacheReadInputTokens; in != 0 {
 			res.inTok = in
 		}
-		if out := u.Usage.CompletionTokens + u.Usage.OutputTokens; out != 0 {
+		if out := f.CompletionTokens + f.OutputTokens; out != 0 {
 			res.outTok = out
 		}
 	}
-	if u.Message != nil && u.Message.Usage != nil {
-		if u.Message.Usage.InputTokens != 0 {
-			res.inTok = u.Message.Usage.InputTokens
-		}
-		if u.Message.Usage.OutputTokens != 0 {
-			res.outTok = u.Message.Usage.OutputTokens
-		}
+	apply(u.Usage)
+	if u.Message != nil {
+		apply(u.Message.Usage)
 	}
 }
 
