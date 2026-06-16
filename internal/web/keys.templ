@@ -33,8 +33,9 @@ templ KeyList(keys []*domain.AccessKey, justCreated *domain.AccessKey) {
 			</div>
 		}
 		if len(keys) == 0 {
-			<p class="empty">No access keys yet.</p>
+			<div class="flash error">No access keys yet. The proxy is currently <strong>open</strong>: it accepts unauthenticated requests. Generate a key to require authentication.</div>
 		} else {
+			<div class="flash ok">Authentication is required: requests must present a valid key. Revoking all keys reopens the proxy to unauthenticated access.</div>
 			<table>
 				<thead>
 					<tr><th>Label</th><th>Token</th><th>Created</th><th></th></tr>

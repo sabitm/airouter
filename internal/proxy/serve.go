@@ -243,17 +243,20 @@ func writeErr(w http.ResponseWriter, c codec, status int, message, errType strin
 }
 
 // authenticate verifies the bearer/x-api-key token against stored access keys,
-// returning the key's label on success.
+// returning the key's label on success. When no access keys exist the proxy
+// runs in open mode and accepts every request unauthenticated.
 func (p *Proxy) authenticate(r *http.Request) (string, bool) {
 	token := extractToken(r)
-	if token == "" {
-		return "", false
+	if token != "" {
+		if key, err := p.store.VerifyToken(r.Context(), token); err == nil {
+			return key.Name, true
+		}
 	}
-	key, err := p.store.VerifyToken(r.Context(), token)
-	if err != nil {
-		return "", false
+	// No valid token: allow only when there are no keys configured at all.
+	if n, err := p.store.CountAccessKeys(r.Context()); err == nil && n == 0 {
+		return "(open)", true
 	}
-	return key.Name, true
+	return "", false
 }
 
 func extractToken(r *http.Request) string {

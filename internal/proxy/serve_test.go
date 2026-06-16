@@ -211,6 +211,54 @@ func TestUnknownCombo(t *testing.T) {
 	}
 }
 
+// TestOpenModeNoKeys verifies the proxy accepts unauthenticated requests when
+// no access keys exist, and locks down once one is created.
+func TestOpenModeNoKeys(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	var cap capturedUpstream
+	upstream := newUpstream(t, &cap)
+	t.Cleanup(upstream.Close)
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", ProviderID: prov.ID, UpstreamModel: "real-model"}); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, false).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
+
+	// No keys: request with no Authorization header succeeds.
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("open mode: status = %d, want 200", resp.StatusCode)
+	}
+
+	// Create a key: now an unauthenticated request is rejected.
+	if _, err := st.NewAccessKey(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(body))
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("locked mode: status = %d, want 401", resp2.StatusCode)
+	}
+}
+
 // waitForLogs polls the store for the expected number of request logs, since
 // recording is fire-and-forget in a background goroutine.
 func waitForLogs(t *testing.T, st *store.Store, want int) []*domain.RequestLog {

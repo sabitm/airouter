@@ -55,6 +55,14 @@ func (s *Store) ListAccessKeys(ctx context.Context) ([]*domain.AccessKey, error)
 	return out, rows.Err()
 }
 
+// CountAccessKeys returns the number of access keys. When zero, the proxy runs
+// in open mode and accepts unauthenticated requests.
+func (s *Store) CountAccessKeys(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM access_keys").Scan(&n)
+	return n, err
+}
+
 // VerifyToken returns the matching access key for a raw bearer token, or
 // ErrNotFound. Used by the proxy auth middleware.
 func (s *Store) VerifyToken(ctx context.Context, token string) (*domain.AccessKey, error) {
