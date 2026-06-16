@@ -59,6 +59,8 @@ formats. Streaming reassembles tool-call argument fragments correctly.
 
 The dashboard is served at `/dashboard`.
 
+![Dashboard screenshot](dashboard.png)
+
 ## Build and run
 
 Requires Go 1.26+. The dashboard uses [templ](https://templ.guide); if you edit
