@@ -1,8 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"airouter/internal/proxy"
@@ -10,44 +14,141 @@ import (
 	"airouter/internal/web"
 )
 
+// traceMaxBody caps how many bytes of a request or response body are logged at
+// trace level, so a long stream or large context cannot flood the terminal.
+const traceMaxBody = 16 << 10
+
 type Server struct {
-	mux   *http.ServeMux
-	debug bool
+	mux        *http.ServeMux
+	debugLevel int
 }
 
-func New(s *store.Store, debug bool) *Server {
+func New(s *store.Store, debugLevel int) *Server {
 	mux := http.NewServeMux()
 	web.NewHandler(s).Mount(mux)
-	proxy.New(s, debug).Mount(mux)
-	return &Server{mux: mux, debug: debug}
+	// The proxy only distinguishes on/off (level >= 1); trace lives in the
+	// middleware below, which sees every path uniformly.
+	proxy.New(s, debugLevel >= 1).Mount(mux)
+	return &Server{mux: mux, debugLevel: debugLevel}
 }
 
 func (s *Server) Handler() http.Handler {
-	if s.debug {
-		return logging(s.mux)
+	if s.debugLevel >= 1 {
+		return logging(s.debugLevel, s.mux)
 	}
 	return s.mux
 }
 
-// logging records one line per request (method, path, status, latency). Only
+// logging records one line per request (method, path, status, latency). At
+// level >= 2 it also tees the request and response bodies into the log. Only
 // installed in debug mode; non-debug serves the bare mux silently.
-func logging(next http.Handler) http.Handler {
+func logging(level int, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+
+		var reqBody []byte
+		if level >= 2 {
+			reqBody = drainRequestBody(r)
+		}
+
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		if level >= 2 {
+			sw.capture = &bytes.Buffer{}
+		}
 		next.ServeHTTP(sw, r)
+
 		log.Printf("%s %s %d %s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond))
+		if level >= 2 {
+			logTrace(r, reqBody, sw)
+		}
 	})
+}
+
+// drainRequestBody reads the full body so it can be logged, then restores it
+// from the buffer so the handler still sees the complete request. Trace mode is
+// operator-enabled, so buffering the body in memory is acceptable here.
+func drainRequestBody(r *http.Request) []byte {
+	if r.Body == nil {
+		return nil
+	}
+	b, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(nil))
+		return b
+	}
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	return b
+}
+
+// logTrace emits the captured request and response bodies. Binary responses are
+// summarized rather than dumped so the log stays readable.
+func logTrace(r *http.Request, reqBody []byte, sw *statusWriter) {
+	log.Printf("[trace] >>> %s %s\n%s", r.Method, r.URL.Path, traceBody(reqBody, len(reqBody)))
+	if ct := sw.Header().Get("Content-Type"); sw.bytesWritten > 0 && !isTextual(ct) {
+		log.Printf("[trace] <<< %d (%s, %d bytes, not logged)", sw.status, ct, sw.bytesWritten)
+		return
+	}
+	log.Printf("[trace] <<< %d\n%s", sw.status, traceBody(sw.capture.Bytes(), sw.bytesWritten))
+}
+
+// traceBody renders captured bytes for the log, appending a marker when the
+// capture was truncated. total is the full body length; captured may be shorter.
+func traceBody(captured []byte, total int) string {
+	if total == 0 {
+		return "(empty)"
+	}
+	if len(captured) > traceMaxBody {
+		captured = captured[:traceMaxBody]
+	}
+	if total > len(captured) {
+		return fmt.Sprintf("%s... (truncated, %d bytes total)", captured, total)
+	}
+	return string(captured)
+}
+
+// isTextual reports whether a Content-Type is safe to dump as text. Empty type
+// is treated as textual since the proxy's JSON/SSE responses often omit it until
+// the first write.
+func isTextual(contentType string) bool {
+	ct := strings.ToLower(contentType)
+	switch {
+	case ct == "",
+		strings.HasPrefix(ct, "application/json"),
+		strings.HasPrefix(ct, "text/"),
+		strings.Contains(ct, "event-stream"):
+		return true
+	default:
+		return false
+	}
 }
 
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	// capture, when non-nil (trace level), accumulates response bytes up to
+	// traceMaxBody; bytesWritten tracks the full length for the truncation marker.
+	capture      *bytes.Buffer
+	bytesWritten int
 }
 
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.capture != nil {
+		if room := traceMaxBody - w.capture.Len(); room > 0 {
+			if room >= len(b) {
+				w.capture.Write(b)
+			} else {
+				w.capture.Write(b[:room])
+			}
+		}
+		w.bytesWritten += len(b)
+	}
+	return w.ResponseWriter.Write(b)
 }
 
 // Flush exposes the underlying flusher so SSE streaming keeps flushing through
