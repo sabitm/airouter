@@ -33,10 +33,49 @@ func New(s *store.Store, debugLevel int) *Server {
 }
 
 func (s *Server) Handler() http.Handler {
+	h := cors(s.mux)
 	if s.debugLevel >= 1 {
-		return logging(s.debugLevel, s.mux)
+		return logging(s.debugLevel, h)
 	}
-	return s.mux
+	return h
+}
+
+// cors handles browser cross-origin requests. The proxy mounts routes with
+// method-specific patterns (POST /messages, ...), so an OPTIONS preflight finds
+// the path but no method handler and gets an auto 405 from the mux before any
+// handler runs; this middleware answers the preflight itself and adds the
+// response headers the browser requires.
+//
+// It only engages when an Origin header is present, leaving server-to-server
+// traffic untouched. The Origin is reflected rather than set to "*" so the
+// headers stay valid if a caller ever uses credentialed requests. Authorization
+// is still required, so reflecting any origin does not weaken access control.
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Add("Vary", "Origin")
+
+		// A real preflight carries Access-Control-Request-Method; a bare OPTIONS
+		// without it is not a preflight and falls through to the mux.
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			reqHeaders := r.Header.Get("Access-Control-Request-Headers")
+			if reqHeaders == "" {
+				reqHeaders = "Authorization, Content-Type"
+			}
+			h.Set("Access-Control-Allow-Headers", reqHeaders)
+			h.Set("Access-Control-Max-Age", "86400")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // logging records one line per request (method, path, status, latency). At
