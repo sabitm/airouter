@@ -85,22 +85,36 @@ func logging(level int, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
+		// Trace bodies only for provider-facing ingress paths; dashboard asset
+		// and HTMX-fragment exchanges would only clutter the log.
+		trace := level >= 2 && isProxyPath(r.URL.Path)
 		var reqBody []byte
-		if level >= 2 {
+		if trace {
 			reqBody = drainRequestBody(r)
 		}
 
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		if level >= 2 {
+		if trace {
 			sw.capture = &bytes.Buffer{}
 		}
 		next.ServeHTTP(sw, r)
 
 		log.Printf("%s %s %d %s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond))
-		if level >= 2 {
+		if trace {
 			logTrace(r, reqBody, sw)
 		}
 	})
+}
+
+// isProxyPath reports whether a path is a provider-facing ingress endpoint, the
+// only traffic worth tracing. It mirrors the routes mounted in proxy.Mount; a
+// new ingress route must be added here to be traced.
+func isProxyPath(p string) bool {
+	switch strings.TrimPrefix(p, "/v1") {
+	case "/messages", "/chat/completions", "/responses", "/models":
+		return true
+	}
+	return false
 }
 
 // drainRequestBody reads the full body so it can be logged, then restores it
