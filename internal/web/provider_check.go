@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,15 +45,22 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto})
+	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto}, h.trace)
 	render(w, r, CheckResult(ok, msg))
 }
+
+// traceMaxBody caps the outbound /models body logged at trace level so a long
+// model list cannot flood the terminal.
+const traceMaxBody = 16 << 10
 
 // checkUpstream performs a GET {base_url}/models with the protocol's auth
 // headers and classifies the outcome. The /models response shape is identical
 // across OpenAI and Anthropic, so protocol verification is a soft signal: a
 // mismatch surfaces only via a 404 or an unexpected body, not definitively.
-func checkUpstream(ctx context.Context, p *domain.Provider) (bool, string) {
+//
+// When trace is set the request and response are logged; auth headers are never
+// logged, so the API key stays out of the log.
+func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -65,11 +73,24 @@ func checkUpstream(ctx context.Context, p *domain.Provider) (bool, string) {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	}
 
+	if trace {
+		log.Printf("[trace] >>> GET %s", url)
+	}
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
+		if trace {
+			log.Printf("[trace] <<< GET %s: %v", url, err)
+		}
 		return false, "could not reach URL: " + err.Error()
 	}
 	defer resp.Body.Close()
+
+	// Read the body before classifying so the trace covers every status, not
+	// just the success path.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if trace {
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body))
+	}
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
@@ -80,7 +101,6 @@ func checkUpstream(ctx context.Context, p *domain.Provider) (bool, string) {
 		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var parsed struct {
 		Data []struct {
 			ID string `json:"id"`
@@ -90,4 +110,16 @@ func checkUpstream(ctx context.Context, p *domain.Provider) (bool, string) {
 		return false, "reachable, but response shape unexpected - protocol may not match"
 	}
 	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
+}
+
+// traceBody renders an outbound response body for the log, truncating to
+// traceMaxBody with a marker when the full body is longer.
+func traceBody(body []byte) string {
+	if len(body) == 0 {
+		return "(empty)"
+	}
+	if len(body) > traceMaxBody {
+		return fmt.Sprintf("%s... (truncated, %d bytes total)", body[:traceMaxBody], len(body))
+	}
+	return string(body)
 }

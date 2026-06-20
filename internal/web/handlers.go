@@ -15,9 +15,13 @@ import (
 
 type Handler struct {
 	store *store.Store
+	// trace, set at -debug=2, logs the dashboard's outbound provider subcalls
+	// (e.g. the /models probe behind the Check button) that the request-logging
+	// middleware cannot see.
+	trace bool
 }
 
-func NewHandler(s *store.Store) *Handler { return &Handler{store: s} }
+func NewHandler(s *store.Store, trace bool) *Handler { return &Handler{store: s, trace: trace} }
 
 // Mount registers all dashboard routes on the given mux.
 func (h *Handler) Mount(mux *http.ServeMux) {
