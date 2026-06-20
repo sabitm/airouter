@@ -136,6 +136,9 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		Protocol:   proto,
 		AuthScheme: auth,
 	}
+	// "default" (empty auth) is an alias: expand it now to the protocol's scheme
+	// so the stored value is always concrete.
+	p.AuthScheme = p.Auth()
 	if err := h.store.CreateProvider(r.Context(), p); err != nil {
 		badRequest(w, err.Error())
 		return
