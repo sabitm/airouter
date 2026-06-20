@@ -26,6 +26,11 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		render(w, r, CheckResult(false, "select a protocol"))
 		return
 	}
+	auth := domain.AuthScheme(r.FormValue("auth_scheme"))
+	if auth != "" && !auth.Valid() {
+		render(w, r, CheckResult(false, "select an auth scheme"))
+		return
+	}
 	baseURL := strings.TrimSpace(r.FormValue("base_url"))
 	if baseURL == "" {
 		render(w, r, CheckResult(false, "enter a base URL"))
@@ -45,7 +50,7 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto}, h.trace)
+	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth}, h.trace)
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -66,11 +71,16 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, s
 	if err != nil {
 		return false, "invalid base URL"
 	}
-	if p.Protocol == domain.ProtocolAnthropic {
+	// Match the auth scheme the proxy would actually use (see applyUpstreamHeaders),
+	// so a passing Check implies the credential will be accepted on real traffic.
+	switch p.Auth() {
+	case domain.AuthXAPIKey:
 		req.Header.Set("x-api-key", p.APIKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
-	} else {
+	default:
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	if p.Protocol == domain.ProtocolAnthropic {
+		req.Header.Set("anthropic-version", "2023-06-01")
 	}
 
 	if trace {

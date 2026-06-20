@@ -40,11 +40,12 @@ const schema = `
 CREATE TABLE IF NOT EXISTS providers (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	name       TEXT NOT NULL UNIQUE,
-	base_url   TEXT NOT NULL,
-	api_key    TEXT NOT NULL,
-	protocol   TEXT NOT NULL,
-	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	base_url    TEXT NOT NULL,
+	api_key     TEXT NOT NULL,
+	protocol    TEXT NOT NULL,
+	auth_scheme TEXT NOT NULL DEFAULT '',
+	created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS combos (
@@ -96,7 +97,22 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
 	}
+	if err := s.migrateProviderAuthScheme(); err != nil {
+		return err
+	}
 	return s.migrateCombosToTargets()
+}
+
+// migrateProviderAuthScheme adds the auth_scheme column to a providers table
+// created before auth was decoupled from protocol. Idempotent; existing rows
+// default to '' (empty), which Provider.Auth resolves by protocol.
+func (s *Store) migrateProviderAuthScheme() error {
+	has, err := s.columnExists("providers", "auth_scheme")
+	if err != nil || has {
+		return err
+	}
+	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN auth_scheme TEXT NOT NULL DEFAULT ''")
+	return err
 }
 
 // migrateCombosToTargets upgrades the pre-multi-target schema: when the combos

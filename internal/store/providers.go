@@ -14,7 +14,7 @@ var ErrNotFound = errors.New("store: not found")
 func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provider, error) {
 	var p domain.Provider
 	var enc string
-	if err := row.Scan(&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := row.Scan(&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	key, err := s.cipher.Decrypt(enc)
@@ -25,7 +25,7 @@ func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provi
 	return &p, nil
 }
 
-const providerCols = "id, name, base_url, api_key, protocol, created_at, updated_at"
+const providerCols = "id, name, base_url, api_key, protocol, auth_scheme, created_at, updated_at"
 
 func (s *Store) ListProviders(ctx context.Context) ([]*domain.Provider, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT "+providerCols+" FROM providers ORDER BY name")
@@ -59,8 +59,8 @@ func (s *Store) CreateProvider(ctx context.Context, p *domain.Provider) error {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx,
-		"INSERT INTO providers (name, base_url, api_key, protocol) VALUES (?, ?, ?, ?)",
-		p.Name, p.BaseURL, enc, p.Protocol)
+		"INSERT INTO providers (name, base_url, api_key, protocol, auth_scheme) VALUES (?, ?, ?, ?, ?)",
+		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme)
 	if err != nil {
 		return err
 	}
@@ -74,8 +74,8 @@ func (s *Store) UpdateProvider(ctx context.Context, p *domain.Provider) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx,
-		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		p.Name, p.BaseURL, enc, p.Protocol, p.ID)
+		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, auth_scheme=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.ID)
 	return err
 }
 

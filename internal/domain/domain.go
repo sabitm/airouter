@@ -14,17 +14,46 @@ func (p Protocol) Valid() bool {
 	return p == ProtocolOpenAI || p == ProtocolAnthropic
 }
 
+// AuthScheme is the header an upstream uses to carry the provider credential. It
+// is independent of Protocol: an Anthropic-format provider may authenticate with
+// a bearer token (ANTHROPIC_AUTH_TOKEN) rather than x-api-key.
+type AuthScheme string
+
+const (
+	AuthBearer  AuthScheme = "bearer"    // Authorization: Bearer <key>
+	AuthXAPIKey AuthScheme = "x-api-key" // x-api-key: <key>
+)
+
+func (a AuthScheme) Valid() bool {
+	return a == AuthBearer || a == AuthXAPIKey
+}
+
 // Provider is a named upstream connection: a base URL, an API key, and the
 // protocol the upstream speaks. The API key is stored encrypted at rest; the
 // value carried on this struct is always the decrypted plaintext.
 type Provider struct {
-	ID        int64
-	Name      string
-	BaseURL   string
-	APIKey    string
-	Protocol  Protocol
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID       int64
+	Name     string
+	BaseURL  string
+	APIKey   string
+	Protocol Protocol
+	// AuthScheme may be empty on legacy rows; use Auth for the effective value.
+	AuthScheme AuthScheme
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// Auth resolves the effective auth scheme, defaulting by protocol when none was
+// set explicitly: Anthropic uses x-api-key, OpenAI uses bearer. This keeps
+// pre-AuthScheme providers behaving exactly as before.
+func (p *Provider) Auth() AuthScheme {
+	if p.AuthScheme.Valid() {
+		return p.AuthScheme
+	}
+	if p.Protocol == ProtocolAnthropic {
+		return AuthXAPIKey
+	}
+	return AuthBearer
 }
 
 // ComboStrategy selects which target a combo resolves to per request.

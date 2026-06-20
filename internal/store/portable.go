@@ -19,6 +19,9 @@ type portableProvider struct {
 	BaseURL  string `json:"base_url"`
 	APIKey   string `json:"api_key"`
 	Protocol string `json:"protocol"`
+	// AuthScheme is omitted when empty so existing exports stay byte-identical;
+	// an absent value resolves by protocol on import (see Provider.Auth).
+	AuthScheme string `json:"auth_scheme,omitempty"`
 }
 
 type portableTarget struct {
@@ -67,6 +70,7 @@ func (s *Store) Export(ctx context.Context, w io.Writer) error {
 	for _, p := range providers {
 		cfg.Providers = append(cfg.Providers, portableProvider{
 			Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, Protocol: string(p.Protocol),
+			AuthScheme: string(p.AuthScheme),
 		})
 	}
 	for _, c := range combos {
@@ -105,13 +109,19 @@ func (s *Store) Import(ctx context.Context, r io.Reader) error {
 		if !proto.Valid() {
 			return fmt.Errorf("provider %q: invalid protocol %q", pp.Name, pp.Protocol)
 		}
+		// Empty auth_scheme is allowed (legacy/auto, resolved by protocol); only
+		// a present-but-unknown value is rejected.
+		auth := domain.AuthScheme(pp.AuthScheme)
+		if auth != "" && !auth.Valid() {
+			return fmt.Errorf("provider %q: invalid auth_scheme %q", pp.Name, pp.AuthScheme)
+		}
 		if cur, ok := byName[pp.Name]; ok {
-			cur.BaseURL, cur.APIKey, cur.Protocol = pp.BaseURL, pp.APIKey, proto
+			cur.BaseURL, cur.APIKey, cur.Protocol, cur.AuthScheme = pp.BaseURL, pp.APIKey, proto, auth
 			if err := s.UpdateProvider(ctx, cur); err != nil {
 				return err
 			}
 		} else {
-			np := &domain.Provider{Name: pp.Name, BaseURL: pp.BaseURL, APIKey: pp.APIKey, Protocol: proto}
+			np := &domain.Provider{Name: pp.Name, BaseURL: pp.BaseURL, APIKey: pp.APIKey, Protocol: proto, AuthScheme: auth}
 			if err := s.CreateProvider(ctx, np); err != nil {
 				return err
 			}

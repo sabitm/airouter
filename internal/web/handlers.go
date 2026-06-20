@@ -124,11 +124,17 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid protocol")
 		return
 	}
+	auth := domain.AuthScheme(r.FormValue("auth_scheme"))
+	if auth != "" && !auth.Valid() {
+		badRequest(w, "invalid auth scheme")
+		return
+	}
 	p := &domain.Provider{
-		Name:     r.FormValue("name"),
-		BaseURL:  r.FormValue("base_url"),
-		APIKey:   r.FormValue("api_key"),
-		Protocol: proto,
+		Name:       r.FormValue("name"),
+		BaseURL:    r.FormValue("base_url"),
+		APIKey:     r.FormValue("api_key"),
+		Protocol:   proto,
+		AuthScheme: auth,
 	}
 	if err := h.store.CreateProvider(r.Context(), p); err != nil {
 		badRequest(w, err.Error())
@@ -185,9 +191,15 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid protocol")
 		return
 	}
+	auth := domain.AuthScheme(r.FormValue("auth_scheme"))
+	if auth != "" && !auth.Valid() {
+		badRequest(w, "invalid auth scheme")
+		return
+	}
 	cur.Name = r.FormValue("name")
 	cur.BaseURL = r.FormValue("base_url")
 	cur.Protocol = proto
+	cur.AuthScheme = auth
 	// Blank api_key means keep the existing one (form never echoes secrets).
 	if k := r.FormValue("api_key"); k != "" {
 		cur.APIKey = k

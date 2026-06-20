@@ -45,15 +45,18 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	switch provider.Protocol {
-	case domain.ProtocolAnthropic:
+	// Credential header depends on the auth scheme, which is independent of the
+	// protocol: an Anthropic-format provider may use a bearer token.
+	switch provider.Auth() {
+	case domain.AuthXAPIKey:
 		req.Header.Set("x-api-key", provider.APIKey)
-		// Preserve the client's anthropic-version if it sent one.
-		if req.Header.Get("anthropic-version") == "" {
-			req.Header.Set("anthropic-version", anthropicVersion)
-		}
 	default:
 		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	}
+	// anthropic-version is a wire-format requirement of the Anthropic Messages
+	// API, tied to protocol rather than auth. Preserve a client-sent value.
+	if provider.Protocol == domain.ProtocolAnthropic && req.Header.Get("anthropic-version") == "" {
+		req.Header.Set("anthropic-version", anthropicVersion)
 	}
 }
 

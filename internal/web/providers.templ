@@ -50,6 +50,10 @@ templ providerForm() {
 			<option value="openai">openai</option>
 			<option value="anthropic">anthropic</option>
 		</select>
+		<select name="auth_scheme" title="credential header">
+			<option value="bearer">bearer</option>
+			<option value="x-api-key">x-api-key</option>
+		</select>
 		<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
 		<span class="check-indicator htmx-indicator">checking...</span>
 		<button type="submit">Add</button>
@@ -73,7 +77,7 @@ templ ProviderList(providers []*domain.Provider) {
 		} else {
 			<table>
 				<thead>
-					<tr><th>Name</th><th>Base URL</th><th>API key</th><th>Protocol</th><th></th></tr>
+					<tr><th>Name</th><th>Base URL</th><th>API key</th><th>Protocol</th><th>Auth</th><th></th></tr>
 				</thead>
 				<tbody>
 					for _, p := range providers {
@@ -91,6 +95,7 @@ templ ProviderRow(p *domain.Provider) {
 		<td class="mono">{ p.BaseURL }</td>
 		<td class="mono">{ maskKey(p.APIKey) }</td>
 		<td>{ string(p.Protocol) }</td>
+		<td>{ string(p.Auth()) }</td>
 		<td class="actions">
 			<button class="link" hx-get={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/edit" } hx-target={ "#provider-" + strconv.FormatInt(p.ID, 10) } hx-swap="outerHTML">Edit</button>
 			<button class="link danger" hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/delete" } hx-target="#provider-list" hx-swap="outerHTML" hx-confirm="Delete this provider and its combos?">Delete</button>
@@ -100,7 +105,7 @@ templ ProviderRow(p *domain.Provider) {
 
 templ ProviderEditRow(p *domain.Provider) {
 	<tr id={ "provider-" + strconv.FormatInt(p.ID, 10) }>
-		<td colspan="5">
+		<td colspan="6">
 			<form class="row-form" hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
 				<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 				<input name="name" value={ p.Name } required/>
@@ -113,6 +118,15 @@ templ ProviderEditRow(p *domain.Provider) {
 					} else {
 						<option value="openai">openai</option>
 						<option value="anthropic" selected>anthropic</option>
+					}
+				</select>
+				<select name="auth_scheme" title="credential header">
+					if p.Auth() == domain.AuthBearer {
+						<option value="bearer" selected>bearer</option>
+						<option value="x-api-key">x-api-key</option>
+					} else {
+						<option value="bearer">bearer</option>
+						<option value="x-api-key" selected>x-api-key</option>
 					}
 				</select>
 				<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
