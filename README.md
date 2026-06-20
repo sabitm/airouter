@@ -13,9 +13,13 @@ embedded SQLite database; there are no external service dependencies.
 
 Three concepts:
 
-- **Provider** - an upstream connection: a base URL, an API key, and the
-  protocol it speaks (`openai` or `anthropic`). The API key is encrypted at
-  rest.
+- **Provider** - an upstream connection: a base URL, an API key, the protocol
+  it speaks (`openai` or `anthropic`), and an auth scheme - how the key is sent:
+  `default` (sensible per protocol: `x-api-key` for Anthropic, `bearer` for
+  OpenAI), `bearer`, or `x-api-key`. The auth scheme is independent of the
+  protocol, so an Anthropic-format upstream that authenticates with a bearer
+  token (an `ANTHROPIC_AUTH_TOKEN`-style gateway) works by selecting protocol
+  `anthropic` + auth `bearer`. The API key is encrypted at rest.
 - **Combo** - a custom model name (e.g. `default`) backed by one or more
   targets, each a provider + real upstream model id (e.g. `gpt-4o`). Clients put
   the combo name in the request `model` field; airouter resolves it to a target
@@ -57,6 +61,10 @@ base it is given.
 Text, images, function/tool calling, and tool results are translated across all
 formats. Streaming reassembles tool-call argument fragments correctly.
 
+Browser clients on other origins are supported: the proxy answers the CORS
+preflight and reflects the request origin, so a local web app can call airouter
+directly.
+
 The dashboard is served at `/dashboard`.
 
 ![Dashboard screenshot](dashboard.png)
@@ -93,7 +101,7 @@ precedence.
 | `-listen` | `AIROUTER_LISTEN` | `:8080` | HTTP listen address |
 | `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
 | `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys at rest |
-| `-debug` | `AIROUTER_DEBUG` | `false` | Log request lines, client-facing failures, and upstream exchanges to the terminal (may include prompt content) |
+| `-debug` | `AIROUTER_DEBUG` | `off` | Log verbosity. Bare `-debug` or `=1` logs request lines, client-facing failures, and upstream error exchanges. `=2` additionally traces full request and response bodies plus the resolved upstream URL for each proxied call (includes prompt content) |
 
 If `AIROUTER_SECRET` is unset, an insecure built-in key is used and a warning is
 logged. Set a real secret in any deployment you care about; rotating it makes
@@ -122,9 +130,10 @@ does not need to know or care which backend serves the request.
 
 ## Import / export
 
-The dashboard's Import / Export page round-trips all providers and combos as
-JSON. Exports include provider API keys in plaintext so config is portable
-across instances with different secrets - treat exported files as secrets.
+The dashboard's Import / Export page round-trips all providers (including their
+auth scheme) and combos as JSON. Exports include provider API keys in plaintext
+so config is portable across instances with different secrets - treat exported
+files as secrets.
 Import upserts by name and never deletes. Access keys are not exported (only
 their hashes exist).
 

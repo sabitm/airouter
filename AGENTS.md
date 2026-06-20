@@ -44,7 +44,10 @@ Supporting packages:
 - `internal/store` - SQLite store, migrations, repos, JSON import/export.
 - `internal/crypto` - AES-256-GCM for provider API keys at rest.
 - `internal/config` - flags/env loading.
-- `internal/server` - HTTP wiring; request-logging middleware in debug mode.
+- `internal/server` - HTTP wiring: CORS (answers browser preflights, reflects
+  the request Origin) and the leveled request-logging middleware. At `-debug`
+  (level 1) it logs access lines; at `-debug=2` it also traces full request and
+  response bodies and the resolved upstream provider URL per proxied call.
 - `internal/web` - templ + HTMX dashboard. `.templ` files generate `*_templ.go`.
 - `cmd/airouter` - main: wires config, crypto, store, server; graceful shutdown.
 
@@ -74,6 +77,12 @@ backend-capable format, also set its `protocol` and `upstreamPath` and add it to
   back on encode. Preserve this invariant in any new codec.
 - The Anthropic Messages API requires `max_tokens`. When translating from a
   format that omits it, `anthropic.DefaultMaxTokens` (4096) is used.
+- A provider's auth scheme is independent of its protocol. `Provider.Auth()`
+  returns the effective scheme, defaulting an unset (`default`) one by protocol
+  (Anthropic -> x-api-key, OpenAI -> bearer). The credential header follows
+  `Auth()`; the `anthropic-version` header follows the protocol. Preserve this
+  split when touching upstream request construction (`applyUpstreamHeaders`) or
+  the dashboard provider check.
 - Streaming uses a no-timeout HTTP client (`Proxy.streamClient`) so long streams
   are bounded by the request context, not a client timeout.
 - Errors before the first streamed byte fall back to the ingress format's unary
