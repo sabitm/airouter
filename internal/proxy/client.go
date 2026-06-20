@@ -62,6 +62,9 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 // clientHeaders, when non-nil (passthrough), are forwarded under the denylist.
 func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header) (int, []byte, error) {
 	url := strings.TrimRight(provider.BaseURL, "/") + path
+	if t := traceInfoFrom(ctx); t != nil {
+		t.UpstreamURL = url
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, err
@@ -84,6 +87,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 // The caller owns closing resp.Body. Used for SSE responses.
 func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header) (*http.Response, error) {
 	url := strings.TrimRight(provider.BaseURL, "/") + path
+	if t := traceInfoFrom(ctx); t != nil {
+		t.UpstreamURL = url
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

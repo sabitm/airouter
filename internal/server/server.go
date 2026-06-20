@@ -88,9 +88,16 @@ func logging(level int, next http.Handler) http.Handler {
 		// Trace bodies only for provider-facing ingress paths; dashboard asset
 		// and HTMX-fragment exchanges would only clutter the log.
 		trace := level >= 2 && isProxyPath(r.URL.Path)
-		var reqBody []byte
+		var (
+			reqBody []byte
+			tinfo   *proxy.TraceInfo
+		)
 		if trace {
 			reqBody = drainRequestBody(r)
+			// The serve path records the resolved upstream URL into tinfo so the
+			// trace can show the provider hit rather than the inbound path.
+			tinfo = &proxy.TraceInfo{}
+			r = r.WithContext(proxy.WithTraceInfo(r.Context(), tinfo))
 		}
 
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -101,7 +108,7 @@ func logging(level int, next http.Handler) http.Handler {
 
 		log.Printf("%s %s %d %s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond))
 		if trace {
-			logTrace(r, reqBody, sw)
+			logTrace(r, reqBody, sw, tinfo)
 		}
 	})
 }
@@ -134,10 +141,16 @@ func drainRequestBody(r *http.Request) []byte {
 	return b
 }
 
-// logTrace emits the captured request and response bodies. Binary responses are
-// summarized rather than dumped so the log stays readable.
-func logTrace(r *http.Request, reqBody []byte, sw *statusWriter) {
-	log.Printf("[trace] >>> %s %s\n%s", r.Method, r.URL.Path, traceBody(reqBody, len(reqBody)))
+// logTrace emits the captured request and response bodies. The request line
+// shows the resolved upstream provider URL when one was reached; otherwise (a
+// local /models response or a pre-upstream rejection) it falls back to the
+// inbound path. Binary responses are summarized rather than dumped.
+func logTrace(r *http.Request, reqBody []byte, sw *statusWriter, tinfo *proxy.TraceInfo) {
+	target := r.URL.Path
+	if tinfo != nil && tinfo.UpstreamURL != "" {
+		target = tinfo.UpstreamURL
+	}
+	log.Printf("[trace] >>> %s %s\n%s", r.Method, target, traceBody(reqBody, len(reqBody)))
 	if ct := sw.Header().Get("Content-Type"); sw.bytesWritten > 0 && !isTextual(ct) {
 		log.Printf("[trace] <<< %d (%s, %d bytes, not logged)", sw.status, ct, sw.bytesWritten)
 		return
