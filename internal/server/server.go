@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -14,28 +15,32 @@ import (
 	"airouter/internal/web"
 )
 
-// traceMaxBody caps how many bytes of a request or response body are logged at
-// trace level, so a long stream or large context cannot flood the terminal.
-const traceMaxBody = 16 << 10
+// traceMaxBody caps how many bytes of a request or response body are logged to
+// stderr at trace level, so a long stream or large context cannot flood the
+// terminal. A configured -log-file captures the full, untruncated bodies.
+const traceMaxBody = 4 << 10
 
 type Server struct {
 	mux        *http.ServeMux
 	debugLevel int
+	// logFile, when non-nil, receives full untruncated trace bodies while stderr
+	// keeps a truncated copy. nil means stderr-only (truncated) tracing.
+	logFile io.Writer
 }
 
-func New(s *store.Store, debugLevel int) *Server {
+func New(s *store.Store, debugLevel int, logFile io.Writer) *Server {
 	mux := http.NewServeMux()
 	web.NewHandler(s, debugLevel >= 2).Mount(mux)
 	// The proxy only distinguishes on/off (level >= 1); trace lives in the
 	// middleware below, which sees every path uniformly.
 	proxy.New(s, debugLevel >= 1).Mount(mux)
-	return &Server{mux: mux, debugLevel: debugLevel}
+	return &Server{mux: mux, debugLevel: debugLevel, logFile: logFile}
 }
 
 func (s *Server) Handler() http.Handler {
 	h := cors(s.mux)
 	if s.debugLevel >= 1 {
-		return logging(s.debugLevel, h)
+		return logging(s.debugLevel, s.logFile, h)
 	}
 	return h
 }
@@ -81,7 +86,17 @@ func cors(next http.Handler) http.Handler {
 // logging records one line per request (method, path, status, latency). At
 // level >= 2 it also tees the request and response bodies into the log. Only
 // installed in debug mode; non-debug serves the bare mux silently.
-func logging(level int, next http.Handler) http.Handler {
+//
+// When logFile is non-nil the trace is emitted twice: full to the file, and
+// truncated to stderr. Otherwise it goes once to the default logger (stderr,
+// truncated). Both per-sink loggers carry the default timestamp prefix so their
+// lines match the access lines written through the shared default logger.
+func logging(level int, logFile io.Writer, next http.Handler) http.Handler {
+	var fileTrace, stderrTrace *log.Logger
+	if logFile != nil {
+		fileTrace = log.New(logFile, "", log.LstdFlags)
+		stderrTrace = log.New(os.Stderr, "", log.LstdFlags)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -103,12 +118,21 @@ func logging(level int, next http.Handler) http.Handler {
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		if trace {
 			sw.capture = &bytes.Buffer{}
+			// The file sink logs the whole body, so retain it uncapped; stderr
+			// still truncates at format time.
+			sw.captureFull = logFile != nil
 		}
 		next.ServeHTTP(sw, r)
 
 		log.Printf("%s %s %d %s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond))
 		if trace {
-			logTrace(r, reqBody, sw, tinfo)
+			logTrace(fileTrace, stderrTrace, r, reqBody, sw, tinfo)
+			// Release the (possibly large, uncapped) capture buffer now that it
+			// has been written. It is request-scoped and would be collected at
+			// handler return regardless; this only trims the lingering window.
+			// Peak memory is unavoidable: the full body must be buffered before
+			// the trace line can be formatted.
+			sw.capture = nil
 		}
 	})
 }
@@ -141,31 +165,45 @@ func drainRequestBody(r *http.Request) []byte {
 	return b
 }
 
-// logTrace emits the captured request and response bodies. The request line
-// shows the resolved upstream provider URL when one was reached; otherwise (a
-// local /models response or a pre-upstream rejection) it falls back to the
-// inbound path. Binary responses are summarized rather than dumped.
-func logTrace(r *http.Request, reqBody []byte, sw *statusWriter, tinfo *proxy.TraceInfo) {
+// logTrace emits the captured request and response bodies. When fileTrace is
+// non-nil the bodies are written in full to the file and truncated to stderr;
+// otherwise a single truncated copy goes to the default logger (stderr).
+func logTrace(fileTrace, stderrTrace *log.Logger, r *http.Request, reqBody []byte, sw *statusWriter, tinfo *proxy.TraceInfo) {
 	target := r.URL.Path
 	if tinfo != nil && tinfo.UpstreamURL != "" {
 		target = tinfo.UpstreamURL
 	}
-	log.Printf("[trace] >>> %s %s\n%s", r.Method, target, traceBody(reqBody, len(reqBody)))
-	if ct := sw.Header().Get("Content-Type"); sw.bytesWritten > 0 && !isTextual(ct) {
-		log.Printf("[trace] <<< %d (%s, %d bytes, not logged)", sw.status, ct, sw.bytesWritten)
+	if fileTrace != nil {
+		emitTrace(fileTrace, r, reqBody, sw, target, 0)
+		emitTrace(stderrTrace, r, reqBody, sw, target, traceMaxBody)
 		return
 	}
-	log.Printf("[trace] <<< %d\n%s", sw.status, traceBody(sw.capture.Bytes(), sw.bytesWritten))
+	emitTrace(log.Default(), r, reqBody, sw, target, traceMaxBody)
+}
+
+// emitTrace writes one request/response trace pair to l. limit caps each body's
+// logged length (<= 0 means unlimited). The request line shows the resolved
+// upstream provider URL when one was reached; otherwise (a local /models
+// response or a pre-upstream rejection) it falls back to the inbound path.
+// Binary responses are summarized rather than dumped.
+func emitTrace(l *log.Logger, r *http.Request, reqBody []byte, sw *statusWriter, target string, limit int) {
+	l.Printf("[trace] >>> %s %s\n%s", r.Method, target, traceBody(reqBody, len(reqBody), limit))
+	if ct := sw.Header().Get("Content-Type"); sw.bytesWritten > 0 && !isTextual(ct) {
+		l.Printf("[trace] <<< %d (%s, %d bytes, not logged)", sw.status, ct, sw.bytesWritten)
+		return
+	}
+	l.Printf("[trace] <<< %d\n%s", sw.status, traceBody(sw.capture.Bytes(), sw.bytesWritten, limit))
 }
 
 // traceBody renders captured bytes for the log, appending a marker when the
 // capture was truncated. total is the full body length; captured may be shorter.
-func traceBody(captured []byte, total int) string {
+// limit caps the logged length; limit <= 0 logs everything captured.
+func traceBody(captured []byte, total, limit int) string {
 	if total == 0 {
 		return "(empty)"
 	}
-	if len(captured) > traceMaxBody {
-		captured = captured[:traceMaxBody]
+	if limit > 0 && len(captured) > limit {
+		captured = captured[:limit]
 	}
 	if total > len(captured) {
 		return fmt.Sprintf("%s... (truncated, %d bytes total)", captured, total)
@@ -192,9 +230,12 @@ func isTextual(contentType string) bool {
 type statusWriter struct {
 	http.ResponseWriter
 	status int
-	// capture, when non-nil (trace level), accumulates response bytes up to
-	// traceMaxBody; bytesWritten tracks the full length for the truncation marker.
+	// capture, when non-nil (trace level), accumulates response bytes;
+	// bytesWritten tracks the full length for the truncation marker. When
+	// captureFull is set (a log file sink wants the whole body) capture grows
+	// unbounded; otherwise it stops at traceMaxBody.
 	capture      *bytes.Buffer
+	captureFull  bool
 	bytesWritten int
 }
 
@@ -205,7 +246,9 @@ func (w *statusWriter) WriteHeader(code int) {
 
 func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.capture != nil {
-		if room := traceMaxBody - w.capture.Len(); room > 0 {
+		if w.captureFull {
+			w.capture.Write(b)
+		} else if room := traceMaxBody - w.capture.Len(); room > 0 {
 			if room >= len(b) {
 				w.capture.Write(b)
 			} else {

@@ -29,6 +29,9 @@ func main() {
 		return
 	}
 
+	// logFile, when non-nil, is the full-trace sink passed to the server; stderr
+	// keeps a truncated copy. nil means stderr-only (truncated) tracing.
+	var logFile io.Writer
 	if cfg.LogFile != "" {
 		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
@@ -36,6 +39,7 @@ func main() {
 		}
 		defer f.Close()
 		log.SetOutput(io.MultiWriter(os.Stderr, f))
+		logFile = f
 	}
 
 	secret, isDev := cfg.EffectiveSecret()
@@ -61,7 +65,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: server.New(st, cfg.DebugLevel).Handler(),
+		Handler: server.New(st, cfg.DebugLevel, logFile).Handler(),
 	}
 
 	go func() {
