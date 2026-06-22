@@ -115,7 +115,7 @@ func setupStreamingWithStore(t *testing.T, backend domain.Protocol, anthropicBod
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, false).Mount(mux)
+	New(st, false, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token, st

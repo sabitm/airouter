@@ -72,7 +72,7 @@ func setupCombo(t *testing.T, strategy domain.ComboStrategy, targets []*scripted
 	}
 
 	mux := http.NewServeMux()
-	New(st, false).Mount(mux)
+	New(st, false, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token

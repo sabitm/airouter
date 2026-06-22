@@ -6,7 +6,9 @@ package proxy
 
 import (
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -100,20 +102,31 @@ type Proxy struct {
 	streamClient *http.Client
 	debug        bool
 
+	// fileLog/stderrLog split debug output when a log file is configured: the
+	// file receives the full message, stderr a truncated copy. Both nil means
+	// debug goes once to the default logger (stderr, truncated).
+	fileLog   *log.Logger
+	stderrLog *log.Logger
+
 	// rr holds per-combo round-robin counters, keyed by combo id. In-memory only:
 	// the rotation resets on restart, which is acceptable for load spreading.
 	rrMu sync.Mutex
 	rr   map[int64]uint64
 }
 
-func New(s *store.Store, debug bool) *Proxy {
-	return &Proxy{
+func New(s *store.Store, debug bool, logFile io.Writer) *Proxy {
+	p := &Proxy{
 		store:        s,
 		client:       &http.Client{Timeout: 5 * time.Minute},
 		streamClient: &http.Client{},
 		debug:        debug,
 		rr:           map[int64]uint64{},
 	}
+	if logFile != nil {
+		p.fileLog = log.New(logFile, "", log.LstdFlags)
+		p.stderrLog = log.New(os.Stderr, "", log.LstdFlags)
+	}
+	return p
 }
 
 // nextRoundRobin returns the starting target index for a round-robin combo with
