@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -26,6 +27,15 @@ func main() {
 	if cfg.Version {
 		fmt.Printf("airouter %s\n", version)
 		return
+	}
+
+	if cfg.LogFile != "" {
+		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			log.Fatalf("open log file: %v", err)
+		}
+		defer f.Close()
+		log.SetOutput(io.MultiWriter(os.Stderr, f))
 	}
 
 	secret, isDev := cfg.EffectiveSecret()

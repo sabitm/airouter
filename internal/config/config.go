@@ -17,6 +17,9 @@ type Config struct {
 	//   0 off; 1 access lines + failed/upstream-error exchanges;
 	//   2 trace (full request and response bodies).
 	DebugLevel int
+	// LogFile, when set, is a path that log output is appended to in addition to
+	// stderr. Empty means stderr only.
+	LogFile string
 	// Version, when true, prints the build version and exits.
 	Version bool
 }
@@ -60,6 +63,7 @@ func Load() Config {
 	flag.StringVar(&c.Secret, "secret", env("AIROUTER_SECRET", ""), "secret seeding the at-rest encryption key")
 	level := debugLevel(envDebugLevel())
 	flag.Var(&level, "debug", "log verbosity: 1=access lines + upstream errors, 2=trace full request/response bodies")
+	flag.StringVar(&c.LogFile, "log-file", env("AIROUTER_LOG_FILE", ""), "also append logs to this file (in addition to stderr)")
 	flag.BoolVar(&c.Version, "version", false, "print version and exit")
 	flag.Parse()
 	c.DebugLevel = int(level)
