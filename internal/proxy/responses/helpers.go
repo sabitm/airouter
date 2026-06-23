@@ -32,6 +32,18 @@ func outputToText(raw json.RawMessage) string {
 	return contentToText(raw)
 }
 
+// toolResultText concatenates the text blocks of an IR tool_result for emission
+// as a Responses function_call_output, which carries a plain string output.
+func toolResultText(b ir.ContentBlock) string {
+	var sb strings.Builder
+	for _, rb := range b.ToolResult {
+		if rb.Type == ir.BlockText {
+			sb.WriteString(rb.Text)
+		}
+	}
+	return sb.String()
+}
+
 func mustJSON(v any) []byte {
 	raw, _ := json.Marshal(v)
 	return raw

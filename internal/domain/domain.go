@@ -6,12 +6,13 @@ import "time"
 type Protocol string
 
 const (
-	ProtocolOpenAI    Protocol = "openai"
-	ProtocolAnthropic Protocol = "anthropic"
+	ProtocolOpenAI          Protocol = "openai"           // OpenAI Chat Completions (/chat/completions)
+	ProtocolAnthropic       Protocol = "anthropic"        // Anthropic Messages (/messages)
+	ProtocolOpenAIResponses Protocol = "openai-responses" // OpenAI Responses (/responses)
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It

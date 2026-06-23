@@ -1,8 +1,8 @@
 // Package responses translates the OpenAI Responses API wire format into and out
-// of the canonical IR. Responses is an ingress-only surface here: clients call
-// /v1/responses, but providers are always reached over chat-completions or
-// Anthropic messages, so this package implements only the ingress directions
-// (request decode, response encode, stream encode).
+// of the canonical IR, in both directions. As ingress (clients calling
+// /v1/responses) it uses request decode, response encode, and stream encode; as
+// a backend (a provider that only exposes /responses) it uses request encode,
+// response decode, and stream decode.
 package responses
 
 import "encoding/json"

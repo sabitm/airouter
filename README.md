@@ -14,9 +14,11 @@ embedded SQLite database; there are no external service dependencies.
 Three concepts:
 
 - **Provider** - an upstream connection: a base URL, an API key, the protocol
-  it speaks (`openai` or `anthropic`), and an auth scheme - how the key is sent:
-  `default` (sensible per protocol: `x-api-key` for Anthropic, `bearer` for
-  OpenAI), `bearer`, or `x-api-key`. The auth scheme is independent of the
+  it speaks (`openai` for Chat Completions, `anthropic` for Messages, or
+  `openai-responses` for the OpenAI Responses API - for upstreams that only
+  expose `/responses`), and an auth scheme - how the key is sent:
+  `default` (sensible per protocol: `x-api-key` for Anthropic, `bearer` for the
+  OpenAI formats), `bearer`, or `x-api-key`. The auth scheme is independent of the
   protocol, so an Anthropic-format upstream that authenticates with a bearer
   token (an `ANTHROPIC_AUTH_TOKEN`-style gateway) works by selecting protocol
   `anthropic` + auth `bearer`. The API key is encrypted at rest.

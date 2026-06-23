@@ -75,23 +75,32 @@ var anthropicCodec = codec{
 	newStreamEncoder: func(model string) streamEncoder { return anthropic.NewStreamEncoder(model) },
 }
 
-// responsesCodec is ingress-only: it has no backend directions (encodeRequest,
-// decodeResponse, decodeStream, upstreamPath) because a provider is never
-// reached over the Responses API. Its distinct id ensures it always translates.
+// responsesCodec is bidirectional: ingress when a client calls /v1/responses,
+// and backend when a provider's protocol is openai-responses. Its id differs
+// from oai-chat, so a Responses request to a Chat-Completions provider still
+// translates; a Responses request to a Responses provider passes through.
 var responsesCodec = codec{
 	id:               "oai-responses",
-	protocol:         domain.ProtocolOpenAI,
+	protocol:         domain.ProtocolOpenAIResponses,
 	decodeRequest:    responses.DecodeRequest,
+	encodeRequest:    responses.EncodeRequest,
+	decodeResponse:   responses.DecodeResponse,
 	encodeResponse:   responses.EncodeResponse,
 	encodeError:      responses.EncodeError,
+	upstreamPath:     "/responses",
+	decodeStream:     responses.DecodeStream,
 	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
 }
 
 func backendCodec(p domain.Protocol) codec {
-	if p == domain.ProtocolAnthropic {
+	switch p {
+	case domain.ProtocolAnthropic:
 		return anthropicCodec
+	case domain.ProtocolOpenAIResponses:
+		return responsesCodec
+	default:
+		return openaiCodec
 	}
-	return openaiCodec
 }
 
 type Proxy struct {

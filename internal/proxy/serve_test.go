@@ -19,6 +19,7 @@ import (
 const (
 	openaiUpstreamBody    = `{"id":"chatcmpl-x","object":"chat.completion","model":"up","choices":[{"index":0,"message":{"role":"assistant","content":"hello from openai"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`
 	anthropicUpstreamBody = `{"id":"msg_x","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"hello from anthropic"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"cache_creation_input_tokens":10,"cache_read_input_tokens":0,"output_tokens":4}}`
+	responsesUpstreamBody = `{"id":"resp_x","object":"response","status":"completed","model":"up","output":[{"type":"message","id":"msg_x","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello from responses","annotations":[]}]}],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}`
 )
 
 type capturedUpstream struct {
@@ -48,9 +49,12 @@ func newUpstream(t *testing.T, cap *capturedUpstream) *httptest.Server {
 		cap.beta = r.Header.Get("anthropic-beta")
 
 		w.Header().Set("Content-Type", "application/json")
-		if strings.HasSuffix(r.URL.Path, "/messages") {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/messages"):
 			_, _ = io.WriteString(w, anthropicUpstreamBody)
-		} else {
+		case strings.HasSuffix(r.URL.Path, "/responses"):
+			_, _ = io.WriteString(w, responsesUpstreamBody)
+		default:
 			_, _ = io.WriteString(w, openaiUpstreamBody)
 		}
 	}))
@@ -135,6 +139,10 @@ func TestMatrix(t *testing.T) {
 			`{"model":"default","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, "hello from anthropic", "/messages"},
 		{"anthropic->openai translate", domain.ProtocolOpenAI, "/v1/messages",
 			`{"model":"default","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, "hello from openai", "/chat/completions"},
+		{"openai->responses translate", domain.ProtocolOpenAIResponses, "/v1/chat/completions",
+			`{"model":"default","messages":[{"role":"user","content":"hi"}]}`, "hello from responses", "/responses"},
+		{"anthropic->responses translate", domain.ProtocolOpenAIResponses, "/v1/messages",
+			`{"model":"default","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, "hello from responses", "/responses"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -150,11 +158,13 @@ func TestMatrix(t *testing.T) {
 			if cap.model != "real-model" {
 				t.Errorf("upstream model = %q, want real-model", cap.model)
 			}
-			// Auth header must match the backend protocol.
-			if tc.backend == domain.ProtocolAnthropic && cap.xkey != "up-key" {
-				t.Errorf("expected x-api-key, got auth=%q xkey=%q", cap.auth, cap.xkey)
-			}
-			if tc.backend == domain.ProtocolOpenAI && cap.auth != "Bearer up-key" {
+			// Auth header must match the backend protocol's default scheme:
+			// Anthropic uses x-api-key, the OpenAI formats use bearer.
+			if tc.backend == domain.ProtocolAnthropic {
+				if cap.xkey != "up-key" {
+					t.Errorf("expected x-api-key, got auth=%q xkey=%q", cap.auth, cap.xkey)
+				}
+			} else if cap.auth != "Bearer up-key" {
 				t.Errorf("expected bearer auth, got %q", cap.auth)
 			}
 			// Response must be in the ingress format and carry the upstream text.
@@ -163,6 +173,30 @@ func TestMatrix(t *testing.T) {
 				t.Errorf("response text = %q, want %q", text, tc.wantText)
 			}
 		})
+	}
+}
+
+// TestResponsesPassthrough verifies a /v1/responses request to a Responses
+// provider passes through (same id), rewriting only the model and using bearer
+// auth, with the upstream body relayed unchanged.
+func TestResponsesPassthrough(t *testing.T) {
+	var cap capturedUpstream
+	base, token := setup(t, domain.ProtocolOpenAIResponses, &cap)
+	resp, out := post(t, base+"/v1/responses", token, `{"model":"default","input":"hi"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	if cap.path != "/responses" {
+		t.Errorf("upstream path = %q, want /responses", cap.path)
+	}
+	if cap.model != "real-model" {
+		t.Errorf("upstream model = %q, want real-model", cap.model)
+	}
+	if cap.auth != "Bearer up-key" {
+		t.Errorf("expected bearer auth, got %q", cap.auth)
+	}
+	if !strings.Contains(string(out), "hello from responses") {
+		t.Errorf("response did not relay upstream body: %s", out)
 	}
 }
 
@@ -400,4 +434,3 @@ func TestRequestLogUnknownCombo(t *testing.T) {
 		t.Errorf("expected failed log for unknown combo, got %+v", l)
 	}
 }
-

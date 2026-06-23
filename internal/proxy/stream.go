@@ -84,6 +84,10 @@ func sniffStreamUsage(data []byte, res *reqResult) {
 		Message *struct {
 			Usage *usageFields `json:"usage"`
 		} `json:"message"`
+		// Responses nests usage under response.usage on the response.completed event.
+		Response *struct {
+			Usage *usageFields `json:"usage"`
+		} `json:"response"`
 	}
 	if json.Unmarshal(data, &u) != nil {
 		return
@@ -102,6 +106,9 @@ func sniffStreamUsage(data []byte, res *reqResult) {
 	apply(u.Usage)
 	if u.Message != nil {
 		apply(u.Message.Usage)
+	}
+	if u.Response != nil {
+		apply(u.Response.Usage)
 	}
 }
 

@@ -1,11 +1,119 @@
 package responses
 
 import (
+	"encoding/json"
+	"io"
 	"strings"
 
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/sse"
 )
+
+// streamEnvelope is the union of the Responses SSE event fields this decoder
+// reads. The event kind is taken from the JSON "type" field rather than the SSE
+// event name, so a producer that omits the name still decodes.
+type streamEnvelope struct {
+	Type        string      `json:"type"`
+	OutputIndex int         `json:"output_index"`
+	Delta       string      `json:"delta"`
+	Item        *streamItem `json:"item"`
+	Response    *respObject `json:"response"`
+}
+
+type streamItem struct {
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Name   string `json:"name"`
+}
+
+// DecodeStream reads an OpenAI Responses SSE stream and emits IR stream events.
+// Used when Responses is the backend format. Tool calls are keyed by the event
+// output_index so argument fragments attribute to the right call. The Finish
+// event is deferred to end-of-stream so the response.completed usage is captured.
+func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
+	reader := sse.NewReader(r)
+	started := false
+	sawTool := false
+	stop := ir.StopEndTurn
+	inputTokens, outputTokens := 0, 0
+
+	ensureStarted := func(id, model string) error {
+		if started {
+			return nil
+		}
+		started = true
+		return emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: id, Model: model})
+	}
+
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if len(ev.Data) == 0 {
+			continue
+		}
+		var env streamEnvelope
+		if json.Unmarshal(ev.Data, &env) != nil {
+			continue
+		}
+		switch env.Type {
+		case "response.created", "response.in_progress":
+			if env.Response != nil {
+				if err := ensureStarted(env.Response.ID, env.Response.Model); err != nil {
+					return err
+				}
+			}
+		case "response.output_item.added":
+			if env.Item != nil && env.Item.Type == "function_call" {
+				if err := ensureStarted("", ""); err != nil {
+					return err
+				}
+				sawTool = true
+				if err := emit(ir.StreamEvent{
+					Kind: ir.EventToolCallStart, Index: env.OutputIndex,
+					ToolID: env.Item.CallID, ToolName: env.Item.Name,
+				}); err != nil {
+					return err
+				}
+			}
+		case "response.output_text.delta":
+			if env.Delta != "" {
+				if err := ensureStarted("", ""); err != nil {
+					return err
+				}
+				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: env.Delta}); err != nil {
+					return err
+				}
+			}
+		case "response.function_call_arguments.delta":
+			if env.Delta != "" {
+				if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: env.OutputIndex, ArgsFrag: env.Delta}); err != nil {
+					return err
+				}
+			}
+		case "response.completed", "response.incomplete", "response.failed":
+			if env.Response != nil {
+				if env.Response.Usage != nil {
+					inputTokens = env.Response.Usage.InputTokens
+					outputTokens = env.Response.Usage.OutputTokens
+				}
+				if env.Response.Status == "incomplete" {
+					stop = ir.StopMaxTokens
+				} else if sawTool {
+					stop = ir.StopToolUse
+				}
+			}
+		}
+	}
+	if !started {
+		return nil
+	}
+	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stop, InputTokens: inputTokens, OutputTokens: outputTokens})
+}
 
 const (
 	openNone = iota

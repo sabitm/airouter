@@ -76,14 +76,56 @@ data: {"type":"message_stop"}
 
 `
 
+const responsesSSE = `event: response.created
+data: {"type":"response.created","response":{"id":"resp_1","model":"up","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","status":"in_progress","role":"assistant","content":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hello "}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"world"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","item_id":"msg_1","output_index":0,"content_index":0,"text":"Hello world"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","model":"up","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}
+
+`
+
+// responsesToolSSE streams a single function_call whose arguments arrive in two
+// fragments, to verify backend Responses tool reassembly.
+const responsesToolSSE = `event: response.created
+data: {"type":"response.created","response":{"id":"resp_2","model":"up","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","status":"in_progress","call_id":"call_9","name":"get_weather","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"city\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"\"paris\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_2","model":"up","status":"completed","usage":{"input_tokens":3,"output_tokens":9,"total_tokens":12}}}
+
+`
+
 func streamingUpstream(t *testing.T, anthropicBody string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		if strings.HasSuffix(r.URL.Path, "/messages") {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/messages"):
 			_, _ = io.WriteString(w, anthropicBody)
-		} else {
+		case strings.HasSuffix(r.URL.Path, "/responses"):
+			_, _ = io.WriteString(w, responsesSSE)
+		default:
 			_, _ = io.WriteString(w, openaiSSE)
 		}
 		w.(http.Flusher).Flush()
@@ -131,6 +173,8 @@ func TestStreamMatrix(t *testing.T) {
 		{"openai->anthropic", domain.ProtocolAnthropic, "/v1/chat/completions"},
 		{"anthropic->anthropic", domain.ProtocolAnthropic, "/v1/messages"},
 		{"anthropic->openai", domain.ProtocolOpenAI, "/v1/messages"},
+		{"openai->responses", domain.ProtocolOpenAIResponses, "/v1/chat/completions"},
+		{"anthropic->responses", domain.ProtocolOpenAIResponses, "/v1/messages"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -173,6 +217,69 @@ func TestStreamToolAnthropicToOpenAI(t *testing.T) {
 	}
 }
 
+// A backend Responses tool_call stream translated to an OpenAI ingress should
+// reassemble into an OpenAI tool_call with concatenated arguments.
+func TestStreamToolResponsesToOpenAI(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, responsesToolSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAIResponses}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "real-model"}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, false, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"weather?"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	name, args, finish := collectOpenAIToolStream(t, body)
+	if name != "get_weather" {
+		t.Errorf("tool name = %q", name)
+	}
+	if args != `{"city":"paris"}` {
+		t.Errorf("tool args = %q", args)
+	}
+	if finish != "tool_calls" {
+		t.Errorf("finish_reason = %q", finish)
+	}
+}
+
+// TestResponsesStreamPassthrough verifies a streaming /v1/responses request to a
+// Responses provider relays the SSE unchanged and still sniffs usage out of the
+// nested response.usage on response.completed.
+func TestResponsesStreamPassthrough(t *testing.T) {
+	base, token, st := setupStreamingWithStore(t, domain.ProtocolOpenAIResponses, anthropicSSE)
+	resp, body := postStream(t, base+"/v1/responses", token, `{"model":"default","input":"hi","stream":true}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"delta":"world"`) || !strings.Contains(body, "response.completed") {
+		t.Errorf("relayed body missing expected events: %s", body)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.InputTokens != 3 || l.OutputTokens != 2 {
+		t.Errorf("tokens = %d/%d, want 3/2", l.InputTokens, l.OutputTokens)
+	}
+}
+
 // TestStreamUsageRecorded verifies token counts are captured from streaming
 // responses across the matrix. Both mock streams report input 3 / output 2: the
 // translated paths read it through the IR stream events, and the passthrough
@@ -191,6 +298,8 @@ func TestStreamUsageRecorded(t *testing.T) {
 		{"openai->anthropic", domain.ProtocolAnthropic, "/v1/chat/completions", 13, 2},
 		{"anthropic->anthropic", domain.ProtocolAnthropic, "/v1/messages", 13, 2},
 		{"anthropic->openai", domain.ProtocolOpenAI, "/v1/messages", 3, 2},
+		{"openai->responses", domain.ProtocolOpenAIResponses, "/v1/chat/completions", 3, 2},
+		{"anthropic->responses", domain.ProtocolOpenAIResponses, "/v1/messages", 3, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

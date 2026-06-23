@@ -154,3 +154,115 @@ func decodeToolChoice(raw json.RawMessage) *ir.ToolChoice {
 	}
 	return &ir.ToolChoice{Type: ir.ToolChoiceTool, Name: obj.Name}
 }
+
+// EncodeRequest renders the IR as an OpenAI Responses request body. Used when
+// Responses is the backend format. Tools are flattened (the Responses function
+// tool keeps name/description/parameters at the top level, unlike Chat).
+func EncodeRequest(req *ir.Request) ([]byte, error) {
+	out := map[string]any{
+		"model":  req.Model,
+		"input":  encodeInput(req),
+		"stream": req.Stream,
+	}
+	if req.System != "" {
+		out["instructions"] = req.System
+	}
+	if req.MaxTokens > 0 {
+		out["max_output_tokens"] = req.MaxTokens
+	}
+	if req.Temperature != nil {
+		out["temperature"] = *req.Temperature
+	}
+	if req.TopP != nil {
+		out["top_p"] = *req.TopP
+	}
+	if len(req.Tools) > 0 {
+		tools := make([]map[string]any, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			params := json.RawMessage(t.Parameters)
+			if len(params) == 0 {
+				params = json.RawMessage("{}")
+			}
+			tools = append(tools, map[string]any{
+				"type":        "function",
+				"name":        t.Name,
+				"description": t.Description,
+				"parameters":  params,
+			})
+		}
+		out["tools"] = tools
+	}
+	if req.ToolChoice != nil {
+		out["tool_choice"] = encodeToolChoice(req.ToolChoice)
+	}
+	return json.Marshal(out)
+}
+
+// encodeInput converts IR messages into the Responses `input` item array. Each
+// IR message may expand into several items: a tool_use block becomes a top-level
+// function_call item separate from any assistant message text, and a user
+// message's tool_result blocks become function_call_output items emitted before
+// the user's own text, mirroring the chat-completions tool ordering.
+func encodeInput(req *ir.Request) []map[string]any {
+	var items []map[string]any
+	for _, m := range req.Messages {
+		if m.Role == ir.RoleAssistant {
+			var parts []map[string]any
+			for _, b := range m.Content {
+				if b.Type == ir.BlockText {
+					parts = append(parts, map[string]any{"type": "output_text", "text": b.Text, "annotations": []any{}})
+				}
+			}
+			if len(parts) > 0 {
+				items = append(items, map[string]any{"type": "message", "role": "assistant", "content": parts})
+			}
+			for _, b := range m.Content {
+				if b.Type == ir.BlockToolUse {
+					args := string(b.ToolInput)
+					if args == "" {
+						args = "{}"
+					}
+					items = append(items, map[string]any{
+						"type": "function_call", "call_id": b.ToolID, "name": b.ToolName, "arguments": args,
+					})
+				}
+			}
+			continue
+		}
+		// user role: tool results first, then the user's text/image parts.
+		for _, b := range m.Content {
+			if b.Type == ir.BlockToolResult {
+				items = append(items, map[string]any{
+					"type": "function_call_output", "call_id": b.ToolUseID, "output": toolResultText(b),
+				})
+			}
+		}
+		var parts []map[string]any
+		for _, b := range m.Content {
+			switch b.Type {
+			case ir.BlockText:
+				parts = append(parts, map[string]any{"type": "input_text", "text": b.Text})
+			case ir.BlockImage:
+				parts = append(parts, map[string]any{"type": "input_image", "image_url": imageToURL(b.Image)})
+			}
+		}
+		if len(parts) > 0 {
+			items = append(items, map[string]any{"type": "message", "role": "user", "content": parts})
+		}
+	}
+	return items
+}
+
+func encodeToolChoice(tc *ir.ToolChoice) any {
+	switch tc.Type {
+	case ir.ToolChoiceAuto:
+		return "auto"
+	case ir.ToolChoiceNone:
+		return "none"
+	case ir.ToolChoiceAny:
+		return "required"
+	case ir.ToolChoiceTool:
+		return map[string]any{"type": "function", "name": tc.Name}
+	}
+	return nil
+}

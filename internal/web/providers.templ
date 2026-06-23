@@ -49,6 +49,7 @@ templ providerForm() {
 		<select name="protocol">
 			<option value="openai">openai</option>
 			<option value="anthropic">anthropic</option>
+			<option value="openai-responses">openai-responses</option>
 		</select>
 		<select name="auth_scheme" title="credential header">
 			<option value="">default</option>
@@ -113,13 +114,9 @@ templ ProviderEditRow(p *domain.Provider) {
 				<input name="base_url" value={ p.BaseURL } required/>
 				<input name="api_key" type="password" placeholder="leave blank to keep current"/>
 				<select name="protocol">
-					if p.Protocol == domain.ProtocolOpenAI {
-						<option value="openai" selected>openai</option>
-						<option value="anthropic">anthropic</option>
-					} else {
-						<option value="openai">openai</option>
-						<option value="anthropic" selected>anthropic</option>
-					}
+					<option value="openai" selected?={ p.Protocol == domain.ProtocolOpenAI }>openai</option>
+					<option value="anthropic" selected?={ p.Protocol == domain.ProtocolAnthropic }>anthropic</option>
+					<option value="openai-responses" selected?={ p.Protocol == domain.ProtocolOpenAIResponses }>openai-responses</option>
 				</select>
 				<select name="auth_scheme" title="credential header">
 					if p.Auth() == domain.AuthBearer {

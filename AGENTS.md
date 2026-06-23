@@ -26,9 +26,10 @@ backend format  --decode-->  IR  --encode-->  ingress format   (response, incl. 
   SSE). Can act as ingress or backend.
 - `internal/proxy/anthropic` - Anthropic Messages codec (all four directions +
   SSE). Can act as ingress or backend.
-- `internal/proxy/responses` - OpenAI Responses codec. **Ingress only**: a
-  provider is never reached over the Responses API, so this package implements
-  only request-decode, response-encode, and stream-encode.
+- `internal/proxy/responses` - OpenAI Responses codec. Bidirectional: ingress
+  when a client calls `/v1/responses`, and backend when a provider's protocol is
+  `openai-responses` (an upstream that only exposes `/responses`). Implements all
+  four directions plus both stream directions.
 - `internal/proxy/sse` - minimal SSE reader/writer shared by the streaming codecs.
 - `internal/proxy/proxy.go` - the `codec` struct bundling a format's directions,
   the codec instances, and route mounting.
@@ -61,9 +62,11 @@ backend codec from a provider's protocol). The passthrough decision compares
   the `model` field. Provider-specific fields the IR does not model are preserved.
 - Different id: translate request and response through the IR.
 
-This is why `oai-responses` and `oai-chat` both have `protocol = openai` but
-distinct ids: a Responses request to an OpenAI provider must still translate
-(Responses != Chat Completions), so it must never match for passthrough.
+This is why `oai-responses` (protocol `openai-responses`) and `oai-chat`
+(protocol `openai`) have distinct ids: a Responses request to a Chat-Completions
+provider must still translate (Responses != Chat Completions), so their ids
+differ and they never match for passthrough. A Responses request to a Responses
+provider does share the id, so it passes through with only the model rewritten.
 
 When adding a new ingress format, give it a unique `id`. When adding a new
 backend-capable format, also set its `protocol` and `upstreamPath` and add it to
