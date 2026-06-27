@@ -32,12 +32,15 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// oauth providers carry no static key; resolve (and refresh) the access token
-	// onto provider.APIKey so fetchUpstreamModels can send it as a bearer.
+	// onto provider.APIKey so fetchUpstreamModels can send it as a bearer. Resolve
+	// does not mutate the provider, so the returned token must be assigned back.
 	if provider.Method() == domain.AuthOAuth {
-		if _, err := h.oauth.Resolve(r.Context(), provider, false); err != nil {
+		tok, err := h.oauth.Resolve(r.Context(), provider, false)
+		if err != nil {
 			render(w, r, ModelDatalist(nil, listID))
 			return
 		}
+		provider.APIKey = tok
 	}
 	models, err := fetchUpstreamModels(r.Context(), provider)
 	if err != nil {
