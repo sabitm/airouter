@@ -69,7 +69,7 @@ type OAuthCreds struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 	// ExpiresAt is the access token's expiry, as a Unix timestamp (seconds). Zero
 	// means unknown; the resolver then refreshes only reactively on a 401/403.
-	ExpiresAt int64 `json:"expires_at,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
 	Email     string `json:"email,omitempty"`
 	IDToken   string `json:"id_token,omitempty"`
 

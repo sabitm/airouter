@@ -10,18 +10,24 @@ import (
 	"github.com/a-h/templ"
 
 	"airouter/internal/domain"
+	"airouter/internal/oauth"
 	"airouter/internal/store"
 )
 
 type Handler struct {
 	store *store.Store
+	// oauth resolves an effective token for oauth providers before the dashboard
+	// probes an upstream (Check button, model autocomplete).
+	oauth *oauth.Service
 	// trace, set at -debug=2, logs the dashboard's outbound provider subcalls
 	// (e.g. the /models probe behind the Check button) that the request-logging
 	// middleware cannot see.
 	trace bool
 }
 
-func NewHandler(s *store.Store, trace bool) *Handler { return &Handler{store: s, trace: trace} }
+func NewHandler(s *store.Store, trace bool) *Handler {
+	return &Handler{store: s, oauth: oauth.New(s), trace: trace}
+}
 
 // Mount registers all dashboard routes on the given mux.
 func (h *Handler) Mount(mux *http.ServeMux) {

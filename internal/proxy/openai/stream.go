@@ -31,8 +31,8 @@ type chunkDelta struct {
 }
 
 type chunkToolCall struct {
-	Index    int    `json:"index"`
-	ID       string `json:"id,omitempty"`
+	Index    int     `json:"index"`
+	ID       string  `json:"id,omitempty"`
 	Function chunkFn `json:"function"`
 }
 

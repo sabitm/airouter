@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/oauth"
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/openai"
@@ -105,6 +106,9 @@ func backendCodec(p domain.Protocol) codec {
 
 type Proxy struct {
 	store *store.Store
+	// oauth resolves the effective upstream bearer token for oauth providers,
+	// refreshing access tokens as needed. apikey providers pass through unchanged.
+	oauth *oauth.Service
 	// client bounds unary requests; streamClient has no total timeout so long
 	// SSE streams are governed by the request context instead.
 	client       *http.Client
@@ -126,6 +130,7 @@ type Proxy struct {
 func New(s *store.Store, debug bool, logFile io.Writer) *Proxy {
 	p := &Proxy{
 		store:        s,
+		oauth:        oauth.New(s),
 		client:       &http.Client{Timeout: 5 * time.Minute},
 		streamClient: &http.Client{},
 		debug:        debug,

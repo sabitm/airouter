@@ -11,11 +11,15 @@ import (
 	"strings"
 
 	"airouter/internal/domain"
+	"airouter/internal/oauth"
 )
 
-// checkProvider validates a base URL + API key + protocol against the live
-// upstream before the provider is saved. The api_key field may be blank on an
-// edit, in which case the stored key for the given id is reused.
+// checkProvider validates a base URL + credential + protocol against the live
+// upstream before the provider is saved. For apikey providers the api_key field
+// may be blank on an edit, in which case the stored key for the given id is
+// reused. For oauth providers there is no api_key: the connection's stored
+// access token (resolved/refreshed) is used, so a Check confirms the OAuth
+// credential is currently valid.
 func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		render(w, r, CheckResult(false, "invalid form"))
@@ -36,6 +40,13 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		render(w, r, CheckResult(false, "enter a base URL"))
 		return
 	}
+
+	method := domain.AuthMethod(r.FormValue("auth_method"))
+	if method == domain.AuthOAuth {
+		h.checkOAuthProvider(w, r, baseURL, proto)
+		return
+	}
+
 	apiKey := r.FormValue("api_key")
 	if apiKey == "" {
 		// Edit form left the key blank to keep the current one; recover it.
@@ -51,6 +62,38 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth}, h.trace)
+	render(w, r, CheckResult(ok, msg))
+}
+
+// checkOAuthProvider resolves an oauth provider's stored access token (the
+// connection must already exist and be connected) and probes the upstream with
+// it. A blank or unconnected provider reports that connect is needed.
+func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, baseURL string, proto domain.Protocol) {
+	id, err := strconv.ParseInt(r.FormValue("id"), 10, 64)
+	if err != nil {
+		render(w, r, CheckResult(false, "connect this provider before checking"))
+		return
+	}
+	p, err := h.store.GetProvider(r.Context(), id)
+	if err != nil || p.OAuthCreds == nil || p.OAuthCreds.AccessToken == "" {
+		render(w, r, CheckResult(false, "not connected yet - run Connect first"))
+		return
+	}
+	// Probe against the form's base URL/protocol (which may differ from stored if
+	// the user edited them), but use the stored, resolved OAuth token.
+	probe := &domain.Provider{
+		ID: p.ID, BaseURL: baseURL, Protocol: proto,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer, OAuthCreds: p.OAuthCreds,
+	}
+	if _, err := h.oauth.Resolve(r.Context(), probe, false); err != nil {
+		if oauth.IsInvalidGrant(err) {
+			render(w, r, CheckResult(false, "token expired - reconnect required"))
+			return
+		}
+		render(w, r, CheckResult(false, "token refresh failed: "+err.Error()))
+		return
+	}
+	ok, msg := checkUpstream(r.Context(), probe, h.trace)
 	render(w, r, CheckResult(ok, msg))
 }
 

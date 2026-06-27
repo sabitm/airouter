@@ -110,7 +110,7 @@ func (s *Store) migrate() error {
 
 // migrateProviderAuthScheme adds the auth_scheme column to a providers table
 // created before auth was decoupled from protocol. Idempotent; existing rows
-// default to '' (empty), which Provider.Auth resolves by protocol.
+// default to ” (empty), which Provider.Auth resolves by protocol.
 func (s *Store) migrateProviderAuthScheme() error {
 	has, err := s.columnExists("providers", "auth_scheme")
 	if err != nil || has {
@@ -122,7 +122,7 @@ func (s *Store) migrateProviderAuthScheme() error {
 
 // migrateProviderAuthMethod adds the auth_method and oauth_creds columns to a
 // providers table created before OAuth was supported. Idempotent; existing rows
-// default to '' (empty), which Provider.Method resolves to apikey.
+// default to ” (empty), which Provider.Method resolves to apikey.
 func (s *Store) migrateProviderAuthMethod() error {
 	has, err := s.columnExists("providers", "auth_method")
 	if err != nil || has {

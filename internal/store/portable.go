@@ -142,7 +142,7 @@ func (s *Store) Import(ctx context.Context, r io.Reader) error {
 		if cur, ok := byName[pp.Name]; ok {
 			cur.BaseURL, cur.APIKey, cur.Protocol = pp.BaseURL, pp.APIKey, proto
 			cur.AuthScheme, cur.AuthMethod, cur.OAuthCreds = auth, method, pp.OAuth
-			cur.AuthScheme = cur.Auth() // expand the default alias to a concrete scheme
+			cur.AuthScheme = cur.Auth()   // expand the default alias to a concrete scheme
 			cur.AuthMethod = cur.Method() // expand the default alias to a concrete method
 			if err := s.UpdateProvider(ctx, cur); err != nil {
 				return err
@@ -152,8 +152,8 @@ func (s *Store) Import(ctx context.Context, r io.Reader) error {
 				Name: pp.Name, BaseURL: pp.BaseURL, APIKey: pp.APIKey, Protocol: proto,
 				AuthScheme: auth, AuthMethod: method, OAuthCreds: pp.OAuth,
 			}
-			np.AuthScheme = np.Auth()    // expand the default alias to a concrete scheme
-			np.AuthMethod = np.Method()  // expand the default alias to a concrete method
+			np.AuthScheme = np.Auth()   // expand the default alias to a concrete scheme
+			np.AuthMethod = np.Method() // expand the default alias to a concrete method
 			if err := s.CreateProvider(ctx, np); err != nil {
 				return err
 			}

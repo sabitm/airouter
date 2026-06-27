@@ -31,6 +31,14 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 		render(w, r, ModelDatalist(nil, listID))
 		return
 	}
+	// oauth providers carry no static key; resolve (and refresh) the access token
+	// onto provider.APIKey so fetchUpstreamModels can send it as a bearer.
+	if provider.Method() == domain.AuthOAuth {
+		if _, err := h.oauth.Resolve(r.Context(), provider, false); err != nil {
+			render(w, r, ModelDatalist(nil, listID))
+			return
+		}
+	}
 	models, err := fetchUpstreamModels(r.Context(), provider)
 	if err != nil {
 		models = nil
@@ -39,18 +47,23 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // fetchUpstreamModels queries the provider's /models endpoint. Both OpenAI and
-// Anthropic return {"data":[{"id":...}]}; only the auth headers differ.
+// Anthropic return {"data":[{"id":...}]}; only the auth headers differ. The
+// credential header follows the effective auth scheme (oauth always bearer),
+// not the protocol, so an oauth provider speaking Anthropic still sends bearer.
 func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, error) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	if p.Protocol == domain.ProtocolAnthropic {
+	switch p.Auth() {
+	case domain.AuthXAPIKey:
 		req.Header.Set("x-api-key", p.APIKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
-	} else {
+	default:
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	if p.Protocol == domain.ProtocolAnthropic {
+		req.Header.Set("anthropic-version", "2023-06-01")
 	}
 
 	resp, err := upstreamClient.Do(req)
