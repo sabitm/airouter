@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"airouter/internal/crypto"
 	"airouter/internal/domain"
@@ -330,6 +331,133 @@ func TestOAuthCheckNotConnected(t *testing.T) {
 	h.checkProvider(rec, reqWithForm(form))
 	if !strings.Contains(rec.Body.String(), "not connected") {
 		t.Fatalf("check result = %s, want not connected", rec.Body.String())
+	}
+}
+
+// TestOAuthCreateManualTokens: an oauth provider can be created from pasted
+// tokens (no connect session), pulling its config from the chosen preset.
+func TestOAuthCreateManualTokens(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "grok")
+	form.Set("base_url", "https://api.x.ai/v1")
+	form.Set("protocol", "openai")
+	form.Set("preset", "xai")
+	form.Set("access_token", "imported-access")
+	form.Set("refresh_token", "imported-refresh")
+	form.Set("expires_at", "2026-06-27T07:14:11Z")
+	form.Set("email", "user@example.com")
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, reqWithForm(form))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	providers, err := h.store.ListProviders(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(providers) != 1 {
+		t.Fatalf("providers = %d, want 1", len(providers))
+	}
+	p := providers[0]
+	if p.Method() != domain.AuthOAuth || p.Auth() != domain.AuthBearer {
+		t.Errorf("method/scheme = %q/%q, want oauth/bearer", p.Method(), p.Auth())
+	}
+	if p.APIKey != "" {
+		t.Errorf("APIKey = %q, want empty", p.APIKey)
+	}
+	c := p.OAuthCreds
+	if c == nil {
+		t.Fatal("nil creds")
+	}
+	if c.AccessToken != "imported-access" || c.RefreshToken != "imported-refresh" {
+		t.Errorf("tokens = %q/%q", c.AccessToken, c.RefreshToken)
+	}
+	if c.Email != "user@example.com" {
+		t.Errorf("email = %q", c.Email)
+	}
+	wantExp, _ := time.Parse(time.RFC3339, "2026-06-27T07:14:11Z")
+	if c.ExpiresAt != wantExp.Unix() {
+		t.Errorf("expires_at = %d, want %d", c.ExpiresAt, wantExp.Unix())
+	}
+	// Config came from the xAI preset, so refresh works without a connect flow.
+	if c.ClientID != "b1a00492-073a-47ea-816f-4c329264a828" || c.TokenURL == "" {
+		t.Errorf("preset config not applied: client_id=%q token_url=%q", c.ClientID, c.TokenURL)
+	}
+}
+
+// TestOAuthCreateManualNoTokensRejected: oauth create with config but neither a
+// connect session nor pasted tokens is rejected and stores nothing.
+func TestOAuthCreateManualNoTokensRejected(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "grok")
+	form.Set("base_url", "https://api.x.ai/v1")
+	form.Set("protocol", "openai")
+	form.Set("preset", "xai")
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, reqWithForm(form))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	providers, _ := h.store.ListProviders(context.Background())
+	if len(providers) != 0 {
+		t.Fatalf("providers = %d, want 0", len(providers))
+	}
+}
+
+func TestParseExpiresAt(t *testing.T) {
+	rfc := "2026-06-27T07:14:11Z"
+	want, _ := time.Parse(time.RFC3339, rfc)
+	cases := map[string]int64{
+		"":             0,
+		"   ":          0,
+		"not-a-time":   0,
+		"1782522851":   1782522851,
+		rfc:            want.Unix(),
+		" 1782522851 ": 1782522851,
+	}
+	for in, exp := range cases {
+		if got := parseExpiresAt(in); got != exp {
+			t.Errorf("parseExpiresAt(%q) = %d, want %d", in, got, exp)
+		}
+	}
+}
+
+// TestOAuthCheckManualTokens: Check probes pasted form tokens (no connect
+// session, no saved id) as-is and reports the model count.
+func TestOAuthCheckManualTokens(t *testing.T) {
+	h := testHandler(t)
+	var sawAuth string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth = r.Header.Get("Authorization")
+		if sawAuth != "Bearer pasted-access" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[{"id":"grok-4"}]}`))
+	}))
+	t.Cleanup(up.Close)
+
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("base_url", up.URL)
+	form.Set("protocol", "openai")
+	form.Set("preset", "xai")
+	form.Set("access_token", "pasted-access")
+	form.Set("refresh_token", "pasted-refresh")
+	rec := httptest.NewRecorder()
+	h.checkProvider(rec, reqWithForm(form))
+
+	if sawAuth != "Bearer pasted-access" {
+		t.Errorf("upstream saw auth = %q, want Bearer pasted-access", sawAuth)
+	}
+	if !strings.Contains(rec.Body.String(), "1 models") {
+		t.Fatalf("check result = %s, want 1 models", rec.Body.String())
 	}
 }
 

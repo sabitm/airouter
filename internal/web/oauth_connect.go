@@ -3,6 +3,7 @@ package web
 import (
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,43 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 type fieldError string
 
 func (e fieldError) Error() string { return string(e) }
+
+// applyManualTokens overlays user-pasted tokens onto a config-only creds, for
+// importing an already-authenticated session (e.g. from a CLI) without running
+// the browser connect flow. It returns false when neither token is present, so
+// the caller can fall back to the connect-session path. The config (token_url,
+// client_id, pkce) still comes from credsFromConnectForm; only the refresh token
+// is strictly required for the token to outlive its expiry.
+func applyManualTokens(c *domain.OAuthCreds, r *http.Request) bool {
+	access := strings.TrimSpace(r.FormValue("access_token"))
+	refresh := strings.TrimSpace(r.FormValue("refresh_token"))
+	if access == "" && refresh == "" {
+		return false
+	}
+	c.AccessToken = access
+	c.RefreshToken = refresh
+	c.Email = strings.TrimSpace(r.FormValue("email"))
+	c.ExpiresAt = parseExpiresAt(r.FormValue("expires_at"))
+	return true
+}
+
+// parseExpiresAt reads an access-token expiry as either a unix-seconds integer or
+// an RFC3339 timestamp (the shape CLIs commonly emit). An empty or unparseable
+// value yields 0 (unknown expiry), which leaves refreshing to the reactive 401
+// path rather than the proactive one.
+func parseExpiresAt(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.Unix()
+	}
+	return 0
+}
 
 // connectPhase reads a session's current outcome without blocking, mapping it to
 // the (phase, email, errMsg) triple the status line renders. Phases: "pending"

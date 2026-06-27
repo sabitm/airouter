@@ -165,15 +165,24 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	h.renderProviderList(w, r)
 }
 
-// createOAuthProvider saves an oauth provider from a connected connect session.
-// The session (keyed by oauth_session = the connect state) must hold a completed
-// flow; its credentials carry the tokens. An oauth provider stores no static
-// key and always authenticates with a bearer token.
+// createOAuthProvider saves an oauth provider. Credentials come from one of two
+// sources, in order: a completed connect session (keyed by oauth_session = the
+// connect state), or tokens pasted into the form (importing an already-
+// authenticated session, with config from the preset/manual fields). An oauth
+// provider stores no static key and always authenticates with a bearer token.
 func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, proto domain.Protocol) {
 	creds, ok := h.connectedCreds(r.FormValue("oauth_session"))
 	if !ok {
-		badRequest(w, "connect this provider before saving")
-		return
+		c, err := credsFromConnectForm(r)
+		if err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+		if !applyManualTokens(c, r) {
+			badRequest(w, "connect this provider or paste an access/refresh token before saving")
+			return
+		}
+		creds = c
 	}
 	p := &domain.Provider{
 		Name:       r.FormValue("name"),
@@ -286,14 +295,17 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 
 // updateOAuthProvider saves edits to an oauth provider. Name/base URL/protocol
 // come from the form; credentials are replaced only when a fresh connect session
-// (a Reconnect) is attached, otherwise the stored tokens are kept. Editing an
-// oauth provider without reconnecting therefore never requires re-auth.
+// (a Reconnect) is attached or fresh tokens are pasted, otherwise the stored
+// tokens are kept. The paste fields are blank by default, so editing an oauth
+// provider without reconnecting or pasting never requires re-auth.
 func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cur *domain.Provider, proto domain.Protocol) {
 	if creds, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
 		cur.OAuthCreds = creds
+	} else if c, err := credsFromConnectForm(r); err == nil && applyManualTokens(c, r) {
+		cur.OAuthCreds = c
 	}
 	if cur.OAuthCreds == nil {
-		badRequest(w, "connect this provider before saving")
+		badRequest(w, "connect this provider or paste an access/refresh token before saving")
 		return
 	}
 	cur.Name = r.FormValue("name")

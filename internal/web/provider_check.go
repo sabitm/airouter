@@ -104,19 +104,23 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	render(w, r, CheckResult(ok, msg))
 }
 
-// oauthCheckCreds finds the credentials to probe for an oauth Check: the saved
-// provider's stored creds (by id) take precedence, falling back to a connected
-// in-flight session (by oauth_session state). fromStore distinguishes the two so
-// the caller knows whether a refresh can be persisted.
+// oauthCheckCreds finds the credentials to probe for an oauth Check, in the same
+// precedence Save uses: a just-completed connect session, then tokens pasted into
+// the form, then the saved provider's stored creds (by id). fromStore is true
+// only for stored creds - the source whose refresh can be persisted; session and
+// pasted tokens are probed as-is.
 func (h *Handler) oauthCheckCreds(r *http.Request) (creds *domain.OAuthCreds, fromStore bool) {
+	if c, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
+		return c, false
+	}
+	if c, err := credsFromConnectForm(r); err == nil && applyManualTokens(c, r) {
+		return c, false
+	}
 	if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
 		if p, err := h.store.GetProvider(r.Context(), id); err == nil &&
 			p.OAuthCreds != nil && p.OAuthCreds.AccessToken != "" {
 			return p.OAuthCreds, true
 		}
-	}
-	if c, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
-		return c, false
 	}
 	return nil, false
 }
