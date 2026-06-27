@@ -64,6 +64,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/providers/oauth/exchange", h.oauthConnectExchange)
 	mux.HandleFunc("POST /dashboard/providers/oauth/cancel", h.oauthConnectCancel)
 	mux.HandleFunc("POST /dashboard/providers/oauth/refresh", h.oauthRefreshTokens)
+	mux.HandleFunc("POST /dashboard/providers/oauth/refresh-all", h.refreshAllOAuth)
 
 	// Combos
 	mux.HandleFunc("GET /dashboard/combos", h.combosPage)
@@ -336,6 +337,40 @@ func (h *Handler) deleteProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.renderProviderList(w, r)
+}
+
+// refreshAllOAuth force-refreshes every saved oauth provider's access token,
+// persisting the rotated tokens, and reports a one-line summary. Failures are
+// collected per provider rather than aborting the batch, so one revoked refresh
+// token does not block refreshing the rest.
+func (h *Handler) refreshAllOAuth(w http.ResponseWriter, r *http.Request) {
+	providers, err := h.store.ListProviders(r.Context())
+	if err != nil {
+		render(w, r, CheckResult(false, err.Error()))
+		return
+	}
+	var refreshed, failed int
+	var problems []string
+	for _, p := range providers {
+		if p.Method() != domain.AuthOAuth {
+			continue
+		}
+		if _, err := h.oauth.Resolve(r.Context(), p, true); err != nil {
+			failed++
+			if oauth.IsInvalidGrant(err) {
+				problems = append(problems, p.Name+": reconnect required")
+			} else {
+				problems = append(problems, p.Name+": "+err.Error())
+			}
+			continue
+		}
+		refreshed++
+	}
+	if failed == 0 {
+		render(w, r, CheckResult(true, fmt.Sprintf("refreshed %d oauth provider(s)", refreshed)))
+		return
+	}
+	render(w, r, CheckResult(false, fmt.Sprintf("refreshed %d, %d failed: %s", refreshed, failed, strings.Join(problems, "; "))))
 }
 
 func (h *Handler) renderProviderList(w http.ResponseWriter, r *http.Request) {

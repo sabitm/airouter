@@ -520,6 +520,69 @@ func TestOAuthRefreshNoRefreshToken(t *testing.T) {
 	}
 }
 
+// TestRefreshAllOAuth: refresh-all force-refreshes every saved oauth provider,
+// skips apikey providers, persists the rotated tokens, and reports the count.
+func TestRefreshAllOAuth(t *testing.T) {
+	h := testHandler(t)
+	hits := new(int)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*hits++
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "rotated",
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	for _, name := range []string{"grok-a", "grok-b"} {
+		p := &domain.Provider{
+			Name: name, BaseURL: "https://api.x.ai/v1", Protocol: domain.ProtocolOpenAI,
+			AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+			OAuthCreds: &domain.OAuthCreds{
+				Mode: domain.OAuthManual, AccessToken: "stale", RefreshToken: "rt-" + name,
+				TokenURL: srv.URL + "/token", ClientID: "cid",
+			},
+		}
+		if err := h.store.CreateProvider(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An apikey provider must be left untouched.
+	if err := h.store.CreateProvider(context.Background(), &domain.Provider{
+		Name: "plain", BaseURL: "https://api.example.com/v1", Protocol: domain.ProtocolOpenAI,
+		APIKey: "sk-x", AuthScheme: domain.AuthBearer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/oauth/refresh-all", nil)
+	rec := httptest.NewRecorder()
+	h.refreshAllOAuth(rec, req)
+
+	if *hits != 2 {
+		t.Errorf("token endpoint hits = %d, want 2", *hits)
+	}
+	if !strings.Contains(rec.Body.String(), "refreshed 2 oauth provider(s)") {
+		t.Fatalf("result = %s, want refreshed 2", rec.Body.String())
+	}
+
+	providers, _ := h.store.ListProviders(context.Background())
+	for _, p := range providers {
+		switch p.Method() {
+		case domain.AuthOAuth:
+			if p.OAuthCreds.AccessToken != "rotated" {
+				t.Errorf("%s access token = %q, want rotated", p.Name, p.OAuthCreds.AccessToken)
+			}
+		default:
+			if p.APIKey != "sk-x" {
+				t.Errorf("apikey provider changed: %q", p.APIKey)
+			}
+		}
+	}
+}
+
 // exchangeConnect completes a connect session via the manual-paste path.
 func exchangeConnect(t *testing.T, h *Handler, state, code string) {
 	t.Helper()

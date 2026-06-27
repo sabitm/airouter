@@ -15,9 +15,34 @@ templ ProvidersPage(providers []*domain.Provider, baseURL string) {
 			@providerForm()
 		</section>
 		<section class="panel">
+			if hasOAuthProvider(providers) {
+				<div class="row-form refresh-all">
+					<button
+						type="button"
+						class="link"
+						hx-post="/dashboard/providers/oauth/refresh-all"
+						hx-target="#refresh-all-result"
+						hx-swap="innerHTML"
+						hx-indicator="#refresh-all-indicator"
+					>Refresh all oauth</button>
+					<span id="refresh-all-indicator" class="htmx-indicator">refreshing...</span>
+					<span id="refresh-all-result"></span>
+				</div>
+			}
 			@ProviderList(providers)
 		</section>
 	}
+}
+
+// hasOAuthProvider reports whether any provider authenticates via oauth, gating
+// the "Refresh all oauth" control so it only appears when it has work to do.
+func hasOAuthProvider(providers []*domain.Provider) bool {
+	for _, p := range providers {
+		if p.Method() == domain.AuthOAuth {
+			return true
+		}
+	}
+	return false
 }
 
 // ConnectionPanel shows the router's own ingress URLs for agent clients. The two
