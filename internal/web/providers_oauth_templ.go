@@ -171,7 +171,7 @@ func oauthFields(c *domain.OAuthCreds, beginTarget string) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 13, "</div></div>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 13, "</div><div class=\"oauth-check row-form\"><button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/check\" hx-include=\"closest form\" hx-target=\"next .check-result\" hx-swap=\"innerHTML\" hx-indicator=\"next .check-indicator\">Check</button> <span class=\"check-indicator htmx-indicator\">checking...</span> <span class=\"check-result\"></span></div></div>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -207,7 +207,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var11 string
 		templ_7745c5c3_Var11, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 46, Col: 16}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 59, Col: 16}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var11)
 		if templ_7745c5c3_Err != nil {
@@ -220,7 +220,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var12 string
 		templ_7745c5c3_Var12, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.APIBase)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 47, Col: 27}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 60, Col: 27}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var12)
 		if templ_7745c5c3_Err != nil {
@@ -233,7 +233,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var13 string
 		templ_7745c5c3_Var13, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(p.Protocol))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 48, Col: 36}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 61, Col: 36}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var13)
 		if templ_7745c5c3_Err != nil {
@@ -246,7 +246,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var14 string
 		templ_7745c5c3_Var14, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.AuthURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 49, Col: 27}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 62, Col: 27}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var14)
 		if templ_7745c5c3_Err != nil {
@@ -259,7 +259,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var15 string
 		templ_7745c5c3_Var15, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.TokenURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 50, Col: 29}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 63, Col: 29}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var15)
 		if templ_7745c5c3_Err != nil {
@@ -272,7 +272,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var16 string
 		templ_7745c5c3_Var16, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.ClientID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 51, Col: 29}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 64, Col: 29}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var16)
 		if templ_7745c5c3_Err != nil {
@@ -285,7 +285,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var17 string
 		templ_7745c5c3_Var17, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.ClientSecret)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 52, Col: 37}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 65, Col: 37}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var17)
 		if templ_7745c5c3_Err != nil {
@@ -298,7 +298,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var18 string
 		templ_7745c5c3_Var18, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.Scopes)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 53, Col: 24}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 66, Col: 24}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var18)
 		if templ_7745c5c3_Err != nil {
@@ -311,7 +311,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var19 string
 		templ_7745c5c3_Var19, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.RedirectURI)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 54, Col: 35}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 67, Col: 35}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var19)
 		if templ_7745c5c3_Err != nil {
@@ -324,7 +324,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var20 string
 		templ_7745c5c3_Var20, templ_7745c5c3_Err = templ.ResolveAttributeValue(boolStr(p.PKCE))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 55, Col: 29}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 68, Col: 29}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var20)
 		if templ_7745c5c3_Err != nil {
@@ -347,7 +347,7 @@ func presetOption(p oauth.Preset, c *domain.OAuthCreds) templ.Component {
 		var templ_7745c5c3_Var21 string
 		templ_7745c5c3_Var21, templ_7745c5c3_Err = templ.JoinStringErrs(p.Label)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 57, Col: 11}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 70, Col: 11}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var21))
 		if templ_7745c5c3_Err != nil {
@@ -421,7 +421,7 @@ func OAuthConnectError(msg string) templ.Component {
 		var templ_7745c5c3_Var24 string
 		templ_7745c5c3_Var24, templ_7745c5c3_Err = templ.JoinStringErrs(msg)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 68, Col: 30}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 81, Col: 30}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var24))
 		if templ_7745c5c3_Err != nil {
@@ -483,7 +483,7 @@ func OAuthConnectView(authURL, state string, loopback bool) templ.Component {
 		var templ_7745c5c3_Var26 templ.SafeURL
 		templ_7745c5c3_Var26, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL(authURL))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 86, Col: 49}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 99, Col: 49}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var26))
 		if templ_7745c5c3_Err != nil {
@@ -496,7 +496,7 @@ func OAuthConnectView(authURL, state string, loopback bool) templ.Component {
 		var templ_7745c5c3_Var27 string
 		templ_7745c5c3_Var27, templ_7745c5c3_Err = templ.ResolveAttributeValue(`{"state":"` + state + `"}`)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 94, Col: 41}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 107, Col: 41}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var27)
 		if templ_7745c5c3_Err != nil {
@@ -509,7 +509,7 @@ func OAuthConnectView(authURL, state string, loopback bool) templ.Component {
 		var templ_7745c5c3_Var28 string
 		templ_7745c5c3_Var28, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-status-" + state)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 95, Col: 40}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 108, Col: 40}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var28)
 		if templ_7745c5c3_Err != nil {
@@ -522,7 +522,7 @@ func OAuthConnectView(authURL, state string, loopback bool) templ.Component {
 		var templ_7745c5c3_Var29 string
 		templ_7745c5c3_Var29, templ_7745c5c3_Err = templ.ResolveAttributeValue(`{"state":"` + state + `"}`)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 102, Col: 41}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 115, Col: 41}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var29)
 		if templ_7745c5c3_Err != nil {
@@ -578,7 +578,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 			var templ_7745c5c3_Var31 string
 			templ_7745c5c3_Var31, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-status-" + state)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 118, Col: 37}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 131, Col: 37}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var31)
 			if templ_7745c5c3_Err != nil {
@@ -591,7 +591,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 			var templ_7745c5c3_Var32 string
 			templ_7745c5c3_Var32, templ_7745c5c3_Err = templ.JoinStringErrs(emailSuffix(email))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 119, Col: 33}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 132, Col: 33}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var32))
 			if templ_7745c5c3_Err != nil {
@@ -604,7 +604,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 			var templ_7745c5c3_Var33 string
 			templ_7745c5c3_Var33, templ_7745c5c3_Err = templ.ResolveAttributeValue(state)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 120, Col: 59}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 133, Col: 59}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var33)
 			if templ_7745c5c3_Err != nil {
@@ -622,7 +622,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 			var templ_7745c5c3_Var34 string
 			templ_7745c5c3_Var34, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-status-" + state)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 123, Col: 37}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 136, Col: 37}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var34)
 			if templ_7745c5c3_Err != nil {
@@ -635,7 +635,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 			var templ_7745c5c3_Var35 string
 			templ_7745c5c3_Var35, templ_7745c5c3_Err = templ.JoinStringErrs(errMsg)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 123, Col: 66}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 136, Col: 66}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var35))
 			if templ_7745c5c3_Err != nil {
@@ -654,7 +654,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 				var templ_7745c5c3_Var36 string
 				templ_7745c5c3_Var36, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-status-" + state)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 127, Col: 33}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 140, Col: 33}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var36)
 				if templ_7745c5c3_Err != nil {
@@ -667,7 +667,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 				var templ_7745c5c3_Var37 string
 				templ_7745c5c3_Var37, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/oauth/status?state=" + state)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 129, Col: 64}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 142, Col: 64}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var37)
 				if templ_7745c5c3_Err != nil {
@@ -680,7 +680,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 				var templ_7745c5c3_Var38 string
 				templ_7745c5c3_Var38, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-status-" + state)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 131, Col: 41}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 144, Col: 41}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var38)
 				if templ_7745c5c3_Err != nil {
@@ -698,7 +698,7 @@ func OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) t
 				var templ_7745c5c3_Var39 string
 				templ_7745c5c3_Var39, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-status-" + state)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 135, Col: 38}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 148, Col: 38}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var39)
 				if templ_7745c5c3_Err != nil {
@@ -745,7 +745,7 @@ func providerCredCell(p *domain.Provider) templ.Component {
 			var templ_7745c5c3_Var41 string
 			templ_7745c5c3_Var41, templ_7745c5c3_Err = templ.JoinStringErrs(oauthLabel(p.OAuthCreds))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 144, Col: 78}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 157, Col: 78}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var41))
 			if templ_7745c5c3_Err != nil {
@@ -763,7 +763,7 @@ func providerCredCell(p *domain.Provider) templ.Component {
 			var templ_7745c5c3_Var42 string
 			templ_7745c5c3_Var42, templ_7745c5c3_Err = templ.JoinStringErrs(maskKey(p.APIKey))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 146, Col: 40}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 159, Col: 40}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var42))
 			if templ_7745c5c3_Err != nil {

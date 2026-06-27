@@ -38,6 +38,19 @@ templ oauthFields(c *domain.OAuthCreds, beginTarget string) {
 		<div id={ beginTarget[1:] } class="oauth-region">
 			@OAuthConnectIdle()
 		</div>
+		<div class="oauth-check row-form">
+			<button
+				type="button"
+				class="link"
+				hx-post="/dashboard/providers/check"
+				hx-include="closest form"
+				hx-target="next .check-result"
+				hx-swap="innerHTML"
+				hx-indicator="next .check-indicator"
+			>Check</button>
+			<span class="check-indicator htmx-indicator">checking...</span>
+			<span class="check-result"></span>
+		</div>
 	</div>
 }
 

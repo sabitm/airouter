@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -241,4 +242,106 @@ func reqWithForm(form url.Values) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return r
+}
+
+// TestOAuthCheckWithSession: right after Connect (before save), Check probes the
+// upstream /models with the session's access token and reports the model count.
+func TestOAuthCheckWithSession(t *testing.T) {
+	h := testHandler(t)
+	srv, _ := tokenServer(t, "tok-check")
+
+	// Upstream /models that accepts only the connected bearer token.
+	var sawAuth string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth = r.Header.Get("Authorization")
+		if sawAuth != "Bearer tok-check" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[{"id":"grok-4"},{"id":"grok-3"}]}`))
+	}))
+	t.Cleanup(up.Close)
+
+	state := beginManualConnect(t, h, srv.URL)
+	exchangeConnect(t, h, state, "code-1")
+
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("base_url", up.URL)
+	form.Set("protocol", "openai")
+	form.Set("oauth_session", state)
+	rec := httptest.NewRecorder()
+	h.checkProvider(rec, reqWithForm(form))
+
+	body := rec.Body.String()
+	if sawAuth != "Bearer tok-check" {
+		t.Errorf("upstream saw auth = %q, want Bearer tok-check", sawAuth)
+	}
+	if !strings.Contains(body, "2 models") {
+		t.Fatalf("check result = %s, want 2 models", body)
+	}
+}
+
+// TestOAuthCheckSavedProvider: a saved, connected oauth provider can be checked
+// by id.
+func TestOAuthCheckSavedProvider(t *testing.T) {
+	h := testHandler(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer stored-tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[{"id":"m1"}]}`))
+	}))
+	t.Cleanup(up.Close)
+
+	p := &domain.Provider{
+		Name: "grok", BaseURL: up.URL, Protocol: domain.ProtocolOpenAI,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{Mode: domain.OAuthAuto, AccessToken: "stored-tok"},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("base_url", up.URL)
+	form.Set("protocol", "openai")
+	form.Set("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.checkProvider(rec, reqWithForm(form))
+	if !strings.Contains(rec.Body.String(), "1 models") {
+		t.Fatalf("check result = %s, want 1 models", rec.Body.String())
+	}
+}
+
+// TestOAuthCheckNotConnected: a Check with neither a saved id nor a connected
+// session reports that connect is needed.
+func TestOAuthCheckNotConnected(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("base_url", "https://api.x.ai/v1")
+	form.Set("protocol", "openai")
+	rec := httptest.NewRecorder()
+	h.checkProvider(rec, reqWithForm(form))
+	if !strings.Contains(rec.Body.String(), "not connected") {
+		t.Fatalf("check result = %s, want not connected", rec.Body.String())
+	}
+}
+
+// exchangeConnect completes a connect session via the manual-paste path.
+func exchangeConnect(t *testing.T, h *Handler, state, code string) {
+	t.Helper()
+	form := url.Values{}
+	form.Set("state", state)
+	form.Set("code", code)
+	rec := httptest.NewRecorder()
+	h.oauthConnectExchange(rec, reqWithForm(form))
+	if !strings.Contains(rec.Body.String(), "connected") {
+		t.Fatalf("exchange did not connect: %s", rec.Body.String())
+	}
 }

@@ -65,36 +65,60 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 	render(w, r, CheckResult(ok, msg))
 }
 
-// checkOAuthProvider resolves an oauth provider's stored access token (the
-// connection must already exist and be connected) and probes the upstream with
-// it. A blank or unconnected provider reports that connect is needed.
+// checkOAuthProvider resolves an oauth provider's access token and probes the
+// upstream with it. Two sources are accepted: a saved provider loaded by id
+// (edit form, already connected) or an in-flight connect session by its state
+// token (create form, connected but not yet saved). Without either, it reports
+// that connect is needed.
 func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, baseURL string, proto domain.Protocol) {
-	id, err := strconv.ParseInt(r.FormValue("id"), 10, 64)
-	if err != nil {
-		render(w, r, CheckResult(false, "connect this provider before checking"))
-		return
-	}
-	p, err := h.store.GetProvider(r.Context(), id)
-	if err != nil || p.OAuthCreds == nil || p.OAuthCreds.AccessToken == "" {
+	creds, fromStore := h.oauthCheckCreds(r)
+	if creds == nil {
 		render(w, r, CheckResult(false, "not connected yet - run Connect first"))
 		return
 	}
-	// Probe against the form's base URL/protocol (which may differ from stored if
-	// the user edited them), but use the stored, resolved OAuth token.
 	probe := &domain.Provider{
-		ID: p.ID, BaseURL: baseURL, Protocol: proto,
-		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer, OAuthCreds: p.OAuthCreds,
+		BaseURL: baseURL, Protocol: proto,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer, OAuthCreds: creds,
 	}
-	if _, err := h.oauth.Resolve(r.Context(), probe, false); err != nil {
-		if oauth.IsInvalidGrant(err) {
-			render(w, r, CheckResult(false, "token expired - reconnect required"))
+	// A saved provider can be refreshed and the rotated token persisted (it has a
+	// store id); a session's token is probed as-is - refreshing it would write
+	// nowhere and the just-connected token is fresh anyway.
+	if fromStore {
+		if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
+			probe.ID = id
+		}
+		tok, err := h.oauth.Resolve(r.Context(), probe, false)
+		if err != nil {
+			if oauth.IsInvalidGrant(err) {
+				render(w, r, CheckResult(false, "token expired - reconnect required"))
+				return
+			}
+			render(w, r, CheckResult(false, "token refresh failed: "+err.Error()))
 			return
 		}
-		render(w, r, CheckResult(false, "token refresh failed: "+err.Error()))
-		return
+		probe.APIKey = tok
+	} else {
+		probe.APIKey = creds.AccessToken
 	}
 	ok, msg := checkUpstream(r.Context(), probe, h.trace)
 	render(w, r, CheckResult(ok, msg))
+}
+
+// oauthCheckCreds finds the credentials to probe for an oauth Check: the saved
+// provider's stored creds (by id) take precedence, falling back to a connected
+// in-flight session (by oauth_session state). fromStore distinguishes the two so
+// the caller knows whether a refresh can be persisted.
+func (h *Handler) oauthCheckCreds(r *http.Request) (creds *domain.OAuthCreds, fromStore bool) {
+	if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
+		if p, err := h.store.GetProvider(r.Context(), id); err == nil &&
+			p.OAuthCreds != nil && p.OAuthCreds.AccessToken != "" {
+			return p.OAuthCreds, true
+		}
+	}
+	if c, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
+		return c, false
+	}
+	return nil, false
 }
 
 // traceMaxBody caps the outbound /models body logged at trace level so a long
