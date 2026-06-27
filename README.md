@@ -13,15 +13,27 @@ embedded SQLite database; there are no external service dependencies.
 
 Three concepts:
 
-- **Provider** - an upstream connection: a base URL, an API key, the protocol
-  it speaks (`openai` for Chat Completions, `anthropic` for Messages, or
+- **Provider** - an upstream connection: a base URL, the protocol it speaks
+  (`openai` for Chat Completions, `anthropic` for Messages, or
   `openai-responses` for the OpenAI Responses API - for upstreams that only
-  expose `/responses`), and an auth scheme - how the key is sent:
+  expose `/responses`), an auth scheme - how the credential is sent:
   `default` (sensible per protocol: `x-api-key` for Anthropic, `bearer` for the
-  OpenAI formats), `bearer`, or `x-api-key`. The auth scheme is independent of the
+  OpenAI formats), `bearer`, or `x-api-key` - and how it authenticates: an
+  **API key** or **OAuth**. The auth scheme is independent of the
   protocol, so an Anthropic-format upstream that authenticates with a bearer
   token (an `ANTHROPIC_AUTH_TOKEN`-style gateway) works by selecting protocol
   `anthropic` + auth `bearer`. The API key is encrypted at rest.
+
+  An OAuth provider authenticates with an access token the router obtains and
+  refreshes for you, instead of a static key. Connect from the dashboard: pick a
+  built-in preset (e.g. **Grok (xAI)**, which prefills xAI's endpoints, client
+  id, and scopes) or fill the config manually for any provider (authorize URL,
+  token URL, client id, optional secret, scopes, redirect URI, PKCE), press
+  Connect, approve in the browser, and the router stores the tokens (encrypted at
+  rest). It then refreshes proactively before expiry and reactively on a 401/403,
+  always sending a bearer token upstream. The browser returns to a loopback
+  callback automatically; on a remote host, paste the resulting code or redirect
+  URL instead.
 - **Combo** - a custom model name (e.g. `default`) backed by one or more
   targets, each a provider + real upstream model id (e.g. `gpt-4o`). Clients put
   the combo name in the request `model` field; airouter resolves it to a target
@@ -102,7 +114,7 @@ precedence.
 |------|-----|---------|-------------|
 | `-listen` | `AIROUTER_LISTEN` | `:8080` | HTTP listen address |
 | `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
-| `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys at rest |
+| `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys and OAuth tokens at rest |
 | `-debug` | `AIROUTER_DEBUG` | `off` | Log verbosity. Bare `-debug` or `=1` logs request lines, client-facing failures, and upstream error exchanges. `=2` additionally traces full request and response bodies plus the resolved upstream URL for each proxied call (includes prompt content) |
 | `-log-file` | `AIROUTER_LOG_FILE` | (stderr only) | Path to also append log output to, in addition to stderr. Captures everything `-debug` emits; at `=2` the file records full, untruncated request/response bodies while stderr stays truncated |
 
@@ -134,7 +146,8 @@ does not need to know or care which backend serves the request.
 ## Import / export
 
 The dashboard's Import / Export page round-trips all providers (including their
-auth scheme) and combos as JSON. Exports include provider API keys in plaintext
+auth scheme and, for OAuth providers, their stored tokens and config) and combos
+as JSON. Exports include provider API keys and OAuth tokens in plaintext
 so config is portable across instances with different secrets - treat exported
 files as secrets.
 Import upserts by name and never deletes. Access keys are not exported (only

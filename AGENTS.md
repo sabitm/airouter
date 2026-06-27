@@ -43,7 +43,19 @@ Supporting packages:
 
 - `internal/domain` - core entities (Provider, Combo, AccessKey, Protocol).
 - `internal/store` - SQLite store, migrations, repos, JSON import/export.
-- `internal/crypto` - AES-256-GCM for provider API keys at rest.
+- `internal/crypto` - AES-256-GCM for provider API keys and OAuth tokens at rest.
+- `internal/oauth` - OAuth connect (authorization code + PKCE) and token refresh
+  for providers whose `auth_method` is `oauth`. Provider-agnostic: every
+  connection carries its full config inline (`domain.OAuthCreds`), so connect and
+  refresh read config from that struct, not a registry. `presets.go` holds the
+  built-in prefills (xAI/Grok) applied at create time. `Service.Resolve` is the
+  single entry point the proxy and dashboard probes call to get an effective
+  bearer token, refreshing proactively (near expiry) or on a forced reactive
+  retry. `Connect` drives one connect attempt (loopback callback or manual paste)
+  and holds the PKCE verifier/state. To avoid a store->oauth import cycle the
+  service depends on the narrow `ProviderStore` interface, which `*store.Store`
+  satisfies; `oauth.Service` is constructed internally by `proxy.New` and
+  `web.NewHandler`, so neither constructor's signature changed.
 - `internal/config` - flags/env loading.
 - `internal/server` - HTTP wiring: CORS (answers browser preflights, reflects
   the request Origin) and the leveled request-logging middleware. At `-debug`
@@ -86,6 +98,16 @@ backend-capable format, also set its `protocol` and `upstreamPath` and add it to
   `Auth()`; the `anthropic-version` header follows the protocol. Preserve this
   split when touching upstream request construction (`applyUpstreamHeaders`) or
   the dashboard provider check.
+- A provider's auth *method* (`Provider.Method()`: `apikey` or `oauth`, empty
+  defaults to `apikey`) is separate from its auth *scheme*. OAuth providers store
+  no static key and always resolve to a `bearer` token. The proxy and dashboard
+  probes call `oauth.Service.Resolve` to get the effective token, then overwrite
+  the request-local hydrated `provider.APIKey` with it - so `applyUpstreamHeaders`
+  and the header split above stay unchanged and credential construction never
+  needs to special-case oauth. The hot path resolves proactively before each send
+  and, on a 401/403 from an oauth provider, force-refreshes and retries once
+  before any response byte is committed. Preserve this token-injection point and
+  the single reactive retry when touching `client.go`/`serve.go`/`stream.go`.
 - Streaming uses a no-timeout HTTP client (`Proxy.streamClient`) so long streams
   are bounded by the request context, not a client timeout.
 - Errors before the first streamed byte fall back to the ingress format's unary
