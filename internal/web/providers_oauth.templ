@@ -1,0 +1,148 @@
+package web
+
+import (
+	"airouter/internal/domain"
+	"airouter/internal/oauth"
+)
+
+// oauthFields renders the OAuth configuration block shared by the create and
+// edit forms: a preset dropdown that prefills the manual fields (via
+// providers.js reading the option's data-* attributes) plus the editable manual
+// fields, the Connect control, and the connect status region. c supplies the
+// current values when editing; pass an empty OAuthCreds for a new provider.
+templ oauthFields(c *domain.OAuthCreds, beginTarget string) {
+	<div class="oauth-fields">
+		<select name="preset" class="oauth-preset" onchange="airouterApplyPreset(this)">
+			<option value="custom" data-custom="1">Custom (manual)</option>
+			for _, p := range oauth.Presets {
+				@presetOption(p, c)
+			}
+		</select>
+		<input name="auth_url" class="oauth-cfg" placeholder="authorize URL" value={ c.AuthURL }/>
+		<input name="token_url" class="oauth-cfg" placeholder="token URL" value={ c.TokenURL }/>
+		<input name="client_id" class="oauth-cfg" placeholder="client id" value={ c.ClientID }/>
+		<input name="client_secret" type="password" class="oauth-cfg" placeholder="client secret (blank for PKCE)" value={ c.ClientSecret }/>
+		<input name="scopes" class="oauth-cfg" placeholder="scopes (space separated)" value={ c.Scopes }/>
+		<input name="redirect_uri" class="oauth-cfg" placeholder="redirect URI" value={ redirectOr(c.RedirectURI) }/>
+		<label class="oauth-pkce">
+			<input type="checkbox" name="pkce" checked?={ c.PKCE }/> PKCE (public client)
+		</label>
+		<button
+			type="button"
+			class="link"
+			hx-post="/dashboard/providers/oauth/begin"
+			hx-include="closest .oauth-fields"
+			hx-target={ beginTarget }
+			hx-swap="innerHTML"
+		>Connect</button>
+		<div id={ beginTarget[1:] } class="oauth-region">
+			@OAuthConnectIdle()
+		</div>
+	</div>
+}
+
+templ presetOption(p oauth.Preset, c *domain.OAuthCreds) {
+	<option
+		value={ p.Name }
+		data-base_url={ p.APIBase }
+		data-protocol={ string(p.Protocol) }
+		data-auth_url={ p.AuthURL }
+		data-token_url={ p.TokenURL }
+		data-client_id={ p.ClientID }
+		data-client_secret={ p.ClientSecret }
+		data-scopes={ p.Scopes }
+		data-redirect_uri={ p.RedirectURI }
+		data-pkce={ boolStr(p.PKCE) }
+		selected?={ c.Preset == p.Name }
+	>{ p.Label }</option>
+}
+
+// OAuthConnectIdle is the empty connect region shown before Connect is pressed
+// and after a cancel.
+templ OAuthConnectIdle() {
+	<span class="muted">Not connected. Fill the fields above and press Connect.</span>
+}
+
+// OAuthConnectError reports a connect setup failure (bad config) inline.
+templ OAuthConnectError(msg string) {
+	<span class="check err">{ msg }</span>
+}
+
+// OAuthConnectView renders the active connect region after begin: the authorize
+// link to open, a manual-paste fallback, and the status line (which polls when a
+// loopback callback is listening). Status element ids are scoped by the unique
+// state token so a create form and an edit row can each host a connect region
+// without id collisions.
+templ OAuthConnectView(authURL, state string, loopback bool) {
+	<div class="oauth-connect">
+		<p class="muted">
+			Open this link, approve access, then
+			if loopback {
+				return here - completion is detected automatically.
+			} else {
+				paste the resulting code or redirect URL below.
+			}
+		</p>
+		<a class="button" href={ templ.SafeURL(authURL) } target="_blank" rel="noopener">Open authorize page</a>
+		<div class="oauth-paste row-form">
+			<input name="code" placeholder="paste code or full redirect URL"/>
+			<button
+				type="button"
+				class="link"
+				hx-post="/dashboard/providers/oauth/exchange"
+				hx-include="closest .oauth-paste"
+				hx-vals={ `{"state":"` + state + `"}` }
+				hx-target={ "#oauth-status-" + state }
+				hx-swap="outerHTML"
+			>Submit code</button>
+			<button
+				type="button"
+				class="link danger"
+				hx-post="/dashboard/providers/oauth/cancel"
+				hx-vals={ `{"state":"` + state + `"}` }
+				hx-target="closest .oauth-region"
+				hx-swap="innerHTML"
+			>Cancel</button>
+		</div>
+		@OAuthStatusLine(state, loopback, "pending", "", "")
+	</div>
+}
+
+// OAuthStatusLine is the swappable status of a connect attempt. While pending
+// with a loopback listener it polls every 2s; the connected/error states omit
+// the trigger so the poll stops. On success it also emits the hidden
+// oauth_session input the provider form submits to claim the connected tokens.
+templ OAuthStatusLine(state string, loopback bool, phase, email, errMsg string) {
+	switch phase {
+		case "connected":
+			<span id={ "oauth-status-" + state } class="check ok">
+				connected{ emailSuffix(email) }
+				<input type="hidden" name="oauth_session" value={ state }/>
+			</span>
+		case "error":
+			<span id={ "oauth-status-" + state } class="check err">{ errMsg }</span>
+		default:
+			if loopback {
+				<span
+					id={ "oauth-status-" + state }
+					class="muted"
+					hx-get={ "/dashboard/providers/oauth/status?state=" + state }
+					hx-trigger="every 2s"
+					hx-target={ "#oauth-status-" + state }
+					hx-swap="outerHTML"
+				>waiting for authorization...</span>
+			} else {
+				<span id={ "oauth-status-" + state } class="muted">waiting for pasted code...</span>
+			}
+	}
+}
+
+// providerCredCell renders the credential column for a provider row: the masked
+// API key for apikey providers, or the connected account for oauth providers.
+templ providerCredCell(p *domain.Provider) {
+	if p.Method() == domain.AuthOAuth {
+		<span class="tag">oauth</span> <span class="mono">{ oauthLabel(p.OAuthCreds) }</span>
+	} else {
+		<span class="mono">{ maskKey(p.APIKey) }</span>
+	}
+}

@@ -177,3 +177,19 @@ td.err { color: var(--danger); max-width: 320px; overflow: hidden; text-overflow
 .muted { color: var(--muted); font-size: 13px; }
 .target-list { list-style: none; margin: 0; padding: 0; }
 .target-list li { padding: 2px 0; }
+
+/* Provider auth-method toggle: show only the active method's field group. */
+.provider-form { flex-wrap: wrap; }
+.provider-form .apikey-fields,
+.provider-form .oauth-edit,
+.provider-form .oauth-fields { display: none; flex-basis: 100%; }
+.provider-form[data-method="apikey"] .apikey-fields { display: flex; }
+.provider-form[data-method="oauth"] .oauth-edit { display: block; }
+.provider-form[data-method="oauth"] .oauth-fields { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+.oauth-fields .oauth-preset { flex: 0 0 180px; }
+.oauth-pkce { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; color: var(--muted); font-size: 13px; }
+.oauth-pkce input { flex: 0 0 auto; min-width: 0; }
+.oauth-region { flex-basis: 100%; margin-top: 6px; }
+.oauth-connect { display: flex; flex-direction: column; gap: 8px; }
+.oauth-paste { margin-top: 4px; }

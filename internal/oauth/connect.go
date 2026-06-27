@@ -48,6 +48,25 @@ func (c *Connect) Addr() string {
 	return c.addr
 }
 
+// State returns the opaque state token tying this attempt's authorize redirect
+// to its token exchange. The dashboard uses it as the connect-session key.
+func (c *Connect) State() string { return c.state }
+
+// Result reports the flow outcome without blocking, for a status poll. done is
+// false while the flow is still in progress (no callback or paste yet); when
+// true, creds is the connected credentials or err describes the failure. Unlike
+// Wait it never blocks, so a polling handler can return immediately.
+func (c *Connect) Result() (creds *domain.OAuthCreds, err error, done bool) {
+	select {
+	case <-c.done:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.result.creds, c.result.err, true
+	default:
+		return nil, nil, false
+	}
+}
+
 type exchangeResult struct {
 	creds *domain.OAuthCreds
 	err   error

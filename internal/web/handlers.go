@@ -19,6 +19,9 @@ type Handler struct {
 	// oauth resolves an effective token for oauth providers before the dashboard
 	// probes an upstream (Check button, model autocomplete).
 	oauth *oauth.Service
+	// sessions holds in-flight OAuth connect attempts between the begin request
+	// and the later status/exchange/save requests.
+	sessions *connectSessions
 	// trace, set at -debug=2, logs the dashboard's outbound provider subcalls
 	// (e.g. the /models probe behind the Check button) that the request-logging
 	// middleware cannot see.
@@ -26,7 +29,7 @@ type Handler struct {
 }
 
 func NewHandler(s *store.Store, trace bool) *Handler {
-	return &Handler{store: s, oauth: oauth.New(s), trace: trace}
+	return &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), trace: trace}
 }
 
 // Mount registers all dashboard routes on the given mux.
@@ -54,6 +57,12 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /dashboard/providers/models", h.providerModels)
 	mux.HandleFunc("POST /dashboard/providers/check", h.checkProvider)
+
+	// OAuth connect flow
+	mux.HandleFunc("POST /dashboard/providers/oauth/begin", h.beginOAuthConnect)
+	mux.HandleFunc("GET /dashboard/providers/oauth/status", h.oauthConnectStatus)
+	mux.HandleFunc("POST /dashboard/providers/oauth/exchange", h.oauthConnectExchange)
+	mux.HandleFunc("POST /dashboard/providers/oauth/cancel", h.oauthConnectCancel)
 
 	// Combos
 	mux.HandleFunc("GET /dashboard/combos", h.combosPage)
@@ -130,6 +139,10 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid protocol")
 		return
 	}
+	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
+		h.createOAuthProvider(w, r, proto)
+		return
+	}
 	auth := domain.AuthScheme(r.FormValue("auth_scheme"))
 	if auth != "" && !auth.Valid() {
 		badRequest(w, "invalid auth scheme")
@@ -150,6 +163,49 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.renderProviderList(w, r)
+}
+
+// createOAuthProvider saves an oauth provider from a connected connect session.
+// The session (keyed by oauth_session = the connect state) must hold a completed
+// flow; its credentials carry the tokens. An oauth provider stores no static
+// key and always authenticates with a bearer token.
+func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, proto domain.Protocol) {
+	creds, ok := h.connectedCreds(r.FormValue("oauth_session"))
+	if !ok {
+		badRequest(w, "connect this provider before saving")
+		return
+	}
+	p := &domain.Provider{
+		Name:       r.FormValue("name"),
+		BaseURL:    r.FormValue("base_url"),
+		Protocol:   proto,
+		AuthMethod: domain.AuthOAuth,
+		AuthScheme: domain.AuthBearer,
+		OAuthCreds: creds,
+	}
+	if err := h.store.CreateProvider(r.Context(), p); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	h.sessions.drop(r.FormValue("oauth_session"))
+	h.renderProviderList(w, r)
+}
+
+// connectedCreds returns the completed credentials for a connect session, or
+// false if the session is unknown or the flow has not completed successfully.
+func (h *Handler) connectedCreds(state string) (*domain.OAuthCreds, bool) {
+	if state == "" {
+		return nil, false
+	}
+	sess, ok := h.sessions.get(state)
+	if !ok {
+		return nil, false
+	}
+	creds, err, done := sess.conn.Result()
+	if !done || err != nil || creds == nil || creds.AccessToken == "" {
+		return nil, false
+	}
+	return creds, true
 }
 
 func (h *Handler) editProvider(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +256,10 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid protocol")
 		return
 	}
+	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
+		h.updateOAuthProvider(w, r, cur, proto)
+		return
+	}
 	auth := domain.AuthScheme(r.FormValue("auth_scheme"))
 	if auth != "" && !auth.Valid() {
 		badRequest(w, "invalid auth scheme")
@@ -209,6 +269,10 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	cur.BaseURL = r.FormValue("base_url")
 	cur.Protocol = proto
 	cur.AuthScheme = auth
+	// Switching an oauth provider back to apikey: drop the stored credentials so
+	// the row no longer resolves a bearer token.
+	cur.AuthMethod = domain.AuthAPIKey
+	cur.OAuthCreds = nil
 	// Blank api_key means keep the existing one (form never echoes secrets).
 	if k := r.FormValue("api_key"); k != "" {
 		cur.APIKey = k
@@ -216,6 +280,34 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
 		badRequest(w, err.Error())
 		return
+	}
+	h.renderProviderList(w, r)
+}
+
+// updateOAuthProvider saves edits to an oauth provider. Name/base URL/protocol
+// come from the form; credentials are replaced only when a fresh connect session
+// (a Reconnect) is attached, otherwise the stored tokens are kept. Editing an
+// oauth provider without reconnecting therefore never requires re-auth.
+func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cur *domain.Provider, proto domain.Protocol) {
+	if creds, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
+		cur.OAuthCreds = creds
+	}
+	if cur.OAuthCreds == nil {
+		badRequest(w, "connect this provider before saving")
+		return
+	}
+	cur.Name = r.FormValue("name")
+	cur.BaseURL = r.FormValue("base_url")
+	cur.Protocol = proto
+	cur.AuthMethod = domain.AuthOAuth
+	cur.AuthScheme = domain.AuthBearer
+	cur.APIKey = ""
+	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if s := r.FormValue("oauth_session"); s != "" {
+		h.sessions.drop(s)
 	}
 	h.renderProviderList(w, r)
 }
