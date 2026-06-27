@@ -38,13 +38,7 @@ templ oauthFields(c *domain.OAuthCreds, beginTarget string) {
 		<div id={ beginTarget[1:] } class="oauth-region">
 			@OAuthConnectIdle()
 		</div>
-		<div class="oauth-tokens">
-			<span class="muted">Import existing tokens (optional, skips Connect):</span>
-			<input name="access_token" type="password" class="oauth-cfg" placeholder="access token" value=""/>
-			<input name="refresh_token" type="password" class="oauth-cfg" placeholder="refresh token" value=""/>
-			<input name="expires_at" class="oauth-cfg" placeholder="expires at (RFC3339 or unix seconds)" value=""/>
-			<input name="email" class="oauth-cfg" placeholder="account email (optional)" value=""/>
-		</div>
+		@oauthTokenFields(&domain.OAuthCreds{}, "", "")
 		<div class="oauth-check row-form">
 			<button
 				type="button"
@@ -58,6 +52,35 @@ templ oauthFields(c *domain.OAuthCreds, beginTarget string) {
 			<span class="check-indicator htmx-indicator">checking...</span>
 			<span class="check-result"></span>
 		</div>
+	</div>
+}
+
+// oauthTokenFields renders the manual token-import inputs, prefilled from c so a
+// Refresh can repopulate them. okMsg/errMsg drive the inline status. The whole
+// block is a swap target: the Refresh button replaces it with the refreshed
+// tokens. Initial renders pass an empty creds to avoid echoing stored secrets.
+templ oauthTokenFields(c *domain.OAuthCreds, okMsg, errMsg string) {
+	<div class="oauth-tokens">
+		<span class="muted">Import existing tokens (optional, skips Connect):</span>
+		<input name="access_token" type="password" class="oauth-cfg" placeholder="access token" value={ c.AccessToken }/>
+		<input name="refresh_token" type="password" class="oauth-cfg" placeholder="refresh token" value={ c.RefreshToken }/>
+		<input name="expires_at" class="oauth-cfg" placeholder="expires at (RFC3339 or unix seconds)" value={ expiresAtStr(c.ExpiresAt) }/>
+		<input name="email" class="oauth-cfg" placeholder="account email (optional)" value={ c.Email }/>
+		<button
+			type="button"
+			class="link"
+			hx-post="/dashboard/providers/oauth/refresh"
+			hx-include="closest .oauth-fields"
+			hx-target="closest .oauth-tokens"
+			hx-swap="outerHTML"
+			hx-indicator="next .refresh-indicator"
+		>Refresh token</button>
+		<span class="refresh-indicator htmx-indicator">refreshing...</span>
+		if errMsg != "" {
+			<span class="check err">{ errMsg }</span>
+		} else if okMsg != "" {
+			<span class="check ok">{ okMsg }</span>
+		}
 	</div>
 }
 

@@ -461,6 +461,65 @@ func TestOAuthCheckManualTokens(t *testing.T) {
 	}
 }
 
+// TestOAuthRefreshTokens: the Refresh button mints a new access token from the
+// pasted refresh token + config and re-renders the fields with it.
+func TestOAuthRefreshTokens(t *testing.T) {
+	h := testHandler(t)
+	var sawGrant, sawRefresh string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		sawGrant = r.FormValue("grant_type")
+		sawRefresh = r.FormValue("refresh_token")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "fresh-access",
+			"refresh_token": "rotated-refresh",
+			"token_type":    "Bearer",
+			"expires_in":    3600,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	form := url.Values{}
+	form.Set("preset", "custom")
+	form.Set("token_url", srv.URL+"/token")
+	form.Set("client_id", "test-client")
+	form.Set("access_token", "expired-access")
+	form.Set("refresh_token", "old-refresh")
+	rec := httptest.NewRecorder()
+	h.oauthRefreshTokens(rec, reqWithForm(form))
+
+	if sawGrant != "refresh_token" || sawRefresh != "old-refresh" {
+		t.Errorf("token endpoint saw grant=%q refresh=%q", sawGrant, sawRefresh)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `value="fresh-access"`) {
+		t.Errorf("refreshed access token not in fields: %s", body)
+	}
+	if !strings.Contains(body, `value="rotated-refresh"`) {
+		t.Errorf("rotated refresh token not in fields: %s", body)
+	}
+	if !strings.Contains(body, "refreshed") {
+		t.Errorf("no success status: %s", body)
+	}
+}
+
+// TestOAuthRefreshNoRefreshToken: refreshing without a refresh token reports the
+// requirement and does not call any endpoint.
+func TestOAuthRefreshNoRefreshToken(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("preset", "custom")
+	form.Set("token_url", "https://example.com/token")
+	form.Set("client_id", "test-client")
+	form.Set("access_token", "only-access")
+	rec := httptest.NewRecorder()
+	h.oauthRefreshTokens(rec, reqWithForm(form))
+	if !strings.Contains(rec.Body.String(), "paste a refresh token") {
+		t.Fatalf("result = %s, want refresh-token requirement", rec.Body.String())
+	}
+}
+
 // exchangeConnect completes a connect session via the manual-paste path.
 func exchangeConnect(t *testing.T, h *Handler, state, code string) {
 	t.Helper()

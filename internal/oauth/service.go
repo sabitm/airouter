@@ -142,6 +142,18 @@ func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCr
 	return &cp, nil
 }
 
+// RefreshTokens exchanges the refresh token for a new access token without
+// persisting, for the dashboard's manual-import flow where the provider is not
+// yet saved (no id to write back to). It works on a copy, so the caller's creds
+// are untouched on failure.
+func (s *Service) RefreshTokens(ctx context.Context, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	cp := *creds
+	if err := refresh(ctx, &cp, s.now()); err != nil {
+		return nil, err
+	}
+	return &cp, nil
+}
+
 // IsInvalidGrant reports whether err is an ErrInvalidGrant, for callers that
 // want to surface a "reconnect required" state.
 func IsInvalidGrant(err error) bool { return errors.Is(err, ErrInvalidGrant) }

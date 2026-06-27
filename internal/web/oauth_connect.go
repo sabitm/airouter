@@ -177,6 +177,61 @@ func (h *Handler) oauthConnectCancel(w http.ResponseWriter, r *http.Request) {
 	render(w, r, OAuthConnectIdle())
 }
 
+// oauthRefreshTokens mints a fresh access token from the form's pasted refresh
+// token and config, then re-renders the token fields with the result. It is the
+// manual-import escape hatch for a CLI access token that expired before it could
+// be pasted: refresh in place rather than re-running the CLI. The tokens are not
+// persisted here (the provider may be unsaved); Save stores whatever is in the
+// fields afterward.
+func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		render(w, r, oauthTokenFields(&domain.OAuthCreds{}, "", "invalid form"))
+		return
+	}
+	creds, err := credsFromConnectForm(r)
+	if err != nil {
+		render(w, r, oauthTokenFields(&domain.OAuthCreds{}, "", err.Error()))
+		return
+	}
+	applyManualTokens(creds, r)
+	if creds.RefreshToken == "" {
+		render(w, r, oauthTokenFields(creds, "", "paste a refresh token to refresh"))
+		return
+	}
+	if creds.TokenURL == "" || creds.ClientID == "" {
+		render(w, r, oauthTokenFields(creds, "", "token URL and client id are required to refresh"))
+		return
+	}
+	updated, err := h.oauth.RefreshTokens(r.Context(), creds)
+	if err != nil {
+		if oauth.IsInvalidGrant(err) {
+			render(w, r, oauthTokenFields(creds, "", "refresh token rejected - re-authorize in the CLI"))
+			return
+		}
+		render(w, r, oauthTokenFields(creds, "", "refresh failed: "+err.Error()))
+		return
+	}
+	render(w, r, oauthTokenFields(updated, refreshOKMsg(updated), ""))
+}
+
+// refreshOKMsg is the success status after a manual refresh, noting the new
+// expiry when known.
+func refreshOKMsg(c *domain.OAuthCreds) string {
+	if c.ExpiresAt == 0 {
+		return "refreshed"
+	}
+	return "refreshed, expires " + expiresAtStr(c.ExpiresAt)
+}
+
+// expiresAtStr renders a unix-seconds expiry as RFC3339 for the input value,
+// blank when unknown.
+func expiresAtStr(unix int64) string {
+	if unix == 0 {
+		return ""
+	}
+	return time.Unix(unix, 0).UTC().Format(time.RFC3339)
+}
+
 // --- template helpers ---
 
 // boolStr renders a bool as the literal "true"/"false" for a data attribute.
