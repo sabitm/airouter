@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS providers (
 	api_key     TEXT NOT NULL,
 	protocol    TEXT NOT NULL,
 	auth_scheme TEXT NOT NULL DEFAULT '',
+	auth_method TEXT NOT NULL DEFAULT '',
+	oauth_creds TEXT NOT NULL DEFAULT '',
 	created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -100,6 +102,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateProviderAuthScheme(); err != nil {
 		return err
 	}
+	if err := s.migrateProviderAuthMethod(); err != nil {
+		return err
+	}
 	return s.migrateCombosToTargets()
 }
 
@@ -112,6 +117,21 @@ func (s *Store) migrateProviderAuthScheme() error {
 		return err
 	}
 	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN auth_scheme TEXT NOT NULL DEFAULT ''")
+	return err
+}
+
+// migrateProviderAuthMethod adds the auth_method and oauth_creds columns to a
+// providers table created before OAuth was supported. Idempotent; existing rows
+// default to '' (empty), which Provider.Method resolves to apikey.
+func (s *Store) migrateProviderAuthMethod() error {
+	has, err := s.columnExists("providers", "auth_method")
+	if err != nil || has {
+		return err
+	}
+	if _, err := s.db.Exec("ALTER TABLE providers ADD COLUMN auth_method TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN oauth_creds TEXT NOT NULL DEFAULT ''")
 	return err
 }
 

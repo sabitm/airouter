@@ -23,6 +23,11 @@ type portableProvider struct {
 	// resolved value (never empty); import also accepts "" or "default" as an
 	// alias for the protocol's scheme (see Provider.Auth).
 	AuthScheme string `json:"auth_scheme"`
+	// AuthMethod selects apikey vs oauth. Export always writes the resolved value;
+	// import also accepts "" or "default" as an alias for apikey (see
+	// Provider.Method).
+	AuthMethod string             `json:"auth_method"`
+	OAuth      *domain.OAuthCreds `json:"oauth,omitempty"`
 }
 
 type portableTarget struct {
@@ -69,10 +74,14 @@ func (s *Store) Export(ctx context.Context, w io.Writer) error {
 	}
 	cfg := portableConfig{Version: 1}
 	for _, p := range providers {
-		cfg.Providers = append(cfg.Providers, portableProvider{
+		pp := portableProvider{
 			Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, Protocol: string(p.Protocol),
-			AuthScheme: string(p.Auth()),
-		})
+			AuthScheme: string(p.Auth()), AuthMethod: string(p.Method()),
+		}
+		if p.Method() == domain.AuthOAuth {
+			pp.OAuth = p.OAuthCreds
+		}
+		cfg.Providers = append(cfg.Providers, pp)
 	}
 	for _, c := range combos {
 		pc := portableCombo{Name: c.Name, Strategy: string(c.Strategy)}
@@ -119,15 +128,32 @@ func (s *Store) Import(ctx context.Context, r io.Reader) error {
 		if auth != "" && !auth.Valid() {
 			return fmt.Errorf("provider %q: invalid auth_scheme %q", pp.Name, pp.AuthScheme)
 		}
+		// "", "default" mean apikey; only apikey/oauth are accepted.
+		method := domain.AuthMethod(pp.AuthMethod)
+		if method == "default" {
+			method = ""
+		}
+		if method != "" && !method.Valid() {
+			return fmt.Errorf("provider %q: invalid auth_method %q", pp.Name, pp.AuthMethod)
+		}
+		if method == domain.AuthOAuth && pp.OAuth == nil {
+			return fmt.Errorf("provider %q: auth_method oauth requires oauth credentials", pp.Name)
+		}
 		if cur, ok := byName[pp.Name]; ok {
-			cur.BaseURL, cur.APIKey, cur.Protocol, cur.AuthScheme = pp.BaseURL, pp.APIKey, proto, auth
+			cur.BaseURL, cur.APIKey, cur.Protocol = pp.BaseURL, pp.APIKey, proto
+			cur.AuthScheme, cur.AuthMethod, cur.OAuthCreds = auth, method, pp.OAuth
 			cur.AuthScheme = cur.Auth() // expand the default alias to a concrete scheme
+			cur.AuthMethod = cur.Method() // expand the default alias to a concrete method
 			if err := s.UpdateProvider(ctx, cur); err != nil {
 				return err
 			}
 		} else {
-			np := &domain.Provider{Name: pp.Name, BaseURL: pp.BaseURL, APIKey: pp.APIKey, Protocol: proto, AuthScheme: auth}
-			np.AuthScheme = np.Auth() // expand the default alias to a concrete scheme
+			np := &domain.Provider{
+				Name: pp.Name, BaseURL: pp.BaseURL, APIKey: pp.APIKey, Protocol: proto,
+				AuthScheme: auth, AuthMethod: method, OAuthCreds: pp.OAuth,
+			}
+			np.AuthScheme = np.Auth()    // expand the default alias to a concrete scheme
+			np.AuthMethod = np.Method()  // expand the default alias to a concrete method
 			if err := s.CreateProvider(ctx, np); err != nil {
 				return err
 			}

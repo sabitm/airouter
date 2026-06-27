@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 
 	"airouter/internal/domain"
@@ -37,14 +38,15 @@ func (s *Store) ListCombos(ctx context.Context) ([]*domain.Combo, error) {
 }
 
 // hydrateTargets loads every combo_targets row whose combo is in byID, joins the
-// provider, decrypts its key, and appends the target in position order.
+// provider, decrypts its key and OAuth credentials, and appends the target in
+// position order.
 func (s *Store) hydrateTargets(ctx context.Context, byID map[int64]*domain.Combo) error {
 	if len(byID) == 0 {
 		return nil
 	}
 	const q = `
 SELECT t.combo_id, t.id, t.provider_id, t.upstream_model, t.position,
-       p.id, p.name, p.base_url, p.api_key, p.protocol, p.auth_scheme, p.created_at, p.updated_at
+       p.id, p.name, p.base_url, p.api_key, p.protocol, p.auth_scheme, p.auth_method, p.oauth_creds, p.created_at, p.updated_at
 FROM combo_targets t JOIN providers p ON p.id = t.provider_id
 ORDER BY t.combo_id, t.position, t.id`
 	rows, err := s.db.QueryContext(ctx, q)
@@ -56,10 +58,10 @@ ORDER BY t.combo_id, t.position, t.id`
 		var comboID int64
 		var t domain.ComboTarget
 		var p domain.Provider
-		var enc string
+		var enc, oauthEnc string
 		if err := rows.Scan(
 			&comboID, &t.ID, &t.ProviderID, &t.UpstreamModel, &t.Position,
-			&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme, &p.CreatedAt, &p.UpdatedAt,
+			&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme, &p.AuthMethod, &oauthEnc, &p.CreatedAt, &p.UpdatedAt,
 		); err != nil {
 			return err
 		}
@@ -72,6 +74,17 @@ ORDER BY t.combo_id, t.position, t.id`
 			return err
 		}
 		p.APIKey = key
+		if oauthEnc != "" {
+			plain, err := s.cipher.Decrypt(oauthEnc)
+			if err != nil {
+				return err
+			}
+			var creds domain.OAuthCreds
+			if err := json.Unmarshal([]byte(plain), &creds); err != nil {
+				return err
+			}
+			p.OAuthCreds = &creds
+		}
 		t.Provider = &p
 		c.Targets = append(c.Targets, t)
 	}
