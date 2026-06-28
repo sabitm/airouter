@@ -67,7 +67,7 @@ templ ConnectionPanel(baseURL string) {
 }
 
 templ providerForm() {
-	<form class="row-form provider-form" data-method="apikey" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this) { this.reset(); airouterToggleAuthMethod(this.querySelector('.auth-method')); }">
+	<form class="row-form provider-form" data-method="apikey" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this) { this.reset(); airouterToggleAuthMethod(this.querySelector('.auth-method')); this.querySelectorAll('.oauth-tokens input').forEach(function(i){ i.value = ''; }); }">
 		<input name="name" placeholder="name (e.g. openrouter)" required/>
 		<input name="base_url" placeholder="https://api.example.com/v1" required/>
 		<select name="protocol">
