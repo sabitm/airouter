@@ -70,7 +70,7 @@ templ oauthTokenFields(c *domain.OAuthCreds, okMsg, errMsg string) {
 			type="button"
 			class="link"
 			hx-post="/dashboard/providers/oauth/refresh"
-			hx-include="closest .oauth-fields"
+			hx-include="closest form"
 			hx-target="closest .oauth-tokens"
 			hx-swap="outerHTML"
 			hx-indicator="next .refresh-indicator"

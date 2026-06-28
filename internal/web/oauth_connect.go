@@ -194,6 +194,25 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	applyManualTokens(creds, r)
+	// Edit form leaves token fields blank to avoid echoing stored secrets, so a
+	// Refresh there must recover the stored tokens by id. Only backfill fields the
+	// form did not supply, so a deliberate paste still overrides what is stored.
+	if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
+		if p, gErr := h.store.GetProvider(r.Context(), id); gErr == nil && p.OAuthCreds != nil {
+			if creds.RefreshToken == "" {
+				creds.RefreshToken = p.OAuthCreds.RefreshToken
+			}
+			if creds.AccessToken == "" {
+				creds.AccessToken = p.OAuthCreds.AccessToken
+			}
+			if creds.ExpiresAt == 0 {
+				creds.ExpiresAt = p.OAuthCreds.ExpiresAt
+			}
+			if creds.Email == "" {
+				creds.Email = p.OAuthCreds.Email
+			}
+		}
+	}
 	if creds.RefreshToken == "" {
 		render(w, r, oauthTokenFields(creds, "", "paste a refresh token to refresh"))
 		return

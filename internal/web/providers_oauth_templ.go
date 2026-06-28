@@ -264,7 +264,7 @@ func oauthTokenFields(c *domain.OAuthCreds, okMsg, errMsg string) templ.Componen
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "\"> <button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/oauth/refresh\" hx-include=\"closest .oauth-fields\" hx-target=\"closest .oauth-tokens\" hx-swap=\"outerHTML\" hx-indicator=\"next .refresh-indicator\">Refresh token</button> <span class=\"refresh-indicator htmx-indicator\">refreshing...</span> ")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "\"> <button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/oauth/refresh\" hx-include=\"closest form\" hx-target=\"closest .oauth-tokens\" hx-swap=\"outerHTML\" hx-indicator=\"next .refresh-indicator\">Refresh token</button> <span class=\"refresh-indicator htmx-indicator\">refreshing...</span> ")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
