@@ -10,6 +10,29 @@ function airouterToggleAuthMethod(sel) {
   }
 }
 
+// airouterResetProviderForm restores the create form to a pristine state after a
+// successful add. form.reset() only reverts native input values; the oauth
+// connect region, the Check result, and any Refresh status were mutated by HTMX
+// swaps and must be cleared back to their initial server-rendered markup by hand.
+function airouterResetProviderForm(form) {
+  form.reset();
+  airouterToggleAuthMethod(form.querySelector(".auth-method"));
+  form.querySelectorAll(".oauth-tokens input").forEach(function (i) {
+    i.value = "";
+  });
+  const region = form.querySelector(".oauth-region");
+  if (region) {
+    region.innerHTML =
+      '<span class="muted">Not connected. Fill the fields above and press Connect.</span>';
+  }
+  form.querySelectorAll(".check-result").forEach(function (el) {
+    el.innerHTML = "";
+  });
+  form.querySelectorAll(".oauth-tokens .check").forEach(function (el) {
+    el.remove();
+  });
+}
+
 // airouterApplyPreset copies the selected option's data-* config into the
 // sibling oauth inputs. Choosing "Custom" leaves the fields as-is for manual
 // entry. It also updates the form's base_url/protocol from the preset.
