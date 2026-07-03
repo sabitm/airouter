@@ -135,6 +135,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		rec.UpstreamModel = t.UpstreamModel
 		backend := backendCodec(provider.Protocol)
 
+		attemptStart := time.Now()
 		if ingress.id == backend.id {
 			if meta.Stream {
 				last = p.streamPassthrough(w, r.Context(), res, ingress, provider, t.UpstreamModel, body, r.Header)
@@ -153,6 +154,21 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		if i < len(candidates)-1 {
 			p.debugf("combo %s: target %d (%s) failed: %d %s; advancing",
 				combo.Name, i, provider.Name, last.status, last.errMsg)
+			// Persist a row per failed-and-superseded target so the Logs tab shows
+			// which provider errored before failover advanced. The final outcome
+			// (a later success or the last target's failure) is still covered by the
+			// deferred rec log, so this only fires for intermediate failures.
+			p.recordLog(&domain.RequestLog{
+				AccessKeyName: rec.AccessKeyName,
+				Combo:         rec.Combo,
+				Provider:      provider.Name,
+				UpstreamModel: t.UpstreamModel,
+				Format:        ingress.id,
+				Stream:        meta.Stream,
+				Status:        last.status,
+				ErrMsg:        last.errMsg,
+				LatencyMS:     time.Since(attemptStart).Milliseconds(),
+			})
 		}
 	}
 
