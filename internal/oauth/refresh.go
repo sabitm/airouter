@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -49,19 +50,38 @@ func shouldRefresh(c *domain.OAuthCreds, now time.Time) bool {
 // (some providers always issue a new one; others reuse). Returns ErrInvalidGrant
 // when the authorization server rejects the refresh token.
 func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
-	form := url.Values{}
-	form.Set("grant_type", "refresh_token")
-	form.Set("client_id", c.ClientID)
-	form.Set("refresh_token", c.RefreshToken)
-	if c.ClientSecret != "" {
-		form.Set("client_secret", c.ClientSecret)
+	if c.RefreshToken == "" {
+		return errors.New("oauth: no refresh token")
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.TokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
+	var req *http.Request
+	var err error
+	if c.RefreshJSON {
+		// Codex/ChatGPT backend requires a JSON body for refresh (not form).
+		body := map[string]string{
+			"grant_type":    "refresh_token",
+			"client_id":     c.ClientID,
+			"refresh_token": c.RefreshToken,
+		}
+		bodyBytes, _ := json.Marshal(body)
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, c.TokenURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		form := url.Values{}
+		form.Set("grant_type", "refresh_token")
+		form.Set("client_id", c.ClientID)
+		form.Set("refresh_token", c.RefreshToken)
+		if c.ClientSecret != "" {
+			form.Set("client_secret", c.ClientSecret)
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, c.TokenURL, strings.NewReader(form.Encode()))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := httpClient.Do(req)
@@ -91,8 +111,13 @@ func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	}
 	if tr.IDToken != "" {
 		c.IDToken = tr.IDToken
-		if email, ok := emailFromIDToken(tr.IDToken); ok {
-			c.Email = email
+		if claims, ok := claimsFromIDToken(tr.IDToken); ok {
+			if claims.Email != "" {
+				c.Email = claims.Email
+			}
+			if claims.AccountID != "" {
+				c.AccountID = claims.AccountID
+			}
 		}
 	}
 	if tr.ExpiresIn > 0 {
@@ -101,23 +126,47 @@ func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	return nil
 }
 
-// emailFromIDToken extracts the email claim from a JWT id_token's payload without
-// verifying its signature. airouter is not the token's audience; the email is
-// used only for display, so an unverified claim is acceptable (matches 9router).
-func emailFromIDToken(idToken string) (string, bool) {
+// idClaims is the subset of a JWT id_token's payload we read. airouter is not the
+// token's audience; the claims are used only for display and an upstream account
+// header, so an unverified decode is acceptable (matches 9router).
+type idClaims struct {
+	Email string `json:"email"`
+	// Auth is OpenAI's namespaced claim block carrying the ChatGPT account id.
+	Auth struct {
+		ChatGPTAccountID string `json:"chatgpt_account_id"`
+	} `json:"https://api.openai.com/auth"`
+	AccountID string `json:"account_id"`
+}
+
+// claimsFromIDToken decodes a JWT id_token's payload (signature unverified) and
+// returns the email and ChatGPT account id it carries. ok is false when the token
+// is malformed.
+func claimsFromIDToken(idToken string) (idClaims, bool) {
 	parts := strings.Split(idToken, ".")
 	if len(parts) < 2 {
-		return "", false
+		return idClaims{}, false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", false
+		return idClaims{}, false
 	}
-	var claims struct {
-		Email string `json:"email"`
-	}
+	var claims idClaims
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return "", false
+		return idClaims{}, false
 	}
-	return claims.Email, claims.Email != ""
+	if claims.AccountID == "" {
+		claims.AccountID = claims.Auth.ChatGPTAccountID
+	}
+	return claims, true
+}
+
+// ClaimsFromToken decodes the display/account claims from a JWT access_token or
+// id_token. It does not verify the signature; callers use these only for display
+// and provider-specific upstream headers, never for router-side authorization.
+func ClaimsFromToken(token string) (email, accountID string, ok bool) {
+	claims, ok := claimsFromIDToken(token)
+	if !ok {
+		return "", "", false
+	}
+	return claims.Email, claims.AccountID, true
 }

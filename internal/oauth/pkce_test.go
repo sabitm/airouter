@@ -69,16 +69,27 @@ func TestLoopbackPort(t *testing.T) {
 	}
 }
 
-func TestEmailFromIDToken(t *testing.T) {
-	tok := idToken(t, "alice@example.com")
-	email, ok := emailFromIDToken(tok)
-	if !ok || email != "alice@example.com" {
-		t.Errorf("email = %q, ok = %v", email, ok)
+func TestClaimsFromIDToken(t *testing.T) {
+	tok := idTokenWith(t, "alice@example.com", "acct-123")
+	claims, ok := claimsFromIDToken(tok)
+	if !ok {
+		t.Fatal("expected ok for well-formed token")
 	}
-	if _, ok := emailFromIDToken("not-a-jwt"); ok {
-		t.Error("malformed token should not yield an email")
+	if claims.Email != "alice@example.com" {
+		t.Errorf("email = %q", claims.Email)
 	}
-	if _, ok := emailFromIDToken(""); ok {
-		t.Error("empty token should not yield an email")
+	if claims.AccountID != "acct-123" {
+		t.Errorf("account id = %q, want acct-123", claims.AccountID)
+	}
+	// Token without the namespaced claim still decodes (account id empty).
+	claims, ok = claimsFromIDToken(idToken(t, "bob@example.com"))
+	if !ok || claims.Email != "bob@example.com" || claims.AccountID != "" {
+		t.Errorf("plain token claims = %+v, ok = %v", claims, ok)
+	}
+	if _, ok := claimsFromIDToken("not-a-jwt"); ok {
+		t.Error("malformed token should not decode")
+	}
+	if _, ok := claimsFromIDToken(""); ok {
+		t.Error("empty token should not decode")
 	}
 }

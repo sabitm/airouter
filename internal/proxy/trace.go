@@ -6,8 +6,13 @@ import "context"
 // request-logging middleware. The middleware attaches an empty TraceInfo to the
 // request context before the handler runs and reads it afterward; the serve path
 // records the resolved upstream URL into it once a target is forwarded to.
+//
+// CodexSessionID is the per-request id the codex backend translate path sets
+// for the session_id header and prompt_cache_key (the two must match upstream).
+// Empty for non-codex requests.
 type TraceInfo struct {
-	UpstreamURL string
+	UpstreamURL    string
+	CodexSessionID string
 }
 
 type traceKeyT struct{}

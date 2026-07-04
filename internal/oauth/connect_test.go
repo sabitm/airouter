@@ -94,6 +94,71 @@ func TestAuthorizeURLNoPKCEForConfidentialClient(t *testing.T) {
 	}
 }
 
+// TestAuthorizeURLExtraParams asserts provider-specific authorize params (Codex's
+// simplified-flow flags) are appended, and cannot override the standard ones.
+func TestAuthorizeURLExtraParams(t *testing.T) {
+	srv := fakeTokenServer(t, func(url.Values) (int, string) { return 200, `{}` })
+	defer srv.Close()
+	creds := testCreds(t, srv)
+	creds.ExtraAuthParams = map[string]string{
+		"codex_cli_simplified_flow": "true",
+		"originator":                "codex_cli_rs",
+		// A preset cannot hijack response_type: the standard value is set first and
+		// url.Values.Set is not called twice for it here, but even if it were, the
+		// standard params are appended before the extras only if re-set. This entry
+		// guards against a future regression that lets extras win.
+		"response_type": "token",
+	}
+	c, _ := NewConnect(creds)
+	u, _ := c.AuthorizeURL()
+	for _, want := range []string{"codex_cli_simplified_flow=true", "originator=codex_cli_rs"} {
+		if !strings.Contains(u, want) {
+			t.Errorf("authorize url missing %q: %s", want, u)
+		}
+	}
+	// state must still be present and unique per connect.
+	if !strings.Contains(u, "state=") {
+		t.Errorf("authorize url missing state: %s", u)
+	}
+}
+
+// TestLoopbackCallbackPathDerivedFromRedirectURI asserts the loopback server
+// serves the path named in the redirect_uri (Codex's /auth/callback), not the
+// hardcoded /callback.
+func TestLoopbackCallbackPathDerivedFromRedirectURI(t *testing.T) {
+	srv := fakeTokenServer(t, func(url.Values) (int, string) {
+		return 200, `{"access_token":"tok","refresh_token":"rt","expires_in":60}`
+	})
+	creds := &domain.OAuthCreds{
+		Mode: domain.OAuthAuto, AuthURL: "https://auth.example/authorize", TokenURL: srv.URL,
+		ClientID: "cid", Scopes: "openid", RedirectURI: "http://127.0.0.1:0/auth/callback", PKCE: true,
+	}
+	c, err := NewConnect(creds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	cbURL := "http://" + c.Addr() + "/auth/callback?code=cc&state=" + c.state
+	resp, err := http.Get(cbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("callback status = %d, want 200 (path not served?)", resp.StatusCode)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := c.Wait(ctx)
+	if err != nil || got.AccessToken != "tok" {
+		t.Errorf("wait: %v token=%q", err, got.AccessToken)
+	}
+}
+
 // TestExchangeCodeManualPaste exchanges a raw code pasted by a remote operator.
 func TestExchangeCodeManualPaste(t *testing.T) {
 	var seen url.Values

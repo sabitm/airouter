@@ -59,3 +59,18 @@ func loopbackPort(redirectURI string) (int, error) {
 	}
 	return port, nil
 }
+
+// reservedAuthParams are the standard authorization-code params set by
+// AuthorizeURL itself; ExtraAuthParams must not override them (a preset that
+// could set response_type=token, say, would break the flow).
+var reservedAuthParams = map[string]bool{
+	"response_type":         true,
+	"client_id":             true,
+	"redirect_uri":          true,
+	"state":                 true,
+	"scope":                 true,
+	"code_challenge":        true,
+	"code_challenge_method": true,
+}
+
+func reservedAuthParam(k string) bool { return reservedAuthParams[k] }

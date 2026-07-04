@@ -105,6 +105,15 @@ func (c *Connect) AuthorizeURL() (string, error) {
 		q.Set("code_challenge", challengeS256(c.verifier))
 		q.Set("code_challenge_method", "S256")
 	}
+	// Provider-specific extras (e.g. Codex's simplified-flow flags). Reserved
+	// standard params are skipped so a preset cannot override response_type,
+	// client_id, redirect_uri, state, scope, or the PKCE challenge.
+	for k, v := range c.creds.ExtraAuthParams {
+		if reservedAuthParam(k) {
+			continue
+		}
+		q.Set(k, v)
+	}
 	authURL := c.creds.AuthURL
 	if c.baseURL != "" {
 		authURL = c.baseURL + "/authorize"
@@ -127,6 +136,13 @@ func (c *Connect) Start(_ context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Derive the callback path from the redirect_uri so provider-specific paths
+	// (Codex's /auth/callback, xAI's /callback) work without hardcoding each.
+	u, _ := url.Parse(c.creds.RedirectURI) // already parsed successfully by loopbackPort
+	callbackPath := u.Path
+	if callbackPath == "" {
+		callbackPath = "/callback"
+	}
 	// Bind synchronously so a port conflict (another connect in flight) is
 	// reported to the caller rather than swallowed by the background goroutine.
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
@@ -134,7 +150,7 @@ func (c *Connect) Start(_ context.Context) error {
 		return fmt.Errorf("oauth: bind callback server on :%d: %w", port, err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", c.handleCallback)
+	mux.HandleFunc(callbackPath, c.handleCallback)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	c.srv = srv
 	c.addr = ln.Addr().String()
@@ -318,8 +334,13 @@ func exchangeCode(ctx context.Context, c *domain.OAuthCreds, code, verifier, bas
 	}
 	if tr.IDToken != "" {
 		c.IDToken = tr.IDToken
-		if email, ok := emailFromIDToken(tr.IDToken); ok {
-			c.Email = email
+		if claims, ok := claimsFromIDToken(tr.IDToken); ok {
+			if claims.Email != "" {
+				c.Email = claims.Email
+			}
+			if claims.AccountID != "" {
+				c.AccountID = claims.AccountID
+			}
 		}
 	}
 	if tr.ExpiresIn > 0 {

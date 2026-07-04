@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/ir"
 	"airouter/internal/store"
 )
 
@@ -242,6 +243,10 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
 	}
+	upstreamBody = prepareCodexRequest(ctx, backend, upstreamBody)
+	if backend.id == "oai-codex" {
+		return p.serveCodexUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody)
+	}
 
 	status, respBody, err := p.forward(ctx, provider, backend.upstreamPath, upstreamBody, nil)
 	if err != nil {
@@ -271,6 +276,108 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
 	return committed()
+}
+
+// serveCodexUnary handles Codex's forced-SSE upstream for a non-streaming client
+// request: it sends the request with Accept: text/event-stream, decodes the
+// Responses SSE into an IR response, then renders the ingress format's unary
+// response envelope.
+func (p *Proxy) serveCodexUnary(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, upstreamBody []byte) attemptResult {
+	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil)
+	if err != nil {
+		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		p.debugf("codex unary %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
+			ingress.id, backend.id, backend.upstreamPath, resp.StatusCode, upstreamBody, errBody)
+		return retryable(resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
+	}
+	irResp, err := collectStreamResponse(resp.Body, backend, upstreamModel)
+	if err != nil {
+		return retryable(http.StatusBadGateway, "upstream stream decode failed: "+err.Error(), "api_error")
+	}
+	out, err := ingress.encodeResponse(irResp)
+	if err != nil {
+		return terminal(http.StatusInternalServerError, "failed to encode response", "api_error")
+	}
+	res.status = http.StatusOK
+	res.inTok = irResp.Usage.InputTokens
+	res.outTok = irResp.Usage.OutputTokens
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(out)
+	return committed()
+}
+
+// collectStreamResponse folds backend stream events into a unary IR response.
+// It is used only for backends that are SSE-only even for non-streaming clients.
+func collectStreamResponse(r io.Reader, backend codec, fallbackModel string) (*ir.Response, error) {
+	resp := &ir.Response{ID: ir.NewID("resp_"), Model: fallbackModel, StopReason: ir.StopEndTurn}
+	var text strings.Builder
+	type toolBuf struct {
+		id   string
+		name string
+		args strings.Builder
+	}
+	tools := map[int]*toolBuf{}
+	var order []int
+	err := backend.decodeStream(r, func(ev ir.StreamEvent) error {
+		switch ev.Kind {
+		case ir.EventMessageStart:
+			if ev.ID != "" {
+				resp.ID = ev.ID
+			}
+			if ev.Model != "" {
+				resp.Model = ev.Model
+			}
+			if ev.InputTokens != 0 {
+				resp.Usage.InputTokens = ev.InputTokens
+			}
+		case ir.EventTextDelta:
+			text.WriteString(ev.Text)
+		case ir.EventToolCallStart:
+			if _, ok := tools[ev.Index]; !ok {
+				order = append(order, ev.Index)
+			}
+			tools[ev.Index] = &toolBuf{id: ev.ToolID, name: ev.ToolName}
+		case ir.EventToolCallDelta:
+			tb := tools[ev.Index]
+			if tb == nil {
+				tb = &toolBuf{}
+				tools[ev.Index] = tb
+				order = append(order, ev.Index)
+			}
+			tb.args.WriteString(ev.ArgsFrag)
+		case ir.EventFinish:
+			if ev.InputTokens != 0 {
+				resp.Usage.InputTokens = ev.InputTokens
+			}
+			resp.Usage.OutputTokens = ev.OutputTokens
+			if ev.StopReason != "" {
+				resp.StopReason = ev.StopReason
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if text.Len() > 0 {
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText, Text: text.String()})
+	}
+	for _, idx := range order {
+		tb := tools[idx]
+		args := []byte(tb.args.String())
+		if len(args) == 0 || !json.Valid(args) {
+			args = []byte("{}")
+		}
+		resp.Content = append(resp.Content, ir.ContentBlock{
+			Type: ir.BlockToolUse, ToolID: tb.id, ToolName: tb.name, ToolInput: json.RawMessage(args),
+		})
+	}
+	return resp, nil
 }
 
 // parseUsage recovers token counts from a unary response body without knowing

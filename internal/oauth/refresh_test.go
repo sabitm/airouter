@@ -3,8 +3,10 @@ package oauth
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -316,8 +318,73 @@ func TestResolveForcedFailureReturnsOldToken(t *testing.T) {
 
 // idToken builds an unsigned JWT with the given email claim for tests.
 func idToken(t *testing.T, email string) string {
+	return idTokenWith(t, email, "")
+}
+
+// idTokenWith builds an unsigned JWT carrying an email and, when non-empty, a
+// ChatGPT account id under OpenAI's namespaced claim (with the flat fallback
+// claim too, so the extractor's precedence is exercised).
+func idTokenWith(t *testing.T, email, accountID string) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"email":%q}`, email)))
-	return header + "." + payload + "."
+	payload := fmt.Sprintf(`{"email":%q`, email)
+	if accountID != "" {
+		payload += fmt.Sprintf(`,"https://api.openai.com/auth":{"chatgpt_account_id":%q},"account_id":%q`, accountID, accountID)
+	}
+	payload += "}"
+	return header + "." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + "."
+}
+
+// jsonTokenServer is a token endpoint that captures the raw request body and
+// content-type, for asserting the JSON refresh path used by Codex.
+func jsonTokenServer(t *testing.T, fn func(body []byte, contentType string) (int, string)) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		status, resp := fn(body, r.Header.Get("Content-Type"))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(resp))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestRefreshJSONBody(t *testing.T) {
+	srv := jsonTokenServer(t, func(body []byte, ct string) (int, string) {
+		if ct != "application/json" {
+			t.Errorf("content-type = %q, want application/json", ct)
+		}
+		var m map[string]string
+		if err := json.Unmarshal(body, &m); err != nil {
+			t.Fatalf("body not JSON: %v", err)
+		}
+		if m["grant_type"] != "refresh_token" || m["refresh_token"] != "rt-old" || m["client_id"] != "cid" {
+			t.Errorf("unexpected JSON body: %v", m)
+		}
+		return 200, `{"access_token":"tok-json","refresh_token":"rt-json","expires_in":3600,"id_token":"` + idTokenWith(t, "u@codex.com", "acct-9") + `"}`
+	})
+	c := newCreds(srv)
+	c.RefreshJSON = true
+	if err := refresh(context.Background(), c, time.Unix(1000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if c.AccessToken != "tok-json" || c.RefreshToken != "rt-json" {
+		t.Errorf("tokens = %+v", c)
+	}
+	if c.AccountID != "acct-9" || c.Email != "u@codex.com" {
+		t.Errorf("claims = email %q account %q", c.Email, c.AccountID)
+	}
+}
+
+func TestRefreshNoRefreshToken(t *testing.T) {
+	srv, _ := tokenTestServer(t, func(url.Values) (int, string) {
+		t.Error("token endpoint should not be hit without a refresh token")
+		return 500, ""
+	})
+	c := newCreds(srv)
+	c.RefreshToken = ""
+	if err := refresh(context.Background(), c, time.Now()); err == nil {
+		t.Fatal("want error when no refresh token is present")
+	}
 }

@@ -93,12 +93,33 @@ var responsesCodec = codec{
 	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
 }
 
+// codexCodec is the ChatGPT-backend Codex provider: same Responses wire format
+// as responsesCodec, but the request encoder enforces the Codex envelope
+// (store=false, effort suffix, default instructions) and the proxy injects the
+// Codex-CLI identity headers. Its id differs from oai-responses so a Responses
+// request to a Codex provider still translates through the Codex encoder rather
+// than passing through.
+var codexCodec = codec{
+	id:               "oai-codex",
+	protocol:         domain.ProtocolOpenAICodex,
+	decodeRequest:    responses.DecodeRequest,
+	encodeRequest:    responses.EncodeCodexRequest,
+	decodeResponse:   responses.DecodeResponse,
+	encodeResponse:   responses.EncodeResponse,
+	encodeError:      responses.EncodeError,
+	upstreamPath:     "/responses",
+	decodeStream:     responses.DecodeStream,
+	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
+}
+
 func backendCodec(p domain.Protocol) codec {
 	switch p {
 	case domain.ProtocolAnthropic:
 		return anthropicCodec
 	case domain.ProtocolOpenAIResponses:
 		return responsesCodec
+	case domain.ProtocolOpenAICodex:
+		return codexCodec
 	default:
 		return openaiCodec
 	}

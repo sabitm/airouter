@@ -9,10 +9,14 @@ const (
 	ProtocolOpenAI          Protocol = "openai"           // OpenAI Chat Completions (/chat/completions)
 	ProtocolAnthropic       Protocol = "anthropic"        // Anthropic Messages (/messages)
 	ProtocolOpenAIResponses Protocol = "openai-responses" // OpenAI Responses (/responses)
+	// ProtocolOpenAICodex is the ChatGPT-backend Codex variant of the Responses
+	// API: same wire shape, but the upstream enforces store=false, requires the
+	// Codex-CLI identity headers, and speaks only at .../codex/responses.
+	ProtocolOpenAICodex Protocol = "openai-codex"
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It
@@ -72,6 +76,10 @@ type OAuthCreds struct {
 	ExpiresAt int64  `json:"expires_at,omitempty"`
 	Email     string `json:"email,omitempty"`
 	IDToken   string `json:"id_token,omitempty"`
+	// AccountID is a provider-specific account identifier extracted from the
+	// id_token (e.g. ChatGPT's chatgpt_account_id), sent as an upstream header for
+	// account binding. Empty when the token carries no such claim.
+	AccountID string `json:"account_id,omitempty"`
 
 	// Connect/refresh configuration. Populated for both modes: auto copies it from
 	// the preset, manual takes it from user input.
@@ -85,6 +93,12 @@ type OAuthCreds struct {
 	// of a client_secret (e.g. xAI). Governs both the authorize request and the
 	// connect flow offered by the dashboard.
 	PKCE bool `json:"pkce,omitempty"`
+	// ExtraAuthParams are additional query parameters appended to the authorize
+	// URL (e.g. Codex's simplified-flow flags). Nil for providers that need none.
+	ExtraAuthParams map[string]string `json:"extra_auth_params,omitempty"`
+	// RefreshJSON sends the token-refresh body as application/json rather than the
+	// default application/x-www-form-urlencoded (required by the ChatGPT backend).
+	RefreshJSON bool `json:"refresh_json,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

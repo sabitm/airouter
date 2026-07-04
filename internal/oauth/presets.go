@@ -29,6 +29,12 @@ type Preset struct {
 	// preset (e.g. xAI speaks OpenAI Chat Completions at https://api.x.ai/v1).
 	APIBase  string
 	Protocol domain.Protocol
+	// ExtraAuthParams are appended to the authorize URL (e.g. Codex's
+	// simplified-flow flags). Reserved standard params are filtered out.
+	ExtraAuthParams map[string]string
+	// RefreshJSON sends the refresh body as application/json rather than form
+	// (the ChatGPT backend requires JSON).
+	RefreshJSON bool
 }
 
 // Presets is the set of built-in OAuth configurations. Add an entry here to
@@ -47,6 +53,30 @@ var Presets = []Preset{
 		PKCE:        true, // xAI is a public client; no client_secret
 		APIBase:     "https://api.x.ai/v1",
 		Protocol:    domain.ProtocolOpenAI,
+	},
+	// Codex is the ChatGPT-subscription-backed coding agent API. The client id is
+	// public (embedded in the official Codex CLI); the ChatGPT token endpoint
+	// requires a JSON refresh body, and the authorize URL carries the Codex-CLI
+	// simplified-flow flags. Upstream is the Responses API under chatgpt.com.
+	{
+		Name:     "codex",
+		Label:    "OpenAI Codex (ChatGPT)",
+		AuthURL:  "https://auth.openai.com/oauth/authorize",
+		TokenURL: "https://auth.openai.com/oauth/token",
+		ClientID: "app_EMoamEEZ73f0CkXaXp7hrann",
+		Scopes:   "openid profile email offline_access",
+		// Fixed port 1455 and /auth/callback path, matching the official CLI so the
+		// authorize redirect targets the loopback server this flow binds there.
+		RedirectURI: "http://localhost:1455/auth/callback",
+		PKCE:        true,
+		ExtraAuthParams: map[string]string{
+			"id_token_add_organizations": "true",
+			"codex_cli_simplified_flow":  "true",
+			"originator":                 "codex_cli_rs",
+		},
+		RefreshJSON: true,
+		APIBase:     "https://chatgpt.com/backend-api/codex",
+		Protocol:    domain.ProtocolOpenAICodex,
 	},
 }
 
@@ -69,14 +99,16 @@ func Apply(p Preset) (provider *domain.Provider, creds *domain.OAuthCreds) {
 			AuthMethod: domain.AuthOAuth,
 		},
 		&domain.OAuthCreds{
-			Mode:         domain.OAuthAuto,
-			Preset:       p.Name,
-			AuthURL:      p.AuthURL,
-			TokenURL:     p.TokenURL,
-			ClientID:     p.ClientID,
-			ClientSecret: p.ClientSecret,
-			Scopes:       p.Scopes,
-			RedirectURI:  p.RedirectURI,
-			PKCE:         p.PKCE,
+			Mode:            domain.OAuthAuto,
+			Preset:          p.Name,
+			AuthURL:         p.AuthURL,
+			TokenURL:        p.TokenURL,
+			ClientID:        p.ClientID,
+			ClientSecret:    p.ClientSecret,
+			Scopes:          p.Scopes,
+			RedirectURI:     p.RedirectURI,
+			PKCE:            p.PKCE,
+			ExtraAuthParams: p.ExtraAuthParams,
+			RefreshJSON:     p.RefreshJSON,
 		}
 }

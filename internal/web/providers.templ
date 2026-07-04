@@ -74,6 +74,7 @@ templ providerForm() {
 			<option value="openai">openai</option>
 			<option value="anthropic">anthropic</option>
 			<option value="openai-responses">openai-responses</option>
+				<option value="openai-codex">openai-codex</option>
 		</select>
 		<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)">
 			<option value="apikey">api key</option>
@@ -148,6 +149,7 @@ templ ProviderEditRow(p *domain.Provider) {
 					<option value="openai" selected?={ p.Protocol == domain.ProtocolOpenAI }>openai</option>
 					<option value="anthropic" selected?={ p.Protocol == domain.ProtocolAnthropic }>anthropic</option>
 					<option value="openai-responses" selected?={ p.Protocol == domain.ProtocolOpenAIResponses }>openai-responses</option>
+						<option value="openai-codex" selected?={ p.Protocol == domain.ProtocolOpenAICodex }>openai-codex</option>
 				</select>
 				<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)">
 					<option value="apikey" selected?={ p.Method() == domain.AuthAPIKey }>api key</option>

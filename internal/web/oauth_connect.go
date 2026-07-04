@@ -54,6 +54,12 @@ func applyManualTokens(c *domain.OAuthCreds, r *http.Request) bool {
 	c.AccessToken = access
 	c.RefreshToken = refresh
 	c.Email = strings.TrimSpace(r.FormValue("email"))
+	if email, accountID, ok := oauth.ClaimsFromToken(access); ok {
+		if c.Email == "" {
+			c.Email = email
+		}
+		c.AccountID = accountID
+	}
 	c.ExpiresAt = parseExpiresAt(r.FormValue("expires_at"))
 	return true
 }
@@ -211,6 +217,9 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 			if creds.Email == "" {
 				creds.Email = p.OAuthCreds.Email
 			}
+			if creds.AccountID == "" {
+				creds.AccountID = p.OAuthCreds.AccountID
+			}
 		}
 	}
 	if creds.RefreshToken == "" {
@@ -271,10 +280,13 @@ func emailSuffix(email string) string {
 }
 
 // oauthLabel is the credential-column text for a connected oauth provider: the
-// account email when known, otherwise a generic "connected".
+// account email when known, then provider account id, otherwise "connected".
 func oauthLabel(c *domain.OAuthCreds) string {
 	if c != nil && c.Email != "" {
 		return c.Email
+	}
+	if c != nil && c.AccountID != "" {
+		return c.AccountID
 	}
 	return "connected"
 }

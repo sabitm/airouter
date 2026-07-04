@@ -3,14 +3,56 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"strings"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/responses"
 )
 
 const anthropicVersion = "2023-06-01"
+
+// applyCodexHeaders sets the Codex-CLI identity headers the ChatGPT backend
+// requires: User-Agent, originator, session_id (the per-request CodexSessionID
+// carried on the trace context), and chatgpt-account-id (from the id_token when
+// the connection extracted one). session_id is also used as prompt_cache_key.
+func applyCodexHeaders(req *http.Request, provider *domain.Provider, ctx context.Context) {
+	req.Header.Set("User-Agent", "codex_cli_rs/"+responses.CodexCLIVersion)
+	req.Header.Set("originator", "codex_cli_rs")
+	if t := traceInfoFrom(ctx); t != nil && t.CodexSessionID != "" {
+		req.Header.Set("session_id", t.CodexSessionID)
+	}
+	if provider.OAuthCreds != nil && provider.OAuthCreds.AccountID != "" {
+		req.Header.Set("chatgpt-account-id", provider.OAuthCreds.AccountID)
+	}
+}
+
+// newCodexSessionID returns a random id suitable for the Codex session_id header
+// and prompt_cache_key. Anthropic-style UUIDs are not required here; a hex token
+// is enough and avoids the format's hyphens in a header value.
+func newCodexSessionID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// prepareCodexRequest sets up the per-request Codex session id and, when the
+// backend is the Codex codec, injects it as prompt_cache_key into the encoded
+// body. The same id is saved on the trace context so applyCodexHeaders emits it
+// as the session_id header. For non-codex backends the body is returned as-is.
+func prepareCodexRequest(ctx context.Context, backend codec, body []byte) []byte {
+	if backend.id != "oai-codex" {
+		return body
+	}
+	id := newCodexSessionID()
+	if t := traceInfoFrom(ctx); t != nil {
+		t.CodexSessionID = id
+	}
+	return responses.InjectCodexRequestKey(body, id)
+}
 
 // hopByHopOrControlled are request headers we never copy from the client: either
 // the transport owns them, or we set them ourselves (auth). Dropping the client
@@ -31,8 +73,9 @@ var hopByHopOrControlled = map[string]bool{
 // request (under the denylist above), then sets the provider auth. Forwarding
 // client headers preserves caller identity (User-Agent, x-app, anthropic-beta,
 // x-stainless-*), which some providers require: an Anthropic upstream may reject
-// a request that does not look like it came from the official client.
-func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHeaders http.Header) {
+// a request that does not look like it came from the official client. ctx is the
+// per-request context so codex headers (session_id) can read the trace session id.
+func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHeaders http.Header, ctx context.Context) {
 	for name, vals := range clientHeaders {
 		if hopByHopOrControlled[http.CanonicalHeaderKey(name)] {
 			continue
@@ -58,6 +101,12 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	if provider.Protocol == domain.ProtocolAnthropic && req.Header.Get("anthropic-version") == "" {
 		req.Header.Set("anthropic-version", anthropicVersion)
 	}
+	// The Codex backend additionally requires the Codex-CLI identity headers.
+	// User-Agent is set after the client-header copy so it overrides any
+	// forwarded client User-Agent the Codex backend would reject.
+	if provider.Protocol == domain.ProtocolOpenAICodex {
+		applyCodexHeaders(req, provider, ctx)
+	}
 }
 
 // forward sends the prepared body to the provider's upstream endpoint for the
@@ -77,7 +126,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if err != nil {
 			return 0, nil, err
 		}
-		applyUpstreamHeaders(req, provider, clientHeaders)
+		applyUpstreamHeaders(req, provider, clientHeaders, ctx)
 		resp, err := p.client.Do(req)
 		if err != nil {
 			return 0, nil, err
@@ -123,7 +172,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		if err != nil {
 			return nil, err
 		}
-		applyUpstreamHeaders(req, provider, clientHeaders)
+		applyUpstreamHeaders(req, provider, clientHeaders, ctx)
 		req.Header.Set("Accept", "text/event-stream")
 		return p.streamClient.Do(req)
 	}

@@ -128,6 +128,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
 	}
+	upstreamBody = prepareCodexRequest(ctx, backend, upstreamBody)
 	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil)
 	if err != nil {
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
