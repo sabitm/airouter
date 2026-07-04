@@ -14,26 +14,27 @@ embedded SQLite database; there are no external service dependencies.
 Three concepts:
 
 - **Provider** - an upstream connection: a base URL, the protocol it speaks
-  (`openai` for Chat Completions, `anthropic` for Messages, or
+  (`openai` for Chat Completions, `anthropic` for Messages,
   `openai-responses` for the OpenAI Responses API - for upstreams that only
-  expose `/responses`), an auth scheme - how the credential is sent:
-  `default` (sensible per protocol: `x-api-key` for Anthropic, `bearer` for the
-  OpenAI formats), `bearer`, or `x-api-key` - and how it authenticates: an
-  **API key** or **OAuth**. The auth scheme is independent of the
-  protocol, so an Anthropic-format upstream that authenticates with a bearer
-  token (an `ANTHROPIC_AUTH_TOKEN`-style gateway) works by selecting protocol
-  `anthropic` + auth `bearer`. The API key is encrypted at rest.
+  expose `/responses`, or `openai-codex` for ChatGPT Codex), an auth scheme -
+  how the credential is sent: `default` (sensible per protocol: `x-api-key` for
+  Anthropic, `bearer` for the OpenAI formats), `bearer`, or `x-api-key` - and
+  how it authenticates: an **API key** or **OAuth**. The auth scheme is
+  independent of the protocol, so an Anthropic-format upstream that
+  authenticates with a bearer token (an `ANTHROPIC_AUTH_TOKEN`-style gateway)
+  works by selecting protocol `anthropic` + auth `bearer`. The API key is
+  encrypted at rest.
 
   An OAuth provider authenticates with an access token the router obtains and
   refreshes for you, instead of a static key. Connect from the dashboard: pick a
-  built-in preset (e.g. **Grok (xAI)**, which prefills xAI's endpoints, client
-  id, and scopes) or fill the config manually for any provider (authorize URL,
-  token URL, client id, optional secret, scopes, redirect URI, PKCE), press
-  Connect, approve in the browser, and the router stores the tokens (encrypted at
-  rest). It then refreshes proactively before expiry and reactively on a 401/403,
-  always sending a bearer token upstream. The browser returns to a loopback
-  callback automatically; on a remote host, paste the resulting code or redirect
-  URL instead.
+  built-in preset (e.g. **Grok (xAI)** or **OpenAI Codex (ChatGPT)**, which
+  prefill their endpoints, client ids, and scopes) or fill the config manually
+  for any provider (authorize URL, token URL, client id, optional secret, scopes,
+  redirect URI, PKCE), press Connect, approve in the browser, and the router
+  stores the tokens (encrypted at rest). It then refreshes proactively before
+  expiry and reactively on a 401/403, always sending a bearer token upstream. The
+  browser returns to a loopback callback automatically; on a remote host, paste
+  the resulting code or redirect URL instead.
 - **Combo** - a custom model name (e.g. `default`) backed by one or more
   targets, each a provider + real upstream model id (e.g. `gpt-4o`). Clients put
   the combo name in the request `model` field; airouter resolves it to a target
@@ -54,6 +55,11 @@ are translated event by event and flushed live.
 
 This means an OpenAI SDK can call an Anthropic model, an Anthropic SDK can call
 an OpenAI model, and the OpenAI Responses API can call either - all transparently.
+
+The `openai-codex` provider protocol targets the ChatGPT Codex backend through a
+ChatGPT OAuth connection. The dashboard's Check button and model autocomplete use
+Codex's account-aware model discovery endpoint; if discovery is unavailable, you
+can still enter the upstream model id manually.
 
 ## Endpoints
 

@@ -28,8 +28,9 @@ backend format  --decode-->  IR  --encode-->  ingress format   (response, incl. 
   SSE). Can act as ingress or backend.
 - `internal/proxy/responses` - OpenAI Responses codec. Bidirectional: ingress
   when a client calls `/v1/responses`, and backend when a provider's protocol is
-  `openai-responses` (an upstream that only exposes `/responses`). Implements all
-  four directions plus both stream directions.
+  `openai-responses` (an upstream that only exposes `/responses`) or
+  `openai-codex` (ChatGPT Codex, using a Codex-specific request envelope).
+  Implements all four directions plus both stream directions.
 - `internal/proxy/sse` - minimal SSE reader/writer shared by the streaming codecs.
 - `internal/proxy/proxy.go` - the `codec` struct bundling a format's directions,
   the codec instances, and route mounting.
@@ -48,7 +49,8 @@ Supporting packages:
   for providers whose `auth_method` is `oauth`. Provider-agnostic: every
   connection carries its full config inline (`domain.OAuthCreds`), so connect and
   refresh read config from that struct, not a registry. `presets.go` holds the
-  built-in prefills (xAI/Grok) applied at create time. `Service.Resolve` is the
+  built-in prefills (xAI/Grok and OpenAI Codex) applied at create time.
+  `Service.Resolve` is the
   single entry point the proxy and dashboard probes call to get an effective
   bearer token, refreshing proactively (near expiry) or on a forced reactive
   retry. `Connect` drives one connect attempt (loopback callback or manual paste)
@@ -59,9 +61,12 @@ Supporting packages:
 - `internal/config` - flags/env loading.
 - `internal/server` - HTTP wiring: CORS (answers browser preflights, reflects
   the request Origin) and the leveled request-logging middleware. At `-debug`
-  (level 1) it logs access lines; at `-debug=2` it also traces full request and
-  response bodies and the resolved upstream provider URL per proxied call.
+  (level 1) it logs access lines; at `-debug=2` it also traces request and
+  response bodies and the resolved upstream provider URL per proxied call. With
+  `-log-file`, the file sink receives full bodies while stderr stays truncated.
 - `internal/web` - templ + HTMX dashboard. `.templ` files generate `*_templ.go`.
+  Dashboard outbound provider probes (Check/model autocomplete) follow the same
+  trace split: full bodies to `-log-file`, truncated bodies to stderr.
 - `cmd/airouter` - main: wires config, crypto, store, server; graceful shutdown.
 
 ## The passthrough vs translate rule
@@ -83,6 +88,24 @@ provider does share the id, so it passes through with only the model rewritten.
 When adding a new ingress format, give it a unique `id`. When adding a new
 backend-capable format, also set its `protocol` and `upstreamPath` and add it to
 `backendCodec`.
+
+## OpenAI Codex backend
+
+`openai-codex` is a backend protocol for the ChatGPT Codex API. It reuses the
+Responses IR mapping but has Codex-specific upstream behavior:
+
+- The codec id is distinct from `oai-responses`, so Responses ingress to Codex
+  translates rather than passing through. Preserve this; the Codex request shape
+  is not the public OpenAI Responses shape.
+- Upstream requests use the Codex CLI identity headers (`User-Agent`,
+  `originator`, `session_id`, and `chatgpt-account-id` when available). The
+  `session_id` header and the request body's `prompt_cache_key` must match.
+- Codex upstream responses are SSE-only. Unary client requests to a Codex backend
+  are sent upstream as a stream and collected back into a unary IR response.
+- Codex model discovery for the dashboard uses
+  `/models?client_version=<CodexCLIVersion>` with the same identity headers.
+  Do not probe `/responses` with a hardcoded model; model availability is
+  account-dependent.
 
 ## Conventions
 
