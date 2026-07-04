@@ -24,7 +24,7 @@ func TestCodexEncodeRequestEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body = prepareCodexRequest(WithTraceInfo(context.Background(), &TraceInfo{}), codexCodec, body)
+	body = prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), codexCodec, &domain.Provider{}, body)
 
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {

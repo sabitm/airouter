@@ -65,6 +65,11 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 		}
 		return models, nil
 	}
+	// Kiro has no /models endpoint; live discovery is out of scope. Serve the
+	// static catalog so combo autocomplete still offers the known model ids.
+	if p.Protocol == domain.ProtocolKiro {
+		return kiroModels(), nil
+	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

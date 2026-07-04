@@ -243,9 +243,9 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
 	}
-	upstreamBody = prepareCodexRequest(ctx, backend, upstreamBody)
-	if backend.id == "oai-codex" {
-		return p.serveCodexUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody)
+	upstreamBody = prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
+	if backend.streamOnly {
+		return p.serveStreamOnlyUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody)
 	}
 
 	status, respBody, err := p.forward(ctx, provider, backend.upstreamPath, upstreamBody, nil)
@@ -278,19 +278,19 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	return committed()
 }
 
-// serveCodexUnary handles Codex's forced-SSE upstream for a non-streaming client
-// request: it sends the request with Accept: text/event-stream, decodes the
-// Responses SSE into an IR response, then renders the ingress format's unary
-// response envelope.
-func (p *Proxy) serveCodexUnary(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, upstreamBody []byte) attemptResult {
-	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil)
+// serveStreamOnlyUnary handles a stream-only backend (Codex, Kiro) for a
+// non-streaming client request: it sends the request with the backend's stream
+// Accept, decodes the upstream stream into an IR response, then renders the
+// ingress format's unary response envelope.
+func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, upstreamBody []byte) attemptResult {
+	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
 	if err != nil {
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(resp.Body)
-		p.debugf("codex unary %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
+		p.debugf("stream-only unary %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
 			ingress.id, backend.id, backend.upstreamPath, resp.StatusCode, upstreamBody, errBody)
 		return retryable(resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
 	}

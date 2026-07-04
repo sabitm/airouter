@@ -7,7 +7,10 @@
 // provider's OAuthCreds rather than being referenced later.
 package oauth
 
-import "airouter/internal/domain"
+import (
+	"airouter/internal/domain"
+	"airouter/internal/proxy/kiro"
+)
 
 // Preset is a built-in OAuth configuration used to prefill a provider's
 // OAuthCreds (and the provider's base URL/protocol) at creation. It is the only
@@ -77,6 +80,12 @@ var Presets = []Preset{
 		RefreshJSON: true,
 		APIBase:     "https://chatgpt.com/backend-api/codex",
 		Protocol:    domain.ProtocolOpenAICodex,
+	},
+	{
+		Name:     "kiro",
+		Label:    "Kiro (import tokens)",
+		APIBase:  kiro.DefaultBaseURL,
+		Protocol: domain.ProtocolKiro,
 	},
 }
 

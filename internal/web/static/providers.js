@@ -10,6 +10,20 @@ function airouterToggleAuthMethod(sel) {
   }
 }
 
+// airouterToggleProtocol drives the form's data-protocol attribute so the
+// Kiro-only config group shows only when protocol is kiro. Mirrors the
+// auth-method toggle; visibility is CSS-driven off the attribute.
+function airouterToggleProtocol(sel) {
+  const form = sel.closest(".provider-form");
+  if (form) {
+    form.setAttribute("data-protocol", sel.value);
+    const baseURL = form.querySelector('[name="base_url"]');
+    if (sel.value === "kiro" && baseURL && baseURL.value.trim() === "") {
+      baseURL.value = "https://codewhisperer.us-east-1.amazonaws.com";
+    }
+  }
+}
+
 // airouterResetProviderForm restores the create form to a pristine state after a
 // successful add. form.reset() only reverts native input values; the oauth
 // connect region, the Check result, and any Refresh status were mutated by HTMX
@@ -62,4 +76,8 @@ function airouterApplyPreset(sel) {
   set(fields, "pkce", opt.dataset.pkce);
   set(form, "base_url", opt.dataset.base_url);
   set(form, "protocol", opt.dataset.protocol);
+  const protoSel = form && form.querySelector('[name="protocol"]');
+  if (protoSel) {
+    airouterToggleProtocol(protoSel);
+  }
 }

@@ -12,17 +12,29 @@ import (
 )
 
 // credsFromConnectForm builds an OAuthCreds config (no tokens yet) from the
-// connect form. A chosen preset supplies the whole configuration; otherwise the
-// manual fields are read verbatim, making the flow work for any provider.
+// connect form. Interactive presets supply the whole configuration; import
+// presets and custom configs read the manual fields verbatim.
 func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 	if name := r.FormValue("preset"); name != "" && name != "custom" {
 		p, ok := oauth.PresetByName(name)
 		if !ok {
 			return nil, fieldError("unknown preset")
 		}
-		_, creds := oauth.Apply(p)
-		return creds, nil
+		// Interactive presets (with an authorize URL) are fully self-configured.
+		// Import presets (Kiro) have no authorize endpoint: their client config comes
+		// from the form fields, tagged with the preset name for display.
+		if p.AuthURL != "" {
+			_, creds := oauth.Apply(p)
+			return creds, nil
+		}
+		c := manualCredsFromForm(r)
+		c.Preset = name
+		return c, nil
 	}
+	return manualCredsFromForm(r), nil
+}
+
+func manualCredsFromForm(r *http.Request) *domain.OAuthCreds {
 	return &domain.OAuthCreds{
 		Mode:         domain.OAuthManual,
 		AuthURL:      strings.TrimSpace(r.FormValue("auth_url")),
@@ -32,12 +44,25 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 		Scopes:       strings.TrimSpace(r.FormValue("scopes")),
 		RedirectURI:  strings.TrimSpace(r.FormValue("redirect_uri")),
 		PKCE:         r.FormValue("pkce") == "on" || r.FormValue("pkce") == "true",
-	}, nil
+	}
 }
 
 type fieldError string
 
 func (e fieldError) Error() string { return string(e) }
+
+// applyKiroConfig overlays the Kiro-only form fields (profile ARN, region, and
+// for oauth the auth flavor) onto creds. It is applied for Kiro providers of
+// either auth method, so the request encoder and the refresh path read this
+// config from one place. kiro_auth is only meaningful for oauth Kiro; on an
+// apikey provider it is stored but unused.
+func applyKiroConfig(c *domain.OAuthCreds, r *http.Request) {
+	c.ProfileArn = strings.TrimSpace(r.FormValue("profile_arn"))
+	c.Region = strings.TrimSpace(r.FormValue("region"))
+	if v := strings.TrimSpace(r.FormValue("kiro_auth")); v != "" {
+		c.KiroAuth = v
+	}
+}
 
 // applyManualTokens overlays user-pasted tokens onto a config-only creds, for
 // importing an already-authenticated session (e.g. from a CLI) without running

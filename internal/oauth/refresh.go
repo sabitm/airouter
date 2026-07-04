@@ -53,6 +53,12 @@ func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	if c.RefreshToken == "" {
 		return errors.New("oauth: no refresh token")
 	}
+	// Kiro social/OIDC refresh uses JSON bodies with camelCase responses the
+	// generic OAuth2 path cannot parse. external_idp is excluded: it refreshes
+	// against a standard Microsoft token endpoint via the generic form path below.
+	if c.KiroAuth != "" && c.KiroAuth != "external_idp" {
+		return refreshKiro(ctx, c, now)
+	}
 	var req *http.Request
 	var err error
 	if c.RefreshJSON {

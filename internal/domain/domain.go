@@ -13,10 +13,15 @@ const (
 	// API: same wire shape, but the upstream enforces store=false, requires the
 	// Codex-CLI identity headers, and speaks only at .../codex/responses.
 	ProtocolOpenAICodex Protocol = "openai-codex"
+	// ProtocolKiro is the AWS CodeWhisperer-backed Kiro provider. It is backend
+	// only (never an ingress format): it speaks CodeWhisperer conversationState
+	// JSON on request and a binary AWS EventStream (not SSE) on response, so every
+	// request to it translates through the IR and the upstream is stream-only.
+	ProtocolKiro Protocol = "kiro"
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It
@@ -99,6 +104,23 @@ type OAuthCreds struct {
 	// RefreshJSON sends the token-refresh body as application/json rather than the
 	// default application/x-www-form-urlencoded (required by the ChatGPT backend).
 	RefreshJSON bool `json:"refresh_json,omitempty"`
+
+	// Kiro-specific config. ProfileArn is the CodeWhisperer profile ARN injected
+	// into every Kiro request body; Region selects the OIDC refresh endpoint host.
+	// These live here (rather than in a dedicated column) because OAuthCreds is
+	// already an encrypted JSON blob, so adding fields needs no schema migration.
+	// A Kiro apikey provider carries an OAuthCreds holding only these fields (no
+	// tokens), so the request encoder reads profile config from one place
+	// regardless of auth method.
+	ProfileArn string `json:"profile_arn,omitempty"`
+	Region     string `json:"region,omitempty"`
+	// KiroAuth marks a Kiro OAuth connection and names its flavor (e.g. "social",
+	// "idc", "builder-id", "external_idp", "imported"). Non-empty routes token
+	// refresh to Kiro's flow instead of the generic one: the social/OIDC branches
+	// use JSON bodies and camelCase responses that the standard OAuth2 refresh
+	// does not. "external_idp" is left to the generic form refresh (it targets a
+	// standard Microsoft token endpoint).
+	KiroAuth string `json:"kiro_auth,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

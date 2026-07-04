@@ -16,6 +16,7 @@ import (
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/openai"
 	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/sse"
@@ -48,6 +49,15 @@ type codec struct {
 
 	decodeStream     func(io.Reader, func(ir.StreamEvent) error) error
 	newStreamEncoder func(model string) streamEncoder
+
+	// streamOnly marks a backend whose upstream returns only a stream, even for a
+	// non-streaming client request: the proxy sends with the stream Accept and
+	// collects the events back into a unary response. Codex and Kiro set this.
+	streamOnly bool
+	// streamAccept overrides the Accept header sent on a streaming upstream
+	// request. Empty means text/event-stream; Kiro sets the binary EventStream
+	// media type. Ignored when this codec is an ingress.
+	streamAccept string
 }
 
 var openaiCodec = codec{
@@ -110,6 +120,22 @@ var codexCodec = codec{
 	upstreamPath:     "/responses",
 	decodeStream:     responses.DecodeStream,
 	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
+	streamOnly:       true,
+}
+
+// kiroCodec is the AWS CodeWhisperer-backed Kiro backend. It is backend-only
+// (no ingress route and no decodeRequest): every request translates through the
+// IR. The upstream returns a binary AWS EventStream, so it is stream-only and
+// its streaming Accept differs from the SSE default. There is no unary response
+// decoder; unary client requests are collected from the stream.
+var kiroCodec = codec{
+	id:            "kiro",
+	protocol:      domain.ProtocolKiro,
+	encodeRequest: kiro.EncodeRequest,
+	upstreamPath:  kiro.UpstreamPath,
+	decodeStream:  kiro.DecodeStream,
+	streamOnly:    true,
+	streamAccept:  kiro.EventStreamAccept,
 }
 
 func backendCodec(p domain.Protocol) codec {
@@ -120,6 +146,8 @@ func backendCodec(p domain.Protocol) codec {
 		return responsesCodec
 	case domain.ProtocolOpenAICodex:
 		return codexCodec
+	case domain.ProtocolKiro:
+		return kiroCodec
 	default:
 		return openaiCodec
 	}

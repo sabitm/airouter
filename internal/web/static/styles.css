@@ -187,6 +187,10 @@ td.err { color: var(--danger); max-width: 320px; overflow: hidden; text-overflow
 .provider-form[data-method="oauth"] .oauth-edit { display: block; }
 .provider-form[data-method="oauth"] .oauth-fields { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 
+/* Kiro-only config: shown only when the selected protocol is kiro. */
+.provider-form .kiro-fields { display: none; flex-basis: 100%; gap: 8px; align-items: center; margin-top: 6px; }
+.provider-form[data-protocol="kiro"] .kiro-fields { display: flex; flex-wrap: wrap; }
+
 .oauth-fields .oauth-preset { flex: 0 0 180px; }
 .oauth-pkce { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; color: var(--muted); font-size: 13px; }
 .oauth-pkce input { flex: 0 0 auto; min-width: 0; }

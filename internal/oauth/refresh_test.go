@@ -150,6 +150,108 @@ func TestRefreshInvalidGrant(t *testing.T) {
 	}
 }
 
+// kiroJSONServer returns a server that decodes the JSON refresh body (Kiro uses
+// JSON, not form) and responds with the given status + body. It records the last
+// decoded body so branch-specific fields can be asserted.
+func kiroJSONServer(t *testing.T, status int, body string) (*httptest.Server, *map[string]any) {
+	t.Helper()
+	last := map[string]any{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &last)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &last
+}
+
+// TestRefreshKiroOIDC covers the AWS SSO OIDC branch: clientId + clientSecret
+// present, JSON body, camelCase response, profileArn patched when unset.
+func TestRefreshKiroOIDC(t *testing.T) {
+	srv, seen := kiroJSONServer(t, 200,
+		`{"accessToken":"tok-new","refreshToken":"rt-new","expiresIn":3600,"profileArn":"arn:from-refresh"}`)
+	orig := kiroOIDCTokenURL
+	kiroOIDCTokenURL = func(string) string { return srv.URL }
+	t.Cleanup(func() { kiroOIDCTokenURL = orig })
+
+	c := &domain.OAuthCreds{
+		KiroAuth: "idc", ClientID: "cid", ClientSecret: "secret",
+		RefreshToken: "rt-old", AccessToken: "tok-old", ExpiresAt: 1,
+	}
+	now := time.Unix(1000, 0)
+	if err := refresh(context.Background(), c, now); err != nil {
+		t.Fatal(err)
+	}
+	if (*seen)["clientId"] != "cid" || (*seen)["clientSecret"] != "secret" || (*seen)["grantType"] != "refresh_token" {
+		t.Errorf("OIDC body = %+v", *seen)
+	}
+	if c.AccessToken != "tok-new" || c.RefreshToken != "rt-new" {
+		t.Errorf("tokens = %q/%q", c.AccessToken, c.RefreshToken)
+	}
+	if c.ExpiresAt != now.Add(3600*time.Second).Unix() {
+		t.Errorf("expires_at = %d", c.ExpiresAt)
+	}
+	if c.ProfileArn != "arn:from-refresh" {
+		t.Errorf("profileArn = %q, want patched from refresh response", c.ProfileArn)
+	}
+}
+
+// TestRefreshKiroSocial covers the social branch: no client secret, fixed social
+// endpoint, camelCase response. A configured profileArn is not overwritten.
+func TestRefreshKiroSocial(t *testing.T) {
+	srv, seen := kiroJSONServer(t, 200,
+		`{"accessToken":"tok-s","refreshToken":"rt-s","expiresIn":3600,"profileArn":"arn:ignored"}`)
+	orig := kiroSocialRefreshURL
+	kiroSocialRefreshURL = srv.URL
+	t.Cleanup(func() { kiroSocialRefreshURL = orig })
+
+	c := &domain.OAuthCreds{
+		KiroAuth: "social", RefreshToken: "rt-old", AccessToken: "tok-old",
+		ProfileArn: "arn:configured", ExpiresAt: 1,
+	}
+	if err := refresh(context.Background(), c, time.Unix(1000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if (*seen)["refreshToken"] != "rt-old" {
+		t.Errorf("social body = %+v", *seen)
+	}
+	if _, ok := (*seen)["clientId"]; ok {
+		t.Errorf("social branch should not send clientId: %+v", *seen)
+	}
+	if c.AccessToken != "tok-s" {
+		t.Errorf("access = %q", c.AccessToken)
+	}
+	if c.ProfileArn != "arn:configured" {
+		t.Errorf("profileArn = %q, want kept configured value", c.ProfileArn)
+	}
+}
+
+// TestRefreshKiroExternalIDPUsesGenericPath verifies external_idp is NOT routed
+// to the Kiro JSON refresh: it falls through to the generic form-based path,
+// hitting the standard TokenURL.
+func TestRefreshKiroExternalIDPUsesGenericPath(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(form url.Values) (int, string) {
+		if form.Get("grant_type") != "refresh_token" {
+			t.Errorf("expected form body, got %+v", form)
+		}
+		return 200, `{"access_token":"tok-eidp","expires_in":3600}`
+	})
+	c := &domain.OAuthCreds{
+		KiroAuth: "external_idp", TokenURL: srv.URL, ClientID: "cid", RefreshToken: "rt-old",
+	}
+	if err := refresh(context.Background(), c, time.Unix(1000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if c.AccessToken != "tok-eidp" {
+		t.Errorf("access = %q", c.AccessToken)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("generic token endpoint hits = %d, want 1", hits.Load())
+	}
+}
+
 func TestShouldRefreshGate(t *testing.T) {
 	now := time.Unix(10000, 0)
 	cases := []struct {

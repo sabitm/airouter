@@ -143,6 +143,9 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	if p.Protocol == domain.ProtocolOpenAICodex {
 		return checkCodexUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
+	if p.Protocol == domain.ProtocolKiro {
+		return checkKiroUpstream(ctx, p, trace, fileTrace, stderrTrace)
+	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

@@ -67,15 +67,17 @@ templ ConnectionPanel(baseURL string) {
 }
 
 templ providerForm() {
-	<form class="row-form provider-form" data-method="apikey" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this) { airouterResetProviderForm(this); }">
+	<form class="row-form provider-form" data-method="apikey" data-protocol="openai" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this) { airouterResetProviderForm(this); }">
 		<input name="name" placeholder="name (e.g. openrouter)" required/>
 		<input name="base_url" placeholder="https://api.example.com/v1" required/>
-		<select name="protocol">
+		<select name="protocol" onchange="airouterToggleProtocol(this)">
 			<option value="openai">openai</option>
 			<option value="anthropic">anthropic</option>
 			<option value="openai-responses">openai-responses</option>
 				<option value="openai-codex">openai-codex</option>
+				<option value="kiro">kiro</option>
 		</select>
+		@kiroFields(&domain.OAuthCreds{})
 		<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)">
 			<option value="apikey">api key</option>
 			<option value="oauth">oauth</option>
@@ -94,6 +96,24 @@ templ providerForm() {
 		@oauthFields(&domain.OAuthCreds{}, "#oauth-region-new")
 		<button type="submit">Add</button>
 	</form>
+}
+
+// kiroFields renders the Kiro-only config (CodeWhisperer profile ARN + region),
+// shown only when the selected protocol is kiro. These apply to both apikey and
+// oauth Kiro providers; the create/update handlers fold them into the provider's
+// OAuthCreds so the request encoder reads them from one place. kiro_auth marks an
+// oauth Kiro connection so token refresh takes Kiro's flow.
+templ kiroFields(c *domain.OAuthCreds) {
+	<div class="kiro-fields row-form">
+		<input name="profile_arn" class="mono" placeholder="profile ARN (arn:aws:codewhisperer:...)" value={ c.ProfileArn }/>
+		<input name="region" placeholder="region (default us-east-1)" value={ c.Region }/>
+		<select name="kiro_auth" title="Kiro OAuth flavor (oauth only)">
+			<option value="social" selected?={ c.KiroAuth == "social" || c.KiroAuth == "" }>social (google/github)</option>
+			<option value="idc" selected?={ c.KiroAuth == "idc" }>idc / builder-id (OIDC)</option>
+			<option value="imported" selected?={ c.KiroAuth == "imported" }>imported</option>
+			<option value="external_idp" selected?={ c.KiroAuth == "external_idp" }>external idp</option>
+		</select>
+	</div>
 }
 
 // CheckResult reports the outcome of a connectivity check inline.
@@ -141,16 +161,18 @@ templ ProviderRow(p *domain.Provider) {
 templ ProviderEditRow(p *domain.Provider) {
 	<tr id={ "provider-" + strconv.FormatInt(p.ID, 10) }>
 		<td colspan="6">
-			<form class="row-form provider-form" data-method={ string(p.Method()) } hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
+			<form class="row-form provider-form" data-method={ string(p.Method()) } data-protocol={ string(p.Protocol) } hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
 				<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 				<input name="name" value={ p.Name } required/>
 				<input name="base_url" value={ p.BaseURL } required/>
-				<select name="protocol">
+				<select name="protocol" onchange="airouterToggleProtocol(this)">
 					<option value="openai" selected?={ p.Protocol == domain.ProtocolOpenAI }>openai</option>
 					<option value="anthropic" selected?={ p.Protocol == domain.ProtocolAnthropic }>anthropic</option>
 					<option value="openai-responses" selected?={ p.Protocol == domain.ProtocolOpenAIResponses }>openai-responses</option>
 						<option value="openai-codex" selected?={ p.Protocol == domain.ProtocolOpenAICodex }>openai-codex</option>
+						<option value="kiro" selected?={ p.Protocol == domain.ProtocolKiro }>kiro</option>
 				</select>
+				@kiroFields(orEmptyCreds(p.OAuthCreds))
 				<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)">
 					<option value="apikey" selected?={ p.Method() == domain.AuthAPIKey }>api key</option>
 					<option value="oauth" selected?={ p.Method() == domain.AuthOAuth }>oauth</option>

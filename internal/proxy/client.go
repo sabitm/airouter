@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/responses"
 )
 
@@ -39,19 +40,39 @@ func newCodexSessionID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// prepareCodexRequest sets up the per-request Codex session id and, when the
-// backend is the Codex codec, injects it as prompt_cache_key into the encoded
-// body. The same id is saved on the trace context so applyCodexHeaders emits it
-// as the session_id header. For non-codex backends the body is returned as-is.
-func prepareCodexRequest(ctx context.Context, backend codec, body []byte) []byte {
-	if backend.id != "oai-codex" {
+// prepareUpstreamRequest applies backend-specific post-encode patches to the
+// upstream body that need per-request state or provider config the codec's
+// encodeRequest cannot see:
+//
+//   - Codex: sets up the per-request session id and injects it as
+//     prompt_cache_key; the id is saved on the trace context so applyCodexHeaders
+//     emits it as the session_id header.
+//   - Kiro: injects the provider's CodeWhisperer profile ARN into the request.
+//
+// Other backends return the body unchanged.
+func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain.Provider, body []byte) []byte {
+	switch backend.id {
+	case "oai-codex":
+		id := newCodexSessionID()
+		if t := traceInfoFrom(ctx); t != nil {
+			t.CodexSessionID = id
+		}
+		return responses.InjectCodexRequestKey(body, id)
+	case "kiro":
+		return kiro.InjectProfileArn(body, kiroProfileArn(provider))
+	default:
 		return body
 	}
-	id := newCodexSessionID()
-	if t := traceInfoFrom(ctx); t != nil {
-		t.CodexSessionID = id
+}
+
+// kiroProfileArn returns the CodeWhisperer profile ARN configured for a Kiro
+// provider, from its OAuthCreds (which carries the field for both apikey and
+// oauth Kiro providers). Empty when unset.
+func kiroProfileArn(provider *domain.Provider) string {
+	if provider != nil && provider.OAuthCreds != nil {
+		return provider.OAuthCreds.ProfileArn
 	}
-	return responses.InjectCodexRequestKey(body, id)
+	return ""
 }
 
 // hopByHopOrControlled are request headers we never copy from the client: either
@@ -107,6 +128,38 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	if provider.Protocol == domain.ProtocolOpenAICodex {
 		applyCodexHeaders(req, provider, ctx)
 	}
+	// Kiro requires the CodeWhisperer/AWS-SDK identity headers; a malformed
+	// User-Agent is rejected upstream. Set after the client-header copy so they
+	// override any forwarded values.
+	if provider.Protocol == domain.ProtocolKiro {
+		applyKiroHeaders(req, provider)
+	}
+}
+
+// applyKiroHeaders sets the CodeWhisperer identity headers and, for an apikey
+// provider, the tokentype marker the upstream keys host acceptance on. The
+// Amz-Sdk-Invocation-Id is a fresh uuid per request. Authorization is already
+// set to the bearer credential by the auth-scheme switch above.
+func applyKiroHeaders(req *http.Request, provider *domain.Provider) {
+	req.Header.Set("X-Amz-Target", kiro.XAmzTarget)
+	req.Header.Set("User-Agent", kiro.UserAgent)
+	req.Header.Set("X-Amz-User-Agent", kiro.XAmzUserAgent)
+	req.Header.Set("Amz-Sdk-Request", kiro.AmzSdkRequest)
+	req.Header.Set("Amz-Sdk-Invocation-Id", newUUID())
+	if provider.Method() == domain.AuthAPIKey {
+		req.Header.Set("tokentype", "API_KEY")
+	}
+}
+
+// newUUID returns a random RFC 4122 version-4 UUID string for the
+// Amz-Sdk-Invocation-Id header.
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return hex.EncodeToString(b[0:4]) + "-" + hex.EncodeToString(b[4:6]) + "-" +
+		hex.EncodeToString(b[6:8]) + "-" + hex.EncodeToString(b[8:10]) + "-" + hex.EncodeToString(b[10:16])
 }
 
 // forward sends the prepared body to the provider's upstream endpoint for the
@@ -162,10 +215,14 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 // The caller owns closing resp.Body. Used for SSE responses. Token resolution
 // and the reactive 401/403 retry mirror forward, but must complete before the
 // stream is handed back since the status is only inspected once.
-func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header) (*http.Response, error) {
+func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header, streamAccept string) (*http.Response, error) {
 	url := strings.TrimRight(provider.BaseURL, "/") + path
 	if t := traceInfoFrom(ctx); t != nil {
 		t.UpstreamURL = url
+	}
+	accept := streamAccept
+	if accept == "" {
+		accept = "text/event-stream"
 	}
 	send := func() (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -173,7 +230,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 			return nil, err
 		}
 		applyUpstreamHeaders(req, provider, clientHeaders, ctx)
-		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Accept", accept)
 		return p.streamClient.Do(req)
 	}
 

@@ -23,7 +23,7 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 	}
-	resp, err := p.forwardStream(ctx, provider, ingress.upstreamPath, rewritten, clientHeaders)
+	resp, err := p.forwardStream(ctx, provider, ingress.upstreamPath, rewritten, clientHeaders, ingress.streamAccept)
 	if err != nil {
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
@@ -128,8 +128,8 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
 	}
-	upstreamBody = prepareCodexRequest(ctx, backend, upstreamBody)
-	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil)
+	upstreamBody = prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
+	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
 	if err != nil {
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}

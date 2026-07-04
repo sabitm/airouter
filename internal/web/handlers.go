@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/proxy/kiro"
 	"airouter/internal/store"
 )
 
@@ -143,6 +144,15 @@ func routerBaseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
+// kiroBaseURLOr defaults a blank Kiro base URL to the CodeWhisperer host so the
+// user need not memorize it; non-Kiro or non-blank values pass through.
+func kiroBaseURLOr(proto domain.Protocol, base string) string {
+	if proto == domain.ProtocolKiro && strings.TrimSpace(base) == "" {
+		return kiro.DefaultBaseURL
+	}
+	return base
+}
+
 func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		badRequest(w, "invalid form")
@@ -164,7 +174,7 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	p := &domain.Provider{
 		Name:       r.FormValue("name"),
-		BaseURL:    r.FormValue("base_url"),
+		BaseURL:    kiroBaseURLOr(proto, r.FormValue("base_url")),
 		APIKey:     r.FormValue("api_key"),
 		Protocol:   proto,
 		AuthScheme: auth,
@@ -172,6 +182,13 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	// "default" (empty auth) is an alias: expand it now to the protocol's scheme
 	// so the stored value is always concrete.
 	p.AuthScheme = p.Auth()
+	// A Kiro apikey provider still needs its profile ARN/region; carry them on a
+	// token-less OAuthCreds so the request encoder reads profile config uniformly.
+	if proto == domain.ProtocolKiro {
+		creds := &domain.OAuthCreds{}
+		applyKiroConfig(creds, r)
+		p.OAuthCreds = creds
+	}
 	if err := h.store.CreateProvider(r.Context(), p); err != nil {
 		badRequest(w, err.Error())
 		return
@@ -198,9 +215,14 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 		}
 		creds = c
 	}
+	// Kiro oauth providers carry the profile ARN/region and the auth-flavor marker
+	// that routes token refresh to Kiro's flow.
+	if proto == domain.ProtocolKiro {
+		applyKiroConfig(creds, r)
+	}
 	p := &domain.Provider{
 		Name:       r.FormValue("name"),
-		BaseURL:    r.FormValue("base_url"),
+		BaseURL:    kiroBaseURLOr(proto, r.FormValue("base_url")),
 		Protocol:   proto,
 		AuthMethod: domain.AuthOAuth,
 		AuthScheme: domain.AuthBearer,
@@ -289,13 +311,19 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cur.Name = r.FormValue("name")
-	cur.BaseURL = r.FormValue("base_url")
+	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))
 	cur.Protocol = proto
 	cur.AuthScheme = auth
 	// Switching an oauth provider back to apikey: drop the stored credentials so
 	// the row no longer resolves a bearer token.
 	cur.AuthMethod = domain.AuthAPIKey
 	cur.OAuthCreds = nil
+	// A Kiro apikey provider keeps a token-less OAuthCreds for its profile config.
+	if proto == domain.ProtocolKiro {
+		creds := &domain.OAuthCreds{}
+		applyKiroConfig(creds, r)
+		cur.OAuthCreds = creds
+	}
 	// Blank api_key means keep the existing one (form never echoes secrets).
 	if k := r.FormValue("api_key"); k != "" {
 		cur.APIKey = k
@@ -322,8 +350,11 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		badRequest(w, "connect this provider or paste an access/refresh token before saving")
 		return
 	}
+	if proto == domain.ProtocolKiro {
+		applyKiroConfig(cur.OAuthCreds, r)
+	}
 	cur.Name = r.FormValue("name")
-	cur.BaseURL = r.FormValue("base_url")
+	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))
 	cur.Protocol = proto
 	cur.AuthMethod = domain.AuthOAuth
 	cur.AuthScheme = domain.AuthBearer
