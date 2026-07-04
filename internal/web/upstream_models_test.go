@@ -54,3 +54,59 @@ func TestProviderModelsOAuth(t *testing.T) {
 		}
 	}
 }
+
+func TestFetchCodexModelsFallsBackToStatic(t *testing.T) {
+	models, err := fetchUpstreamModels(context.Background(), &domain.Provider{
+		Protocol: domain.ProtocolOpenAICodex,
+		BaseURL:  "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "gpt-5.3-codex-high"
+	for _, m := range models {
+		if m == want {
+			return
+		}
+	}
+	t.Fatalf("codex fallback models missing %q: %v", want, models)
+}
+
+func TestCheckCodexUpstreamUsesModelsEndpoint(t *testing.T) {
+	var method, path, clientVersion, auth, ua, originator, sessionID, accountID string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		path = r.URL.Path
+		clientVersion = r.URL.Query().Get("client_version")
+		auth = r.Header.Get("Authorization")
+		ua = r.Header.Get("User-Agent")
+		originator = r.Header.Get("originator")
+		sessionID = r.Header.Get("session_id")
+		accountID = r.Header.Get("chatgpt-account-id")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"models":[{"id":"acct-model-1"},{"slug":"acct-model-2"}]}`))
+	}))
+	t.Cleanup(up.Close)
+
+	ok, msg := checkUpstream(context.Background(), &domain.Provider{
+		BaseURL:  up.URL,
+		APIKey:   "tok",
+		Protocol: domain.ProtocolOpenAICodex,
+		OAuthCreds: &domain.OAuthCreds{
+			AccountID: "acct-1",
+		},
+	}, false)
+	if !ok {
+		t.Fatalf("check failed: %s", msg)
+	}
+	if method != http.MethodGet || path != "/models" || clientVersion == "" {
+		t.Fatalf("request = %s %s?client_version=%s, want GET /models with client_version", method, path, clientVersion)
+	}
+	if auth != "Bearer tok" || originator != "codex_cli_rs" || sessionID == "" || accountID != "acct-1" {
+		t.Errorf("headers auth=%q originator=%q session=%q account=%q", auth, originator, sessionID, accountID)
+	}
+	if !strings.HasPrefix(ua, "codex_cli_rs/") {
+		t.Errorf("user-agent = %q", ua)
+	}
+}

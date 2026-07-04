@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -137,6 +139,9 @@ const traceMaxBody = 16 << 10
 // When trace is set the request and response are logged; auth headers are never
 // logged, so the API key stays out of the log.
 func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+	if p.Protocol == domain.ProtocolOpenAICodex {
+		return checkCodexUpstream(ctx, p, trace)
+	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -191,6 +196,44 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, s
 		return false, "reachable, but response shape unexpected - protocol may not match"
 	}
 	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
+}
+
+// checkCodexUpstream validates the ChatGPT Codex model-discovery endpoint. It is
+// account-aware and avoids hardcoding a probe model that may not be available to
+// this ChatGPT account.
+func checkCodexUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+	models, status, body, err := fetchCodexModels(ctx, p, trace)
+	if err != nil {
+		switch {
+		case status == http.StatusUnauthorized || status == http.StatusForbidden:
+			return false, fmt.Sprintf("API key rejected (HTTP %d)", status)
+		case status == http.StatusNotFound:
+			return false, "not found (HTTP 404) - check base URL and protocol"
+		case status >= 400:
+			return false, fmt.Sprintf("upstream returned HTTP %d: %s", status, upstreamErrorText(body))
+		default:
+			return false, "could not reach URL: " + err.Error()
+		}
+	}
+	return true, fmt.Sprintf("OK - Codex models reachable, token accepted (%d models)", len(models))
+}
+
+func newCheckSessionID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+func upstreamErrorText(body []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
+		return e.Error.Message
+	}
+	return string(body)
 }
 
 // traceBody renders an outbound response body for the log, truncating to

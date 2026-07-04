@@ -3,12 +3,16 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/responses"
 )
 
 var upstreamClient = &http.Client{Timeout: 15 * time.Second}
@@ -54,6 +58,13 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 // credential header follows the effective auth scheme (oauth always bearer),
 // not the protocol, so an oauth provider speaking Anthropic still sends bearer.
 func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, error) {
+	if p.Protocol == domain.ProtocolOpenAICodex {
+		models, _, _, err := fetchCodexModels(ctx, p, false)
+		if err != nil || len(models) == 0 {
+			return codexModels(), nil
+		}
+		return models, nil
+	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -90,4 +101,104 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 		}
 	}
 	return out, nil
+}
+
+func fetchCodexModels(ctx context.Context, p *domain.Provider, trace bool) ([]string, int, []byte, error) {
+	url := strings.TrimRight(p.BaseURL, "/") + "/models?client_version=" + responses.CodexCLIVersion
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "codex_cli_rs/"+responses.CodexCLIVersion)
+	req.Header.Set("originator", "codex_cli_rs")
+	req.Header.Set("session_id", newCheckSessionID())
+	if p.OAuthCreds != nil && p.OAuthCreds.AccountID != "" {
+		req.Header.Set("chatgpt-account-id", p.OAuthCreds.AccountID)
+	}
+	if trace {
+		log.Printf("[trace] >>> GET %s", url)
+	}
+	resp, err := upstreamClient.Do(req)
+	if err != nil {
+		if trace {
+			log.Printf("[trace] <<< GET %s: %v", url, err)
+		}
+		return nil, 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if trace {
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, resp.StatusCode, body, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	models, err := parseModelIDs(body)
+	return models, resp.StatusCode, body, err
+}
+
+func parseModelIDs(body []byte) ([]string, error) {
+	var wrapper struct {
+		Data   []modelID `json:"data"`
+		Models []modelID `json:"models"`
+	}
+	if err := json.Unmarshal(body, &wrapper); err == nil {
+		if out := collectModelIDs(wrapper.Data); len(out) > 0 {
+			return out, nil
+		}
+		if out := collectModelIDs(wrapper.Models); len(out) > 0 {
+			return out, nil
+		}
+	}
+	var arr []modelID
+	if err := json.Unmarshal(body, &arr); err == nil {
+		if out := collectModelIDs(arr); len(out) > 0 {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("model response shape unexpected")
+}
+
+type modelID struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+}
+
+func collectModelIDs(models []modelID) []string {
+	out := make([]string, 0, len(models))
+	seen := map[string]bool{}
+	for _, m := range models {
+		id := m.ID
+		if id == "" {
+			id = m.Slug
+		}
+		if id == "" {
+			id = m.Name
+		}
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+func codexModels() []string {
+	return []string{
+		"gpt-5.5",
+		"gpt-5.4",
+		"gpt-5.4-mini",
+		"gpt-5.3-codex",
+		"gpt-5.3-codex-spark",
+		"gpt-5.3-codex-none",
+		"gpt-5.3-codex-low",
+		"gpt-5.3-codex-medium",
+		"gpt-5.3-codex-high",
+		"gpt-5.3-codex-xhigh",
+		"gpt-5.3-codex-review",
+	}
 }
