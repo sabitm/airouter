@@ -59,7 +59,7 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 // not the protocol, so an oauth provider speaking Anthropic still sends bearer.
 func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, error) {
 	if p.Protocol == domain.ProtocolOpenAICodex {
-		models, _, _, err := fetchCodexModels(ctx, p, false)
+		models, _, _, err := fetchCodexModels(ctx, p, false, nil, nil)
 		if err != nil || len(models) == 0 {
 			return codexModels(), nil
 		}
@@ -103,7 +103,7 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 	return out, nil
 }
 
-func fetchCodexModels(ctx context.Context, p *domain.Provider, trace bool) ([]string, int, []byte, error) {
+func fetchCodexModels(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) ([]string, int, []byte, error) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models?client_version=" + responses.CodexCLIVersion
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -118,19 +118,19 @@ func fetchCodexModels(ctx context.Context, p *domain.Provider, trace bool) ([]st
 		req.Header.Set("chatgpt-account-id", p.OAuthCreds.AccountID)
 	}
 	if trace {
-		log.Printf("[trace] >>> GET %s", url)
+		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
 	}
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			log.Printf("[trace] <<< GET %s: %v", url, err)
+			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
 		}
 		return nil, 0, nil, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body))
+		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp.StatusCode, body, fmt.Errorf("HTTP %d", resp.StatusCode)

@@ -30,7 +30,7 @@ type Server struct {
 
 func New(s *store.Store, debugLevel int, logFile io.Writer) *Server {
 	mux := http.NewServeMux()
-	web.NewHandler(s, debugLevel >= 2).Mount(mux)
+	web.NewHandler(s, debugLevel >= 2, logFile).Mount(mux)
 	// The proxy only distinguishes on/off (level >= 1); trace lives in the
 	// middleware below, which sees every path uniformly.
 	proxy.New(s, debugLevel >= 1, logFile).Mount(mux)

@@ -1,7 +1,9 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -96,7 +98,7 @@ func TestCheckCodexUpstreamUsesModelsEndpoint(t *testing.T) {
 		OAuthCreds: &domain.OAuthCreds{
 			AccountID: "acct-1",
 		},
-	}, false)
+	}, false, nil, nil)
 	if !ok {
 		t.Fatalf("check failed: %s", msg)
 	}
@@ -108,5 +110,36 @@ func TestCheckCodexUpstreamUsesModelsEndpoint(t *testing.T) {
 	}
 	if !strings.HasPrefix(ua, "codex_cli_rs/") {
 		t.Errorf("user-agent = %q", ua)
+	}
+}
+
+func TestCheckCodexUpstreamTraceSplitsFileAndStderr(t *testing.T) {
+	longID := strings.Repeat("x", traceMaxBody+64)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"models":[{"id":"` + longID + `"}]}`))
+	}))
+	t.Cleanup(up.Close)
+
+	var fileBuf, stderrBuf bytes.Buffer
+	fileTrace := log.New(&fileBuf, "", 0)
+	stderrTrace := log.New(&stderrBuf, "", 0)
+	ok, msg := checkUpstream(context.Background(), &domain.Provider{
+		BaseURL:  up.URL,
+		APIKey:   "tok",
+		Protocol: domain.ProtocolOpenAICodex,
+	}, true, fileTrace, stderrTrace)
+	if !ok {
+		t.Fatalf("check failed: %s", msg)
+	}
+
+	fileLog := fileBuf.String()
+	stderrLog := stderrBuf.String()
+	if !strings.Contains(fileLog, longID) || strings.Contains(fileLog, "truncated") {
+		t.Fatalf("file trace was not full: %s", fileLog)
+	}
+	if strings.Contains(stderrLog, longID) || !strings.Contains(stderrLog, "truncated") {
+		t.Fatalf("stderr trace was not truncated: %s", stderrLog)
 	}
 }

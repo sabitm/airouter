@@ -3,7 +3,10 @@ package web
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -26,10 +29,19 @@ type Handler struct {
 	// (e.g. the /models probe behind the Check button) that the request-logging
 	// middleware cannot see.
 	trace bool
+	// fileTrace/stderrTrace split dashboard trace output when a log file is
+	// configured: the file receives the full message, stderr a truncated copy.
+	fileTrace   *log.Logger
+	stderrTrace *log.Logger
 }
 
-func NewHandler(s *store.Store, trace bool) *Handler {
-	return &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), trace: trace}
+func NewHandler(s *store.Store, trace bool, logFile ...io.Writer) *Handler {
+	h := &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), trace: trace}
+	if len(logFile) > 0 && logFile[0] != nil {
+		h.fileTrace = log.New(logFile[0], "", log.LstdFlags)
+		h.stderrTrace = log.New(os.Stderr, "", log.LstdFlags)
+	}
+	return h
 }
 
 // Mount registers all dashboard routes on the given mux.

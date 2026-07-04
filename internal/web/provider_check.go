@@ -63,7 +63,7 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth}, h.trace)
+	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth}, h.trace, h.fileTrace, h.stderrTrace)
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -102,7 +102,7 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	} else {
 		probe.APIKey = creds.AccessToken
 	}
-	ok, msg := checkUpstream(r.Context(), probe, h.trace)
+	ok, msg := checkUpstream(r.Context(), probe, h.trace, h.fileTrace, h.stderrTrace)
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -127,8 +127,9 @@ func (h *Handler) oauthCheckCreds(r *http.Request) (creds *domain.OAuthCreds, fr
 	return nil, false
 }
 
-// traceMaxBody caps the outbound /models body logged at trace level so a long
-// model list cannot flood the terminal.
+// traceMaxBody caps the outbound /models body logged to stderr at trace level so
+// a long model list cannot flood the terminal. A configured -log-file receives
+// the full, untruncated body.
 const traceMaxBody = 16 << 10
 
 // checkUpstream performs a GET {base_url}/models with the protocol's auth
@@ -138,9 +139,9 @@ const traceMaxBody = 16 << 10
 //
 // When trace is set the request and response are logged; auth headers are never
 // logged, so the API key stays out of the log.
-func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
 	if p.Protocol == domain.ProtocolOpenAICodex {
-		return checkCodexUpstream(ctx, p, trace)
+		return checkCodexUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -160,12 +161,12 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, s
 	}
 
 	if trace {
-		log.Printf("[trace] >>> GET %s", url)
+		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
 	}
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			log.Printf("[trace] <<< GET %s: %v", url, err)
+			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
 		}
 		return false, "could not reach URL: " + err.Error()
 	}
@@ -175,7 +176,7 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, s
 	// just the success path.
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body))
+		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
 	}
 
 	switch {
@@ -201,8 +202,8 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, s
 // checkCodexUpstream validates the ChatGPT Codex model-discovery endpoint. It is
 // account-aware and avoids hardcoding a probe model that may not be available to
 // this ChatGPT account.
-func checkCodexUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
-	models, status, body, err := fetchCodexModels(ctx, p, trace)
+func checkCodexUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+	models, status, body, err := fetchCodexModels(ctx, p, trace, fileTrace, stderrTrace)
 	if err != nil {
 		switch {
 		case status == http.StatusUnauthorized || status == http.StatusForbidden:
@@ -236,14 +237,32 @@ func upstreamErrorText(body []byte) string {
 	return string(body)
 }
 
-// traceBody renders an outbound response body for the log, truncating to
-// traceMaxBody with a marker when the full body is longer.
-func traceBody(body []byte) string {
+func logProviderTracef(fileTrace, stderrTrace *log.Logger, format string, args ...any) {
+	if fileTrace != nil {
+		fileTrace.Printf(format, args...)
+		stderrTrace.Printf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func logProviderTraceBody(fileTrace, stderrTrace *log.Logger, status int, body []byte) {
+	if fileTrace != nil {
+		fileTrace.Printf("[trace] <<< %d\n%s", status, traceBody(body, 0))
+		stderrTrace.Printf("[trace] <<< %d\n%s", status, traceBody(body, traceMaxBody))
+		return
+	}
+	log.Printf("[trace] <<< %d\n%s", status, traceBody(body, traceMaxBody))
+}
+
+// traceBody renders an outbound response body for the log, appending a marker
+// when the output was capped. limit <= 0 logs the whole body.
+func traceBody(body []byte, limit int) string {
 	if len(body) == 0 {
 		return "(empty)"
 	}
-	if len(body) > traceMaxBody {
-		return fmt.Sprintf("%s... (truncated, %d bytes total)", body[:traceMaxBody], len(body))
+	if limit > 0 && len(body) > limit {
+		return fmt.Sprintf("%s... (truncated, %d bytes total)", body[:limit], len(body))
 	}
 	return string(body)
 }
