@@ -115,7 +115,7 @@ templ ProviderRecipeForm(r recipe) {
 				<button type="button" class="link" onclick="document.getElementById('provider-form-slot').innerHTML=''">Cancel</button>
 			</form>
 		case kindKiro:
-			<form class="row-form provider-form" data-method="apikey" data-protocol="kiro" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ document.getElementById('provider-form-slot').innerHTML=''; }">
+			<form class="row-form provider-form" data-method="apikey" data-oauth-mode="web" data-protocol="kiro" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ document.getElementById('provider-form-slot').innerHTML=''; }">
 				<input type="hidden" name="protocol" value="kiro"/>
 				<input type="hidden" name="preset" value="kiro"/>
 				<input name="name" placeholder="name" required/>
@@ -133,14 +133,26 @@ templ ProviderRecipeForm(r recipe) {
 					<span class="check-result"></span>
 				</div>
 				<div class="oauth-fields">
-					<input type="hidden" name="kiro_auth" value="builder-id"/>
-					<span class="muted">AWS Builder ID: paste the client id, client secret, and access/refresh tokens from your Kiro export.</span>
-					<input name="client_id" class="oauth-cfg" placeholder="client id"/>
-					<input name="client_secret" type="password" class="oauth-cfg" placeholder="client secret"/>
-					@oauthTokenFields(&domain.OAuthCreds{}, "", "")
-					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
-					<span class="check-indicator htmx-indicator">checking...</span>
-					<span class="check-result"></span>
+					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" title="how to obtain tokens">
+						<option value="web" selected>Web auth</option>
+						<option value="manual">Manual</option>
+					</select>
+					<div class="oauth-web">
+						<button type="button" class="link" hx-post="/dashboard/providers/kiro/device/begin" hx-include="closest form" hx-target="#oauth-region-new-kiro" hx-swap="innerHTML">Connect (AWS Builder ID)</button>
+						<div id="oauth-region-new-kiro" class="oauth-region">
+							@OAuthConnectIdle()
+						</div>
+					</div>
+					<div class="oauth-manual">
+						<input type="hidden" name="kiro_auth" value="builder-id"/>
+						<span class="muted">AWS Builder ID: paste the client id, client secret, and access/refresh tokens from your Kiro export.</span>
+						<input name="client_id" class="oauth-cfg" placeholder="client id"/>
+						<input name="client_secret" type="password" class="oauth-cfg" placeholder="client secret"/>
+						@oauthTokenFields(&domain.OAuthCreds{}, "", "")
+						<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+						<span class="check-indicator htmx-indicator">checking...</span>
+						<span class="check-result"></span>
+					</div>
 				</div>
 				<button type="submit">Add</button>
 				<button type="button" class="link" onclick="document.getElementById('provider-form-slot').innerHTML=''">Cancel</button>

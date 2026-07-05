@@ -57,8 +57,13 @@ func (e fieldError) Error() string { return string(e) }
 // config from one place. kiro_auth is only meaningful for oauth Kiro; on an
 // apikey provider it is stored but unused.
 func applyKiroConfig(c *domain.OAuthCreds, r *http.Request) {
-	c.ProfileArn = strings.TrimSpace(r.FormValue("profile_arn"))
-	c.Region = strings.TrimSpace(r.FormValue("region"))
+	// Only overwrite when the form supplies a value so device-resolved ARN/region survive web-auth save.
+	if v := strings.TrimSpace(r.FormValue("profile_arn")); v != "" {
+		c.ProfileArn = v
+	}
+	if v := strings.TrimSpace(r.FormValue("region")); v != "" {
+		c.Region = v
+	}
 	if v := strings.TrimSpace(r.FormValue("kiro_auth")); v != "" {
 		c.KiroAuth = v
 	}
@@ -170,7 +175,16 @@ func (h *Handler) oauthConnectStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	phase, email, errMsg := connectPhase(sess)
-	render(w, r, OAuthStatusLine(state, sess.conn.Addr() != "", phase, email, errMsg))
+	render(w, r, OAuthStatusLine(state, connectPolls(sess), phase, email, errMsg))
+}
+
+// connectPolls is true when the status line should poll: loopback authorization-code
+// connects, or device-code connects (always poll). Paste-only code flow does not poll.
+func connectPolls(sess *connectSession) bool {
+	if ac, ok := sess.conn.(*oauth.Connect); ok {
+		return ac.Addr() != ""
+	}
+	return true
 }
 
 // oauthConnectExchange completes the flow from a pasted authorization code or
@@ -189,15 +203,40 @@ func (h *Handler) oauthConnectExchange(w http.ResponseWriter, r *http.Request) {
 	}
 	code := strings.TrimSpace(r.FormValue("code"))
 	if code == "" {
-		render(w, r, OAuthStatusLine(state, sess.conn.Addr() != "", "error", "", "paste the code or full redirect URL"))
+		render(w, r, OAuthStatusLine(state, connectPolls(sess), "error", "", "paste the code or full redirect URL"))
 		return
 	}
-	if _, err := sess.conn.ExchangeCode(r.Context(), code); err != nil {
-		render(w, r, OAuthStatusLine(state, sess.conn.Addr() != "", "error", "", err.Error()))
+	ac, ok := sess.conn.(*oauth.Connect)
+	if !ok {
+		render(w, r, OAuthStatusLine(state, true, "error", "", "this connect does not accept a pasted code"))
+		return
+	}
+	if _, err := ac.ExchangeCode(r.Context(), code); err != nil {
+		render(w, r, OAuthStatusLine(state, ac.Addr() != "", "error", "", err.Error()))
 		return
 	}
 	phase, email, errMsg := connectPhase(sess)
-	render(w, r, OAuthStatusLine(state, sess.conn.Addr() != "", phase, email, errMsg))
+	render(w, r, OAuthStatusLine(state, ac.Addr() != "", phase, email, errMsg))
+}
+
+func (h *Handler) kiroDeviceBegin(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		render(w, r, OAuthConnectError("invalid form"))
+		return
+	}
+	region := strings.TrimSpace(r.FormValue("region"))
+	conn, err := oauth.NewDeviceConnect(region)
+	if err != nil {
+		render(w, r, OAuthConnectError(err.Error()))
+		return
+	}
+	if err := conn.Start(r.Context()); err != nil {
+		conn.Close()
+		render(w, r, OAuthConnectError(err.Error()))
+		return
+	}
+	h.sessions.put(conn.State(), &connectSession{conn: conn, created: time.Now()}, time.Now())
+	render(w, r, KiroDeviceView(conn.State(), conn.VerificationURI(), conn.UserCode()))
 }
 
 // oauthConnectCancel abandons an in-flight connect, releasing its loopback

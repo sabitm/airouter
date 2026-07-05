@@ -79,6 +79,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/providers/oauth/cancel", h.oauthConnectCancel)
 	mux.HandleFunc("POST /dashboard/providers/oauth/refresh", h.oauthRefreshTokens)
 	mux.HandleFunc("POST /dashboard/providers/oauth/refresh-all", h.refreshAllOAuth)
+	mux.HandleFunc("POST /dashboard/providers/kiro/device/begin", h.kiroDeviceBegin)
 
 	// Combos
 	mux.HandleFunc("GET /dashboard/combos", h.combosPage)

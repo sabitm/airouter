@@ -100,6 +100,15 @@ templ presetOption(p oauth.Preset, c *domain.OAuthCreds) {
 	>{ p.Label }</option>
 }
 
+templ KiroDeviceView(state, verificationURI, userCode string) {
+	<div class="oauth-connect">
+		<p class="muted">Open the AWS authorization page, sign in with your Builder ID, and approve the request. This page detects completion automatically.</p>
+		<a class="button" href={ templ.SafeURL(verificationURI) } target="_blank" rel="noopener">Open authorization page</a>
+		<p class="muted">Verification code: <span class="mono">{ userCode }</span></p>
+		@OAuthStatusLine(state, true, "pending", "", "")
+	</div>
+}
+
 // OAuthConnectIdle is the empty connect region shown before Connect is pressed
 // and after a cancel.
 templ OAuthConnectIdle() {

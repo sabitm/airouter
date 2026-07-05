@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"airouter/internal/oauth"
+	"airouter/internal/domain"
 )
 
 // connectTTL bounds how long an in-flight OAuth connect attempt is kept before
@@ -13,12 +13,18 @@ import (
 // (find the tab, approve, paste) still lands inside it.
 const connectTTL = 10 * time.Minute
 
+// connector is the shared lifecycle for authorization-code and device-code connects.
+type connector interface {
+	State() string
+	Result() (*domain.OAuthCreds, error, bool)
+	Close() error
+}
+
 // connectSession is one in-flight OAuth connect attempt. It outlives the begin
 // request so the later status-poll / paste / save requests can reach the same
-// oauth.Connect, which holds the PKCE verifier and state tying the authorize
-// redirect to the token exchange and, on success, the connected credentials.
+// connector, which holds the state tying the flow to the resulting credentials.
 type connectSession struct {
-	conn    *oauth.Connect
+	conn    connector
 	created time.Time
 }
 
