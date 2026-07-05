@@ -136,6 +136,17 @@ Responses IR mapping but has Codex-specific upstream behavior:
 - Errors before the first streamed byte fall back to the ingress format's unary
   error envelope; mid-stream failures terminate the response cleanly.
 - Each ingress format renders its own error envelope shape (`encodeError`).
+- Failover backoff is per-provider and request-count-based, held in memory on the
+  `Proxy` (`bo`), not persisted (it resets on restart). A target that fails before
+  committing any bytes is penalized (`penalizeProvider`); `orderTargets` then
+  defers that provider behind healthy targets for an exponentially growing number
+  of subsequent requests (2, 4, 8, ... clamped at `backoffMaxSkips`), consuming
+  one skip credit per unique provider per request (`providerBackedOff`), and never
+  drops it - an all-backed-off combo still resolves its least-bad option. A
+  committed success clears the penalty (`clearBackoff`). Archived providers and
+  disabled targets, by contrast, are dropped from resolution entirely. Preserve
+  this drop-vs-defer distinction when touching
+  `orderTargets`/`penalizeProvider`/`providerBackedOff`.
 - Token usage is recorded per request for the dashboard logs. Unary parses it
   from the response body; streaming requires care: OpenAI backends omit usage
   unless `stream_options.include_usage` is set on the request, OpenAI reports

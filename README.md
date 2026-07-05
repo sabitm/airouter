@@ -35,14 +35,20 @@ Three concepts:
   expiry and reactively on a 401/403, always sending a bearer token upstream. The
   browser returns to a loopback callback automatically; on a remote host, paste
   the resulting code or redirect URL instead.
+
+  A provider you no longer use can be **archived**: it is hidden from the combo
+  builder and skipped during resolution, but kept so you can restore or delete it
+  later. A "delete all archived" action removes them in bulk.
 - **Combo** - a custom model name (e.g. `default`) backed by one or more
   targets, each a provider + real upstream model id (e.g. `gpt-4o`). Clients put
   the combo name in the request `model` field; airouter resolves it to a target
   and rewrites the model. With multiple targets, a strategy picks which to use:
   `failover` tries them in order, `round-robin` spreads load and still fails over
   past a dead target. The router advances to the next target on any upstream
-  failure that happens before the response starts streaming; targets may mix
-  protocols.
+  failure that happens before the response starts streaming; a target that keeps
+  failing is temporarily deprioritized (deferred behind healthy targets for a
+  growing number of subsequent requests) rather than retried first every time.
+  Targets may mix protocols.
 - **Access key** - a bearer token clients use to authenticate against the
   router. The full token is shown once at creation; only its hash is stored.
 
