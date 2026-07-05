@@ -24,6 +24,17 @@ function airouterToggleProtocol(sel) {
   }
 }
 
+// airouterToggleOAuthMode drives the form's data-oauth-mode attribute so an
+// interactive-oauth form shows either the web-auth (Connect) group or the manual
+// token-import group, never both. Mirrors the auth-method toggle; visibility is
+// CSS-driven off the attribute.
+function airouterToggleOAuthMode(sel) {
+  const form = sel.closest(".provider-form");
+  if (form) {
+    form.setAttribute("data-oauth-mode", sel.value);
+  }
+}
+
 // airouterResetProviderForm restores the create form to a pristine state after a
 // successful add. form.reset() only reverts native input values; the oauth
 // connect region, the Check result, and any Refresh status were mutated by HTMX

@@ -12,7 +12,7 @@ templ ProvidersPage(providers []*domain.Provider, baseURL string) {
 		<section class="panel">
 			<h1>Providers</h1>
 			<p class="hint">An upstream connection: a base URL, an API key, and the protocol it speaks.</p>
-			@providerForm()
+			@providerCards()
 		</section>
 		<section class="panel">
 			if hasOAuthProvider(providers) {
@@ -66,36 +66,104 @@ templ ConnectionPanel(baseURL string) {
 	</section>
 }
 
-templ providerForm() {
-	<form class="row-form provider-form" data-method="apikey" data-protocol="openai" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this) { airouterResetProviderForm(this); }">
-		<input name="name" placeholder="name (e.g. openrouter)" required/>
-		<input name="base_url" placeholder="https://api.example.com/v1" required/>
-		<select name="protocol" onchange="airouterToggleProtocol(this)">
-			<option value="openai">openai</option>
-			<option value="anthropic">anthropic</option>
-			<option value="openai-responses">openai-responses</option>
-				<option value="openai-codex">openai-codex</option>
-				<option value="kiro">kiro</option>
-		</select>
-		@kiroFields(&domain.OAuthCreds{})
-		<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)">
-			<option value="apikey">api key</option>
-			<option value="oauth">oauth</option>
-		</select>
-		<div class="apikey-fields row-form">
-			<input name="api_key" type="password" placeholder="api key"/>
-			<select name="auth_scheme" title="credential header">
-				<option value="">default</option>
-				<option value="bearer">bearer</option>
-				<option value="x-api-key">x-api-key</option>
-			</select>
-			<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
-			<span class="check-indicator htmx-indicator">checking...</span>
-			<span class="check-result"></span>
-		</div>
-		@oauthFields(&domain.OAuthCreds{}, "#oauth-region-new")
-		<button type="submit">Add</button>
-	</form>
+templ providerCards() {
+	<p class="hint">Choose a provider type to add.</p>
+	<div class="provider-cards">
+		for _, r := range recipes {
+			<button
+				type="button"
+				class="provider-card"
+				hx-get={ "/dashboard/providers/new?recipe=" + r.ID }
+				hx-target="#provider-form-slot"
+				hx-swap="innerHTML"
+			>
+				<span class="pc-label">{ r.Label }</span>
+				<span class="pc-sub">{ r.Sublabel }</span>
+				<span class="pc-tag">{ r.Tag }</span>
+			</button>
+		}
+	</div>
+	<div id="provider-form-slot"></div>
+}
+
+templ ProviderRecipeForm(r recipe) {
+	switch r.Kind {
+		case kindInteractiveOAuth:
+			<form class="row-form provider-form" data-method="oauth" data-oauth-mode="web" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ document.getElementById('provider-form-slot').innerHTML=''; }">
+				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
+				<input type="hidden" name="auth_method" value="oauth"/>
+				<input type="hidden" name="preset" value={ r.Preset }/>
+				<input name="name" placeholder="name" required/>
+				<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
+				<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" title="how to obtain tokens">
+					<option value="web" selected>Web auth</option>
+					<option value="manual">Manual</option>
+				</select>
+				<div class="oauth-web">
+					<button type="button" class="link" hx-post="/dashboard/providers/oauth/begin" hx-include="closest form" hx-target={ "#oauth-region-new-" + r.ID } hx-swap="innerHTML">Connect</button>
+					<div id={ "oauth-region-new-" + r.ID } class="oauth-region">
+						@OAuthConnectIdle()
+					</div>
+				</div>
+				<div class="oauth-manual">
+					@oauthTokenFields(&domain.OAuthCreds{}, "", "")
+				</div>
+				<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+				<span class="check-indicator htmx-indicator">checking...</span>
+				<span class="check-result"></span>
+				<button type="submit">Add</button>
+				<button type="button" class="link" onclick="document.getElementById('provider-form-slot').innerHTML=''">Cancel</button>
+			</form>
+		case kindKiro:
+			<form class="row-form provider-form" data-method="apikey" data-protocol="kiro" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ document.getElementById('provider-form-slot').innerHTML=''; }">
+				<input type="hidden" name="protocol" value="kiro"/>
+				<input type="hidden" name="preset" value="kiro"/>
+				<input name="name" placeholder="name" required/>
+				<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
+				<input name="profile_arn" class="mono" placeholder="profile ARN (arn:aws:codewhisperer:...)"/>
+				<input name="region" placeholder="region (default us-east-1)"/>
+				<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)">
+					<option value="apikey">api key</option>
+					<option value="oauth">AWS Builder ID (oauth)</option>
+				</select>
+				<div class="apikey-fields row-form">
+					<input name="api_key" type="password" placeholder="api key"/>
+					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+					<span class="check-indicator htmx-indicator">checking...</span>
+					<span class="check-result"></span>
+				</div>
+				<div class="oauth-fields">
+					<input type="hidden" name="kiro_auth" value="builder-id"/>
+					<span class="muted">AWS Builder ID: paste the client id, client secret, and access/refresh tokens from your Kiro export.</span>
+					<input name="client_id" class="oauth-cfg" placeholder="client id"/>
+					<input name="client_secret" type="password" class="oauth-cfg" placeholder="client secret"/>
+					@oauthTokenFields(&domain.OAuthCreds{}, "", "")
+					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+					<span class="check-indicator htmx-indicator">checking...</span>
+					<span class="check-result"></span>
+				</div>
+				<button type="submit">Add</button>
+				<button type="button" class="link" onclick="document.getElementById('provider-form-slot').innerHTML=''">Cancel</button>
+			</form>
+		case kindGenericAPIKey:
+			<form class="row-form provider-form" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ document.getElementById('provider-form-slot').innerHTML=''; }">
+				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
+				<input type="hidden" name="auth_method" value="apikey"/>
+				<input name="name" placeholder="name" required/>
+				<input name="base_url" placeholder="https://api.example.com/v1" required/>
+				<input name="api_key" type="password" placeholder="api key"/>
+				<select name="auth_scheme" title="credential header">
+					<option value="">default</option>
+					<option value="bearer">bearer</option>
+					<option value="x-api-key">x-api-key</option>
+				</select>
+				<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+				<span class="check-indicator htmx-indicator">checking...</span>
+				<span class="check-result"></span>
+				<button type="submit">Add</button>
+				<button type="button" class="link" onclick="document.getElementById('provider-form-slot').innerHTML=''">Cancel</button>
+			</form>
+	}
 }
 
 // kiroFields renders the Kiro-only config (CodeWhisperer profile ARN + region),

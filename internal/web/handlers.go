@@ -62,6 +62,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	// Providers
 	mux.HandleFunc("GET /dashboard/providers", h.providersPage)
+	mux.HandleFunc("GET /dashboard/providers/new", h.newProviderForm)
 	mux.HandleFunc("POST /dashboard/providers", h.createProvider)
 	mux.HandleFunc("GET /dashboard/providers/{id}/edit", h.editProvider)
 	mux.HandleFunc("GET /dashboard/providers/{id}/row", h.providerRow)
@@ -130,6 +131,15 @@ func (h *Handler) providersPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	render(w, r, ProvidersPage(providers, routerBaseURL(r)))
+}
+
+func (h *Handler) newProviderForm(w http.ResponseWriter, r *http.Request) {
+	rec, ok := recipeByID(r.URL.Query().Get("recipe"))
+	if !ok {
+		badRequest(w, "unknown provider type")
+		return
+	}
+	render(w, r, ProviderRecipeForm(rec))
 }
 
 // routerBaseURL reconstructs the router's externally visible origin from the

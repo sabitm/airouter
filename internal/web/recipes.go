@@ -1,0 +1,45 @@
+package web
+
+import (
+	"airouter/internal/domain"
+	"airouter/internal/proxy/kiro"
+)
+
+type recipeKind string
+
+const (
+	kindInteractiveOAuth recipeKind = "interactive-oauth"
+	kindKiro             recipeKind = "kiro"
+	kindGenericAPIKey    recipeKind = "generic-apikey"
+)
+
+// recipe is a provider-creation template: a card in the gallery that, when
+// chosen, renders a focused form exposing only the fields that provider needs.
+type recipe struct {
+	ID       string
+	Label    string
+	Sublabel string
+	Tag      string
+	Kind     recipeKind
+	Protocol domain.Protocol
+	Method   domain.AuthMethod
+	Preset   string
+	BaseURL  string
+}
+
+var recipes = []recipe{
+	{ID: "xai", Label: "Grok", Sublabel: "xAI", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "xai", BaseURL: "https://api.x.ai/v1"},
+	{ID: "codex", Label: "OpenAI Codex", Sublabel: "ChatGPT", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAICodex, Method: domain.AuthOAuth, Preset: "codex", BaseURL: "https://chatgpt.com/backend-api/codex"},
+	{ID: "kiro", Label: "Kiro", Sublabel: "AWS CodeWhisperer", Tag: "API key / OAuth", Kind: kindKiro, Protocol: domain.ProtocolKiro, BaseURL: kiro.DefaultBaseURL},
+	{ID: "openai", Label: "OpenAI-compatible", Sublabel: "OpenRouter, OpenAI, vLLM...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAI, Method: domain.AuthAPIKey},
+	{ID: "anthropic", Label: "Anthropic-compatible", Sublabel: "Claude API...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolAnthropic, Method: domain.AuthAPIKey},
+}
+
+func recipeByID(id string) (recipe, bool) {
+	for _, r := range recipes {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	return recipe{}, false
+}
