@@ -198,18 +198,19 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 // orderTargets returns the combo's targets in the order the resolution loop
 // should try them. Failover keeps position order; round-robin rotates the start
 // by a per-combo counter, then continues through the remainder so it still fails
-// over past a dead target. In both cases, providers currently inside their
-// failover backoff window are deferred behind healthy ones (stably, preserving
-// relative order) so a persistently failing target is not retried first every
-// request. Penalized targets are only deferred, never dropped, so an all-backed-off
-// combo still resolves and retries its least-bad option.
+// over past a dead target. In both cases, disabled targets and archived providers
+// are dropped entirely (unlike backoff, which only defers). Providers currently
+// inside their failover backoff window are deferred behind healthy ones (stably,
+// preserving relative order) so a persistently failing target is not retried
+// first every request. Penalized targets are only deferred, never dropped, so an
+// all-backed-off combo still resolves and retries its least-bad option.
 func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
-	// Disabled targets are an explicit user choice: drop them entirely (unlike
-	// backoff, which only defers). An all-disabled combo yields no candidates and
-	// the caller surfaces a clean "no targets" error.
+	// Disabled targets and archived providers are explicit user choices: drop
+	// them from resolution entirely (unlike backoff, which only defers). The
+	// Provider nil-guard keeps unit tests that omit the hydrated provider working.
 	enabled := make([]domain.ComboTarget, 0, len(combo.Targets))
 	for _, t := range combo.Targets {
-		if t.Enabled {
+		if t.Enabled && (t.Provider == nil || !t.Provider.Archived) {
 			enabled = append(enabled, t)
 		}
 	}

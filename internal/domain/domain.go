@@ -139,8 +139,11 @@ type Provider struct {
 	OAuthCreds *OAuthCreds
 	// AuthScheme may be empty on legacy rows; use Auth for the effective value.
 	AuthScheme AuthScheme
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// Archived providers are soft-disabled: hidden from the combo builder and
+	// skipped during resolution, but kept so they can be restored or deleted.
+	Archived  bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Method resolves the effective auth method, defaulting to apikey when none was

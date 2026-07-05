@@ -46,7 +46,7 @@ func (s *Store) hydrateTargets(ctx context.Context, byID map[int64]*domain.Combo
 	}
 	const q = `
 SELECT t.combo_id, t.id, t.provider_id, t.upstream_model, t.position, t.enabled,
-       p.id, p.name, p.base_url, p.api_key, p.protocol, p.auth_scheme, p.auth_method, p.oauth_creds, p.created_at, p.updated_at
+       p.id, p.name, p.base_url, p.api_key, p.protocol, p.auth_scheme, p.auth_method, p.oauth_creds, p.created_at, p.updated_at, p.archived
 FROM combo_targets t JOIN providers p ON p.id = t.provider_id
 ORDER BY t.combo_id, t.position, t.id`
 	rows, err := s.db.QueryContext(ctx, q)
@@ -61,7 +61,7 @@ ORDER BY t.combo_id, t.position, t.id`
 		var enc, oauthEnc string
 		if err := rows.Scan(
 			&comboID, &t.ID, &t.ProviderID, &t.UpstreamModel, &t.Position, &t.Enabled,
-			&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme, &p.AuthMethod, &oauthEnc, &p.CreatedAt, &p.UpdatedAt,
+			&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme, &p.AuthMethod, &oauthEnc, &p.CreatedAt, &p.UpdatedAt, &p.Archived,
 		); err != nil {
 			return err
 		}

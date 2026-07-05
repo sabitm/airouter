@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS providers (
 	auth_scheme TEXT NOT NULL DEFAULT '',
 	auth_method TEXT NOT NULL DEFAULT '',
 	oauth_creds TEXT NOT NULL DEFAULT '',
+	archived    INTEGER NOT NULL DEFAULT 0,
 	created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -106,6 +107,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateProviderAuthMethod(); err != nil {
 		return err
 	}
+	if err := s.migrateProviderArchived(); err != nil {
+		return err
+	}
 	if err := s.migrateComboTargetEnabled(); err != nil {
 		return err
 	}
@@ -136,6 +140,18 @@ func (s *Store) migrateProviderAuthMethod() error {
 		return err
 	}
 	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN oauth_creds TEXT NOT NULL DEFAULT ''")
+	return err
+}
+
+// migrateProviderArchived adds the archived column to a providers table
+// created before providers could be archived. Idempotent; existing rows
+// default to 0 (active).
+func (s *Store) migrateProviderArchived() error {
+	has, err := s.columnExists("providers", "archived")
+	if err != nil || has {
+		return err
+	}
+	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
 	return err
 }
 

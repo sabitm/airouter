@@ -36,6 +36,26 @@ templ ProvidersPage(providers []*domain.Provider, baseURL string) {
 
 // hasOAuthProvider reports whether any provider authenticates via oauth, gating
 // the "Refresh all oauth" control so it only appears when it has work to do.
+func activeProviders(ps []*domain.Provider) []*domain.Provider {
+	out := make([]*domain.Provider, 0, len(ps))
+	for _, p := range ps {
+		if !p.Archived {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func archivedProviders(ps []*domain.Provider) []*domain.Provider {
+	var out []*domain.Provider
+	for _, p := range ps {
+		if p.Archived {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func hasOAuthProvider(providers []*domain.Provider) bool {
 	for _, p := range providers {
 		if p.Method() == domain.AuthOAuth {
@@ -251,20 +271,44 @@ templ CheckResult(ok bool, msg string) {
 }
 
 templ ProviderList(providers []*domain.Provider) {
+	{{ active := activeProviders(providers) }}
+	{{ archived := archivedProviders(providers) }}
 	<div id="provider-list">
-		if len(providers) == 0 {
+		if len(active) == 0 && len(archived) == 0 {
 			<p class="empty">No providers yet.</p>
 		} else {
-			<table>
-				<thead>
-					<tr><th>Name</th><th>Base URL</th><th>API key</th><th>Protocol</th><th>Auth</th><th></th></tr>
-				</thead>
-				<tbody>
-					for _, p := range providers {
-						@ProviderRow(p)
-					}
-				</tbody>
-			</table>
+			if len(active) > 0 {
+				<table>
+					<thead>
+						<tr><th>Name</th><th>Base URL</th><th>API key</th><th>Protocol</th><th>Auth</th><th></th></tr>
+					</thead>
+					<tbody>
+						for _, p := range active {
+							@ProviderRow(p)
+						}
+					</tbody>
+				</table>
+			} else {
+				<p class="empty">No active providers.</p>
+			}
+			if len(archived) > 0 {
+				<div class="archived-section">
+					<div class="row-form archived-head">
+						<h2>Archived</h2>
+						<button class="link danger" hx-post="/dashboard/providers/archived/delete-all" hx-target="#provider-list" hx-swap="outerHTML" hx-confirm="Delete all archived providers and their combos?">Delete all archived</button>
+					</div>
+					<table>
+						<thead>
+							<tr><th>Name</th><th>Base URL</th><th>API key</th><th>Protocol</th><th>Auth</th><th></th></tr>
+						</thead>
+						<tbody>
+							for _, p := range archived {
+								@ArchivedProviderRow(p)
+							}
+						</tbody>
+					</table>
+				</div>
+			}
 		}
 	</div>
 }
@@ -278,6 +322,21 @@ templ ProviderRow(p *domain.Provider) {
 		<td>{ string(p.Auth()) }</td>
 		<td class="actions">
 			<button class="link" hx-get={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/edit" } hx-target={ "#provider-" + strconv.FormatInt(p.ID, 10) } hx-swap="outerHTML">Edit</button>
+			<button class="link" hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/archive" } hx-target="#provider-list" hx-swap="outerHTML">Archive</button>
+			<button class="link danger" hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/delete" } hx-target="#provider-list" hx-swap="outerHTML" hx-confirm={ "Delete provider \"" + p.Name + "\" and its combos?" }>Delete</button>
+		</td>
+	</tr>
+}
+
+templ ArchivedProviderRow(p *domain.Provider) {
+	<tr id={ "provider-" + strconv.FormatInt(p.ID, 10) } class="archived">
+		<td>{ p.Name }</td>
+		<td class="mono">{ p.BaseURL }</td>
+		<td>@providerCredCell(p)</td>
+		<td>{ string(p.Protocol) }</td>
+		<td>{ string(p.Auth()) }</td>
+		<td class="actions">
+			<button class="link" hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/restore" } hx-target="#provider-list" hx-swap="outerHTML">Restore</button>
 			<button class="link danger" hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/delete" } hx-target="#provider-list" hx-swap="outerHTML" hx-confirm={ "Delete provider \"" + p.Name + "\" and its combos?" }>Delete</button>
 		</td>
 	</tr>

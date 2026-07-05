@@ -6,6 +6,14 @@ import (
 	"airouter/internal/domain"
 )
 
+func providerOptionLabel(p *domain.Provider) string {
+	label := p.Name + " (" + string(p.Protocol) + ")"
+	if p.Archived {
+		label += " [archived]"
+	}
+	return label
+}
+
 templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
 	@Layout("Combos", "/dashboard/combos") {
 		<section class="panel">
@@ -63,9 +71,9 @@ templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderI
 		<select name="provider_id" hx-get={ "/dashboard/providers/models?list=" + listID } hx-trigger="change, load" hx-target={ "#model-options-wrap-" + uid } hx-swap="innerHTML">
 			for _, p := range providers {
 				if p.ID == selectedProviderID {
-					<option value={ strconv.FormatInt(p.ID, 10) } selected>{ p.Name } ({ string(p.Protocol) })</option>
+					<option value={ strconv.FormatInt(p.ID, 10) } selected>{ providerOptionLabel(p) }</option>
 				} else {
-					<option value={ strconv.FormatInt(p.ID, 10) }>{ p.Name } ({ string(p.Protocol) })</option>
+					<option value={ strconv.FormatInt(p.ID, 10) }>{ providerOptionLabel(p) }</option>
 				}
 			}
 		</select>

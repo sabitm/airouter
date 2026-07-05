@@ -28,6 +28,7 @@ type portableProvider struct {
 	// Provider.Method).
 	AuthMethod string             `json:"auth_method"`
 	OAuth      *domain.OAuthCreds `json:"oauth,omitempty"`
+	Archived   bool               `json:"archived,omitempty"`
 }
 
 type portableTarget struct {
@@ -77,7 +78,7 @@ func (s *Store) Export(ctx context.Context, w io.Writer) error {
 	for _, p := range providers {
 		pp := portableProvider{
 			Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, Protocol: string(p.Protocol),
-			AuthScheme: string(p.Auth()), AuthMethod: string(p.Method()),
+			AuthScheme: string(p.Auth()), AuthMethod: string(p.Method()), Archived: p.Archived,
 		}
 		if p.Method() == domain.AuthOAuth {
 			pp.OAuth = p.OAuthCreds
@@ -142,7 +143,7 @@ func (s *Store) Import(ctx context.Context, r io.Reader) error {
 		}
 		if cur, ok := byName[pp.Name]; ok {
 			cur.BaseURL, cur.APIKey, cur.Protocol = pp.BaseURL, pp.APIKey, proto
-			cur.AuthScheme, cur.AuthMethod, cur.OAuthCreds = auth, method, pp.OAuth
+			cur.AuthScheme, cur.AuthMethod, cur.OAuthCreds, cur.Archived = auth, method, pp.OAuth, pp.Archived
 			cur.AuthScheme = cur.Auth()   // expand the default alias to a concrete scheme
 			cur.AuthMethod = cur.Method() // expand the default alias to a concrete method
 			if err := s.UpdateProvider(ctx, cur); err != nil {
@@ -151,7 +152,7 @@ func (s *Store) Import(ctx context.Context, r io.Reader) error {
 		} else {
 			np := &domain.Provider{
 				Name: pp.Name, BaseURL: pp.BaseURL, APIKey: pp.APIKey, Protocol: proto,
-				AuthScheme: auth, AuthMethod: method, OAuthCreds: pp.OAuth,
+				AuthScheme: auth, AuthMethod: method, OAuthCreds: pp.OAuth, Archived: pp.Archived,
 			}
 			np.AuthScheme = np.Auth()   // expand the default alias to a concrete scheme
 			np.AuthMethod = np.Method() // expand the default alias to a concrete method

@@ -68,6 +68,9 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /dashboard/providers/{id}/row", h.providerRow)
 	mux.HandleFunc("POST /dashboard/providers/{id}", h.updateProvider)
 	mux.HandleFunc("POST /dashboard/providers/{id}/delete", h.deleteProvider)
+	mux.HandleFunc("POST /dashboard/providers/{id}/archive", h.archiveProvider)
+	mux.HandleFunc("POST /dashboard/providers/{id}/restore", h.restoreProvider)
+	mux.HandleFunc("POST /dashboard/providers/archived/delete-all", h.deleteAllArchived)
 
 	mux.HandleFunc("GET /dashboard/providers/models", h.providerModels)
 	mux.HandleFunc("POST /dashboard/providers/check", h.checkProvider)
@@ -394,6 +397,40 @@ func (h *Handler) deleteProvider(w http.ResponseWriter, r *http.Request) {
 	h.renderProviderList(w, r)
 }
 
+func (h *Handler) archiveProvider(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		badRequest(w, "bad id")
+		return
+	}
+	if err := h.store.SetProviderArchived(r.Context(), id, true); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	h.renderProviderList(w, r)
+}
+
+func (h *Handler) restoreProvider(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		badRequest(w, "bad id")
+		return
+	}
+	if err := h.store.SetProviderArchived(r.Context(), id, false); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	h.renderProviderList(w, r)
+}
+
+func (h *Handler) deleteAllArchived(w http.ResponseWriter, r *http.Request) {
+	if err := h.store.DeleteArchivedProviders(r.Context()); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	h.renderProviderList(w, r)
+}
+
 // refreshAllOAuth force-refreshes every saved oauth provider's access token,
 // persisting the rotated tokens, and reports a one-line summary. Failures are
 // collected per provider rather than aborting the batch, so one revoked refresh
@@ -407,7 +444,7 @@ func (h *Handler) refreshAllOAuth(w http.ResponseWriter, r *http.Request) {
 	var refreshed, failed int
 	var problems []string
 	for _, p := range providers {
-		if p.Method() != domain.AuthOAuth {
+		if p.Method() != domain.AuthOAuth || p.Archived {
 			continue
 		}
 		if _, err := h.oauth.Resolve(r.Context(), p, true); err != nil {
@@ -445,7 +482,7 @@ func (h *Handler) combosPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	render(w, r, CombosPage(combos, providers))
+	render(w, r, CombosPage(combos, activeProviders(providers)))
 }
 
 func (h *Handler) comboData(ctx context.Context) ([]*domain.Combo, []*domain.Provider, error) {
@@ -537,7 +574,26 @@ func (h *Handler) editCombo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	render(w, r, ComboEditRow(c, providers))
+	render(w, r, ComboEditRow(c, comboEditProviders(activeProviders(providers), c)))
+}
+
+// comboEditProviders is the provider list offered in a combo's edit dropdowns:
+// the active providers plus any archived provider a target already references,
+// so editing does not silently re-point a target off its archived provider.
+func comboEditProviders(active []*domain.Provider, c *domain.Combo) []*domain.Provider {
+	seen := make(map[int64]bool, len(active))
+	out := make([]*domain.Provider, 0, len(active)+len(c.Targets))
+	for _, p := range active {
+		out = append(out, p)
+		seen[p.ID] = true
+	}
+	for _, t := range c.Targets {
+		if t.Provider != nil && !seen[t.Provider.ID] {
+			out = append(out, t.Provider)
+			seen[t.Provider.ID] = true
+		}
+	}
+	return out
 }
 
 func (h *Handler) comboRow(w http.ResponseWriter, r *http.Request) {

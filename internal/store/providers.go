@@ -17,7 +17,7 @@ func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provi
 	var p domain.Provider
 	var enc, oauthEnc string
 	if err := row.Scan(&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme,
-		&p.AuthMethod, &oauthEnc, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		&p.AuthMethod, &oauthEnc, &p.Archived, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	key, err := s.cipher.Decrypt(enc)
@@ -39,7 +39,7 @@ func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provi
 	return &p, nil
 }
 
-const providerCols = "id, name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, created_at, updated_at"
+const providerCols = "id, name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, archived, created_at, updated_at"
 
 func (s *Store) ListProviders(ctx context.Context) ([]*domain.Provider, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT "+providerCols+" FROM providers ORDER BY name")
@@ -89,8 +89,8 @@ func (s *Store) CreateProvider(ctx context.Context, p *domain.Provider) error {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx,
-		"INSERT INTO providers (name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc)
+		"INSERT INTO providers (name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.Archived)
 	if err != nil {
 		return err
 	}
@@ -108,8 +108,8 @@ func (s *Store) UpdateProvider(ctx context.Context, p *domain.Provider) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx,
-		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, auth_scheme=?, auth_method=?, oauth_creds=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.ID)
+		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, auth_scheme=?, auth_method=?, oauth_creds=?, archived=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.Archived, p.ID)
 	return err
 }
 
@@ -130,5 +130,20 @@ func (s *Store) UpdateProviderOAuth(ctx context.Context, id int64, creds *domain
 
 func (s *Store) DeleteProvider(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM providers WHERE id = ?", id)
+	return err
+}
+
+// SetProviderArchived flips a provider's archived flag without touching the
+// rest of the row, so archive/restore is a cheap one-row update.
+func (s *Store) SetProviderArchived(ctx context.Context, id int64, archived bool) error {
+	_, err := s.db.ExecContext(ctx,
+		"UPDATE providers SET archived=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", archived, id)
+	return err
+}
+
+// DeleteArchivedProviders hard-deletes every archived provider. Foreign-key
+// cascade removes their combo_targets.
+func (s *Store) DeleteArchivedProviders(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM providers WHERE archived=1")
 	return err
 }

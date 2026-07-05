@@ -219,3 +219,8 @@ td.err { color: var(--danger); max-width: 320px; overflow: hidden; text-overflow
 .refresh-all { margin-bottom: 12px; }
 .oauth-tokens { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
 .oauth-tokens .muted { flex-basis: 100%; font-size: 13px; }
+
+.archived-section { margin-top: 1.5rem; }
+.archived-section .archived-head { align-items: center; }
+.archived-section h2 { font-size: 1rem; margin: 0; }
+tr.archived { opacity: 0.6; }

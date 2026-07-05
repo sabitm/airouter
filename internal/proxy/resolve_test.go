@@ -143,6 +143,51 @@ func TestDisabledTargetSkipped(t *testing.T) {
 	}
 }
 
+// TestArchivedProviderSkipped: an enabled target whose provider is archived must
+// not be contacted; resolution uses the other enabled target.
+func TestArchivedProviderSkipped(t *testing.T) {
+	a := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	b := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	st := newTestStore(t)
+	ctx := context.Background()
+	pa := &domain.Provider{Name: "pa", BaseURL: a.server.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	pb := &domain.Provider{Name: "pb", BaseURL: b.server.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, pa); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, pb); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetProviderArchived(ctx, pa.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	combo := &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: pa.ID, UpstreamModel: "real-model", Enabled: true},
+		{ProviderID: pb.ID, UpstreamModel: "real-model", Enabled: true},
+	}}
+	if err := st.CreateCombo(ctx, combo); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, false, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	resp, out := post(t, ts.URL+"/v1/chat/completions", key.Token, oaiReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	if a.hits.Load() != 0 {
+		t.Errorf("archived provider hits = %d, want 0", a.hits.Load())
+	}
+	if b.hits.Load() != 1 {
+		t.Errorf("active target hits = %d, want 1", b.hits.Load())
+	}
+}
+
 // TestFailoverAllFail: every target fails; the client gets the last failure.
 func TestFailoverAllFail(t *testing.T) {
 	a := newScriptedUpstream(t, domain.ProtocolOpenAI)

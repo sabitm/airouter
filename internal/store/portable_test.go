@@ -54,6 +54,33 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestExportImportArchivedFlag(t *testing.T) {
+	src := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{Name: "arch", BaseURL: "http://a", APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := src.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.SetProviderArchived(ctx, p.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := src.Export(ctx, &buf); err != nil {
+		t.Fatal(err)
+	}
+	dst := testStore(t)
+	if err := dst.Import(ctx, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.GetProvider(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Archived {
+		t.Error("imported provider should preserve Archived == true")
+	}
+}
+
 // TestImportLegacyComboShape accepts the pre-multi-target export format, folding
 // the single provider/upstream_model fields into one target.
 func TestImportLegacyComboShape(t *testing.T) {
