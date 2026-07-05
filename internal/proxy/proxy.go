@@ -174,7 +174,31 @@ type Proxy struct {
 	// the rotation resets on restart, which is acceptable for load spreading.
 	rrMu sync.Mutex
 	rr   map[int64]uint64
+
+	// bo holds per-provider failover backoff state, keyed by provider id. A
+	// provider that fails over (before committing any bytes) is deferred behind
+	// healthy providers for an exponentially growing window, so a persistently
+	// failing target (e.g. out of balance) is not retried first on every request.
+	// Keyed by provider, not combo target, because a provider's health is shared
+	// across every combo it appears in. In-memory only: it resets on restart.
+	boMu sync.Mutex
+	bo   map[int64]*backoffState
 }
+
+// backoffState tracks a provider's consecutive failover count and the time until
+// which it should be deferred behind healthy targets.
+type backoffState struct {
+	failures int
+	until    time.Time
+}
+
+const (
+	backoffBase = 1 * time.Second
+	backoffMax  = 5 * time.Minute
+	// backoffShiftCap bounds the exponent so base<<shift cannot overflow the
+	// duration; the result is clamped to backoffMax well before this anyway.
+	backoffShiftCap = 30
+)
 
 func New(s *store.Store, debug bool, logFile io.Writer) *Proxy {
 	p := &Proxy{
@@ -184,6 +208,7 @@ func New(s *store.Store, debug bool, logFile io.Writer) *Proxy {
 		streamClient: &http.Client{},
 		debug:        debug,
 		rr:           map[int64]uint64{},
+		bo:           map[int64]*backoffState{},
 	}
 	if logFile != nil {
 		p.fileLog = log.New(logFile, "", log.LstdFlags)
@@ -203,6 +228,46 @@ func (p *Proxy) nextRoundRobin(comboID int64, n int) int {
 	p.rr[comboID] = i + 1
 	p.rrMu.Unlock()
 	return int(i % uint64(n))
+}
+
+// providerBackedOff reports whether a provider is currently inside its failover
+// penalty window and should be deferred behind healthy targets.
+func (p *Proxy) providerBackedOff(providerID int64, now time.Time) bool {
+	p.boMu.Lock()
+	defer p.boMu.Unlock()
+	st, ok := p.bo[providerID]
+	return ok && now.Before(st.until)
+}
+
+// penalizeProvider records a failover for a provider, extending its penalty
+// window exponentially with the consecutive failure count (base * 2^(n-1),
+// clamped to backoffMax). Called when an attempt fails before committing bytes.
+func (p *Proxy) penalizeProvider(providerID int64, now time.Time) {
+	p.boMu.Lock()
+	defer p.boMu.Unlock()
+	st := p.bo[providerID]
+	if st == nil {
+		st = &backoffState{}
+		p.bo[providerID] = st
+	}
+	st.failures++
+	shift := st.failures - 1
+	if shift > backoffShiftCap {
+		shift = backoffShiftCap
+	}
+	d := backoffBase << uint(shift)
+	if d > backoffMax || d <= 0 {
+		d = backoffMax
+	}
+	st.until = now.Add(d)
+}
+
+// clearBackoff resets a provider's penalty state after a committed success, so a
+// recovered provider is immediately eligible again.
+func (p *Proxy) clearBackoff(providerID int64) {
+	p.boMu.Lock()
+	delete(p.bo, providerID)
+	p.boMu.Unlock()
 }
 
 // Mount registers the proxy ingress endpoints. Each is mounted under both the

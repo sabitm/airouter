@@ -150,8 +150,18 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		}
 
 		if !last.retry {
+			// A committed success clears the provider's penalty so it is immediately
+			// eligible again. A terminal pre-commit error (not a failover) leaves the
+			// backoff untouched: it is not an upstream-health signal.
+			if last.written {
+				p.clearBackoff(provider.ID)
+			}
 			break
 		}
+		// The attempt failed over before committing bytes: penalize the provider so
+		// subsequent requests defer it behind healthy targets. Applies to the last
+		// target too, so a whole-combo outage still grows the window.
+		p.penalizeProvider(provider.ID, time.Now())
 		if i < len(candidates)-1 {
 			p.debugf("combo %s: target %d (%s) failed: %d %s; advancing",
 				combo.Name, i, provider.Name, last.status, last.errMsg)
@@ -188,18 +198,35 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 // orderTargets returns the combo's targets in the order the resolution loop
 // should try them. Failover keeps position order; round-robin rotates the start
 // by a per-combo counter, then continues through the remainder so it still fails
-// over past a dead target.
+// over past a dead target. In both cases, providers currently inside their
+// failover backoff window are deferred behind healthy ones (stably, preserving
+// relative order) so a persistently failing target is not retried first every
+// request. Penalized targets are only deferred, never dropped, so an all-backed-off
+// combo still resolves and retries its least-bad option.
 func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
 	targets := combo.Targets
-	if combo.Strategy != domain.StrategyRoundRobin || len(targets) <= 1 {
+	if len(targets) <= 1 {
 		return targets
 	}
-	start := p.nextRoundRobin(combo.ID, len(targets))
-	out := make([]domain.ComboTarget, 0, len(targets))
-	for i := range targets {
-		out = append(out, targets[(start+i)%len(targets)])
+	base := targets
+	if combo.Strategy == domain.StrategyRoundRobin {
+		start := p.nextRoundRobin(combo.ID, len(targets))
+		base = make([]domain.ComboTarget, 0, len(targets))
+		for i := range targets {
+			base = append(base, targets[(start+i)%len(targets)])
+		}
 	}
-	return out
+	now := time.Now()
+	healthy := make([]domain.ComboTarget, 0, len(base))
+	backedOff := make([]domain.ComboTarget, 0, len(base))
+	for _, t := range base {
+		if p.providerBackedOff(t.ProviderID, now) {
+			backedOff = append(backedOff, t)
+		} else {
+			healthy = append(healthy, t)
+		}
+	}
+	return append(healthy, backedOff...)
 }
 
 // servePassthrough forwards the body unchanged except for the model rewrite,

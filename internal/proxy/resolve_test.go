@@ -156,6 +156,33 @@ func TestRoundRobinStillFailsOver(t *testing.T) {
 	}
 }
 
+// TestFailoverBacksOffRepeatedFailure: a failover combo whose first target is
+// persistently down. After the first request pays the failover cost, subsequent
+// requests must skip the dead target and hit the healthy one directly, proving
+// the backoff defers it rather than retrying it first every time.
+func TestFailoverBacksOffRepeatedFailure(t *testing.T) {
+	a := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	b := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	a.status.Store(http.StatusInternalServerError)
+	base, token := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{a, b}, []domain.Protocol{domain.ProtocolOpenAI, domain.ProtocolOpenAI})
+
+	for i := 0; i < 3; i++ {
+		resp, out := post(t, base+"/v1/chat/completions", token, oaiReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("req %d: status %d, body %s", i, resp.StatusCode, out)
+		}
+	}
+	// The dead target is tried only on the first request; the backoff window (>=1s)
+	// keeps it deferred for the next two, which reach the healthy target directly.
+	if a.hits.Load() != 1 {
+		t.Errorf("dead target hits = %d, want 1 (deferred after first failure)", a.hits.Load())
+	}
+	if b.hits.Load() != 3 {
+		t.Errorf("healthy target hits = %d, want 3", b.hits.Load())
+	}
+}
+
 // TestMixedProtocolCombo: an OpenAI ingress request fails over from a dead
 // OpenAI target to a healthy Anthropic target, translating on the second leg.
 func TestMixedProtocolCombo(t *testing.T) {
