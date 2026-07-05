@@ -167,7 +167,9 @@ td.mono { overflow-wrap: anywhere; }
 .stat-value { font-size: 22px; font-weight: 600; }
 .stat-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
 
-td.err { color: var(--danger); max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+/* Auto table-layout ignores max-width on a cell, so bound the Error column with a
+   real width and let long messages wrap instead of widening the whole table. */
+td.err { color: var(--danger); width: 260px; white-space: normal; overflow-wrap: anywhere; }
 
 .flash.created { border-color: var(--ok); background: rgba(63,185,80,0.1); }
 .flash.error { border-color: var(--danger); background: rgba(229,83,75,0.1); }
