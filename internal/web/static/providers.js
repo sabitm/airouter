@@ -10,20 +10,6 @@ function airouterToggleAuthMethod(sel) {
   }
 }
 
-// airouterToggleProtocol drives the form's data-protocol attribute so the
-// Kiro-only config group shows only when protocol is kiro. Mirrors the
-// auth-method toggle; visibility is CSS-driven off the attribute.
-function airouterToggleProtocol(sel) {
-  const form = sel.closest(".provider-form");
-  if (form) {
-    form.setAttribute("data-protocol", sel.value);
-    const baseURL = form.querySelector('[name="base_url"]');
-    if (sel.value === "kiro" && baseURL && baseURL.value.trim() === "") {
-      baseURL.value = "https://codewhisperer.us-east-1.amazonaws.com";
-    }
-  }
-}
-
 // airouterToggleOAuthMode drives the form's data-oauth-mode attribute so an
 // interactive-oauth form shows either the web-auth (Connect) group or the manual
 // token-import group, never both. Mirrors the auth-method toggle; visibility is
@@ -56,39 +42,4 @@ function airouterResetProviderForm(form) {
   form.querySelectorAll(".oauth-tokens .check").forEach(function (el) {
     el.remove();
   });
-}
-
-// airouterApplyPreset copies the selected option's data-* config into the
-// sibling oauth inputs. Choosing "Custom" leaves the fields as-is for manual
-// entry. It also updates the form's base_url/protocol from the preset.
-function airouterApplyPreset(sel) {
-  const opt = sel.options[sel.selectedIndex];
-  if (!opt || opt.dataset.custom) {
-    return;
-  }
-  const fields = sel.closest(".oauth-fields");
-  const form = sel.closest(".provider-form");
-  const set = (root, name, val) => {
-    if (val === undefined) return;
-    const el = root && root.querySelector('[name="' + name + '"]');
-    if (!el) return;
-    if (el.type === "checkbox") {
-      el.checked = val === "true";
-    } else {
-      el.value = val;
-    }
-  };
-  set(fields, "auth_url", opt.dataset.auth_url);
-  set(fields, "token_url", opt.dataset.token_url);
-  set(fields, "client_id", opt.dataset.client_id);
-  set(fields, "client_secret", opt.dataset.client_secret);
-  set(fields, "scopes", opt.dataset.scopes);
-  set(fields, "redirect_uri", opt.dataset.redirect_uri);
-  set(fields, "pkce", opt.dataset.pkce);
-  set(form, "base_url", opt.dataset.base_url);
-  set(form, "protocol", opt.dataset.protocol);
-  const protoSel = form && form.querySelector('[name="protocol"]');
-  if (protoSel) {
-    airouterToggleProtocol(protoSel);
-  }
 }

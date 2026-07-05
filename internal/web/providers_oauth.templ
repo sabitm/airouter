@@ -2,58 +2,7 @@ package web
 
 import (
 	"airouter/internal/domain"
-	"airouter/internal/oauth"
 )
-
-// oauthFields renders the OAuth configuration block shared by the create and
-// edit forms: a preset dropdown that prefills the manual fields (via
-// providers.js reading the option's data-* attributes) plus the editable manual
-// fields, the Connect control, and the connect status region. c supplies the
-// current values when editing; pass an empty OAuthCreds for a new provider.
-templ oauthFields(c *domain.OAuthCreds, beginTarget string) {
-	<div class="oauth-fields">
-		<select name="preset" class="oauth-preset" onchange="airouterApplyPreset(this)">
-			<option value="custom" data-custom="1">Custom (manual)</option>
-			for _, p := range oauth.Presets {
-				@presetOption(p, c)
-			}
-		</select>
-		<input name="auth_url" class="oauth-cfg" placeholder="authorize URL" value={ c.AuthURL }/>
-		<input name="token_url" class="oauth-cfg" placeholder="token URL" value={ c.TokenURL }/>
-		<input name="client_id" class="oauth-cfg" placeholder="client id" value={ c.ClientID }/>
-		<input name="client_secret" type="password" class="oauth-cfg" placeholder="client secret (blank for PKCE)" value={ c.ClientSecret }/>
-		<input name="scopes" class="oauth-cfg" placeholder="scopes (space separated)" value={ c.Scopes }/>
-		<input name="redirect_uri" class="oauth-cfg" placeholder="redirect URI" value={ redirectOr(c.RedirectURI) }/>
-		<label class="oauth-pkce">
-			<input type="checkbox" name="pkce" checked?={ c.PKCE }/> PKCE (public client)
-		</label>
-		<button
-			type="button"
-			class="link"
-			hx-post="/dashboard/providers/oauth/begin"
-			hx-include="closest .oauth-fields"
-			hx-target={ beginTarget }
-			hx-swap="innerHTML"
-		>Connect</button>
-		<div id={ beginTarget[1:] } class="oauth-region">
-			@OAuthConnectIdle()
-		</div>
-		@oauthTokenFields(&domain.OAuthCreds{}, "", "")
-		<div class="oauth-check row-form">
-			<button
-				type="button"
-				class="link"
-				hx-post="/dashboard/providers/check"
-				hx-include="closest form"
-				hx-target="next .check-result"
-				hx-swap="innerHTML"
-				hx-indicator="next .check-indicator"
-			>Check</button>
-			<span class="check-indicator htmx-indicator">checking...</span>
-			<span class="check-result"></span>
-		</div>
-	</div>
-}
 
 // oauthTokenFields renders the manual token-import inputs, prefilled from c so a
 // Refresh can repopulate them. okMsg/errMsg drive the inline status. The whole
@@ -82,22 +31,6 @@ templ oauthTokenFields(c *domain.OAuthCreds, okMsg, errMsg string) {
 			<span class="check ok">{ okMsg }</span>
 		}
 	</div>
-}
-
-templ presetOption(p oauth.Preset, c *domain.OAuthCreds) {
-	<option
-		value={ p.Name }
-		data-base_url={ p.APIBase }
-		data-protocol={ string(p.Protocol) }
-		data-auth_url={ p.AuthURL }
-		data-token_url={ p.TokenURL }
-		data-client_id={ p.ClientID }
-		data-client_secret={ p.ClientSecret }
-		data-scopes={ p.Scopes }
-		data-redirect_uri={ p.RedirectURI }
-		data-pkce={ boolStr(p.PKCE) }
-		selected?={ c.Preset == p.Name }
-	>{ p.Label }</option>
 }
 
 templ KiroDeviceView(state, verificationURI, userCode string) {
