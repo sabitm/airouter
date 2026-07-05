@@ -87,6 +87,7 @@ templ providerCards() {
 			<button
 				type="button"
 				class="provider-card"
+				onclick="airouterSelectProviderCard(this)"
 				hx-get={ "/dashboard/providers/new?recipe=" + r.ID }
 				hx-target="#provider-form-slot"
 				hx-swap="innerHTML"
@@ -103,7 +104,7 @@ templ providerCards() {
 templ ProviderRecipeForm(r recipe) {
 	switch r.Kind {
 		case kindInteractiveOAuth:
-			<form class="row-form provider-form" data-method="oauth" data-oauth-mode="web" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ document.getElementById('provider-form-slot').innerHTML=''; }">
+			<form class="row-form provider-form" data-method="oauth" data-oauth-mode="web" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
 				<input type="hidden" name="auth_method" value="oauth"/>
 				<input type="hidden" name="preset" value={ r.Preset }/>
@@ -126,10 +127,10 @@ templ ProviderRecipeForm(r recipe) {
 				<span class="check-indicator htmx-indicator">checking...</span>
 				<span class="check-result"></span>
 				<button type="submit">Add</button>
-				<button type="button" class="link" onclick="document.getElementById('provider-form-slot').innerHTML=''">Cancel</button>
+				<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
 			</form>
 		case kindKiro:
-			<form class="row-form provider-form" data-method="apikey" data-oauth-mode="web" data-protocol="kiro" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ document.getElementById('provider-form-slot').innerHTML=''; }">
+			<form class="row-form provider-form" data-method="apikey" data-oauth-mode="web" data-protocol="kiro" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value="kiro"/>
 				<input type="hidden" name="preset" value="kiro"/>
 				<input name="name" placeholder="name" required/>
@@ -169,10 +170,10 @@ templ ProviderRecipeForm(r recipe) {
 					</div>
 				</div>
 				<button type="submit">Add</button>
-				<button type="button" class="link" onclick="document.getElementById('provider-form-slot').innerHTML=''">Cancel</button>
+				<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
 			</form>
 		case kindGenericAPIKey:
-			<form class="row-form provider-form" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ document.getElementById('provider-form-slot').innerHTML=''; }">
+			<form class="row-form provider-form" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
 				<input type="hidden" name="auth_method" value="apikey"/>
 				<input name="name" placeholder="name" required/>
@@ -187,7 +188,7 @@ templ ProviderRecipeForm(r recipe) {
 				<span class="check-indicator htmx-indicator">checking...</span>
 				<span class="check-result"></span>
 				<button type="submit">Add</button>
-				<button type="button" class="link" onclick="document.getElementById('provider-form-slot').innerHTML=''">Cancel</button>
+				<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
 			</form>
 	}
 }

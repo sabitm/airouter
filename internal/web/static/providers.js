@@ -21,6 +21,29 @@ function airouterToggleOAuthMode(sel) {
   }
 }
 
+// airouterSelectProviderCard marks the clicked card as the active one so the
+// grid shows which recipe's add-form is open. Selection is purely visual and
+// non-persistent; a page reload clears it, which matches the empty form slot on
+// load.
+function airouterSelectProviderCard(btn) {
+  document.querySelectorAll(".provider-card.selected").forEach(function (c) {
+    c.classList.remove("selected");
+  });
+  btn.classList.add("selected");
+}
+
+// airouterCloseProviderForm dismisses the open add-form and clears the card
+// selection together, so a closed form never leaves a stale-selected card.
+function airouterCloseProviderForm() {
+  const slot = document.getElementById("provider-form-slot");
+  if (slot) {
+    slot.innerHTML = "";
+  }
+  document.querySelectorAll(".provider-card.selected").forEach(function (c) {
+    c.classList.remove("selected");
+  });
+}
+
 // airouterResetProviderForm restores the create form to a pristine state after a
 // successful add. form.reset() only reverts native input values; the oauth
 // connect region, the Check result, and any Refresh status were mutated by HTMX
