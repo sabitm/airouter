@@ -95,10 +95,15 @@ func refreshKiro(ctx context.Context, c *domain.OAuthCreds, now time.Time) error
 	if err := json.Unmarshal(raw, &tr); err != nil {
 		return fmt.Errorf("oauth: kiro refresh: decode %d: %w", resp.StatusCode, err)
 	}
-	// The OIDC endpoint reports an invalid refresh token as an error field; the
-	// social endpoint may use a non-2xx status with a message. Treat either as a
-	// hard invalid-grant so the connection is flagged for reconnect.
-	if isKiroInvalidGrant(tr.Error) || (resp.StatusCode == http.StatusBadRequest && tr.AccessToken == "") {
+	// The OIDC endpoint reports an invalid refresh token as an error field; it may
+	// also reject a revoked refresh token or dead client registration with a bare
+	// 401/403 and no parseable error body. The social endpoint may use a non-2xx
+	// status with a message. Treat any of these as a hard invalid-grant so the
+	// connection is flagged for reconnect rather than surfaced as a raw failure.
+	badStatus := resp.StatusCode == http.StatusBadRequest ||
+		resp.StatusCode == http.StatusUnauthorized ||
+		resp.StatusCode == http.StatusForbidden
+	if isKiroInvalidGrant(tr.Error) || (badStatus && tr.AccessToken == "") {
 		return ErrInvalidGrant
 	}
 	if tr.Error != "" {

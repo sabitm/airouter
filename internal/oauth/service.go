@@ -154,6 +154,13 @@ func (s *Service) RefreshTokens(ctx context.Context, creds *domain.OAuthCreds) (
 	return &cp, nil
 }
 
+// RefreshAndPersist refreshes a saved provider's tokens and writes the rotated
+// credentials back to the store, for the dashboard edit form where the provider
+// already has an id. Unlike RefreshTokens (create/import, no id) this persists.
+func (s *Service) RefreshAndPersist(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	return s.doRefresh(ctx, id, creds)
+}
+
 // IsInvalidGrant reports whether err is an ErrInvalidGrant, for callers that
 // want to surface a "reconnect required" state.
 func IsInvalidGrant(err error) bool { return errors.Is(err, ErrInvalidGrant) }

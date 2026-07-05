@@ -250,60 +250,126 @@ func (h *Handler) oauthConnectCancel(w http.ResponseWriter, r *http.Request) {
 // oauthRefreshTokens mints a fresh access token from the form's pasted refresh
 // token and config, then re-renders the token fields with the result. It is the
 // manual-import escape hatch for a CLI access token that expired before it could
-// be pasted: refresh in place rather than re-running the CLI. The tokens are not
-// persisted here (the provider may be unsaved); Save stores whatever is in the
-// fields afterward.
+// be pasted: refresh in place rather than re-running the CLI. For unsaved
+// providers tokens are not persisted here; Save stores whatever is in the fields
+// afterward. It also handles saved-provider refresh (persisting) and Kiro.
 func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
+	statusView := false
+	renderErr := func(c *domain.OAuthCreds, msg string) {
+		if statusView {
+			render(w, r, OAuthRefreshResult("", msg))
+		} else {
+			render(w, r, oauthTokenFields(c, "", msg))
+		}
+	}
+	renderOK := func(c *domain.OAuthCreds, msg string) {
+		if statusView {
+			render(w, r, OAuthRefreshResult(msg, ""))
+		} else {
+			render(w, r, oauthTokenFields(c, msg, ""))
+		}
+	}
+
 	if err := r.ParseForm(); err != nil {
-		render(w, r, oauthTokenFields(&domain.OAuthCreds{}, "", "invalid form"))
+		renderErr(&domain.OAuthCreds{}, "invalid form")
 		return
 	}
+	statusView = r.FormValue("refresh_view") == "status"
+
 	creds, err := credsFromConnectForm(r)
 	if err != nil {
-		render(w, r, oauthTokenFields(&domain.OAuthCreds{}, "", err.Error()))
+		renderErr(&domain.OAuthCreds{}, err.Error())
 		return
 	}
 	applyManualTokens(creds, r)
-	// Edit form leaves token fields blank to avoid echoing stored secrets, so a
-	// Refresh there must recover the stored tokens by id. Only backfill fields the
-	// form did not supply, so a deliberate paste still overrides what is stored.
-	if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
-		if p, gErr := h.store.GetProvider(r.Context(), id); gErr == nil && p.OAuthCreds != nil {
+	applyKiroConfig(creds, r)
+
+	var savedID bool
+	var id int64
+	if parsed, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
+		if p, gErr := h.store.GetProvider(r.Context(), parsed); gErr == nil && p.OAuthCreds != nil {
+			savedID = true
+			id = parsed
+			stored := p.OAuthCreds
 			if creds.RefreshToken == "" {
-				creds.RefreshToken = p.OAuthCreds.RefreshToken
+				creds.RefreshToken = stored.RefreshToken
 			}
 			if creds.AccessToken == "" {
-				creds.AccessToken = p.OAuthCreds.AccessToken
+				creds.AccessToken = stored.AccessToken
 			}
 			if creds.ExpiresAt == 0 {
-				creds.ExpiresAt = p.OAuthCreds.ExpiresAt
+				creds.ExpiresAt = stored.ExpiresAt
 			}
 			if creds.Email == "" {
-				creds.Email = p.OAuthCreds.Email
+				creds.Email = stored.Email
 			}
 			if creds.AccountID == "" {
-				creds.AccountID = p.OAuthCreds.AccountID
+				creds.AccountID = stored.AccountID
+			}
+			if creds.TokenURL == "" {
+				creds.TokenURL = stored.TokenURL
+			}
+			if creds.ClientID == "" {
+				creds.ClientID = stored.ClientID
+			}
+			if creds.ClientSecret == "" {
+				creds.ClientSecret = stored.ClientSecret
+			}
+			if creds.Scopes == "" {
+				creds.Scopes = stored.Scopes
+			}
+			if creds.RedirectURI == "" {
+				creds.RedirectURI = stored.RedirectURI
+			}
+			if !creds.PKCE {
+				creds.PKCE = stored.PKCE
+			}
+			if creds.Region == "" {
+				creds.Region = stored.Region
+			}
+			if creds.KiroAuth == "" {
+				creds.KiroAuth = stored.KiroAuth
+			}
+			if creds.ProfileArn == "" {
+				creds.ProfileArn = stored.ProfileArn
+			}
+			if !creds.RefreshJSON {
+				creds.RefreshJSON = stored.RefreshJSON
+			}
+			if creds.IDToken == "" {
+				creds.IDToken = stored.IDToken
+			}
+			if creds.Preset == "" {
+				creds.Preset = stored.Preset
 			}
 		}
 	}
+
 	if creds.RefreshToken == "" {
-		render(w, r, oauthTokenFields(creds, "", "paste a refresh token to refresh"))
+		renderErr(creds, "paste a refresh token to refresh")
 		return
 	}
-	if creds.TokenURL == "" || creds.ClientID == "" {
-		render(w, r, oauthTokenFields(creds, "", "token URL and client id are required to refresh"))
+	kiroFlow := creds.KiroAuth != "" && creds.KiroAuth != "external_idp"
+	if !kiroFlow && (creds.TokenURL == "" || creds.ClientID == "") {
+		renderErr(creds, "token URL and client id are required to refresh")
 		return
 	}
-	updated, err := h.oauth.RefreshTokens(r.Context(), creds)
+
+	var updated *domain.OAuthCreds
+	if savedID {
+		updated, err = h.oauth.RefreshAndPersist(r.Context(), id, creds)
+	} else {
+		updated, err = h.oauth.RefreshTokens(r.Context(), creds)
+	}
 	if err != nil {
 		if oauth.IsInvalidGrant(err) {
-			render(w, r, oauthTokenFields(creds, "", "refresh token rejected - re-authorize in the CLI"))
+			renderErr(creds, "refresh token rejected - re-authorize")
 			return
 		}
-		render(w, r, oauthTokenFields(creds, "", "refresh failed: "+err.Error()))
+		renderErr(creds, "refresh failed: "+err.Error())
 		return
 	}
-	render(w, r, oauthTokenFields(updated, refreshOKMsg(updated), ""))
+	renderOK(updated, refreshOKMsg(updated))
 }
 
 // refreshOKMsg is the success status after a manual refresh, noting the new

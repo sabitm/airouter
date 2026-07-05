@@ -198,6 +198,28 @@ func TestRefreshKiroOIDC(t *testing.T) {
 	}
 }
 
+// TestRefreshKiroOIDCUnauthorized verifies the OIDC branch treats a bare 401 with
+// no parseable error body (a revoked refresh token or dead client registration)
+// as ErrInvalidGrant, so refresh-all flags reconnect instead of a raw failure.
+func TestRefreshKiroOIDCUnauthorized(t *testing.T) {
+	srv, _ := kiroJSONServer(t, 401, `{}`)
+	orig := kiroOIDCTokenURL
+	kiroOIDCTokenURL = func(string) string { return srv.URL }
+	t.Cleanup(func() { kiroOIDCTokenURL = orig })
+
+	c := &domain.OAuthCreds{
+		KiroAuth: "builder-id", ClientID: "cid", ClientSecret: "secret",
+		RefreshToken: "rt-old", AccessToken: "tok-old", ExpiresAt: 1,
+	}
+	err := refresh(context.Background(), c, time.Unix(1000, 0))
+	if !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("err = %v, want ErrInvalidGrant", err)
+	}
+	if c.AccessToken != "tok-old" {
+		t.Errorf("access changed on failure: %q", c.AccessToken)
+	}
+}
+
 // TestRefreshKiroSocial covers the social branch: no client secret, fixed social
 // endpoint, camelCase response. A configured profileArn is not overwritten.
 func TestRefreshKiroSocial(t *testing.T) {

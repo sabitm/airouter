@@ -218,6 +218,18 @@ templ kiroEditOAuthBlock(p *domain.Provider) {
 		<div id={ "oauth-region-edit-" + strconv.FormatInt(p.ID, 10) } class="oauth-region">
 			@OAuthConnectIdle()
 		</div>
+		<button
+			type="button"
+			class="link"
+			hx-post="/dashboard/providers/oauth/refresh"
+			hx-include="closest form"
+			hx-vals='{"refresh_view":"status"}'
+			hx-target={ "#oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) }
+			hx-swap="innerHTML"
+			hx-indicator="next .refresh-indicator"
+		>Refresh token</button>
+		<span class="refresh-indicator htmx-indicator">refreshing...</span>
+		<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result"></span>
 	</div>
 	<div class="oauth-manual">
 		<span class="muted">AWS Builder ID: paste the client id, client secret, and access/refresh tokens from your Kiro export.</span>
@@ -374,6 +386,18 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 			<div id={ "oauth-region-edit-" + strconv.FormatInt(p.ID, 10) } class="oauth-region">
 				@OAuthConnectIdle()
 			</div>
+			<button
+				type="button"
+				class="link"
+				hx-post="/dashboard/providers/oauth/refresh"
+				hx-include="closest form"
+				hx-vals='{"refresh_view":"status"}'
+				hx-target={ "#oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) }
+				hx-swap="innerHTML"
+				hx-indicator="next .refresh-indicator"
+			>Refresh token</button>
+			<span class="refresh-indicator htmx-indicator">refreshing...</span>
+			<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result"></span>
 		</div>
 		<div class="oauth-manual">
 			@oauthTokenFields(&domain.OAuthCreds{}, "", "")

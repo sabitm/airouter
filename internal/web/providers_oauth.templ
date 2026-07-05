@@ -33,6 +33,16 @@ templ oauthTokenFields(c *domain.OAuthCreds, okMsg, errMsg string) {
 	</div>
 }
 
+// OAuthRefreshResult is the compact inline status for a refresh triggered from
+// web-auth mode, where the full token-import fields are not shown.
+templ OAuthRefreshResult(okMsg, errMsg string) {
+	if errMsg != "" {
+		<span class="check err">{ errMsg }</span>
+	} else if okMsg != "" {
+		<span class="check ok">{ okMsg }</span>
+	}
+}
+
 templ KiroDeviceView(state, verificationURI, userCode string) {
 	<div class="oauth-connect">
 		<p class="muted">Open the AWS authorization page, sign in with your Builder ID, and approve the request. This page detects completion automatically.</p>
