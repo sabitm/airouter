@@ -151,7 +151,7 @@ templ ComboRow(c *domain.Combo) {
 		</td>
 		<td class="actions">
 			<button class="link" hx-get={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/edit" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML">Edit</button>
-			<button class="link danger" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/delete" } hx-target="#combo-list" hx-swap="outerHTML" hx-confirm="Delete this combo?">Delete</button>
+			<button class="link danger" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/delete" } hx-target="#combo-list" hx-swap="outerHTML" hx-confirm={ "Delete combo \"" + c.Name + "\"?" }>Delete</button>
 		</td>
 	</tr>
 }
