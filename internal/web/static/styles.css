@@ -100,7 +100,7 @@ button:hover, .button:hover { filter: brightness(1.1); }
 button.link {
 	background: none;
 	color: var(--accent);
-	padding: 4px 8px;
+	padding: 4px 6px;
 }
 
 button.link.danger { color: var(--danger); }
@@ -117,6 +117,10 @@ th, td {
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
 
 td.actions { text-align: right; white-space: nowrap; }
+
+/* Long upstream URLs must be allowed to break so the flexible column yields
+   width instead of forcing the actions cell past the panel edge. */
+td.mono { overflow-wrap: anywhere; }
 
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
 
