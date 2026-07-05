@@ -321,8 +321,11 @@ func exchangeCode(ctx context.Context, c *domain.OAuthCreds, code, verifier, bas
 	if err := jsonUnmarshal(body, &tr); err != nil {
 		return fmt.Errorf("oauth: exchange: decode %d: %w", resp.StatusCode, err)
 	}
-	if tr.Error != "" {
-		return fmt.Errorf("oauth: exchange: %s: %s", tr.Error, tr.ErrorDescription)
+	if code, desc := parseTokenError(tr.Error); code != "" {
+		if desc == "" {
+			desc = tr.ErrorDescription
+		}
+		return fmt.Errorf("oauth: exchange: %s: %s", code, desc)
 	}
 	if tr.AccessToken == "" {
 		return fmt.Errorf("oauth: exchange: empty access_token (HTTP %d)", resp.StatusCode)

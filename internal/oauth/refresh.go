@@ -25,15 +25,58 @@ var ErrInvalidGrant = errors.New("oauth: refresh token invalid or revoked")
 // uses 5 minutes; applied uniformly since the connect config is inline.
 const refreshLead = 5 * time.Minute
 
-// tokenResponse is the subset of an OAuth/OIDC token response we persist.
+// tokenResponse is the subset of an OAuth/OIDC token response we persist. Error
+// is RawMessage because providers disagree on its shape: the OAuth2 standard uses
+// a flat string ("error":"invalid_grant"), while the ChatGPT/OpenAI backend nests
+// an object ("error":{"code":"token_invalidated","message":...}). Typing it as a
+// string would fail the whole decode against the nested shape, masking a revoked
+// token as a raw parse error instead of a clean reconnect prompt.
 type tokenResponse struct {
-	AccessToken      string `json:"access_token"`
-	RefreshToken     string `json:"refresh_token"`
-	IDToken          string `json:"id_token"`
-	ExpiresIn        int    `json:"expires_in"`
-	Scope            string `json:"scope"`
-	Error            string `json:"error"`
-	ErrorDescription string `json:"error_description"`
+	AccessToken      string          `json:"access_token"`
+	RefreshToken     string          `json:"refresh_token"`
+	IDToken          string          `json:"id_token"`
+	ExpiresIn        int             `json:"expires_in"`
+	Scope            string          `json:"scope"`
+	Error            json.RawMessage `json:"error"`
+	ErrorDescription string          `json:"error_description"`
+}
+
+// parseTokenError extracts a machine code and human description from the two
+// error envelope shapes: a flat string (code, no description) or a nested object
+// carrying code/message/type. Returns empty code when the token response carries
+// no error.
+func parseTokenError(raw json.RawMessage) (code, desc string) {
+	if len(raw) == 0 {
+		return "", ""
+	}
+	var flat string
+	if err := json.Unmarshal(raw, &flat); err == nil {
+		return flat, ""
+	}
+	var obj struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		code = obj.Code
+		if code == "" {
+			code = obj.Type
+		}
+		return code, obj.Message
+	}
+	return "", ""
+}
+
+// isInvalidGrantCode reports whether an error code from a token endpoint denotes
+// a permanently rejected refresh token (revoked, expired, or invalidated) that
+// requires re-running the connect flow rather than a retry.
+func isInvalidGrantCode(code string) bool {
+	switch strings.ToLower(code) {
+	case "invalid_grant", "invalid_request", "token_invalidated", "token_expired":
+		return true
+	}
+	return false
 }
 
 // shouldRefresh reports whether the access token should be refreshed before use.
@@ -97,17 +140,35 @@ func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	defer resp.Body.Close()
 	body, _ := readLimited(resp.Body)
 
+	// A non-2xx with no parseable JSON body (e.g. an HTML error page) still means a
+	// rejected credential; classify by status rather than surfacing a decode error.
+	badStatus := resp.StatusCode == http.StatusBadRequest ||
+		resp.StatusCode == http.StatusUnauthorized ||
+		resp.StatusCode == http.StatusForbidden
+
 	var tr tokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
-		return fmt.Errorf("oauth: refresh: decode %d: %w", resp.StatusCode, err)
-	}
-	if tr.Error != "" {
-		if tr.Error == "invalid_grant" || tr.Error == "invalid_request" {
+		if badStatus {
 			return ErrInvalidGrant
 		}
-		return fmt.Errorf("oauth: refresh: %s: %s", tr.Error, tr.ErrorDescription)
+		return fmt.Errorf("oauth: refresh: decode %d: %w", resp.StatusCode, err)
+	}
+	code, desc := parseTokenError(tr.Error)
+	if code != "" {
+		if isInvalidGrantCode(code) {
+			return ErrInvalidGrant
+		}
+		if desc == "" {
+			desc = tr.ErrorDescription
+		}
+		return fmt.Errorf("oauth: refresh: %s: %s", code, desc)
 	}
 	if tr.AccessToken == "" {
+		// An empty token on a rejection status is a revoked/invalidated credential
+		// whose envelope wording we do not recognize; prefer reconnect over a raw error.
+		if badStatus {
+			return ErrInvalidGrant
+		}
 		return fmt.Errorf("oauth: refresh: empty access_token (HTTP %d)", resp.StatusCode)
 	}
 

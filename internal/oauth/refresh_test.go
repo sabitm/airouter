@@ -150,6 +150,24 @@ func TestRefreshInvalidGrant(t *testing.T) {
 	}
 }
 
+// TestRefreshInvalidGrantNestedEnvelope covers the ChatGPT/OpenAI backend, which
+// nests the error as an object rather than the OAuth2 flat string. The nested
+// shape must still classify as ErrInvalidGrant instead of failing the decode.
+func TestRefreshInvalidGrantNestedEnvelope(t *testing.T) {
+	srv, _ := tokenTestServer(t, func(url.Values) (int, string) {
+		return 401, `{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated","param":null},"status":401}`
+	})
+	c := newCreds(srv)
+	c.RefreshJSON = true
+	err := refresh(context.Background(), c, time.Now())
+	if !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("err = %v, want ErrInvalidGrant", err)
+	}
+	if c.AccessToken != "tok-old" {
+		t.Errorf("access changed on failure: %q", c.AccessToken)
+	}
+}
+
 // kiroJSONServer returns a server that decodes the JSON refresh body (Kiro uses
 // JSON, not form) and responds with the given status + body. It records the last
 // decoded body so branch-specific fields can be asserted.
