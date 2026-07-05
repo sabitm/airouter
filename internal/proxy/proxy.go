@@ -177,26 +177,30 @@ type Proxy struct {
 
 	// bo holds per-provider failover backoff state, keyed by provider id. A
 	// provider that fails over (before committing any bytes) is deferred behind
-	// healthy providers for an exponentially growing window, so a persistently
-	// failing target (e.g. out of balance) is not retried first on every request.
-	// Keyed by provider, not combo target, because a provider's health is shared
-	// across every combo it appears in. In-memory only: it resets on restart.
+	// healthy providers for an exponentially growing number of subsequent requests,
+	// so a persistently failing target (e.g. out of balance) is not retried first
+	// on every request. Keyed by provider, not combo target, because a provider's
+	// health is shared across every combo it appears in. In-memory only: it resets
+	// on restart.
 	boMu sync.Mutex
 	bo   map[int64]*backoffState
 }
 
-// backoffState tracks a provider's consecutive failover count and the time until
-// which it should be deferred behind healthy targets.
+// backoffState tracks a provider's consecutive pre-commit failures and the number
+// of subsequent requests for which it should still be deferred behind healthy
+// targets. skips is consumed one credit per request that resolves the combo.
 type backoffState struct {
 	failures int
-	until    time.Time
+	skips    int
 }
 
 const (
-	backoffBase = 1 * time.Second
-	backoffMax  = 5 * time.Minute
-	// backoffShiftCap bounds the exponent so base<<shift cannot overflow the
-	// duration; the result is clamped to backoffMax well before this anyway.
+	// A provider's first failure defers it for backoffBaseSkips requests, doubling
+	// per consecutive failure up to backoffMaxSkips.
+	backoffBaseSkips = 2
+	backoffMaxSkips  = 256
+	// backoffShiftCap bounds the exponent so base<<shift cannot overflow int; the
+	// result is clamped to backoffMaxSkips well before this anyway.
 	backoffShiftCap = 30
 )
 
@@ -230,19 +234,27 @@ func (p *Proxy) nextRoundRobin(comboID int64, n int) int {
 	return int(i % uint64(n))
 }
 
-// providerBackedOff reports whether a provider is currently inside its failover
-// penalty window and should be deferred behind healthy targets.
-func (p *Proxy) providerBackedOff(providerID int64, now time.Time) bool {
+// providerBackedOff reports whether a provider should be deferred behind healthy
+// targets for this request, consuming one skip credit when it is. Consuming here
+// means each call represents one request's worth of deferral, so a provider
+// penalized for N skips is deferred for exactly the next N requests that consult
+// it, after which it becomes eligible again (and is re-probed).
+func (p *Proxy) providerBackedOff(providerID int64) bool {
 	p.boMu.Lock()
 	defer p.boMu.Unlock()
 	st, ok := p.bo[providerID]
-	return ok && now.Before(st.until)
+	if !ok || st.skips <= 0 {
+		return false
+	}
+	st.skips--
+	return true
 }
 
-// penalizeProvider records a failover for a provider, extending its penalty
-// window exponentially with the consecutive failure count (base * 2^(n-1),
-// clamped to backoffMax). Called when an attempt fails before committing bytes.
-func (p *Proxy) penalizeProvider(providerID int64, now time.Time) {
+// penalizeProvider records a failover for a provider, setting the number of
+// subsequent requests it is deferred for exponentially with the consecutive
+// failure count (backoffBaseSkips * 2^(n-1), clamped to backoffMaxSkips). Called
+// when an attempt fails before committing bytes.
+func (p *Proxy) penalizeProvider(providerID int64) {
 	p.boMu.Lock()
 	defer p.boMu.Unlock()
 	st := p.bo[providerID]
@@ -255,11 +267,11 @@ func (p *Proxy) penalizeProvider(providerID int64, now time.Time) {
 	if shift > backoffShiftCap {
 		shift = backoffShiftCap
 	}
-	d := backoffBase << uint(shift)
-	if d > backoffMax || d <= 0 {
-		d = backoffMax
+	n := backoffBaseSkips << uint(shift)
+	if n > backoffMaxSkips || n <= 0 {
+		n = backoffMaxSkips
 	}
-	st.until = now.Add(d)
+	st.skips = n
 }
 
 // clearBackoff resets a provider's penalty state after a committed success, so a

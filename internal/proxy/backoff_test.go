@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"testing"
-	"time"
 
 	"airouter/internal/domain"
 )
@@ -11,53 +10,50 @@ func newBackoffProxy() *Proxy {
 	return &Proxy{rr: map[int64]uint64{}, bo: map[int64]*backoffState{}}
 }
 
-// TestBackoffScheduleGrowsAndCaps verifies the penalty window doubles per
-// consecutive failure and clamps at backoffMax.
+// TestBackoffScheduleGrowsAndCaps verifies the skip count doubles per consecutive
+// failure and clamps at backoffMaxSkips.
 func TestBackoffScheduleGrowsAndCaps(t *testing.T) {
 	p := newBackoffProxy()
-	now := time.Unix(1_000_000, 0)
 
-	want := []time.Duration{
-		backoffBase,      // 1st failure: base << 0
-		backoffBase * 2,  // 2nd: base << 1
-		backoffBase * 4,  // 3rd: base << 2
-		backoffBase * 8,  // 4th
-		backoffBase * 16, // 5th
+	want := []int{
+		backoffBaseSkips,      // 1st failure: base << 0
+		backoffBaseSkips * 2,  // 2nd: base << 1
+		backoffBaseSkips * 4,  // 3rd: base << 2
+		backoffBaseSkips * 8,  // 4th
+		backoffBaseSkips * 16, // 5th
 	}
 	for i, w := range want {
-		p.penalizeProvider(1, now)
-		got := p.bo[1].until.Sub(now)
+		p.penalizeProvider(1)
+		got := p.bo[1].skips
 		if got != w {
-			t.Errorf("failure %d: window = %v, want %v", i+1, got, w)
+			t.Errorf("failure %d: skips = %d, want %d", i+1, got, w)
 		}
 	}
 
-	// Many more failures must clamp at backoffMax, never overflow.
+	// Many more failures must clamp at backoffMaxSkips, never overflow.
 	for i := 0; i < 40; i++ {
-		p.penalizeProvider(1, now)
+		p.penalizeProvider(1)
 	}
-	if got := p.bo[1].until.Sub(now); got != backoffMax {
-		t.Errorf("clamped window = %v, want %v", got, backoffMax)
+	if got := p.bo[1].skips; got != backoffMaxSkips {
+		t.Errorf("clamped skips = %d, want %d", got, backoffMaxSkips)
 	}
 }
 
-// TestBackoffWindowExpiry verifies a provider is backed off only until its
-// window elapses.
-func TestBackoffWindowExpiry(t *testing.T) {
+// TestBackoffConsumesSkips verifies a provider is backed off for exactly as many
+// requests as its skip count, consuming one credit per providerBackedOff call.
+func TestBackoffConsumesSkips(t *testing.T) {
 	p := newBackoffProxy()
-	now := time.Unix(1_000_000, 0)
-	p.penalizeProvider(1, now) // window = backoffBase
+	p.penalizeProvider(1) // skips = backoffBaseSkips
 
-	if !p.providerBackedOff(1, now) {
-		t.Fatal("want backed off immediately after penalty")
+	for i := 0; i < backoffBaseSkips; i++ {
+		if !p.providerBackedOff(1) {
+			t.Fatalf("want backed off on consume %d of %d", i+1, backoffBaseSkips)
+		}
 	}
-	if !p.providerBackedOff(1, now.Add(backoffBase-time.Millisecond)) {
-		t.Error("want still backed off just before window end")
+	if p.providerBackedOff(1) {
+		t.Error("want eligible after all skip credits consumed")
 	}
-	if p.providerBackedOff(1, now.Add(backoffBase)) {
-		t.Error("want eligible once window elapses")
-	}
-	if p.providerBackedOff(2, now) {
+	if p.providerBackedOff(2) {
 		t.Error("unrelated provider must not be backed off")
 	}
 }
@@ -66,17 +62,16 @@ func TestBackoffWindowExpiry(t *testing.T) {
 // so the next failure starts the schedule over at base.
 func TestClearBackoffResets(t *testing.T) {
 	p := newBackoffProxy()
-	now := time.Unix(1_000_000, 0)
-	p.penalizeProvider(1, now)
-	p.penalizeProvider(1, now) // window = base*2
+	p.penalizeProvider(1)
+	p.penalizeProvider(1) // skips = base*2
 	p.clearBackoff(1)
 
-	if p.providerBackedOff(1, now) {
+	if p.providerBackedOff(1) {
 		t.Fatal("want eligible after clear")
 	}
-	p.penalizeProvider(1, now)
-	if got := p.bo[1].until.Sub(now); got != backoffBase {
-		t.Errorf("post-clear window = %v, want base %v (schedule reset)", got, backoffBase)
+	p.penalizeProvider(1)
+	if got := p.bo[1].skips; got != backoffBaseSkips {
+		t.Errorf("post-clear skips = %d, want base %d (schedule reset)", got, backoffBaseSkips)
 	}
 }
 
@@ -94,7 +89,7 @@ func TestOrderTargetsDefersBackedOff(t *testing.T) {
 		},
 	}
 	// Penalize the first target; it must sink to the back.
-	p.penalizeProvider(10, time.Now())
+	p.penalizeProvider(10)
 
 	got := p.orderTargets(combo)
 	order := [3]int64{got[0].ProviderID, got[1].ProviderID, got[2].ProviderID}
@@ -117,9 +112,8 @@ func TestOrderTargetsAllBackedOffKeepsOrder(t *testing.T) {
 			{ProviderID: 20, Position: 1, Enabled: true},
 		},
 	}
-	now := time.Now()
-	p.penalizeProvider(10, now)
-	p.penalizeProvider(20, now)
+	p.penalizeProvider(10)
+	p.penalizeProvider(20)
 
 	got := p.orderTargets(combo)
 	if len(got) != 2 || got[0].ProviderID != 10 || got[1].ProviderID != 20 {

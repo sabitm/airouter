@@ -161,7 +161,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// The attempt failed over before committing bytes: penalize the provider so
 		// subsequent requests defer it behind healthy targets. Applies to the last
 		// target too, so a whole-combo outage still grows the window.
-		p.penalizeProvider(provider.ID, time.Now())
+		p.penalizeProvider(provider.ID)
 		if i < len(candidates)-1 {
 			p.debugf("combo %s: target %d (%s) failed: %d %s; advancing",
 				combo.Name, i, provider.Name, last.status, last.errMsg)
@@ -199,11 +199,12 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 // should try them. Failover keeps position order; round-robin rotates the start
 // by a per-combo counter, then continues through the remainder so it still fails
 // over past a dead target. In both cases, disabled targets and archived providers
-// are dropped entirely (unlike backoff, which only defers). Providers currently
-// inside their failover backoff window are deferred behind healthy ones (stably,
-// preserving relative order) so a persistently failing target is not retried
-// first every request. Penalized targets are only deferred, never dropped, so an
-// all-backed-off combo still resolves and retries its least-bad option.
+// are dropped entirely (unlike backoff, which only defers). Providers penalized
+// for recent pre-commit failures are deferred behind healthy ones for a number of
+// subsequent requests (stably, preserving relative order) so a persistently
+// failing target is not retried first every request. Penalized targets are only
+// deferred, never dropped, so an all-backed-off combo still resolves and retries
+// its least-bad option.
 func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
 	// Disabled targets and archived providers are explicit user choices: drop
 	// them from resolution entirely (unlike backoff, which only defers). The
@@ -225,11 +226,18 @@ func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
 			base = append(base, enabled[(start+i)%len(enabled)])
 		}
 	}
-	now := time.Now()
+	// Consume at most one skip credit per unique provider per request: a provider
+	// appearing in multiple targets of one combo must not be charged twice.
+	seen := make(map[int64]bool, len(base))
 	healthy := make([]domain.ComboTarget, 0, len(base))
 	backedOff := make([]domain.ComboTarget, 0, len(base))
 	for _, t := range base {
-		if p.providerBackedOff(t.ProviderID, now) {
+		off, ok := seen[t.ProviderID]
+		if !ok {
+			off = p.providerBackedOff(t.ProviderID)
+			seen[t.ProviderID] = off
+		}
+		if off {
 			backedOff = append(backedOff, t)
 		} else {
 			healthy = append(healthy, t)
