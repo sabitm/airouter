@@ -61,7 +61,7 @@ func setupCombo(t *testing.T, strategy domain.ComboStrategy, targets []*scripted
 		if err := st.CreateProvider(ctx, prov); err != nil {
 			t.Fatal(err)
 		}
-		combo.Targets = append(combo.Targets, domain.ComboTarget{ProviderID: prov.ID, UpstreamModel: "real-model"})
+		combo.Targets = append(combo.Targets, domain.ComboTarget{ProviderID: prov.ID, UpstreamModel: "real-model", Enabled: true})
 	}
 	if err := st.CreateCombo(ctx, combo); err != nil {
 		t.Fatal(err)
@@ -98,6 +98,48 @@ func TestFailoverAdvancesOnFailure(t *testing.T) {
 	}
 	if got := extractText(t, "/v1/chat/completions", out); got != "hello from openai" {
 		t.Errorf("text = %q", got)
+	}
+}
+
+// TestDisabledTargetSkipped: a combo whose first (healthy) target is disabled
+// must route straight to the second target; the disabled one is never contacted.
+func TestDisabledTargetSkipped(t *testing.T) {
+	a := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	b := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	st := newTestStore(t)
+	ctx := context.Background()
+	pa := &domain.Provider{Name: "pa", BaseURL: a.server.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	pb := &domain.Provider{Name: "pb", BaseURL: b.server.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, pa); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, pb); err != nil {
+		t.Fatal(err)
+	}
+	combo := &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: pa.ID, UpstreamModel: "real-model", Enabled: false},
+		{ProviderID: pb.ID, UpstreamModel: "real-model", Enabled: true},
+	}}
+	if err := st.CreateCombo(ctx, combo); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, false, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	resp, out := post(t, ts.URL+"/v1/chat/completions", key.Token, oaiReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	if a.hits.Load() != 0 {
+		t.Errorf("disabled target hits = %d, want 0", a.hits.Load())
+	}
+	if b.hits.Load() != 1 {
+		t.Errorf("enabled target hits = %d, want 1", b.hits.Load())
 	}
 }
 

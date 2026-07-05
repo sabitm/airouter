@@ -177,6 +177,8 @@ td.err { color: var(--danger); max-width: 320px; overflow: hidden; text-overflow
 .muted { color: var(--muted); font-size: 13px; }
 .target-list { list-style: none; margin: 0; padding: 0; }
 .target-list li { padding: 2px 0; }
+.target-list li.disabled { opacity: 0.55; }
+.target-list li.disabled .mono { text-decoration: line-through; }
 
 .provider-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin: 12px 0; }
 .provider-card { text-align: left; cursor: pointer; border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: transparent; color: inherit; display: flex; flex-direction: column; gap: 4px; }

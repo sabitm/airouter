@@ -33,6 +33,7 @@ type portableProvider struct {
 type portableTarget struct {
 	Provider      string `json:"provider"` // provider name, not id, for portability
 	UpstreamModel string `json:"upstream_model"`
+	Disabled      bool   `json:"disabled,omitempty"`
 }
 
 type portableCombo struct {
@@ -87,7 +88,7 @@ func (s *Store) Export(ctx context.Context, w io.Writer) error {
 		pc := portableCombo{Name: c.Name, Strategy: string(c.Strategy)}
 		for _, t := range c.Targets {
 			pc.Targets = append(pc.Targets, portableTarget{
-				Provider: t.Provider.Name, UpstreamModel: t.UpstreamModel,
+				Provider: t.Provider.Name, UpstreamModel: t.UpstreamModel, Disabled: !t.Enabled,
 			})
 		}
 		cfg.Combos = append(cfg.Combos, pc)
@@ -178,7 +179,7 @@ func (s *Store) Import(ctx context.Context, r io.Reader) error {
 				return fmt.Errorf("combo %q references unknown provider %q", pc.Name, pt.Provider)
 			}
 			targets = append(targets, domain.ComboTarget{
-				ProviderID: prov.ID, UpstreamModel: pt.UpstreamModel,
+				ProviderID: prov.ID, UpstreamModel: pt.UpstreamModel, Enabled: !pt.Disabled,
 			})
 		}
 		if len(targets) == 0 {

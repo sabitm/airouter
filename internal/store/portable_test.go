@@ -23,8 +23,8 @@ func TestExportImportRoundTrip(t *testing.T) {
 		Name:     "multi",
 		Strategy: domain.StrategyRoundRobin,
 		Targets: []domain.ComboTarget{
-			{ProviderID: p1.ID, UpstreamModel: "m1"},
-			{ProviderID: p2.ID, UpstreamModel: "m2"},
+			{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+			{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
 		},
 	}); err != nil {
 		t.Fatal(err)

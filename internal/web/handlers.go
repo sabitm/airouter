@@ -88,6 +88,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /dashboard/combos/{id}/row", h.comboRow)
 	mux.HandleFunc("POST /dashboard/combos/{id}", h.updateCombo)
 	mux.HandleFunc("POST /dashboard/combos/{id}/delete", h.deleteCombo)
+	mux.HandleFunc("POST /dashboard/combos/{id}/targets/{tid}/toggle", h.toggleComboTarget)
 
 	// Access keys
 	mux.HandleFunc("GET /dashboard/keys", h.keysPage)
@@ -482,6 +483,7 @@ func (h *Handler) createCombo(w http.ResponseWriter, r *http.Request) {
 func parseComboForm(r *http.Request) (*domain.Combo, error) {
 	providerIDs := r.Form["provider_id"]
 	models := r.Form["upstream_model"]
+	enabledVals := r.Form["enabled"]
 	var targets []domain.ComboTarget
 	for i, raw := range providerIDs {
 		var model string
@@ -496,7 +498,11 @@ func parseComboForm(r *http.Request) (*domain.Combo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid provider in target %d", i+1)
 		}
-		targets = append(targets, domain.ComboTarget{ProviderID: pid, UpstreamModel: model})
+		en := true
+		if i < len(enabledVals) {
+			en = strings.TrimSpace(enabledVals[i]) != "0"
+		}
+		targets = append(targets, domain.ComboTarget{ProviderID: pid, UpstreamModel: model, Enabled: en})
 	}
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("a combo needs at least one provider + model target")
@@ -589,6 +595,45 @@ func (h *Handler) deleteCombo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.renderComboList(w, r)
+}
+
+func (h *Handler) toggleComboTarget(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		badRequest(w, "bad id")
+		return
+	}
+	tid, err := strconv.ParseInt(r.PathValue("tid"), 10, 64)
+	if err != nil {
+		badRequest(w, "bad target id")
+		return
+	}
+	combo, err := h.store.GetCombo(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	var cur *domain.ComboTarget
+	for i := range combo.Targets {
+		if combo.Targets[i].ID == tid {
+			cur = &combo.Targets[i]
+			break
+		}
+	}
+	if cur == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := h.store.SetTargetEnabled(r.Context(), tid, !cur.Enabled); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	combo, err = h.store.GetCombo(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	render(w, r, ComboRow(combo))
 }
 
 func (h *Handler) renderComboList(w http.ResponseWriter, r *http.Request) {

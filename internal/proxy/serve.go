@@ -204,16 +204,24 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 // request. Penalized targets are only deferred, never dropped, so an all-backed-off
 // combo still resolves and retries its least-bad option.
 func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
-	targets := combo.Targets
-	if len(targets) <= 1 {
-		return targets
+	// Disabled targets are an explicit user choice: drop them entirely (unlike
+	// backoff, which only defers). An all-disabled combo yields no candidates and
+	// the caller surfaces a clean "no targets" error.
+	enabled := make([]domain.ComboTarget, 0, len(combo.Targets))
+	for _, t := range combo.Targets {
+		if t.Enabled {
+			enabled = append(enabled, t)
+		}
 	}
-	base := targets
+	if len(enabled) <= 1 {
+		return enabled
+	}
+	base := enabled
 	if combo.Strategy == domain.StrategyRoundRobin {
-		start := p.nextRoundRobin(combo.ID, len(targets))
-		base = make([]domain.ComboTarget, 0, len(targets))
-		for i := range targets {
-			base = append(base, targets[(start+i)%len(targets)])
+		start := p.nextRoundRobin(combo.ID, len(enabled))
+		base = make([]domain.ComboTarget, 0, len(enabled))
+		for i := range enabled {
+			base = append(base, enabled[(start+i)%len(enabled)])
 		}
 	}
 	now := time.Now()

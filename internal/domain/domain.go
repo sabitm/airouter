@@ -206,6 +206,10 @@ type ComboTarget struct {
 	ProviderID    int64
 	UpstreamModel string
 	Position      int
+	// Enabled targets participate in resolution; disabled ones are skipped by the
+	// router but preserved. Zero value is false, so all store/parse paths must set
+	// this explicitly (existing rows default to enabled via the store column).
+	Enabled bool
 
 	// Provider is hydrated for display/resolution. Not a stored column here.
 	Provider *Provider

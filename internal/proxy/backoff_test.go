@@ -88,9 +88,9 @@ func TestOrderTargetsDefersBackedOff(t *testing.T) {
 		ID:       1,
 		Strategy: domain.StrategyFailover,
 		Targets: []domain.ComboTarget{
-			{ProviderID: 10, Position: 0},
-			{ProviderID: 20, Position: 1},
-			{ProviderID: 30, Position: 2},
+			{ProviderID: 10, Position: 0, Enabled: true},
+			{ProviderID: 20, Position: 1, Enabled: true},
+			{ProviderID: 30, Position: 2, Enabled: true},
 		},
 	}
 	// Penalize the first target; it must sink to the back.
@@ -113,8 +113,8 @@ func TestOrderTargetsAllBackedOffKeepsOrder(t *testing.T) {
 		ID:       1,
 		Strategy: domain.StrategyFailover,
 		Targets: []domain.ComboTarget{
-			{ProviderID: 10, Position: 0},
-			{ProviderID: 20, Position: 1},
+			{ProviderID: 10, Position: 0, Enabled: true},
+			{ProviderID: 20, Position: 1, Enabled: true},
 		},
 	}
 	now := time.Now()

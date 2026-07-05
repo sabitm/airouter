@@ -89,7 +89,7 @@ func setupKiro(t *testing.T, upstreamBody []byte, captured *kiroCapture) (string
 	if err := st.CreateProvider(ctx, prov); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "claude-sonnet-4.5"}}}); err != nil {
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "claude-sonnet-4.5", Enabled: true}}}); err != nil {
 		t.Fatal(err)
 	}
 	key, err := st.NewAccessKey(ctx, "test")

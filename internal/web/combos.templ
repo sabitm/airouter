@@ -30,7 +30,7 @@ templ comboForm(providers []*domain.Provider) {
 			@strategySelect("")
 		</div>
 		<div class="targets">
-			@comboTargetRow("add-0", providers, 0, "")
+			@comboTargetRow("add-0", providers, 0, "", true)
 		</div>
 		@targetTemplate(providers)
 		<div class="row-form">
@@ -55,8 +55,10 @@ templ strategySelect(selected domain.ComboStrategy) {
 // comboTargetRow renders one provider + upstream-model pair. uid must be unique
 // on the page so the datalist id and the htmx model-fetch target do not collide
 // across rows or across open forms.
-templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderID int64, model string) {
+templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderID int64, model string, enabled bool) {
 	{{ listID := "model-options-" + uid }}
+	{{ enabledVal := "0" }}
+	{{ if enabled { enabledVal = "1" } }}
 	<div class="target-row row-form">
 		<select name="provider_id" hx-get={ "/dashboard/providers/models?list=" + listID } hx-trigger="change, load" hx-target={ "#model-options-wrap-" + uid } hx-swap="innerHTML">
 			for _, p := range providers {
@@ -67,6 +69,7 @@ templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderI
 				}
 			}
 		</select>
+		<input type="hidden" name="enabled" value={ enabledVal }/>
 		<input name="upstream_model" list={ listID } value={ model } placeholder="upstream model id (e.g. gpt-4o)" required/>
 		<span id={ "model-options-wrap-" + uid }>@ModelDatalist(nil, listID)</span>
 		<button type="button" class="link danger" onclick="removeComboTarget(this)" title="remove target">x</button>
@@ -79,7 +82,7 @@ templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderI
 // so htmx does not wire it until it is cloned into the form.
 templ targetTemplate(providers []*domain.Provider) {
 	<template class="target-template">
-		@comboTargetRow("__IDX__", providers, 0, "")
+		@comboTargetRow("__IDX__", providers, 0, "", true)
 	</template>
 }
 
@@ -127,11 +130,22 @@ templ ComboRow(c *domain.Combo) {
 		<td>
 			<ul class="target-list">
 				for _, t := range c.Targets {
-					<li>
-						{ t.Provider.Name }
-						<span class="tag">{ string(t.Provider.Protocol) }</span>
-						<span class="mono">{ t.UpstreamModel }</span>
-					</li>
+					if t.Enabled {
+						<li>
+							{ t.Provider.Name }
+							<span class="tag">{ string(t.Provider.Protocol) }</span>
+							<span class="mono">{ t.UpstreamModel }</span>
+							<button class="link" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/targets/" + strconv.FormatInt(t.ID, 10) + "/toggle" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML" title="temporarily disable this target">Disable</button>
+						</li>
+					} else {
+						<li class="disabled">
+							{ t.Provider.Name }
+							<span class="tag">{ string(t.Provider.Protocol) }</span>
+							<span class="mono">{ t.UpstreamModel }</span>
+							<span class="muted">disabled</span>
+							<button class="link" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/targets/" + strconv.FormatInt(t.ID, 10) + "/toggle" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML" title="re-enable this target">Enable</button>
+						</li>
+					}
 				}
 			</ul>
 		</td>
@@ -160,7 +174,7 @@ templ ComboEditRow(c *domain.Combo, providers []*domain.Provider) {
 				</div>
 				<div class="targets">
 					for i, t := range c.Targets {
-						@comboTargetRow("edit-"+id+"-"+strconv.Itoa(i), providers, t.ProviderID, t.UpstreamModel)
+						@comboTargetRow("edit-"+id+"-"+strconv.Itoa(i), providers, t.ProviderID, t.UpstreamModel, t.Enabled)
 					}
 				</div>
 				@targetTemplate(providers)

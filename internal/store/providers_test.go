@@ -114,7 +114,7 @@ func TestOAuthProviderHydratedInCombo(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Targets: []domain.ComboTarget{
-		{ProviderID: p.ID, UpstreamModel: "grok-4"},
+		{ProviderID: p.ID, UpstreamModel: "grok-4", Enabled: true},
 	}}); err != nil {
 		t.Fatal(err)
 	}

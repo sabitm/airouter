@@ -94,7 +94,7 @@ func setupOAuthCombo(t *testing.T, up *oauthUpstream, te *tokenEndpoint, accessT
 		t.Fatal(err)
 	}
 	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Targets: []domain.ComboTarget{
-		{ProviderID: prov.ID, UpstreamModel: "grok-4"},
+		{ProviderID: prov.ID, UpstreamModel: "grok-4", Enabled: true},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestOAuthStreamingReactiveRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Targets: []domain.ComboTarget{
-		{ProviderID: prov.ID, UpstreamModel: "grok-4"},
+		{ProviderID: prov.ID, UpstreamModel: "grok-4", Enabled: true},
 	}}); err != nil {
 		t.Fatal(err)
 	}

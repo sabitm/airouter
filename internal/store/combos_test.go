@@ -73,8 +73,8 @@ func TestComboTargetsRoundTrip(t *testing.T) {
 		Name:     "default",
 		Strategy: domain.StrategyRoundRobin,
 		Targets: []domain.ComboTarget{
-			{ProviderID: p1.ID, UpstreamModel: "m1"},
-			{ProviderID: p2.ID, UpstreamModel: "m2"},
+			{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+			{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
 		},
 	}
 	if err := st.CreateCombo(ctx, c); err != nil {
@@ -100,9 +100,23 @@ func TestComboTargetsRoundTrip(t *testing.T) {
 	if got.Targets[1].UpstreamModel != "m2" || got.Targets[1].Provider.Protocol != domain.ProtocolAnthropic {
 		t.Errorf("target 1 = %+v", got.Targets[1])
 	}
+	if !got.Targets[0].Enabled || !got.Targets[1].Enabled {
+		t.Errorf("targets should default to enabled: %+v %+v", got.Targets[0].Enabled, got.Targets[1].Enabled)
+	}
+
+	if err := st.SetTargetEnabled(ctx, got.Targets[0].ID, false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = st.GetComboByName(ctx, "default")
+	if got.Targets[0].Enabled {
+		t.Errorf("target 0 still enabled after SetTargetEnabled(false)")
+	}
+	if !got.Targets[1].Enabled {
+		t.Errorf("target 1 should remain enabled")
+	}
 
 	// Update replaces targets wholesale and preserves order.
-	c.Targets = []domain.ComboTarget{{ProviderID: p2.ID, UpstreamModel: "only"}}
+	c.Targets = []domain.ComboTarget{{ProviderID: p2.ID, UpstreamModel: "only", Enabled: true}}
 	c.Strategy = domain.StrategyFailover
 	if err := st.UpdateCombo(ctx, c); err != nil {
 		t.Fatal(err)
@@ -160,6 +174,9 @@ func TestLegacyComboMigration(t *testing.T) {
 	}
 	if got.Targets[0].Provider.APIKey != "k1" {
 		t.Errorf("migrated key = %q, want k1", got.Targets[0].Provider.APIKey)
+	}
+	if !got.Targets[0].Enabled {
+		t.Errorf("migrated target should default to enabled")
 	}
 
 	// Reopening again must be a no-op (idempotent migration).

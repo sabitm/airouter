@@ -45,7 +45,7 @@ func (s *Store) hydrateTargets(ctx context.Context, byID map[int64]*domain.Combo
 		return nil
 	}
 	const q = `
-SELECT t.combo_id, t.id, t.provider_id, t.upstream_model, t.position,
+SELECT t.combo_id, t.id, t.provider_id, t.upstream_model, t.position, t.enabled,
        p.id, p.name, p.base_url, p.api_key, p.protocol, p.auth_scheme, p.auth_method, p.oauth_creds, p.created_at, p.updated_at
 FROM combo_targets t JOIN providers p ON p.id = t.provider_id
 ORDER BY t.combo_id, t.position, t.id`
@@ -60,7 +60,7 @@ ORDER BY t.combo_id, t.position, t.id`
 		var p domain.Provider
 		var enc, oauthEnc string
 		if err := rows.Scan(
-			&comboID, &t.ID, &t.ProviderID, &t.UpstreamModel, &t.Position,
+			&comboID, &t.ID, &t.ProviderID, &t.UpstreamModel, &t.Position, &t.Enabled,
 			&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme, &p.AuthMethod, &oauthEnc, &p.CreatedAt, &p.UpdatedAt,
 		); err != nil {
 			return err
@@ -174,13 +174,29 @@ func (s *Store) UpdateCombo(ctx context.Context, c *domain.Combo) error {
 	return tx.Commit()
 }
 
+// SetTargetEnabled flips a single target's enabled flag without rewriting the
+// combo's target set, so the inline list toggle is a cheap one-row update.
+func (s *Store) SetTargetEnabled(ctx context.Context, targetID int64, enabled bool) error {
+	v := 0
+	if enabled {
+		v = 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		"UPDATE combo_targets SET enabled=? WHERE id=?", v, targetID)
+	return err
+}
+
 // insertTargets writes targets with position set to slice order, so the stored
 // position always reflects the caller's intended ordering.
 func insertTargets(ctx context.Context, tx *sql.Tx, comboID int64, targets []domain.ComboTarget) error {
 	for i, t := range targets {
+		enabled := 0
+		if t.Enabled {
+			enabled = 1
+		}
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO combo_targets (combo_id, provider_id, upstream_model, position) VALUES (?, ?, ?, ?)",
-			comboID, t.ProviderID, t.UpstreamModel, i); err != nil {
+			"INSERT INTO combo_targets (combo_id, provider_id, upstream_model, position, enabled) VALUES (?, ?, ?, ?, ?)",
+			comboID, t.ProviderID, t.UpstreamModel, i, enabled); err != nil {
 			return err
 		}
 	}

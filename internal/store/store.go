@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS combo_targets (
 	combo_id       INTEGER NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
 	provider_id    INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
 	upstream_model TEXT NOT NULL,
-	position       INTEGER NOT NULL DEFAULT 0
+	position       INTEGER NOT NULL DEFAULT 0,
+	enabled        INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_combo_targets_combo ON combo_targets(combo_id, position);
@@ -105,6 +106,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateProviderAuthMethod(); err != nil {
 		return err
 	}
+	if err := s.migrateComboTargetEnabled(); err != nil {
+		return err
+	}
 	return s.migrateCombosToTargets()
 }
 
@@ -132,6 +136,18 @@ func (s *Store) migrateProviderAuthMethod() error {
 		return err
 	}
 	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN oauth_creds TEXT NOT NULL DEFAULT ''")
+	return err
+}
+
+// migrateComboTargetEnabled adds the enabled column to a combo_targets table
+// created before targets could be individually disabled. Idempotent; existing
+// rows default to 1 (enabled).
+func (s *Store) migrateComboTargetEnabled() error {
+	has, err := s.columnExists("combo_targets", "enabled")
+	if err != nil || has {
+		return err
+	}
+	_, err = s.db.Exec("ALTER TABLE combo_targets ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
 	return err
 }
 
