@@ -44,6 +44,36 @@ function airouterCloseProviderForm() {
   });
 }
 
+// Provider Edit/Save/Archive/Restore/Delete all swap either the whole list
+// (#provider-list) or a single row (#provider-<id>) with outerHTML, changing the
+// document height. When it grows (Edit expands a row into a tall form) or shrinks
+// (Save/Archive/Delete), the browser reclamps scroll and can jump the viewport to
+// the bottom. Preserve the scroll position across these swaps instead of chasing
+// any particular row - scrollIntoView would follow an archived row down into the
+// bottom "Archived" section, which is exactly the jump we want to avoid.
+let airouterProviderScrollY = null;
+
+function airouterIsProviderSwap(t) {
+  return !!t && (t.id === "provider-list" || /^provider-\d+$/.test(t.id));
+}
+
+document.body.addEventListener("htmx:beforeSwap", function (event) {
+  if (airouterIsProviderSwap(event.detail.target)) {
+    airouterProviderScrollY = window.scrollY;
+  }
+});
+
+// Restore on afterSwap, not afterSettle: afterSwap runs synchronously in the same
+// task as the DOM replacement, before the browser paints, so the clamped/jumped
+// position never reaches the screen. afterSettle fires on a later timer, letting
+// one intermediate frame paint first - the visible flicker.
+document.body.addEventListener("htmx:afterSwap", function (event) {
+  if (airouterProviderScrollY !== null && airouterIsProviderSwap(event.detail.target)) {
+    window.scrollTo({ top: airouterProviderScrollY });
+    airouterProviderScrollY = null;
+  }
+});
+
 // airouterResetProviderForm restores the create form to a pristine state after a
 // successful add. form.reset() only reverts native input values; the oauth
 // connect region, the Check result, and any Refresh status were mutated by HTMX
