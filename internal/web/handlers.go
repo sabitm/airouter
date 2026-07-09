@@ -100,6 +100,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	// Logs
 	mux.HandleFunc("GET /dashboard/logs", h.logsPage)
+	mux.HandleFunc("GET /dashboard/logs/rows", h.logsRows)
 	mux.HandleFunc("POST /dashboard/logs/clear", h.clearLogs)
 
 	// Settings
@@ -783,10 +784,44 @@ func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request) {
 
 // --- Logs ---
 
-const logsPageLimit = 200
+const logsPageSize = 50
+
+func parseLogQuery(r *http.Request) store.RequestLogQuery {
+	q := store.RequestLogQuery{
+		Combo:       strings.TrimSpace(r.URL.Query().Get("combo")),
+		Provider:    strings.TrimSpace(r.URL.Query().Get("provider")),
+		StatusClass: strings.TrimSpace(r.URL.Query().Get("status")),
+		Limit:       logsPageSize,
+	}
+	switch q.StatusClass {
+	case "", "ok", "client", "server", "error":
+	default:
+		q.StatusClass = ""
+	}
+	if raw := r.URL.Query().Get("before_id"); raw != "" {
+		if id, err := strconv.ParseInt(raw, 10, 64); err == nil && id > 0 {
+			q.BeforeID = id
+		}
+	}
+	return q
+}
+
+func (h *Handler) logFilterOpts(ctx context.Context) (LogFilterOpts, error) {
+	combos, err := h.store.DistinctRequestLogValues(ctx, "combo")
+	if err != nil {
+		return LogFilterOpts{}, err
+	}
+	providers, err := h.store.DistinctRequestLogValues(ctx, "provider")
+	if err != nil {
+		return LogFilterOpts{}, err
+	}
+	return LogFilterOpts{Combos: combos, Providers: providers}, nil
+}
 
 func (h *Handler) logsPage(w http.ResponseWriter, r *http.Request) {
-	logs, err := h.store.ListRequestLogs(r.Context(), logsPageLimit)
+	q := parseLogQuery(r)
+	q.BeforeID = 0 // full page always starts from the newest matching row
+	logs, err := h.store.ListRequestLogsQuery(r.Context(), q)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -796,7 +831,34 @@ func (h *Handler) logsPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	render(w, r, LogsPage(logs, LogStats{TotalReqs: reqs, TotalIn: in, TotalOut: out}))
+	opts, err := h.logFilterOpts(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	stats := LogStats{TotalReqs: reqs, TotalIn: in, TotalOut: out}
+	// HTMX filter form targets #logs-body; non-HTMX gets the full page shell.
+	if r.Header.Get("HX-Request") != "" {
+		render(w, r, LogsBody(logs, stats, q, opts))
+		return
+	}
+	render(w, r, LogsPage(logs, stats, q, opts))
+}
+
+// logsRows returns additional table rows (and an OOB load-more control) for
+// keyset pagination under the current filters.
+func (h *Handler) logsRows(w http.ResponseWriter, r *http.Request) {
+	q := parseLogQuery(r)
+	if q.BeforeID <= 0 {
+		http.Error(w, "before_id required", http.StatusBadRequest)
+		return
+	}
+	logs, err := h.store.ListRequestLogsQuery(r.Context(), q)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	render(w, r, LogsMoreFragment(logs, q))
 }
 
 func (h *Handler) clearLogs(w http.ResponseWriter, r *http.Request) {
@@ -804,7 +866,7 @@ func (h *Handler) clearLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	render(w, r, LogsBody(nil, LogStats{}))
+	render(w, r, LogsBody(nil, LogStats{}, store.RequestLogQuery{Limit: logsPageSize}, LogFilterOpts{}))
 }
 
 // --- Settings / import-export ---

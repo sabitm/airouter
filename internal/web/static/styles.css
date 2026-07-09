@@ -302,3 +302,45 @@ tr.archived { opacity: 0.6; }
 		transition: none;
 	}
 }
+
+
+.logs-filters { margin-bottom: 16px; }
+.logs-filters .button.link {
+	background: none;
+	color: var(--accent);
+	padding: 8px 10px;
+	box-shadow: none;
+}
+#logs-load-more { margin-top: 12px; }
+
+.log-err { margin: 0; }
+.log-err summary {
+	cursor: pointer;
+	list-style: none;
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 12px;
+	color: var(--danger);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	max-width: 240px;
+}
+.log-err summary::-webkit-details-marker { display: none; }
+.log-err[open] summary {
+	white-space: normal;
+	overflow: visible;
+	margin-bottom: 6px;
+}
+.log-err-full {
+	margin: 0;
+	padding: 8px;
+	background: var(--input-bg);
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 12px;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	max-width: 480px;
+	color: var(--text);
+}

@@ -1,9 +1,11 @@
 package web
 
 import (
+	"net/url"
 	"strconv"
 
 	"airouter/internal/domain"
+	"airouter/internal/store"
 )
 
 type LogStats struct {
@@ -12,24 +14,29 @@ type LogStats struct {
 	TotalOut  int64
 }
 
-templ LogsPage(logs []*domain.RequestLog, stats LogStats) {
+// LogFilterOpts holds distinct values for filter datalists.
+type LogFilterOpts struct {
+	Combos    []string
+	Providers []string
+}
+
+templ LogsPage(logs []*domain.RequestLog, stats LogStats, q store.RequestLogQuery, opts LogFilterOpts) {
 	@Layout("Logs", "/dashboard/logs") {
-		@LogsBody(logs, stats)
+		@LogsBody(logs, stats, q, opts)
 	}
 }
 
-// LogsBody is the swappable region: stats cards plus the log table. The clear
-// action re-renders this fragment so the page need not fully reload.
-templ LogsBody(logs []*domain.RequestLog, stats LogStats) {
+// LogsBody is the swappable region: stats, filters, and the log table.
+templ LogsBody(logs []*domain.RequestLog, stats LogStats, q store.RequestLogQuery, opts LogFilterOpts) {
 	<div id="logs-body">
 		<section class="panel">
 			<div class="panel-head">
 				<h1>Request Logs</h1>
-				if len(logs) > 0 {
+				if stats.TotalReqs > 0 {
 					<button class="link danger" hx-post="/dashboard/logs/clear" hx-target="#logs-body" hx-swap="outerHTML" hx-confirm="Delete all request logs?">Clear logs</button>
 				}
 			</div>
-			<p class="hint">One row per proxied request. Token counts are unavailable for streaming passthrough. Showing latest 200 requests.</p>
+			<p class="hint">One row per proxied attempt. Token counts are unavailable for streaming passthrough. Stats are all-time; filters apply to the table only.</p>
 			<div class="stats">
 				<div class="stat">
 					<span class="stat-value">{ strconv.FormatInt(stats.TotalReqs, 10) }</span>
@@ -46,51 +53,155 @@ templ LogsBody(logs []*domain.RequestLog, stats LogStats) {
 			</div>
 		</section>
 		<section class="panel">
-			if len(logs) == 0 {
-				<p class="empty">No requests recorded yet.</p>
-			} else {
-				<table>
-					<thead>
-						<tr>
-							<th>Time</th>
-							<th>Key</th>
-							<th>Combo</th>
-							<th>Provider / model</th>
-							<th>Format</th>
-							<th>Status</th>
-							<th>In</th>
-							<th>Out</th>
-							<th>Latency</th>
-							<th>Error</th>
-						</tr>
-					</thead>
-					<tbody>
-						for _, l := range logs {
-							<tr>
-								<td>{ l.CreatedAt.Format("2006-01-02 15:04:05") }</td>
-								<td>{ l.AccessKeyName }</td>
-								<td>
-									{ l.Combo }
-									if l.Stream {
-										<span class="tag">stream</span>
-									}
-								</td>
-								<td>{ l.Provider } / { l.UpstreamModel }</td>
-								<td class="mono">{ l.Format }</td>
-								<td>@statusBadge(l.Status)</td>
-								<td>{ strconv.Itoa(l.InputTokens) }</td>
-								<td>{ strconv.Itoa(l.OutputTokens) }</td>
-								<td>{ strconv.FormatInt(l.LatencyMS, 10) }ms</td>
-								<td class="err">{ l.ErrMsg }</td>
-							</tr>
-						}
-					</tbody>
-				</table>
-			}
+			@LogsFilterForm(q, opts)
+			@LogsTable(logs, q)
 		</section>
 	</div>
 }
 
+templ LogsFilterForm(q store.RequestLogQuery, opts LogFilterOpts) {
+	<form
+		class="row-form logs-filters"
+		method="get"
+		action="/dashboard/logs"
+		hx-get="/dashboard/logs"
+		hx-target="#logs-body"
+		hx-swap="outerHTML"
+		hx-push-url="true"
+	>
+		<select name="status" title="status filter">
+			<option value="" selected?={ q.StatusClass == "" }>All statuses</option>
+			<option value="error" selected?={ q.StatusClass == "error" }>Errors (4xx/5xx)</option>
+			<option value="ok" selected?={ q.StatusClass == "ok" }>2xx</option>
+			<option value="client" selected?={ q.StatusClass == "client" }>4xx</option>
+			<option value="server" selected?={ q.StatusClass == "server" }>5xx</option>
+		</select>
+		<input name="combo" list="log-combo-options" value={ q.Combo } placeholder="combo" title="exact combo name"/>
+		<datalist id="log-combo-options">
+			for _, c := range opts.Combos {
+				<option value={ c }></option>
+			}
+		</datalist>
+		<input name="provider" list="log-provider-options" value={ q.Provider } placeholder="provider" title="exact provider name"/>
+		<datalist id="log-provider-options">
+			for _, p := range opts.Providers {
+				<option value={ p }></option>
+			}
+		</datalist>
+		<button type="submit">Apply</button>
+		if q.Combo != "" || q.Provider != "" || q.StatusClass != "" {
+			<a class="button link" href="/dashboard/logs">Clear filters</a>
+		}
+	</form>
+}
+
+templ LogsTable(logs []*domain.RequestLog, q store.RequestLogQuery) {
+	if len(logs) == 0 {
+		if q.Combo != "" || q.Provider != "" || q.StatusClass != "" {
+			<p class="empty">No matching requests.</p>
+		} else {
+			<p class="empty">No requests recorded yet.</p>
+		}
+	} else {
+		<table>
+			<thead>
+				<tr>
+					<th>Time</th>
+					<th>Key</th>
+					<th>Combo</th>
+					<th>Provider / model</th>
+					<th>Format</th>
+					<th>Status</th>
+					<th>In</th>
+					<th>Out</th>
+					<th>Latency</th>
+					<th>Error</th>
+				</tr>
+			</thead>
+			<tbody id="logs-tbody">
+				@LogRows(logs)
+			</tbody>
+		</table>
+		@LogsLoadMore(logs, q)
+	}
+}
+
+// LogRows is the load-more fragment: additional <tr> elements only.
+templ LogRows(logs []*domain.RequestLog) {
+	for _, l := range logs {
+		@LogRow(l)
+	}
+}
+
+templ LogRow(l *domain.RequestLog) {
+	<tr data-id={ strconv.FormatInt(l.ID, 10) }>
+		<td>{ l.CreatedAt.Format("2006-01-02 15:04:05") }</td>
+		<td>{ l.AccessKeyName }</td>
+		<td>
+			{ l.Combo }
+			if l.Stream {
+				<span class="tag">stream</span>
+			}
+		</td>
+		<td>{ l.Provider } / { l.UpstreamModel }</td>
+		<td class="mono">{ l.Format }</td>
+		<td>@statusBadge(l.Status)</td>
+		<td>{ strconv.Itoa(l.InputTokens) }</td>
+		<td>{ strconv.Itoa(l.OutputTokens) }</td>
+		<td>{ strconv.FormatInt(l.LatencyMS, 10) }ms</td>
+		<td class="err">
+			if l.ErrMsg != "" {
+				<details class="log-err">
+					<summary>{ truncateErr(l.ErrMsg, 80) }</summary>
+					<pre class="log-err-full">{ l.ErrMsg }</pre>
+				</details>
+			}
+		</td>
+	</tr>
+}
+
+// LogsLoadMore renders the load-more control. hasMore is inferred: when the
+// last page returned a full limit, offer another page starting before the last id.
+templ LogsLoadMore(logs []*domain.RequestLog, q store.RequestLogQuery) {
+	{{ limit := q.Limit }}
+	{{ if limit <= 0 { limit = 50 } }}
+	{{ hasMore := len(logs) >= limit }}
+	{{ var lastID int64 }}
+	{{ if len(logs) > 0 { lastID = logs[len(logs)-1].ID } }}
+	<div id="logs-load-more">
+		if hasMore && lastID > 0 {
+			<button
+				type="button"
+				class="link"
+				hx-get={ logsRowsURL(q, lastID) }
+				hx-target="#logs-tbody"
+				hx-swap="beforeend"
+			>Load more</button>
+		}
+	</div>
+}
+
+// LogsMoreFragment is the load-more response: new rows plus an OOB replacement
+// for the load-more button so the cursor advances.
+templ LogsMoreFragment(logs []*domain.RequestLog, q store.RequestLogQuery) {
+	@LogRows(logs)
+	<div id="logs-load-more" hx-swap-oob="true">
+		{{ limit := q.Limit }}
+		{{ if limit <= 0 { limit = 50 } }}
+		{{ hasMore := len(logs) >= limit }}
+		{{ var lastID int64 }}
+		{{ if len(logs) > 0 { lastID = logs[len(logs)-1].ID } }}
+		if hasMore && lastID > 0 {
+			<button
+				type="button"
+				class="link"
+				hx-get={ logsRowsURL(q, lastID) }
+				hx-target="#logs-tbody"
+				hx-swap="beforeend"
+			>Load more</button>
+		}
+	</div>
+}
 
 templ statusBadge(code int) {
 	{{ class := statusClass(code) }}
@@ -110,4 +221,27 @@ func statusClass(code int) string {
 	default:
 		return "status-redirect"
 	}
+}
+
+func truncateErr(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// logsRowsURL builds the load-more GET URL with the current filters and cursor.
+func logsRowsURL(q store.RequestLogQuery, beforeID int64) string {
+	v := url.Values{}
+	if q.StatusClass != "" {
+		v.Set("status", q.StatusClass)
+	}
+	if q.Combo != "" {
+		v.Set("combo", q.Combo)
+	}
+	if q.Provider != "" {
+		v.Set("provider", q.Provider)
+	}
+	v.Set("before_id", strconv.FormatInt(beforeID, 10))
+	return "/dashboard/logs/rows?" + v.Encode()
 }
