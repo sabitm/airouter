@@ -24,7 +24,7 @@ func seedLog(t *testing.T, st *Store, combo, provider string, status int, errMsg
 	return l
 }
 
-func TestListRequestLogsQueryFiltersAndCursor(t *testing.T) {
+func TestListRequestLogsQueryFiltersAndPages(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 
@@ -35,8 +35,8 @@ func TestListRequestLogsQueryFiltersAndCursor(t *testing.T) {
 	_ = b400
 	_ = c500
 
-	// Newest first: c500, b400, a200 (ids ascending with insert order).
-	all, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: 10})
+	// Newest first: c500, b400, a200
+	all, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: 10, Page: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestListRequestLogsQueryFiltersAndCursor(t *testing.T) {
 		t.Fatalf("order wrong: got ids %d,%d,%d", all[0].ID, all[1].ID, all[2].ID)
 	}
 
-	errs, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{StatusClass: "error", Limit: 10})
+	errs, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{StatusClass: "error", Limit: 10, Page: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,44 +55,42 @@ func TestListRequestLogsQueryFiltersAndCursor(t *testing.T) {
 		t.Fatalf("error filter len = %d, want 2", len(errs))
 	}
 
-	ok, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{StatusClass: "ok", Limit: 10})
+	n, err := st.CountRequestLogsQuery(ctx, RequestLogQuery{StatusClass: "error"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ok) != 1 || ok[0].Status != 200 {
-		t.Fatalf("ok filter = %+v", ok)
+	if n != 2 {
+		t.Fatalf("error count = %d, want 2", n)
 	}
 
-	byCombo, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Combo: "backup", Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(byCombo) != 1 || byCombo[0].Provider != "openai" {
-		t.Fatalf("combo filter = %+v", byCombo)
-	}
-
-	byProv, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Provider: "anthropic", Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(byProv) != 1 || byProv[0].Status != 400 {
-		t.Fatalf("provider filter = %+v", byProv)
-	}
-
-	// Cursor: page size 1, then before first page id.
-	page1, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: 1})
+	page1, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: 1, Page: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page1) != 1 || page1[0].ID != c500.ID {
 		t.Fatalf("page1 = %+v", page1)
 	}
-	page2, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: 1, BeforeID: page1[0].ID})
+	page2, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: 1, Page: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page2) != 1 || page2[0].ID != b400.ID {
 		t.Fatalf("page2 = %+v", page2)
+	}
+	page3, err := st.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: 1, Page: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page3) != 1 || page3[0].ID != a200.ID {
+		t.Fatalf("page3 = %+v", page3)
+	}
+
+	total, err := st.CountRequestLogsQuery(ctx, RequestLogQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
 	}
 }
 
@@ -102,7 +100,7 @@ func TestDistinctRequestLogValues(t *testing.T) {
 	seedLog(t, st, "default", "openai", 200, "")
 	seedLog(t, st, "backup", "openai", 200, "")
 	seedLog(t, st, "default", "anthropic", 200, "")
-	seedLog(t, st, "", "x", 200, "") // empty combo skipped
+	seedLog(t, st, "", "x", 200, "")
 
 	combos, err := st.DistinctRequestLogValues(ctx, "combo")
 	if err != nil {

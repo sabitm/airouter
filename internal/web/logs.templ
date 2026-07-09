@@ -20,14 +20,22 @@ type LogFilterOpts struct {
 	Providers []string
 }
 
-templ LogsPage(logs []*domain.RequestLog, stats LogStats, q store.RequestLogQuery, opts LogFilterOpts) {
+// LogsPageMeta describes the current page of filtered log rows.
+type LogsPageMeta struct {
+	Page       int
+	PageSize   int
+	Total      int64
+	TotalPages int
+}
+
+templ LogsPage(logs []*domain.RequestLog, stats LogStats, q store.RequestLogQuery, opts LogFilterOpts, meta LogsPageMeta) {
 	@Layout("Logs", "/dashboard/logs") {
-		@LogsBody(logs, stats, q, opts)
+		@LogsBody(logs, stats, q, opts, meta)
 	}
 }
 
-// LogsBody is the swappable region: stats, filters, and the log table.
-templ LogsBody(logs []*domain.RequestLog, stats LogStats, q store.RequestLogQuery, opts LogFilterOpts) {
+// LogsBody is the swappable region: stats, filters, table, and pager.
+templ LogsBody(logs []*domain.RequestLog, stats LogStats, q store.RequestLogQuery, opts LogFilterOpts, meta LogsPageMeta) {
 	<div id="logs-body">
 		<section class="panel">
 			<div class="panel-head">
@@ -54,7 +62,7 @@ templ LogsBody(logs []*domain.RequestLog, stats LogStats, q store.RequestLogQuer
 		</section>
 		<section class="panel">
 			@LogsFilterForm(q, opts)
-			@LogsTable(logs, q)
+			@LogsTable(logs, q, meta)
 		</section>
 	</div>
 }
@@ -95,7 +103,7 @@ templ LogsFilterForm(q store.RequestLogQuery, opts LogFilterOpts) {
 	</form>
 }
 
-templ LogsTable(logs []*domain.RequestLog, q store.RequestLogQuery) {
+templ LogsTable(logs []*domain.RequestLog, q store.RequestLogQuery, meta LogsPageMeta) {
 	if len(logs) == 0 {
 		if q.Combo != "" || q.Provider != "" || q.StatusClass != "" {
 			<p class="empty">No matching requests.</p>
@@ -122,11 +130,10 @@ templ LogsTable(logs []*domain.RequestLog, q store.RequestLogQuery) {
 				@LogRows(logs)
 			</tbody>
 		</table>
-		@LogsLoadMore(logs, q)
+		@LogsPager(q, meta)
 	}
 }
 
-// LogRows is the load-more fragment: additional <tr> elements only.
 templ LogRows(logs []*domain.RequestLog) {
 	for _, l := range logs {
 		@LogRow(l)
@@ -160,47 +167,54 @@ templ LogRow(l *domain.RequestLog) {
 	</tr>
 }
 
-// LogsLoadMore renders the load-more control. hasMore is inferred: when the
-// last page returned a full limit, offer another page starting before the last id.
-templ LogsLoadMore(logs []*domain.RequestLog, q store.RequestLogQuery) {
-	{{ limit := q.Limit }}
-	{{ if limit <= 0 { limit = 50 } }}
-	{{ hasMore := len(logs) >= limit }}
-	{{ var lastID int64 }}
-	{{ if len(logs) > 0 { lastID = logs[len(logs)-1].ID } }}
-	<div id="logs-load-more">
-		if hasMore && lastID > 0 {
-			<button
-				type="button"
-				class="link"
-				hx-get={ logsRowsURL(q, lastID) }
-				hx-target="#logs-tbody"
-				hx-swap="beforeend"
-			>Load more</button>
-		}
-	</div>
-}
-
-// LogsMoreFragment is the load-more response: new rows plus an OOB replacement
-// for the load-more button so the cursor advances.
-templ LogsMoreFragment(logs []*domain.RequestLog, q store.RequestLogQuery) {
-	@LogRows(logs)
-	<div id="logs-load-more" hx-swap-oob="true">
-		{{ limit := q.Limit }}
-		{{ if limit <= 0 { limit = 50 } }}
-		{{ hasMore := len(logs) >= limit }}
-		{{ var lastID int64 }}
-		{{ if len(logs) > 0 { lastID = logs[len(logs)-1].ID } }}
-		if hasMore && lastID > 0 {
-			<button
-				type="button"
-				class="link"
-				hx-get={ logsRowsURL(q, lastID) }
-				hx-target="#logs-tbody"
-				hx-swap="beforeend"
-			>Load more</button>
-		}
-	</div>
+templ LogsPager(q store.RequestLogQuery, meta LogsPageMeta) {
+	if meta.Total > 0 && meta.TotalPages > 0 {
+		<nav class="logs-pager" aria-label="Log pages">
+			<span class="muted">{ logsShowingText(meta) }</span>
+			<div class="logs-pager-nav">
+				if meta.Page > 1 {
+					<a
+						class="link"
+						href={ templ.SafeURL(logsPageURL(q, meta.Page-1)) }
+						hx-get={ logsPageURL(q, meta.Page-1) }
+						hx-target="#logs-body"
+						hx-swap="outerHTML"
+						hx-push-url="true"
+					>Prev</a>
+				} else {
+					<span class="muted">Prev</span>
+				}
+				for _, item := range logsPageItems(meta.Page, meta.TotalPages) {
+					if item.Ellipsis {
+						<span class="muted">...</span>
+					} else if item.Page == meta.Page {
+						<span class="logs-pager-current" aria-current="page">{ strconv.Itoa(item.Page) }</span>
+					} else {
+						<a
+							class="link"
+							href={ templ.SafeURL(logsPageURL(q, item.Page)) }
+							hx-get={ logsPageURL(q, item.Page) }
+							hx-target="#logs-body"
+							hx-swap="outerHTML"
+							hx-push-url="true"
+						>{ strconv.Itoa(item.Page) }</a>
+					}
+				}
+				if meta.Page < meta.TotalPages {
+					<a
+						class="link"
+						href={ templ.SafeURL(logsPageURL(q, meta.Page+1)) }
+						hx-get={ logsPageURL(q, meta.Page+1) }
+						hx-target="#logs-body"
+						hx-swap="outerHTML"
+						hx-push-url="true"
+					>Next</a>
+				} else {
+					<span class="muted">Next</span>
+				}
+			</div>
+		</nav>
+	}
 }
 
 templ statusBadge(code int) {
@@ -230,8 +244,43 @@ func truncateErr(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// logsRowsURL builds the load-more GET URL with the current filters and cursor.
-func logsRowsURL(q store.RequestLogQuery, beforeID int64) string {
+func logsPageMeta(page, pageSize int, total int64) LogsPageMeta {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	meta := LogsPageMeta{Page: page, PageSize: pageSize, Total: total}
+	if total <= 0 {
+		return meta
+	}
+	pages := int((total + int64(pageSize) - 1) / int64(pageSize))
+	if pages < 1 {
+		pages = 1
+	}
+	meta.TotalPages = pages
+	if meta.Page > pages {
+		meta.Page = pages
+	}
+	return meta
+}
+
+func logsShowingText(meta LogsPageMeta) string {
+	if meta.Total == 0 {
+		return "No results"
+	}
+	start := (meta.Page-1)*meta.PageSize + 1
+	end := meta.Page * meta.PageSize
+	if int64(end) > meta.Total {
+		end = int(meta.Total)
+	}
+	return "Showing " + strconv.Itoa(start) + "-" + strconv.Itoa(end) + " of " + strconv.FormatInt(meta.Total, 10)
+}
+
+// logsPageURL builds a bookmarkable logs URL for the given filters and page.
+// Filters always reset implicitly when page is omitted from the filter form.
+func logsPageURL(q store.RequestLogQuery, page int) string {
 	v := url.Values{}
 	if q.StatusClass != "" {
 		v.Set("status", q.StatusClass)
@@ -242,6 +291,65 @@ func logsRowsURL(q store.RequestLogQuery, beforeID int64) string {
 	if q.Provider != "" {
 		v.Set("provider", q.Provider)
 	}
-	v.Set("before_id", strconv.FormatInt(beforeID, 10))
-	return "/dashboard/logs/rows?" + v.Encode()
+	if page > 1 {
+		v.Set("page", strconv.Itoa(page))
+	}
+	qs := v.Encode()
+	if qs == "" {
+		return "/dashboard/logs"
+	}
+	return "/dashboard/logs?" + qs
+}
+
+type logsPageItem struct {
+	Page     int
+	Ellipsis bool
+}
+
+// logsPageItems returns a compact window of page numbers around current,
+// always including first and last when the range is large.
+func logsPageItems(current, total int) []logsPageItem {
+	if total <= 0 {
+		return nil
+	}
+	if total <= 7 {
+		out := make([]logsPageItem, 0, total)
+		for i := 1; i <= total; i++ {
+			out = append(out, logsPageItem{Page: i})
+		}
+		return out
+	}
+	// Always: 1 … window … last
+	seen := map[int]bool{}
+	var pages []int
+	add := func(p int) {
+		if p < 1 || p > total || seen[p] {
+			return
+		}
+		seen[p] = true
+		pages = append(pages, p)
+	}
+	add(1)
+	for p := current - 2; p <= current+2; p++ {
+		add(p)
+	}
+	add(total)
+	// sort pages (small N)
+	for i := 0; i < len(pages); i++ {
+		for j := i + 1; j < len(pages); j++ {
+			if pages[j] < pages[i] {
+				pages[i], pages[j] = pages[j], pages[i]
+			}
+		}
+	}
+	var out []logsPageItem
+	prev := 0
+	for _, p := range pages {
+		if prev > 0 && p > prev+1 {
+			out = append(out, logsPageItem{Ellipsis: true})
+		}
+		out = append(out, logsPageItem{Page: p})
+		prev = p
+	}
+	return out
 }

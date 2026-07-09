@@ -431,3 +431,28 @@ tr.archived { opacity: 0.6; }
 .flash-sink:empty { display: none; }
 .flash-sink:not(:empty) { display: block; margin-bottom: 12px; }
 .check-result:empty { display: none; }
+
+
+.logs-pager {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	margin-top: 14px;
+}
+.logs-pager-nav {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+}
+.logs-pager-current {
+	display: inline-block;
+	min-width: 1.5em;
+	text-align: center;
+	font-weight: 600;
+	padding: 2px 6px;
+	border-radius: 4px;
+	background: var(--surface-hover);
+}

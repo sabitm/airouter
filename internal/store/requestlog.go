@@ -24,17 +24,17 @@ func (s *Store) CreateRequestLog(ctx context.Context, l *domain.RequestLog) erro
 
 // RequestLogQuery filters and pages request logs. Empty string fields are ignored.
 // StatusClass is one of: "", "ok" (2xx), "client" (4xx), "server" (5xx), "error" (>=400).
-// BeforeID, when >0, returns only rows with id < BeforeID (keyset cursor, newest-first).
+// Page is 1-based; Offset = (Page-1)*Limit.
 type RequestLogQuery struct {
 	Combo       string
 	Provider    string
 	StatusClass string
-	BeforeID    int64
+	Page        int
 	Limit       int
 }
 
 const (
-	defaultLogLimit = 50
+	defaultLogLimit = 20
 	maxLogLimit     = 100
 )
 
@@ -48,18 +48,27 @@ func clampLogLimit(n int) int {
 	return n
 }
 
-// ListRequestLogs returns the newest logs up to limit (legacy helper).
-func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]*domain.RequestLog, error) {
-	return s.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: limit})
+func clampLogPage(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	return n
 }
 
-// ListRequestLogsQuery lists logs matching q, newest first.
+// ListRequestLogs returns the newest logs up to limit (legacy helper).
+func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]*domain.RequestLog, error) {
+	return s.ListRequestLogsQuery(ctx, RequestLogQuery{Limit: limit, Page: 1})
+}
+
+// ListRequestLogsQuery lists logs matching q, newest first, for one page.
 func (s *Store) ListRequestLogsQuery(ctx context.Context, q RequestLogQuery) ([]*domain.RequestLog, error) {
 	q.Limit = clampLogLimit(q.Limit)
+	q.Page = clampLogPage(q.Page)
 	where, args := buildLogWhere(q)
+	offset := (q.Page - 1) * q.Limit
 	sql := `SELECT id, created_at, access_key_name, combo, provider, upstream_model, format, stream, status, input_tokens, output_tokens, latency_ms, err_msg
-		 FROM request_logs` + where + ` ORDER BY created_at DESC, id DESC LIMIT ?`
-	args = append(args, q.Limit)
+		 FROM request_logs` + where + ` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+	args = append(args, q.Limit, offset)
 
 	rows, err := s.db.QueryContext(ctx, sql, args...)
 	if err != nil {
@@ -77,6 +86,17 @@ func (s *Store) ListRequestLogsQuery(ctx context.Context, q RequestLogQuery) ([]
 		out = append(out, &l)
 	}
 	return out, rows.Err()
+}
+
+// CountRequestLogsQuery returns how many rows match q's filters (ignores Page/Limit).
+func (s *Store) CountRequestLogsQuery(ctx context.Context, q RequestLogQuery) (int64, error) {
+	where, args := buildLogWhere(q)
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM request_logs`+where, args...)
+	var n int64
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func buildLogWhere(q RequestLogQuery) (string, []any) {
@@ -99,10 +119,6 @@ func buildLogWhere(q RequestLogQuery) (string, []any) {
 		parts = append(parts, "status >= 500")
 	case "error":
 		parts = append(parts, "status >= 400")
-	}
-	if q.BeforeID > 0 {
-		parts = append(parts, "id < ?")
-		args = append(args, q.BeforeID)
 	}
 	if len(parts) == 0 {
 		return "", args
