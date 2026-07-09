@@ -774,7 +774,12 @@ func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "key-flash", "invalid form")
 		return
 	}
-	created, err := h.store.NewAccessKey(r.Context(), r.FormValue("name"))
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		htmxBadRequest(w, r, "key-flash", "label is required")
+		return
+	}
+	created, err := h.store.NewAccessKey(r.Context(), name)
 	if err != nil {
 		htmxBadRequest(w, r, "key-flash", err.Error())
 		return
@@ -910,5 +915,5 @@ func (h *Handler) importConfig(w http.ResponseWriter, r *http.Request) {
 		render(w, r, flash("error", "import failed: "+err.Error()))
 		return
 	}
-	render(w, r, flash("ok", "import complete"))
+	render(w, r, flash("ok", "Import complete — review Providers and Combos"))
 }
