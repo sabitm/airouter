@@ -26,6 +26,7 @@ templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
 			}
 		</section>
 		<section class="panel">
+			<div id="combo-flash"></div>
 			@ComboList(combos)
 		</section>
 	}
@@ -79,7 +80,7 @@ templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderI
 		</select>
 		<input type="hidden" name="enabled" value={ enabledVal }/>
 		<input name="upstream_model" list={ listID } value={ model } placeholder="upstream model id (e.g. gpt-4o)" required/>
-		<span id={ "model-options-wrap-" + uid }>@ModelDatalist(nil, listID)</span>
+		<span id={ "model-options-wrap-" + uid }>@ModelOptions(nil, listID, false)</span>
 		<button type="button" class="link danger" onclick="removeComboTarget(this)" title="remove target">x</button>
 	</div>
 }
@@ -94,10 +95,19 @@ templ targetTemplate(providers []*domain.Provider) {
 	</template>
 }
 
+// ModelOptions wraps the model datalist and an optional load-failure hint.
+// listID must be unique per page so the add form and each open edit row stay
+// distinct. failed is true when the provider probe could not load models.
+templ ModelOptions(models []string, listID string, failed bool) {
+	@ModelDatalist(models, listID)
+	if failed {
+		<span class="field-hint">Could not load models; enter id manually.</span>
+	}
+}
+
 // ModelDatalist backs an upstream_model input's autocomplete with models
 // fetched live from the selected provider. An empty list just yields no
-// suggestions; the field stays free-text. listID must be unique per page, so
-// the add form and each open edit row use distinct ids.
+// suggestions; the field stays free-text.
 templ ModelDatalist(models []string, listID string) {
 	<datalist id={ listID }>
 		for _, m := range models {

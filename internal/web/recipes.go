@@ -32,6 +32,7 @@ var recipes = []recipe{
 	{ID: "codex", Label: "OpenAI Codex", Sublabel: "ChatGPT", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAICodex, Method: domain.AuthOAuth, Preset: "codex", BaseURL: "https://chatgpt.com/backend-api/codex"},
 	{ID: "kiro", Label: "Kiro", Sublabel: "AWS CodeWhisperer", Tag: "API key / OAuth", Kind: kindKiro, Protocol: domain.ProtocolKiro, BaseURL: kiro.DefaultBaseURL},
 	{ID: "openai", Label: "OpenAI-compatible", Sublabel: "OpenRouter, OpenAI, vLLM...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAI, Method: domain.AuthAPIKey},
+	{ID: "openai-responses", Label: "OpenAI Responses", Sublabel: "Responses API upstreams", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAIResponses, Method: domain.AuthAPIKey},
 	{ID: "anthropic", Label: "Anthropic-compatible", Sublabel: "Claude API...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolAnthropic, Method: domain.AuthAPIKey},
 }
 

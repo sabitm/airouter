@@ -26,10 +26,14 @@ templ KeysPage(keys []*domain.AccessKey) {
 // token banner once.
 templ KeyList(keys []*domain.AccessKey, justCreated *domain.AccessKey) {
 	<div id="key-list">
+		<div id="key-flash"></div>
 		if justCreated != nil {
 			<div class="flash created">
 				New token (copy now, it will not be shown again):
-				<code class="mono">{ justCreated.Token }</code>
+				<div class="flash-copy">
+					<code class="mono" id="created-key-token">{ justCreated.Token }</code>
+						<button type="button" class="link" onclick="airouterCopyText(document.getElementById('created-key-token').textContent, this)">Copy</button>
+				</div>
 			</div>
 		}
 		if len(keys) == 0 {

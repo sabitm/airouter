@@ -22,6 +22,7 @@ templ Layout(title, active string) {
 			<title>{ title } - airouter</title>
 			<link rel="stylesheet" href="/static/styles.css"/>
 			<script src="/static/htmx.min.js"></script>
+			<script src="/static/dashboard.js" defer></script>
 			<script src="/static/combos.js" defer></script>
 			<script src="/static/providers.js" defer></script>
 		</head>
@@ -31,7 +32,7 @@ templ Layout(title, active string) {
 				<nav>
 					for _, item := range navItems {
 						if item.Href == active {
-							<a href={ templ.SafeURL(item.Href) } class="active">{ item.Label }</a>
+							<a href={ templ.SafeURL(item.Href) } class="active" aria-current="page">{ item.Label }</a>
 						} else {
 							<a href={ templ.SafeURL(item.Href) }>{ item.Label }</a>
 						}
@@ -47,5 +48,5 @@ templ Layout(title, active string) {
 
 // flash renders a transient status message returned from an HTMX action.
 templ flash(kind, msg string) {
-	<div class={ "flash", kind } _="">{ msg }</div>
+	<div class={ "flash", kind }>{ msg }</div>
 }

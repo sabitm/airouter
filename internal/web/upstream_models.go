@@ -19,7 +19,8 @@ var upstreamClient = &http.Client{Timeout: 15 * time.Second}
 
 // providerModels fetches the selected provider's live model list and returns it
 // as a datalist for the combo form's upstream_model autocomplete. Best-effort:
-// any failure yields an empty datalist so combo creation still works manually.
+// any failure yields an empty datalist plus a muted hint so combo creation still
+// works manually.
 func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 	listID := r.URL.Query().Get("list")
 	if listID == "" {
@@ -27,12 +28,12 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := strconv.ParseInt(r.URL.Query().Get("provider_id"), 10, 64)
 	if err != nil {
-		render(w, r, ModelDatalist(nil, listID))
+		render(w, r, ModelOptions(nil, listID, false))
 		return
 	}
 	provider, err := h.store.GetProvider(r.Context(), id)
 	if err != nil {
-		render(w, r, ModelDatalist(nil, listID))
+		render(w, r, ModelOptions(nil, listID, true))
 		return
 	}
 	// oauth providers carry no static key; resolve (and refresh) the access token
@@ -41,16 +42,17 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 	if provider.Method() == domain.AuthOAuth {
 		tok, err := h.oauth.Resolve(r.Context(), provider, false)
 		if err != nil {
-			render(w, r, ModelDatalist(nil, listID))
+			render(w, r, ModelOptions(nil, listID, true))
 			return
 		}
 		provider.APIKey = tok
 	}
 	models, err := fetchUpstreamModels(r.Context(), provider)
-	if err != nil {
+	failed := err != nil
+	if failed {
 		models = nil
 	}
-	render(w, r, ModelDatalist(models, listID))
+	render(w, r, ModelOptions(models, listID, failed))
 }
 
 // fetchUpstreamModels queries the provider's /models endpoint. Both OpenAI and

@@ -24,3 +24,25 @@ function removeComboTarget(btn) {
     row.remove();
   }
 }
+
+// Combo Edit/Save/Delete/toggle swap #combo-list or a single #combo-<id> row,
+// changing document height. Preserve scrollY across those swaps (same approach
+// as providers.js) so the viewport does not jump to the bottom.
+let airouterComboScrollY = null;
+
+function airouterIsComboSwap(t) {
+  return !!t && (t.id === "combo-list" || /^combo-\d+$/.test(t.id));
+}
+
+document.body.addEventListener("htmx:beforeSwap", function (event) {
+  if (airouterIsComboSwap(event.detail.target)) {
+    airouterComboScrollY = window.scrollY;
+  }
+});
+
+document.body.addEventListener("htmx:afterSwap", function (event) {
+  if (airouterComboScrollY !== null && airouterIsComboSwap(event.detail.target)) {
+    window.scrollTo({ top: airouterComboScrollY });
+    airouterComboScrollY = null;
+  }
+});

@@ -119,6 +119,32 @@ func badRequest(w http.ResponseWriter, msg string) {
 	http.Error(w, msg, http.StatusBadRequest)
 }
 
+// htmxBadRequest returns a styled flash for HTMX mutations, or a plain HTTP
+// error for non-HTMX callers. flashID is the sink element to retarget when the
+// request was aimed at a list/row that should stay intact on validation failure.
+func htmxBadRequest(w http.ResponseWriter, r *http.Request, flashID, msg string) {
+	if r.Header.Get("HX-Request") != "" {
+		renderHXFlash(w, r, flashID, msg)
+		return
+	}
+	badRequest(w, msg)
+}
+
+func renderHXFlash(w http.ResponseWriter, r *http.Request, flashID, msg string) {
+	if flashID != "" {
+		w.Header().Set("HX-Retarget", "#"+flashID)
+		w.Header().Set("HX-Reswap", "innerHTML")
+	}
+	// 400 so hx-on::after-request success handlers (form close/reset) do not fire;
+	// dashboard.js allows HTMX to still swap 400 bodies into the flash sink.
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusBadRequest)
+	if err := flash("error", msg).Render(r.Context(), w); err != nil {
+		// headers already committed
+	}
+}
+
+
 func pathID(r *http.Request) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -170,12 +196,12 @@ func kiroBaseURLOr(proto domain.Protocol, base string) string {
 
 func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		badRequest(w, "invalid form")
+		htmxBadRequest(w, r, "provider-flash", "invalid form")
 		return
 	}
 	proto := domain.Protocol(r.FormValue("protocol"))
 	if !proto.Valid() {
-		badRequest(w, "invalid protocol")
+		htmxBadRequest(w, r, "provider-flash", "invalid protocol")
 		return
 	}
 	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
@@ -184,13 +210,20 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	auth := domain.AuthScheme(r.FormValue("auth_scheme"))
 	if auth != "" && !auth.Valid() {
-		badRequest(w, "invalid auth scheme")
+		htmxBadRequest(w, r, "provider-flash", "invalid auth scheme")
+		return
+	}
+	apiKey := strings.TrimSpace(r.FormValue("api_key"))
+	// Generic apikey providers need a credential at create time. Kiro may still
+	// rely on profile/oauth paths and is validated separately there.
+	if proto != domain.ProtocolKiro && apiKey == "" {
+		htmxBadRequest(w, r, "provider-flash", "API key is required")
 		return
 	}
 	p := &domain.Provider{
 		Name:       r.FormValue("name"),
 		BaseURL:    kiroBaseURLOr(proto, r.FormValue("base_url")),
-		APIKey:     r.FormValue("api_key"),
+		APIKey:     apiKey,
 		Protocol:   proto,
 		AuthScheme: auth,
 	}
@@ -205,7 +238,7 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		p.OAuthCreds = creds
 	}
 	if err := h.store.CreateProvider(r.Context(), p); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
 	h.renderProviderList(w, r)
@@ -221,11 +254,11 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 	if !ok {
 		c, err := credsFromConnectForm(r)
 		if err != nil {
-			badRequest(w, err.Error())
+			htmxBadRequest(w, r, "provider-flash", err.Error())
 			return
 		}
 		if !applyManualTokens(c, r) {
-			badRequest(w, "connect this provider or paste an access/refresh token before saving")
+			htmxBadRequest(w, r, "provider-flash", "connect this provider or paste an access/refresh token before saving")
 			return
 		}
 		creds = c
@@ -244,7 +277,7 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 		OAuthCreds: creds,
 	}
 	if err := h.store.CreateProvider(r.Context(), p); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
 	h.sessions.drop(r.FormValue("oauth_session"))
@@ -299,11 +332,11 @@ func (h *Handler) providerRow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
-		badRequest(w, "bad id")
+		htmxBadRequest(w, r, "provider-flash", "bad id")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		badRequest(w, "invalid form")
+		htmxBadRequest(w, r, "provider-flash", "invalid form")
 		return
 	}
 	cur, err := h.store.GetProvider(r.Context(), id)
@@ -313,7 +346,7 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	proto := domain.Protocol(r.FormValue("protocol"))
 	if !proto.Valid() {
-		badRequest(w, "invalid protocol")
+		htmxBadRequest(w, r, "provider-flash", "invalid protocol")
 		return
 	}
 	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
@@ -322,7 +355,7 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	auth := domain.AuthScheme(r.FormValue("auth_scheme"))
 	if auth != "" && !auth.Valid() {
-		badRequest(w, "invalid auth scheme")
+		htmxBadRequest(w, r, "provider-flash", "invalid auth scheme")
 		return
 	}
 	cur.Name = r.FormValue("name")
@@ -344,7 +377,7 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		cur.APIKey = k
 	}
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
 	h.renderProviderList(w, r)
@@ -362,7 +395,7 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		cur.OAuthCreds = c
 	}
 	if cur.OAuthCreds == nil {
-		badRequest(w, "connect this provider or paste an access/refresh token before saving")
+		htmxBadRequest(w, r, "provider-flash", "connect this provider or paste an access/refresh token before saving")
 		return
 	}
 	if proto == domain.ProtocolKiro {
@@ -375,7 +408,7 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	cur.AuthScheme = domain.AuthBearer
 	cur.APIKey = ""
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
 	if s := r.FormValue("oauth_session"); s != "" {
@@ -387,11 +420,11 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 func (h *Handler) deleteProvider(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
-		badRequest(w, "bad id")
+		htmxBadRequest(w, r, "provider-flash", "bad id")
 		return
 	}
 	if err := h.store.DeleteProvider(r.Context(), id); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
 	h.renderProviderList(w, r)
@@ -400,11 +433,11 @@ func (h *Handler) deleteProvider(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) archiveProvider(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
-		badRequest(w, "bad id")
+		htmxBadRequest(w, r, "provider-flash", "bad id")
 		return
 	}
 	if err := h.store.SetProviderArchived(r.Context(), id, true); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
 	h.renderProviderList(w, r)
@@ -413,11 +446,11 @@ func (h *Handler) archiveProvider(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) restoreProvider(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
-		badRequest(w, "bad id")
+		htmxBadRequest(w, r, "provider-flash", "bad id")
 		return
 	}
 	if err := h.store.SetProviderArchived(r.Context(), id, false); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
 	h.renderProviderList(w, r)
@@ -425,7 +458,7 @@ func (h *Handler) restoreProvider(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteAllArchived(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.DeleteArchivedProviders(r.Context()); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
 	h.renderProviderList(w, r)
@@ -499,16 +532,16 @@ func (h *Handler) comboData(ctx context.Context) ([]*domain.Combo, []*domain.Pro
 
 func (h *Handler) createCombo(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		badRequest(w, "invalid form")
+		htmxBadRequest(w, r, "combo-flash", "invalid form")
 		return
 	}
 	c, err := parseComboForm(r)
 	if err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "combo-flash", err.Error())
 		return
 	}
 	if err := h.store.CreateCombo(r.Context(), c); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "combo-flash", err.Error())
 		return
 	}
 	h.renderComboList(w, r)
@@ -620,21 +653,21 @@ func (h *Handler) comboRow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) updateCombo(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
-		badRequest(w, "bad id")
+		htmxBadRequest(w, r, "combo-flash", "bad id")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		badRequest(w, "invalid form")
+		htmxBadRequest(w, r, "combo-flash", "invalid form")
 		return
 	}
 	c, err := parseComboForm(r)
 	if err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "combo-flash", err.Error())
 		return
 	}
 	c.ID = id
 	if err := h.store.UpdateCombo(r.Context(), c); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "combo-flash", err.Error())
 		return
 	}
 	h.renderComboList(w, r)
@@ -643,11 +676,11 @@ func (h *Handler) updateCombo(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) deleteCombo(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
-		badRequest(w, "bad id")
+		htmxBadRequest(w, r, "combo-flash", "bad id")
 		return
 	}
 	if err := h.store.DeleteCombo(r.Context(), id); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "combo-flash", err.Error())
 		return
 	}
 	h.renderComboList(w, r)
@@ -656,12 +689,12 @@ func (h *Handler) deleteCombo(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) toggleComboTarget(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
-		badRequest(w, "bad id")
+		htmxBadRequest(w, r, "combo-flash", "bad id")
 		return
 	}
 	tid, err := strconv.ParseInt(r.PathValue("tid"), 10, 64)
 	if err != nil {
-		badRequest(w, "bad target id")
+		htmxBadRequest(w, r, "combo-flash", "bad target id")
 		return
 	}
 	combo, err := h.store.GetCombo(r.Context(), id)
@@ -681,7 +714,7 @@ func (h *Handler) toggleComboTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.store.SetTargetEnabled(r.Context(), tid, !cur.Enabled); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "combo-flash", err.Error())
 		return
 	}
 	combo, err = h.store.GetCombo(r.Context(), id)
@@ -714,12 +747,12 @@ func (h *Handler) keysPage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		badRequest(w, "invalid form")
+		htmxBadRequest(w, r, "key-flash", "invalid form")
 		return
 	}
 	created, err := h.store.NewAccessKey(r.Context(), r.FormValue("name"))
 	if err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "key-flash", err.Error())
 		return
 	}
 	keys, err := h.store.ListAccessKeys(r.Context())
@@ -733,11 +766,11 @@ func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
-		badRequest(w, "bad id")
+		htmxBadRequest(w, r, "key-flash", "bad id")
 		return
 	}
 	if err := h.store.DeleteAccessKey(r.Context(), id); err != nil {
-		badRequest(w, err.Error())
+		htmxBadRequest(w, r, "key-flash", err.Error())
 		return
 	}
 	keys, err := h.store.ListAccessKeys(r.Context())
