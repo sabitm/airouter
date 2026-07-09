@@ -233,24 +233,65 @@ td.err { color: var(--danger); width: 260px; white-space: normal; overflow-wrap:
 #provider-form-slot .provider-form { margin-top: 8px; }
 
 /* Provider auth-method toggle: show only the active method's field group. */
-.provider-form { flex-wrap: wrap; }
+.provider-form.provider-form-grid {
+	display: grid;
+	/* Fixed two columns so Name/Base URL and similar pairs stay even. */
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 10px 12px;
+	align-items: end;
+}
+.provider-form .field {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	min-width: 0;
+}
+.provider-form .field-name {
+	font-size: 12px;
+	color: var(--muted);
+}
+.provider-form .field input,
+.provider-form .field select {
+	flex: 1 1 auto;
+	min-width: 0;
+	width: 100%;
+}
+.provider-form .form-actions {
+	grid-column: 1 / -1;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	align-items: center;
+}
+/* display:contents lets children participate in the parent 2-col grid so
+   nested groups do not create a full-width sub-row with uneven columns. */
 .provider-form .apikey-fields,
 .provider-form .oauth-edit,
-.provider-form .oauth-fields { display: none; flex-basis: 100%; }
-.provider-form[data-method="apikey"] .apikey-fields { display: flex; }
-.provider-form[data-method="oauth"] .oauth-edit { display: block; }
-.provider-form[data-method="oauth"] .oauth-fields { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.provider-form .oauth-fields,
+.provider-form .kiro-fields { display: none; }
+.provider-form[data-method="apikey"] .apikey-fields { display: contents; }
+.provider-form[data-method="oauth"] .oauth-edit { display: contents; }
+.provider-form[data-method="oauth"] .oauth-fields { display: contents; }
+.provider-form[data-protocol="kiro"] .kiro-fields { display: contents; }
 
 /* Interactive-oauth mode toggle: show either the web-auth (Connect) group or
    the manual token-import group, never both. */
 .provider-form .oauth-web,
-.provider-form .oauth-manual { display: none; flex-basis: 100%; }
+.provider-form .oauth-manual { display: none; grid-column: 1 / -1; }
 .provider-form[data-oauth-mode="web"] .oauth-web { display: block; }
 .provider-form[data-oauth-mode="manual"] .oauth-manual { display: block; }
 
-/* Kiro-only config: shown only when the selected protocol is kiro. */
-.provider-form .kiro-fields { display: none; flex-basis: 100%; gap: 8px; align-items: center; margin-top: 6px; }
-.provider-form[data-protocol="kiro"] .kiro-fields { display: flex; flex-wrap: wrap; }
+/* Full-width helpers inside oauth/manual blocks that use display:contents parents. */
+.provider-form .oauth-manual > .muted,
+.provider-form .oauth-manual > .form-actions,
+.provider-form .oauth-manual > .oauth-tokens { grid-column: 1 / -1; }
+.provider-form .field-span-2 { grid-column: 1 / -1; }
+
+@media (max-width: 560px) {
+	.provider-form.provider-form-grid {
+		grid-template-columns: 1fr;
+	}
+}
 
 .oauth-fields .oauth-preset { flex: 0 0 180px; }
 .oauth-pkce { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; color: var(--muted); font-size: 13px; }
@@ -385,3 +426,8 @@ tr.archived { opacity: 0.6; }
 	flex-direction: column;
 	gap: 4px;
 }
+
+
+.flash-sink:empty { display: none; }
+.flash-sink:not(:empty) { display: block; margin-bottom: 12px; }
+.check-result:empty { display: none; }

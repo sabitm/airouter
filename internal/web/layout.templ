@@ -48,5 +48,9 @@ templ Layout(title, active string) {
 
 // flash renders a transient status message returned from an HTMX action.
 templ flash(kind, msg string) {
-	<div class={ "flash", kind }>{ msg }</div>
+	if kind == "error" {
+		<div class={ "flash", kind } role="alert" aria-live="assertive">{ msg }</div>
+	} else {
+		<div class={ "flash", kind } role="status" aria-live="polite">{ msg }</div>
+	}
 }

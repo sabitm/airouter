@@ -29,7 +29,7 @@ templ ProvidersPage(providers []*domain.Provider, baseURL string) {
 					<span id="refresh-all-result"></span>
 				</div>
 			}
-			<div id="provider-flash"></div>
+			<div id="provider-flash" class="flash-sink" aria-live="polite"></div>
 			@ProviderList(providers)
 		</section>
 	}
@@ -108,6 +108,8 @@ templ providerCards() {
 			<button
 				type="button"
 				class="provider-card"
+				aria-pressed="false"
+				aria-controls="provider-form-slot"
 				onclick="airouterSelectProviderCard(this)"
 				hx-get={ "/dashboard/providers/new?recipe=" + r.ID }
 				hx-target="#provider-form-slot"
@@ -125,19 +127,28 @@ templ providerCards() {
 templ ProviderRecipeForm(r recipe) {
 	switch r.Kind {
 		case kindInteractiveOAuth:
-			<form class="row-form provider-form" data-method="oauth" data-oauth-mode="web" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="web" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
 				<input type="hidden" name="auth_method" value="oauth"/>
 				<input type="hidden" name="preset" value={ r.Preset }/>
-				<input name="name" placeholder="name" required/>
-				<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
-				<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" title="how to obtain tokens">
-					<option value="web" selected>Web auth</option>
-					<option value="manual">Manual</option>
-				</select>
+				<label class="field">
+					<span class="field-name">Name</span>
+					<input name="name" placeholder="e.g. my-grok" required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Base URL</span>
+					<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Auth mode</span>
+					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
+						<option value="web" selected>Web auth</option>
+						<option value="manual">Manual</option>
+					</select>
+				</label>
 				<div class="oauth-web">
 					<button type="button" class="link" hx-post="/dashboard/providers/oauth/begin" hx-include="closest form" hx-target={ "#oauth-region-new-" + r.ID } hx-swap="innerHTML">Connect</button>
-					<div id={ "oauth-region-new-" + r.ID } class="oauth-region">
+					<div id={ "oauth-region-new-" + r.ID } class="oauth-region" aria-live="polite">
 						@OAuthConnectIdle()
 					</div>
 					<p class="field-hint">Save after Connect succeeds, or switch to Manual and paste tokens.</p>
@@ -145,73 +156,122 @@ templ ProviderRecipeForm(r recipe) {
 				<div class="oauth-manual">
 					@oauthTokenFields(&domain.OAuthCreds{}, "", "")
 				</div>
-				<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
-				<span class="check-indicator htmx-indicator">checking...</span>
-				<span class="check-result"></span>
-				<button type="submit">Add</button>
-				<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
-			</form>
-		case kindKiro:
-			<form class="row-form provider-form" data-method="apikey" data-oauth-mode="web" data-protocol="kiro" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
-				<input type="hidden" name="protocol" value="kiro"/>
-				<input type="hidden" name="preset" value="kiro"/>
-				<input name="name" placeholder="name" required/>
-				<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
-				<input name="profile_arn" class="mono" placeholder="profile ARN (arn:aws:codewhisperer:...)"/>
-				<input name="region" placeholder="region (default us-east-1)"/>
-				<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)">
-					<option value="apikey">api key</option>
-					<option value="oauth">AWS Builder ID (oauth)</option>
-				</select>
-				<div class="apikey-fields row-form">
-					<input name="api_key" type="password" placeholder="api key"/>
+				<div class="form-actions">
 					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
 					<span class="check-indicator htmx-indicator">checking...</span>
-					<span class="check-result"></span>
+					<span class="check-result" aria-live="polite"></span>
+					<button type="submit">Add</button>
+					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				</div>
+			</form>
+		case kindKiro:
+			<form class="provider-form provider-form-grid" data-method="apikey" data-oauth-mode="web" data-protocol="kiro" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+				<input type="hidden" name="protocol" value="kiro"/>
+				<input type="hidden" name="preset" value="kiro"/>
+				<label class="field">
+					<span class="field-name">Name</span>
+					<input name="name" placeholder="e.g. kiro" required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Base URL</span>
+					<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
+				</label>
+				<div class="kiro-fields">
+					<label class="field">
+						<span class="field-name">Profile ARN</span>
+						<input name="profile_arn" class="mono" placeholder="arn:aws:codewhisperer:..."/>
+					</label>
+					<label class="field">
+						<span class="field-name">Region</span>
+						<input name="region" placeholder="default us-east-1"/>
+					</label>
+				</div>
+				<label class="field">
+					<span class="field-name">Auth method</span>
+					<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)" aria-label="auth method">
+						<option value="apikey">api key</option>
+						<option value="oauth">AWS Builder ID (oauth)</option>
+					</select>
+				</label>
+				<div class="apikey-fields">
+					<label class="field">
+						<span class="field-name">API key</span>
+						<input name="api_key" type="password" placeholder="api key"/>
+					</label>
 				</div>
 				<div class="oauth-fields">
-					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" title="how to obtain tokens">
-						<option value="web" selected>Web auth</option>
-						<option value="manual">Manual</option>
-					</select>
+					<label class="field">
+						<span class="field-name">Auth mode</span>
+						<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
+							<option value="web" selected>Web auth</option>
+							<option value="manual">Manual</option>
+						</select>
+					</label>
 					<div class="oauth-web">
 						<button type="button" class="link" hx-post="/dashboard/providers/kiro/device/begin" hx-include="closest form" hx-target="#oauth-region-new-kiro" hx-swap="innerHTML">Connect (AWS Builder ID)</button>
-						<div id="oauth-region-new-kiro" class="oauth-region">
+						<div id="oauth-region-new-kiro" class="oauth-region" aria-live="polite">
 							@OAuthConnectIdle()
 						</div>
-					<p class="field-hint">Save after Connect succeeds, or switch to Manual and paste tokens.</p>
+						<p class="field-hint">Save after Connect succeeds, or switch to Manual and paste tokens.</p>
 					</div>
 					<div class="oauth-manual">
 						<input type="hidden" name="kiro_auth" value="builder-id"/>
 						<span class="muted">AWS Builder ID: paste the client id, client secret, and access/refresh tokens from your Kiro export.</span>
-						<input name="client_id" class="oauth-cfg" placeholder="client id"/>
-						<input name="client_secret" type="password" class="oauth-cfg" placeholder="client secret"/>
+						<label class="field">
+							<span class="field-name">Client id</span>
+							<input name="client_id" class="oauth-cfg" placeholder="client id" aria-label="client id"/>
+						</label>
+						<label class="field">
+							<span class="field-name">Client secret</span>
+							<input name="client_secret" type="password" class="oauth-cfg" placeholder="client secret" aria-label="client secret"/>
+						</label>
 						@oauthTokenFields(&domain.OAuthCreds{}, "", "")
-						<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
-						<span class="check-indicator htmx-indicator">checking...</span>
-						<span class="check-result"></span>
+						<div class="form-actions">
+							<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+							<span class="check-indicator htmx-indicator">checking...</span>
+							<span class="check-result" aria-live="polite"></span>
+						</div>
 					</div>
 				</div>
-				<button type="submit">Add</button>
-				<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				<div class="form-actions">
+					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+					<span class="check-indicator htmx-indicator">checking...</span>
+					<span class="check-result" aria-live="polite"></span>
+					<button type="submit">Add</button>
+					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				</div>
 			</form>
 		case kindGenericAPIKey:
-			<form class="row-form provider-form" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+			<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
 				<input type="hidden" name="auth_method" value="apikey"/>
-				<input name="name" placeholder="name" required/>
-				<input name="base_url" placeholder="https://api.example.com/v1" required/>
-				<input name="api_key" type="password" placeholder="api key" required/>
-				<select name="auth_scheme" title="credential header">
-					<option value="">default</option>
-					<option value="bearer">bearer</option>
-					<option value="x-api-key">x-api-key</option>
-				</select>
-				<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
-				<span class="check-indicator htmx-indicator">checking...</span>
-				<span class="check-result"></span>
-				<button type="submit">Add</button>
-				<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				<label class="field">
+					<span class="field-name">Name</span>
+					<input name="name" placeholder="e.g. openrouter" required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Base URL</span>
+					<input name="base_url" placeholder="https://api.example.com/v1" required/>
+				</label>
+				<label class="field">
+					<span class="field-name">API key</span>
+					<input name="api_key" type="password" placeholder="api key" required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Auth scheme</span>
+					<select name="auth_scheme" title="credential header" aria-label="credential header">
+						<option value="">default</option>
+						<option value="bearer">bearer</option>
+						<option value="x-api-key">x-api-key</option>
+					</select>
+				</label>
+				<div class="form-actions">
+					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+					<span class="check-indicator htmx-indicator">checking...</span>
+					<span class="check-result" aria-live="polite"></span>
+					<button type="submit">Add</button>
+					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				</div>
 			</form>
 	}
 }
@@ -224,7 +284,7 @@ templ providerEditSaveCancel(p *domain.Provider) {
 templ providerEditCheck() {
 	<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
 	<span class="check-indicator htmx-indicator">checking...</span>
-	<span class="check-result"></span>
+	<span class="check-result" aria-live="polite"></span>
 }
 
 templ kiroEditOAuthBlock(p *domain.Provider) {
@@ -239,7 +299,7 @@ templ kiroEditOAuthBlock(p *domain.Provider) {
 	</select>
 	<div class="oauth-web">
 		<button type="button" class="link" hx-post="/dashboard/providers/kiro/device/begin" hx-include="closest form" hx-target={ "#oauth-region-edit-" + strconv.FormatInt(p.ID, 10) } hx-swap="innerHTML">Reconnect (AWS Builder ID)</button>
-		<div id={ "oauth-region-edit-" + strconv.FormatInt(p.ID, 10) } class="oauth-region">
+		<div id={ "oauth-region-edit-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
 			@OAuthConnectIdle()
 		</div>
 		<button
@@ -253,7 +313,7 @@ templ kiroEditOAuthBlock(p *domain.Provider) {
 			hx-indicator="next .refresh-indicator"
 		>Refresh token</button>
 		<span class="refresh-indicator htmx-indicator">refreshing...</span>
-		<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result"></span>
+		<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result" aria-live="polite"></span>
 	</div>
 	<div class="oauth-manual">
 		<span class="muted">AWS Builder ID: paste the client id, client secret, and access/refresh tokens from your Kiro export.</span>
@@ -360,31 +420,45 @@ templ ProviderEditRow(p *domain.Provider) {
 }
 
 templ providerEditRowGenericAPIKey(p *domain.Provider) {
-	<form class="row-form provider-form" data-method="apikey" data-protocol={ string(p.Protocol) } hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
+	<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(p.Protocol) } hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
 		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 		<input type="hidden" name="protocol" value={ string(p.Protocol) }/>
 		<input type="hidden" name="auth_method" value="apikey"/>
-		<input name="name" value={ p.Name } required/>
-		<input name="base_url" value={ p.BaseURL } required/>
-		<input name="api_key" type="password" placeholder="leave blank to keep current"/>
-		<select name="auth_scheme" title="credential header">
-			if p.Auth() == domain.AuthBearer {
-				<option value="bearer" selected>bearer</option>
-				<option value="x-api-key">x-api-key</option>
-			} else {
-				<option value="bearer">bearer</option>
-				<option value="x-api-key" selected>x-api-key</option>
-			}
-		</select>
-		@providerEditCheck()
-		@providerEditSaveCancel(p)
+		<label class="field">
+			<span class="field-name">Name</span>
+			<input name="name" value={ p.Name } required/>
+		</label>
+		<label class="field">
+			<span class="field-name">Base URL</span>
+			<input name="base_url" value={ p.BaseURL } required/>
+		</label>
+		<label class="field">
+			<span class="field-name">API key</span>
+			<input name="api_key" type="password" placeholder="leave blank to keep current"/>
+		</label>
+		<label class="field">
+			<span class="field-name">Auth scheme</span>
+			<select name="auth_scheme" title="credential header" aria-label="credential header">
+				if p.Auth() == domain.AuthBearer {
+					<option value="bearer" selected>bearer</option>
+					<option value="x-api-key">x-api-key</option>
+				} else {
+					<option value="bearer">bearer</option>
+					<option value="x-api-key" selected>x-api-key</option>
+				}
+			</select>
+		</label>
+		<div class="form-actions">
+			@providerEditCheck()
+			@providerEditSaveCancel(p)
+		</div>
 	</form>
 }
 
 templ providerEditRowKiro(p *domain.Provider) {
 	{{ c := orEmptyCreds(p.OAuthCreds) }}
 	<form
-		class="row-form provider-form"
+		class="provider-form provider-form-grid"
 		data-method={ string(p.Method()) }
 		data-protocol="kiro"
 		data-oauth-mode="web"
@@ -394,29 +468,51 @@ templ providerEditRowKiro(p *domain.Provider) {
 	>
 		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 		<input type="hidden" name="protocol" value="kiro"/>
-		<input name="name" value={ p.Name } required/>
-		<input name="base_url" value={ p.BaseURL } required/>
-		<input name="profile_arn" class="mono" placeholder="profile ARN (arn:aws:codewhisperer:...)" value={ c.ProfileArn }/>
-		<input name="region" placeholder="region (default us-east-1)" value={ c.Region }/>
-		<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)">
-			<option value="apikey" selected?={ p.Method() == domain.AuthAPIKey }>api key</option>
-			<option value="oauth" selected?={ p.Method() == domain.AuthOAuth }>AWS Builder ID (oauth)</option>
-		</select>
-		<div class="apikey-fields row-form">
-			<input name="api_key" type="password" placeholder="leave blank to keep current"/>
-			@providerEditCheck()
+		<label class="field">
+			<span class="field-name">Name</span>
+			<input name="name" value={ p.Name } required/>
+		</label>
+		<label class="field">
+			<span class="field-name">Base URL</span>
+			<input name="base_url" value={ p.BaseURL } required/>
+		</label>
+		<div class="kiro-fields">
+			<label class="field">
+				<span class="field-name">Profile ARN</span>
+				<input name="profile_arn" class="mono" placeholder="arn:aws:codewhisperer:..." value={ c.ProfileArn }/>
+			</label>
+			<label class="field">
+				<span class="field-name">Region</span>
+				<input name="region" placeholder="default us-east-1" value={ c.Region }/>
+			</label>
+		</div>
+		<label class="field">
+			<span class="field-name">Auth method</span>
+			<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)" aria-label="auth method">
+				<option value="apikey" selected?={ p.Method() == domain.AuthAPIKey }>api key</option>
+				<option value="oauth" selected?={ p.Method() == domain.AuthOAuth }>AWS Builder ID (oauth)</option>
+			</select>
+		</label>
+		<div class="apikey-fields">
+			<label class="field">
+				<span class="field-name">API key</span>
+				<input name="api_key" type="password" placeholder="leave blank to keep current"/>
+			</label>
 		</div>
 		<div class="oauth-fields">
 			@kiroEditOAuthBlock(p)
 		</div>
-		@providerEditSaveCancel(p)
+		<div class="form-actions">
+			@providerEditCheck()
+			@providerEditSaveCancel(p)
+		</div>
 	</form>
 }
 
 templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 	{{ c := orEmptyCreds(p.OAuthCreds) }}
 	<form
-		class="row-form provider-form"
+		class="provider-form provider-form-grid"
 		data-method="oauth"
 		data-protocol={ string(p.Protocol) }
 		data-oauth-mode="web"
@@ -437,16 +533,25 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 		<input type="hidden" name="scopes" value={ c.Scopes }/>
 		<input type="hidden" name="redirect_uri" value={ redirectOr(c.RedirectURI) }/>
 		<input type="hidden" name="pkce" value={ boolStr(c.PKCE) }/>
-		<input name="name" value={ p.Name } required/>
-		<input name="base_url" value={ p.BaseURL } required/>
+		<label class="field">
+			<span class="field-name">Name</span>
+			<input name="name" value={ p.Name } required/>
+		</label>
+		<label class="field">
+			<span class="field-name">Base URL</span>
+			<input name="base_url" value={ p.BaseURL } required/>
+		</label>
 		<span class="muted">Connected: { oauthLabel(p.OAuthCreds) }. Reconnect only if the refresh token is revoked.</span>
-		<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" title="how to obtain tokens">
-			<option value="web" selected>Web auth</option>
-			<option value="manual">Manual</option>
-		</select>
+		<label class="field">
+			<span class="field-name">Auth mode</span>
+			<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
+				<option value="web" selected>Web auth</option>
+				<option value="manual">Manual</option>
+			</select>
+		</label>
 		<div class="oauth-web">
 			<button type="button" class="link" hx-post="/dashboard/providers/oauth/begin" hx-include="closest form" hx-target={ "#oauth-region-edit-" + strconv.FormatInt(p.ID, 10) } hx-swap="innerHTML">Reconnect</button>
-			<div id={ "oauth-region-edit-" + strconv.FormatInt(p.ID, 10) } class="oauth-region">
+			<div id={ "oauth-region-edit-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
 				@OAuthConnectIdle()
 			</div>
 			<button
@@ -460,12 +565,14 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 				hx-indicator="next .refresh-indicator"
 			>Refresh token</button>
 			<span class="refresh-indicator htmx-indicator">refreshing...</span>
-			<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result"></span>
+			<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result" aria-live="polite"></span>
 		</div>
 		<div class="oauth-manual">
 			@oauthTokenFields(&domain.OAuthCreds{}, "", "")
 			@providerEditCheck()
 		</div>
-		@providerEditSaveCancel(p)
+		<div class="form-actions">
+			@providerEditSaveCancel(p)
+		</div>
 	</form>
 }

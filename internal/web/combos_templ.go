@@ -70,7 +70,7 @@ func CombosPage(combos []*domain.Combo, providers []*domain.Provider) templ.Comp
 					return templ_7745c5c3_Err
 				}
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "</section><section class=\"panel\"><div id=\"combo-flash\"></div>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "</section><section class=\"panel\"><div id=\"combo-flash\" class=\"flash-sink\" aria-live=\"polite\"></div>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -113,7 +113,7 @@ func comboForm(providers []*domain.Provider) templ.Component {
 			templ_7745c5c3_Var3 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 5, "<form class=\"combo-form\" hx-post=\"/dashboard/combos\" hx-target=\"#combo-list\" hx-swap=\"outerHTML\" hx-on::after-request=\"if(event.detail.successful &amp;&amp; event.detail.elt === this) this.reset()\"><div class=\"row-form\"><input name=\"name\" placeholder=\"combo name (e.g. default)\" required>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 5, "<form class=\"combo-form\" hx-post=\"/dashboard/combos\" hx-target=\"#combo-list\" hx-swap=\"outerHTML\" hx-on::after-request=\"if(event.detail.successful &amp;&amp; event.detail.elt === this) this.reset()\"><div class=\"row-form\"><input name=\"name\" placeholder=\"combo name (e.g. default)\" aria-label=\"combo name\" required>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -166,7 +166,7 @@ func strategySelect(selected domain.ComboStrategy) templ.Component {
 			templ_7745c5c3_Var4 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 9, "<select name=\"strategy\" title=\"failover: try top-to-bottom; round-robin: rotate start, then fail over\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 9, "<select name=\"strategy\" title=\"failover: try top-to-bottom; round-robin: rotate start, then fail over\" aria-label=\"selection strategy\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -985,7 +985,7 @@ func ComboEditRow(c *domain.Combo, providers []*domain.Provider) templ.Component
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 75, "\" required>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 75, "\" aria-label=\"combo name\" required>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

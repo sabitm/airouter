@@ -28,8 +28,10 @@ function airouterToggleOAuthMode(sel) {
 function airouterSelectProviderCard(btn) {
   document.querySelectorAll(".provider-card.selected").forEach(function (c) {
     c.classList.remove("selected");
+    c.setAttribute("aria-pressed", "false");
   });
   btn.classList.add("selected");
+  btn.setAttribute("aria-pressed", "true");
 }
 
 // airouterCloseProviderForm dismisses the open add-form and clears the card
@@ -41,6 +43,7 @@ function airouterCloseProviderForm() {
   }
   document.querySelectorAll(".provider-card.selected").forEach(function (c) {
     c.classList.remove("selected");
+    c.setAttribute("aria-pressed", "false");
   });
 }
 

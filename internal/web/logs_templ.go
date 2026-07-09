@@ -187,7 +187,7 @@ func LogsFilterForm(q store.RequestLogQuery, opts LogFilterOpts) templ.Component
 			templ_7745c5c3_Var7 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 8, "<form class=\"row-form logs-filters\" method=\"get\" action=\"/dashboard/logs\" hx-get=\"/dashboard/logs\" hx-target=\"#logs-body\" hx-swap=\"outerHTML\" hx-push-url=\"true\"><select name=\"status\" title=\"status filter\"><option value=\"\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 8, "<form class=\"row-form logs-filters\" method=\"get\" action=\"/dashboard/logs\" hx-get=\"/dashboard/logs\" hx-target=\"#logs-body\" hx-swap=\"outerHTML\" hx-push-url=\"true\"><select name=\"status\" title=\"status filter\" aria-label=\"status filter\"><option value=\"\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -250,7 +250,7 @@ func LogsFilterForm(q store.RequestLogQuery, opts LogFilterOpts) templ.Component
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "\" placeholder=\"combo\" title=\"exact combo name\"> <datalist id=\"log-combo-options\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "\" placeholder=\"combo\" title=\"exact combo name\" aria-label=\"combo filter\"> <datalist id=\"log-combo-options\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -286,7 +286,7 @@ func LogsFilterForm(q store.RequestLogQuery, opts LogFilterOpts) templ.Component
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 23, "\" placeholder=\"provider\" title=\"exact provider name\"> <datalist id=\"log-provider-options\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 23, "\" placeholder=\"provider\" title=\"exact provider name\" aria-label=\"provider filter\"> <datalist id=\"log-provider-options\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

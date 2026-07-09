@@ -47,7 +47,7 @@ func KeysPage(keys []*domain.AccessKey) templ.Component {
 				}()
 			}
 			ctx = templ.InitializeContext(ctx)
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<section class=\"panel\"><h1>Access Keys</h1><p class=\"hint\">Bearer tokens clients send to authenticate against the router proxy. The full token is shown only once at creation.</p><form class=\"row-form\" hx-post=\"/dashboard/keys\" hx-target=\"#key-list\" hx-swap=\"outerHTML\" hx-on::after-request=\"if(event.detail.successful) this.reset()\"><input name=\"name\" placeholder=\"label (e.g. my-laptop)\" required> <button type=\"submit\">Generate</button></form></section><section class=\"panel\">")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<section class=\"panel\"><h1>Access Keys</h1><p class=\"hint\">Bearer tokens clients send to authenticate against the router proxy. The full token is shown only once at creation.</p><form class=\"row-form\" hx-post=\"/dashboard/keys\" hx-target=\"#key-list\" hx-swap=\"outerHTML\" hx-on::after-request=\"if(event.detail.successful) this.reset()\"><input name=\"name\" placeholder=\"label (e.g. my-laptop)\" aria-label=\"access key label\" required> <button type=\"submit\">Generate</button></form></section><section class=\"panel\">")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -92,7 +92,7 @@ func KeyList(keys []*domain.AccessKey, justCreated *domain.AccessKey) templ.Comp
 			templ_7745c5c3_Var3 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<div id=\"key-list\"><div id=\"key-flash\"></div>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<div id=\"key-list\"><div id=\"key-flash\" class=\"flash-sink\" aria-live=\"polite\"></div>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

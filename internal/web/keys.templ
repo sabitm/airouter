@@ -12,7 +12,7 @@ templ KeysPage(keys []*domain.AccessKey) {
 			<h1>Access Keys</h1>
 			<p class="hint">Bearer tokens clients send to authenticate against the router proxy. The full token is shown only once at creation.</p>
 			<form class="row-form" hx-post="/dashboard/keys" hx-target="#key-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
-				<input name="name" placeholder="label (e.g. my-laptop)" required/>
+				<input name="name" placeholder="label (e.g. my-laptop)" aria-label="access key label" required/>
 				<button type="submit">Generate</button>
 			</form>
 		</section>
@@ -26,7 +26,7 @@ templ KeysPage(keys []*domain.AccessKey) {
 // token banner once.
 templ KeyList(keys []*domain.AccessKey, justCreated *domain.AccessKey) {
 	<div id="key-list">
-		<div id="key-flash"></div>
+		<div id="key-flash" class="flash-sink" aria-live="polite"></div>
 		if justCreated != nil {
 			<div class="flash created">
 				New token (copy now, it will not be shown again):

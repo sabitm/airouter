@@ -69,20 +69,20 @@ templ LogsFilterForm(q store.RequestLogQuery, opts LogFilterOpts) {
 		hx-swap="outerHTML"
 		hx-push-url="true"
 	>
-		<select name="status" title="status filter">
+		<select name="status" title="status filter" aria-label="status filter">
 			<option value="" selected?={ q.StatusClass == "" }>All statuses</option>
 			<option value="error" selected?={ q.StatusClass == "error" }>Errors (4xx/5xx)</option>
 			<option value="ok" selected?={ q.StatusClass == "ok" }>2xx</option>
 			<option value="client" selected?={ q.StatusClass == "client" }>4xx</option>
 			<option value="server" selected?={ q.StatusClass == "server" }>5xx</option>
 		</select>
-		<input name="combo" list="log-combo-options" value={ q.Combo } placeholder="combo" title="exact combo name"/>
+		<input name="combo" list="log-combo-options" value={ q.Combo } placeholder="combo" title="exact combo name" aria-label="combo filter"/>
 		<datalist id="log-combo-options">
 			for _, c := range opts.Combos {
 				<option value={ c }></option>
 			}
 		</datalist>
-		<input name="provider" list="log-provider-options" value={ q.Provider } placeholder="provider" title="exact provider name"/>
+		<input name="provider" list="log-provider-options" value={ q.Provider } placeholder="provider" title="exact provider name" aria-label="provider filter"/>
 		<datalist id="log-provider-options">
 			for _, p := range opts.Providers {
 				<option value={ p }></option>

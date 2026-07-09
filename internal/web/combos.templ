@@ -35,7 +35,7 @@ templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
 			}
 		</section>
 		<section class="panel">
-			<div id="combo-flash"></div>
+			<div id="combo-flash" class="flash-sink" aria-live="polite"></div>
 			@ComboList(combos)
 		</section>
 	}
@@ -44,7 +44,7 @@ templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
 templ comboForm(providers []*domain.Provider) {
 	<form class="combo-form" hx-post="/dashboard/combos" hx-target="#combo-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this) this.reset()">
 		<div class="row-form">
-			<input name="name" placeholder="combo name (e.g. default)" required/>
+			<input name="name" placeholder="combo name (e.g. default)" aria-label="combo name" required/>
 			@strategySelect("")
 		</div>
 		<div class="targets">
@@ -59,7 +59,7 @@ templ comboForm(providers []*domain.Provider) {
 }
 
 templ strategySelect(selected domain.ComboStrategy) {
-	<select name="strategy" title="failover: try top-to-bottom; round-robin: rotate start, then fail over">
+	<select name="strategy" title="failover: try top-to-bottom; round-robin: rotate start, then fail over" aria-label="selection strategy">
 		if selected == domain.StrategyRoundRobin {
 			<option value="failover">failover</option>
 			<option value="roundrobin" selected>round-robin</option>
@@ -212,7 +212,7 @@ templ ComboEditRow(c *domain.Combo, providers []*domain.Provider) {
 		<td colspan="4">
 			<form class="combo-form" hx-post={ "/dashboard/combos/" + id } hx-target="#combo-list" hx-swap="outerHTML">
 				<div class="row-form">
-					<input name="name" value={ c.Name } required/>
+					<input name="name" value={ c.Name } aria-label="combo name" required/>
 					@strategySelect(c.Strategy)
 				</div>
 				<div class="targets">

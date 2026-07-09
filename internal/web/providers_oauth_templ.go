@@ -37,53 +37,53 @@ func oauthTokenFields(c *domain.OAuthCreds, okMsg, errMsg string) templ.Componen
 			templ_7745c5c3_Var1 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<div class=\"oauth-tokens\"><span class=\"muted\">Import existing tokens (optional, skips Connect):</span> <input name=\"access_token\" type=\"password\" class=\"oauth-cfg\" placeholder=\"access token\" value=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<div class=\"oauth-tokens\"><span class=\"muted\">Import existing tokens (optional, skips Connect):</span> <input name=\"access_token\" type=\"password\" class=\"oauth-cfg\" placeholder=\"access token\" aria-label=\"access token\" value=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var2 string
 		templ_7745c5c3_Var2, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.AccessToken)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 14, Col: 111}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 14, Col: 137}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var2)
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 2, "\"> <input name=\"refresh_token\" type=\"password\" class=\"oauth-cfg\" placeholder=\"refresh token\" value=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 2, "\"> <input name=\"refresh_token\" type=\"password\" class=\"oauth-cfg\" placeholder=\"refresh token\" aria-label=\"refresh token\" value=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var3 string
 		templ_7745c5c3_Var3, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.RefreshToken)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 15, Col: 114}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 15, Col: 141}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var3)
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "\"> <input name=\"expires_at\" class=\"oauth-cfg\" placeholder=\"expires at (RFC3339 or unix seconds)\" value=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "\"> <input name=\"expires_at\" class=\"oauth-cfg\" placeholder=\"expires at (RFC3339 or unix seconds)\" aria-label=\"expires at\" value=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var4 string
 		templ_7745c5c3_Var4, templ_7745c5c3_Err = templ.ResolveAttributeValue(expiresAtStr(c.ExpiresAt))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 16, Col: 129}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 16, Col: 153}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var4)
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "\"> <input name=\"email\" class=\"oauth-cfg\" placeholder=\"account email (optional)\" value=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "\"> <input name=\"email\" class=\"oauth-cfg\" placeholder=\"account email (optional)\" aria-label=\"account email\" value=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var5 string
 		templ_7745c5c3_Var5, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.Email)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 17, Col: 94}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers_oauth.templ`, Line: 17, Col: 121}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var5)
 		if templ_7745c5c3_Err != nil {
@@ -393,7 +393,7 @@ func OAuthConnectView(authURL, state string, loopback bool) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 26, "\" target=\"_blank\" rel=\"noopener\">Open authorize page</a><div class=\"oauth-paste row-form\"><input name=\"code\" placeholder=\"paste code or full redirect URL\"> <button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/oauth/exchange\" hx-include=\"closest .oauth-paste\" hx-vals=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 26, "\" target=\"_blank\" rel=\"noopener\">Open authorize page</a><div class=\"oauth-paste row-form\"><input name=\"code\" placeholder=\"paste code or full redirect URL\" aria-label=\"authorization code or redirect URL\"> <button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/oauth/exchange\" hx-include=\"closest .oauth-paste\" hx-vals=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
