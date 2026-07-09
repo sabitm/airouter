@@ -25,6 +25,35 @@ function removeComboTarget(btn) {
   }
 }
 
+// Checkbox has no name; the hidden input is what the form submits so unchecked
+// rows still post "0" instead of disappearing from the parallel enabled array.
+function airouterSetTargetEnabled(cb) {
+  const row = cb.closest(".target-row");
+  if (!row) return;
+  const hidden = row.querySelector('input[name="enabled"]');
+  if (hidden) {
+    hidden.value = cb.checked ? "1" : "0";
+  }
+}
+
+// dir -1 moves earlier in failover order (toward top); +1 later (toward bottom).
+function moveComboTarget(btn, dir) {
+  const row = btn.closest(".target-row");
+  if (!row) return;
+  const container = row.parentElement;
+  if (dir < 0) {
+    const prev = row.previousElementSibling;
+    if (prev && prev.classList.contains("target-row")) {
+      container.insertBefore(row, prev);
+    }
+    return;
+  }
+  const next = row.nextElementSibling;
+  if (next && next.classList.contains("target-row")) {
+    container.insertBefore(next, row);
+  }
+}
+
 // Combo Edit/Save/Delete/toggle swap #combo-list or a single #combo-<id> row,
 // changing document height. Preserve scrollY across those swaps (same approach
 // as providers.js) so the viewport does not jump to the bottom.

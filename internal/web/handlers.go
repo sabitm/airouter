@@ -578,6 +578,16 @@ func parseComboForm(r *http.Request) (*domain.Combo, error) {
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("a combo needs at least one provider + model target")
 	}
+	hasEnabled := false
+	for _, t := range targets {
+		if t.Enabled {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
+		return nil, fmt.Errorf("at least one target must be enabled")
+	}
 	strategy := domain.ComboStrategy(r.FormValue("strategy"))
 	if strategy == "" {
 		strategy = domain.StrategyFailover
@@ -713,6 +723,20 @@ func (h *Handler) toggleComboTarget(w http.ResponseWriter, r *http.Request) {
 	if cur == nil {
 		http.NotFound(w, r)
 		return
+	}
+	// Disabling is rejected when this is the last enabled target, matching
+	// parseComboForm so list toggles and edit-form saves share one rule.
+	if cur.Enabled {
+		enabledCount := 0
+		for _, t := range combo.Targets {
+			if t.Enabled {
+				enabledCount++
+			}
+		}
+		if enabledCount <= 1 {
+			htmxBadRequest(w, r, "combo-flash", "at least one target must be enabled")
+			return
+		}
 	}
 	if err := h.store.SetTargetEnabled(r.Context(), tid, !cur.Enabled); err != nil {
 		htmxBadRequest(w, r, "combo-flash", err.Error())

@@ -19,6 +19,15 @@ templ CombosPage(combos []*domain.Combo, providers []*domain.Provider) {
 		<section class="panel">
 			<h1>Combos</h1>
 			<p class="hint">A custom model name clients call (e.g. "default"), backed by one or more provider + upstream-model targets. With multiple targets, the strategy picks which to use: failover tries them in order, round-robin spreads load and still fails over.</p>
+			<details class="routing-hint">
+				<summary>How routing works</summary>
+				<ul class="routing-hint-list">
+					<li>Failover tries targets top-to-bottom (reorder rows to change priority).</li>
+					<li>Round-robin rotates the start target, then fails over through the rest.</li>
+					<li>Disabled targets and archived providers are skipped entirely.</li>
+					<li>A target that fails before the response starts is temporarily deprioritized for later requests, not removed.</li>
+				</ul>
+			</details>
 			if len(providers) == 0 {
 				<p class="empty">Add a provider first.</p>
 			} else {
@@ -50,7 +59,7 @@ templ comboForm(providers []*domain.Provider) {
 }
 
 templ strategySelect(selected domain.ComboStrategy) {
-	<select name="strategy" title="selection strategy">
+	<select name="strategy" title="failover: try top-to-bottom; round-robin: rotate start, then fail over">
 		if selected == domain.StrategyRoundRobin {
 			<option value="failover">failover</option>
 			<option value="roundrobin" selected>round-robin</option>
@@ -63,12 +72,21 @@ templ strategySelect(selected domain.ComboStrategy) {
 
 // comboTargetRow renders one provider + upstream-model pair. uid must be unique
 // on the page so the datalist id and the htmx model-fetch target do not collide
-// across rows or across open forms.
+// across rows or across open forms. DOM order of rows is the failover order.
 templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderID int64, model string, enabled bool) {
 	{{ listID := "model-options-" + uid }}
 	{{ enabledVal := "0" }}
 	{{ if enabled { enabledVal = "1" } }}
 	<div class="target-row row-form">
+		<label class="target-enabled" title="include in routing">
+			if enabled {
+				<input type="checkbox" checked onchange="airouterSetTargetEnabled(this)"/>
+			} else {
+				<input type="checkbox" onchange="airouterSetTargetEnabled(this)"/>
+			}
+			<span>On</span>
+		</label>
+		<input type="hidden" name="enabled" value={ enabledVal }/>
 		<select name="provider_id" hx-get={ "/dashboard/providers/models?list=" + listID } hx-trigger="change, load" hx-target={ "#model-options-wrap-" + uid } hx-swap="innerHTML">
 			for _, p := range providers {
 				if p.ID == selectedProviderID {
@@ -78,9 +96,10 @@ templ comboTargetRow(uid string, providers []*domain.Provider, selectedProviderI
 				}
 			}
 		</select>
-		<input type="hidden" name="enabled" value={ enabledVal }/>
 		<input name="upstream_model" list={ listID } value={ model } placeholder="upstream model id (e.g. gpt-4o)" required/>
 		<span id={ "model-options-wrap-" + uid }>@ModelOptions(nil, listID, false)</span>
+		<button type="button" class="link" onclick="moveComboTarget(this, -1)" title="move earlier in failover order">Up</button>
+		<button type="button" class="link" onclick="moveComboTarget(this, 1)" title="move later in failover order">Down</button>
 		<button type="button" class="link danger" onclick="removeComboTarget(this)" title="remove target">x</button>
 	</div>
 }
@@ -147,9 +166,12 @@ templ ComboRow(c *domain.Combo) {
 		</td>
 		<td>
 			<ul class="target-list">
-				for _, t := range c.Targets {
+				for i, t := range c.Targets {
 					if t.Enabled {
 						<li>
+							if len(c.Targets) > 1 {
+								<span class="target-ord">{ strconv.Itoa(i+1) }.</span>
+							}
 							{ t.Provider.Name }
 							<span class="tag">{ string(t.Provider.Protocol) }</span>
 							<span class="mono">{ t.UpstreamModel }</span>
@@ -157,6 +179,9 @@ templ ComboRow(c *domain.Combo) {
 						</li>
 					} else {
 						<li class="disabled">
+							if len(c.Targets) > 1 {
+								<span class="target-ord">{ strconv.Itoa(i+1) }.</span>
+							}
 							{ t.Provider.Name }
 							<span class="tag">{ string(t.Provider.Protocol) }</span>
 							<span class="mono">{ t.UpstreamModel }</span>

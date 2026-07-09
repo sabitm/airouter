@@ -344,3 +344,44 @@ tr.archived { opacity: 0.6; }
 	max-width: 480px;
 	color: var(--text);
 }
+
+
+.target-enabled {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	flex: 0 0 auto;
+	color: var(--muted);
+	font-size: 13px;
+	cursor: pointer;
+	user-select: none;
+}
+.target-enabled input {
+	flex: 0 0 auto;
+	min-width: 0;
+	width: auto;
+	margin: 0;
+}
+.target-ord {
+	color: var(--muted);
+	font-size: 12px;
+	margin-right: 4px;
+	font-variant-numeric: tabular-nums;
+}
+.routing-hint {
+	margin: 0 0 16px;
+	color: var(--muted);
+	font-size: 13px;
+}
+.routing-hint summary {
+	cursor: pointer;
+	color: var(--muted);
+}
+.routing-hint summary:hover { color: var(--text); }
+.routing-hint-list {
+	margin: 8px 0 0;
+	padding-left: 1.2rem;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
