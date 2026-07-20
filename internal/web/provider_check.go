@@ -146,6 +146,9 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	if p.Protocol == domain.ProtocolKiro {
 		return checkKiroUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
+	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
+		return checkClineUpstream(ctx, p, trace, fileTrace, stderrTrace)
+	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -202,6 +205,50 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 		return false, "reachable, but response shape unexpected - protocol may not match"
 	}
 	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
+}
+
+// checkClineUpstream validates a Cline/ClinePass OAuth token against Cline's
+// /users/me endpoint. Plain Cline does not expose /models, so probing it (the
+// generic path) returns a misleading 404 even for a valid token. /users/me is
+// what 9router uses to verify the access token.
+func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+	url := strings.TrimRight(p.BaseURL, "/") + "/users/me"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, "invalid base URL"
+	}
+	applyClineProbeHeaders(req, p)
+	req.Header.Set("Accept", "application/json")
+
+	if trace {
+		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
+	}
+
+	resp, err := upstreamClient.Do(req)
+	if err != nil {
+		if trace {
+			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
+		}
+		return false, "could not reach URL: " + err.Error()
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if trace {
+		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+	}
+
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		return false, "token invalid or revoked (HTTP 401)"
+	case resp.StatusCode == http.StatusForbidden:
+		return false, "access denied (HTTP 403)"
+	case resp.StatusCode == http.StatusNotFound:
+		return false, "not found (HTTP 404) - check base URL"
+	case resp.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	}
+	return true, "OK - reachable, token accepted"
 }
 
 // checkCodexUpstream validates the ChatGPT Codex model-discovery endpoint. It is
