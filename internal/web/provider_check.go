@@ -162,10 +162,12 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	if p.Protocol == domain.ProtocolAnthropic {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
+	applyClineProbeHeaders(req, p)
 
 	if trace {
 		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
 	}
+
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
@@ -238,6 +240,18 @@ func upstreamErrorText(body []byte) string {
 		return e.Error.Message
 	}
 	return string(body)
+}
+
+// applyClineProbeHeaders overlays Cline identity headers (and the workos:
+// bearer prefix) when the provider is a Cline/ClinePass OAuth connection, so
+// dashboard Check and /models probes match what the proxy sends upstream.
+func applyClineProbeHeaders(req *http.Request, p *domain.Provider) {
+	if p == nil || p.OAuthCreds == nil || !p.OAuthCreds.ClineAuth {
+		return
+	}
+	for k, v := range oauth.ClineIdentityHeaders("", p.APIKey) {
+		req.Header.Set(k, v)
+	}
 }
 
 func logProviderTracef(fileTrace, stderrTrace *log.Logger, format string, args ...any) {

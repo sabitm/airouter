@@ -86,6 +86,7 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 	if p.Protocol == domain.ProtocolAnthropic {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
+	applyClineProbeHeaders(req, p)
 
 	resp, err := upstreamClient.Do(req)
 	if err != nil {

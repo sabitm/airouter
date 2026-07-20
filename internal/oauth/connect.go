@@ -74,12 +74,16 @@ type exchangeResult struct {
 
 // NewConnect prepares an authorization-code flow for the given OAuth config. The
 // tokens are populated by AuthorizeURL -> (callback or ExchangeCode) -> wait.
+// Cline connections (ClineAuth) omit client_id; every other flow still requires it.
 func NewConnect(creds *domain.OAuthCreds) (*Connect, error) {
 	if creds == nil {
 		return nil, errors.New("oauth: nil creds")
 	}
-	if creds.AuthURL == "" || creds.TokenURL == "" || creds.ClientID == "" {
-		return nil, errors.New("oauth: connect requires auth_url, token_url, client_id")
+	if creds.AuthURL == "" || creds.TokenURL == "" {
+		return nil, errors.New("oauth: connect requires auth_url, token_url")
+	}
+	if !creds.ClineAuth && creds.ClientID == "" {
+		return nil, errors.New("oauth: connect requires client_id")
 	}
 	verifier, err := newVerifier()
 	if err != nil {
@@ -93,8 +97,23 @@ func NewConnect(creds *domain.OAuthCreds) (*Connect, error) {
 }
 
 // AuthorizeURL builds the authorization endpoint URL the user's browser visits.
-// It includes the PKCE code_challenge for public clients (PKCE=true).
+// It includes the PKCE code_challenge for public clients (PKCE=true). Cline uses
+// a non-standard authorize shape (client_type + callback_url, no client_id/PKCE).
 func (c *Connect) AuthorizeURL() (string, error) {
+	authURL := c.creds.AuthURL
+	if c.baseURL != "" {
+		authURL = c.baseURL + "/authorize"
+	}
+	if c.creds.ClineAuth {
+		q := url.Values{}
+		q.Set("client_type", "extension")
+		q.Set("callback_url", c.creds.RedirectURI)
+		q.Set("redirect_uri", c.creds.RedirectURI)
+		// state is kept even though 9router omits it: airouter's loopback session is
+		// state-keyed. handleCallback tolerates a missing echo from the AS.
+		q.Set("state", c.state)
+		return authURL + "?" + q.Encode(), nil
+	}
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", c.creds.ClientID)
@@ -113,10 +132,6 @@ func (c *Connect) AuthorizeURL() (string, error) {
 			continue
 		}
 		q.Set(k, v)
-	}
-	authURL := c.creds.AuthURL
-	if c.baseURL != "" {
-		authURL = c.baseURL + "/authorize"
 	}
 	return authURL + "?" + q.Encode(), nil
 }
@@ -168,9 +183,13 @@ func (c *Connect) handleCallback(w http.ResponseWriter, r *http.Request) {
 		c.finish(w, http.StatusBadRequest, "OAuth error: "+q.Get("error"))
 		return
 	}
-	if q.Get("state") != c.state {
-		c.finish(w, http.StatusBadRequest, "state mismatch")
-		return
+	// Cline's AS may not echo state (9router never sends it). When state is absent
+	// on a Cline callback, skip the check; when present, still require a match.
+	if s := q.Get("state"); s != "" || !c.creds.ClineAuth {
+		if s != c.state {
+			c.finish(w, http.StatusBadRequest, "state mismatch")
+			return
+		}
 	}
 	code := q.Get("code")
 	if code == "" {
@@ -286,7 +305,11 @@ func (c *Connect) Close() error {
 
 // exchangeCode posts the authorization-code grant, populating creds with the
 // response. baseURL overrides the token URL in tests (empty in production).
+// ClineAuth routes to the Cline-specific exchange (base64 code or JSON body).
 func exchangeCode(ctx context.Context, c *domain.OAuthCreds, code, verifier, baseURL string) error {
+	if c.ClineAuth {
+		return exchangeClineCode(ctx, c, code, baseURL)
+	}
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)

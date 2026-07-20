@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"airouter/internal/domain"
+	"airouter/internal/oauth"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/responses"
 )
@@ -133,6 +134,20 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	// override any forwarded values.
 	if provider.Protocol == domain.ProtocolKiro {
 		applyKiroHeaders(req, provider)
+	}
+	// Cline/ClinePass OAuth needs the workos: bearer prefix and Cline identity
+	// headers; set after the auth-scheme switch so Authorization is rewritten.
+	if provider.OAuthCreds != nil && provider.OAuthCreds.ClineAuth {
+		applyClineHeaders(req, provider)
+	}
+}
+
+// applyClineHeaders sets Cline identity headers and normalizes the bearer token
+// with the workos: prefix the upstream requires. Auth method is already bearer
+// from the scheme switch; this overwrites Authorization with the prefixed form.
+func applyClineHeaders(req *http.Request, provider *domain.Provider) {
+	for k, v := range oauth.ClineIdentityHeaders("", provider.APIKey) {
+		req.Header.Set(k, v)
 	}
 }
 

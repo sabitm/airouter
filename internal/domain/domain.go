@@ -104,6 +104,16 @@ type OAuthCreds struct {
 	// RefreshJSON sends the token-refresh body as application/json rather than the
 	// default application/x-www-form-urlencoded (required by the ChatGPT backend).
 	RefreshJSON bool `json:"refresh_json,omitempty"`
+	// RefreshURL is an optional dedicated refresh endpoint. When set, refresh posts
+	// here instead of TokenURL (Cline's exchange and refresh hosts differ). Empty keeps
+	// the historical behavior of refreshing against TokenURL.
+	RefreshURL string `json:"refresh_url,omitempty"`
+
+	// ClineAuth marks a Cline/ClinePass OAuth connection. When true, authorize,
+	// exchange, and refresh leave the generic OAuth2 path: no client_id/PKCE, a
+	// base64-embedded code (with JSON token-endpoint fallback), camelCase refresh, and
+	// the workos: access-token prefix plus Cline identity headers upstream.
+	ClineAuth bool `json:"cline_auth,omitempty"`
 
 	// Kiro-specific config. ProfileArn is the CodeWhisperer profile ARN injected
 	// into every Kiro request body; Region selects the OIDC refresh endpoint host.

@@ -38,6 +38,11 @@ type Preset struct {
 	// RefreshJSON sends the refresh body as application/json rather than form
 	// (the ChatGPT backend requires JSON).
 	RefreshJSON bool
+	// RefreshURL is an optional dedicated refresh endpoint copied into OAuthCreds
+	// (Cline's exchange and refresh hosts differ). Empty means refresh uses TokenURL.
+	RefreshURL string
+	// ClineAuth marks a Cline/ClinePass connection (non-standard OAuth + headers).
+	ClineAuth bool
 }
 
 // Presets is the set of built-in OAuth configurations. Add an entry here to
@@ -87,6 +92,34 @@ var Presets = []Preset{
 		APIBase:  kiro.DefaultBaseURL,
 		Protocol: domain.ProtocolKiro,
 	},
+	// Cline is the cline.bot OAuth provider. It speaks OpenAI Chat Completions but
+	// uses a non-standard authorization-code flow (no client_id/PKCE; tokens often
+	// embedded as base64 in the redirect code) and requires a workos:-prefixed bearer
+	// plus Cline identity headers upstream. Exchange and refresh hit different URLs.
+	{
+		Name:        "cline",
+		Label:       "Cline",
+		AuthURL:     "https://api.cline.bot/api/v1/auth/authorize",
+		TokenURL:    "https://api.cline.bot/api/v1/auth/token",
+		RefreshURL:  "https://api.cline.bot/api/v1/auth/refresh",
+		RedirectURI: "http://127.0.0.1:56122/callback",
+		ClineAuth:   true,
+		APIBase:     "https://api.cline.bot/api/v1",
+		Protocol:    domain.ProtocolOpenAI,
+	},
+	// ClinePass shares Cline's OAuth endpoints and header rules; only the product
+	// label differs. API-key ClinePass is the generic OpenAI-compatible recipe.
+	{
+		Name:        "clinepass",
+		Label:       "ClinePass",
+		AuthURL:     "https://api.cline.bot/api/v1/auth/authorize",
+		TokenURL:    "https://api.cline.bot/api/v1/auth/token",
+		RefreshURL:  "https://api.cline.bot/api/v1/auth/refresh",
+		RedirectURI: "http://127.0.0.1:56122/callback",
+		ClineAuth:   true,
+		APIBase:     "https://api.cline.bot/api/v1",
+		Protocol:    domain.ProtocolOpenAI,
+	},
 }
 
 // PresetByName returns the preset with the given name, or false.
@@ -119,5 +152,7 @@ func Apply(p Preset) (provider *domain.Provider, creds *domain.OAuthCreds) {
 			PKCE:            p.PKCE,
 			ExtraAuthParams: p.ExtraAuthParams,
 			RefreshJSON:     p.RefreshJSON,
+			RefreshURL:      p.RefreshURL,
+			ClineAuth:       p.ClineAuth,
 		}
 }

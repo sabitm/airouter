@@ -239,6 +239,30 @@ func TestOAuthPresetCreatesXAIConfig(t *testing.T) {
 	}
 }
 
+func TestOAuthPresetCreatesClineConfig(t *testing.T) {
+	form := url.Values{}
+	form.Set("preset", "cline")
+	creds, err := credsFromConnectForm(reqWithForm(form))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !creds.ClineAuth {
+		t.Error("cline preset should set ClineAuth")
+	}
+	if creds.ClientID != "" {
+		t.Errorf("client id = %q, want empty", creds.ClientID)
+	}
+	if creds.PKCE {
+		t.Error("cline preset should not use PKCE")
+	}
+	if creds.TokenURL == "" || creds.RefreshURL == "" || creds.AuthURL == "" {
+		t.Errorf("urls incomplete: %+v", creds)
+	}
+	if creds.Mode != domain.OAuthAuto || creds.Preset != "cline" {
+		t.Errorf("mode/preset = %q/%q", creds.Mode, creds.Preset)
+	}
+}
+
 func reqWithForm(form url.Values) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")

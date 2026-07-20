@@ -102,6 +102,10 @@ func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	if c.KiroAuth != "" && c.KiroAuth != "external_idp" {
 		return refreshKiro(ctx, c, now)
 	}
+	// Cline/ClinePass refresh is camelCase JSON against a dedicated refresh URL.
+	if c.ClineAuth {
+		return refreshCline(ctx, c, now)
+	}
 	var req *http.Request
 	var err error
 	if c.RefreshJSON {

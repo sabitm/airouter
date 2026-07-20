@@ -49,7 +49,7 @@ Supporting packages:
   for providers whose `auth_method` is `oauth`. Provider-agnostic: every
   connection carries its full config inline (`domain.OAuthCreds`), so connect and
   refresh read config from that struct, not a registry. `presets.go` holds the
-  built-in prefills (xAI/Grok and OpenAI Codex) applied at create time.
+  built-in prefills (xAI/Grok, OpenAI Codex, Cline/ClinePass) applied at create time.
   `Service.Resolve` is the
   single entry point the proxy and dashboard probes call to get an effective
   bearer token, refreshing proactively (near expiry) or on a forced reactive
@@ -131,6 +131,17 @@ Responses IR mapping but has Codex-specific upstream behavior:
   and, on a 401/403 from an oauth provider, force-refreshes and retries once
   before any response byte is committed. Preserve this token-injection point and
   the single reactive retry when touching `client.go`/`serve.go`/`stream.go`.
+- Cline/ClinePass OAuth is a marker-gated variant on self-contained `OAuthCreds`
+  (`ClineAuth`), not a new protocol: upstream remains OpenAI Chat Completions.
+  Connect skips client_id/PKCE and builds a Cline authorize URL
+  (`client_type=extension`, `callback_url`+`redirect_uri`); exchange prefers a
+  base64-embedded token JSON in the redirect `code`, with a JSON token-endpoint
+  fallback. Refresh posts camelCase JSON to optional `RefreshURL` (else
+  `TokenURL`). Access tokens are stored and sent with an idempotent `workos:`
+  prefix; Cline identity headers are applied at the same upstream-header seam as
+  Codex/Kiro (`applyUpstreamHeaders` and dashboard probes), not inside
+  `Service.Resolve`. Preserve the marker + header-seam split when touching
+  connect/refresh or upstream construction.
 - Streaming uses a no-timeout HTTP client (`Proxy.streamClient`) so long streams
   are bounded by the request context, not a client timeout.
 - Errors before the first streamed byte fall back to the ingress format's unary

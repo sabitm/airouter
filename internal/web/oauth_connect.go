@@ -336,6 +336,12 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 			if !creds.RefreshJSON {
 				creds.RefreshJSON = stored.RefreshJSON
 			}
+			if creds.RefreshURL == "" {
+				creds.RefreshURL = stored.RefreshURL
+			}
+			if !creds.ClineAuth {
+				creds.ClineAuth = stored.ClineAuth
+			}
 			if creds.IDToken == "" {
 				creds.IDToken = stored.IDToken
 			}
@@ -350,9 +356,20 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kiroFlow := creds.KiroAuth != "" && creds.KiroAuth != "external_idp"
-	if !kiroFlow && (creds.TokenURL == "" || creds.ClientID == "") {
-		renderErr(creds, "token URL and client id are required to refresh")
-		return
+	clineFlow := creds.ClineAuth
+	switch {
+	case kiroFlow:
+		// Kiro social/OIDC does not require client_id on this form path.
+	case clineFlow:
+		if creds.RefreshURL == "" && creds.TokenURL == "" {
+			renderErr(creds, "refresh URL is required to refresh")
+			return
+		}
+	default:
+		if creds.TokenURL == "" || creds.ClientID == "" {
+			renderErr(creds, "token URL and client id are required to refresh")
+			return
+		}
 	}
 
 	var updated *domain.OAuthCreds

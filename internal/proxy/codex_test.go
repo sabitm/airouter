@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"airouter/internal/domain"
@@ -96,5 +97,37 @@ func TestApplyCodexHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("chatgpt-account-id"); got != "acct-1" {
 		t.Errorf("chatgpt-account-id = %q", got)
+	}
+}
+
+func TestApplyClineHeaders(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.cline.bot/api/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &domain.Provider{
+		Protocol: domain.ProtocolOpenAI,
+		APIKey:   "raw-token",
+		OAuthCreds: &domain.OAuthCreds{
+			ClineAuth: true,
+		},
+	}
+	clientHeaders := http.Header{"User-Agent": []string{"bad-client"}}
+	applyUpstreamHeaders(req, provider, clientHeaders, context.Background())
+
+	if got := req.Header.Get("Authorization"); got != "Bearer workos:raw-token" {
+		t.Errorf("authorization = %q", got)
+	}
+	if got := req.Header.Get("HTTP-Referer"); got != "https://cline.bot" {
+		t.Errorf("referer = %q", got)
+	}
+	if got := req.Header.Get("X-Title"); got != "Cline" {
+		t.Errorf("x-title = %q", got)
+	}
+	if got := req.Header.Get("X-CLIENT-TYPE"); got != "airouter" {
+		t.Errorf("x-client-type = %q", got)
+	}
+	if got := req.Header.Get("User-Agent"); !strings.HasPrefix(got, "airouter/") {
+		t.Errorf("user-agent = %q, want airouter/ prefix", got)
 	}
 }
