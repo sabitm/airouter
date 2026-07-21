@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
 )
@@ -79,6 +80,13 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 			return append([]string(nil), qoder.StaticModels...), nil
 		}
 		return ids, nil
+	}
+	if p.Protocol == domain.ProtocolAntigravity {
+		pid := ""
+		if p.OAuthCreds != nil {
+			pid = p.OAuthCreds.ProjectID
+		}
+		return antigravity.ListModelIDs(ctx, p.APIKey, pid), nil
 	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

@@ -15,6 +15,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/anthropic"
+	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/openai"
@@ -151,6 +152,17 @@ var qoderCodec = codec{
 	streamOnly:    true,
 }
 
+// antigravityCodec is Google Antigravity / Cloud Code: Gemini-in-envelope chat,
+// SSE-only. Backend-only; every request translates through the IR.
+var antigravityCodec = codec{
+	id:            "antigravity",
+	protocol:      domain.ProtocolAntigravity,
+	encodeRequest: antigravity.EncodeRequest,
+	upstreamPath:  antigravity.UpstreamPathStream,
+	decodeStream:  antigravity.DecodeStream,
+	streamOnly:    true,
+}
+
 func backendCodec(p domain.Protocol) codec {
 	switch p {
 	case domain.ProtocolAnthropic:
@@ -163,6 +175,8 @@ func backendCodec(p domain.Protocol) codec {
 		return kiroCodec
 	case domain.ProtocolQoder:
 		return qoderCodec
+	case domain.ProtocolAntigravity:
+		return antigravityCodec
 	default:
 		return openaiCodec
 	}

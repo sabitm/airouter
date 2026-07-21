@@ -126,7 +126,8 @@ func providerEditInteractiveOAuth(proto domain.Protocol) bool {
 	return proto == domain.ProtocolOpenAI ||
 		proto == domain.ProtocolOpenAICodex ||
 		proto == domain.ProtocolOpenAIResponses ||
-		proto == domain.ProtocolAnthropic
+		proto == domain.ProtocolAnthropic ||
+		proto == domain.ProtocolAntigravity
 }
 
 func kiroAuthOrBuilderID(c *domain.OAuthCreds) string {
@@ -168,7 +169,7 @@ func ConnectionPanel(baseURL string) templ.Component {
 		var templ_7745c5c3_Var4 string
 		templ_7745c5c3_Var4, templ_7745c5c3_Err = templ.ResolveAttributeValue(baseURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 93, Col: 56}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 94, Col: 56}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var4)
 		if templ_7745c5c3_Err != nil {
@@ -181,7 +182,7 @@ func ConnectionPanel(baseURL string) templ.Component {
 		var templ_7745c5c3_Var5 string
 		templ_7745c5c3_Var5, templ_7745c5c3_Err = templ.ResolveAttributeValue(baseURL + "/v1")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 98, Col: 64}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 99, Col: 64}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var5)
 		if templ_7745c5c3_Err != nil {
@@ -228,7 +229,7 @@ func providerCards() templ.Component {
 			var templ_7745c5c3_Var7 string
 			templ_7745c5c3_Var7, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/new?recipe=" + r.ID)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 114, Col: 54}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 115, Col: 54}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var7)
 			if templ_7745c5c3_Err != nil {
@@ -241,7 +242,7 @@ func providerCards() templ.Component {
 			var templ_7745c5c3_Var8 string
 			templ_7745c5c3_Var8, templ_7745c5c3_Err = templ.JoinStringErrs(r.Label)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 118, Col: 36}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 119, Col: 36}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var8))
 			if templ_7745c5c3_Err != nil {
@@ -254,7 +255,7 @@ func providerCards() templ.Component {
 			var templ_7745c5c3_Var9 string
 			templ_7745c5c3_Var9, templ_7745c5c3_Err = templ.JoinStringErrs(r.Sublabel)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 119, Col: 37}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 120, Col: 37}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var9))
 			if templ_7745c5c3_Err != nil {
@@ -267,7 +268,7 @@ func providerCards() templ.Component {
 			var templ_7745c5c3_Var10 string
 			templ_7745c5c3_Var10, templ_7745c5c3_Err = templ.JoinStringErrs(r.Tag)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 120, Col: 32}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 121, Col: 32}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var10))
 			if templ_7745c5c3_Err != nil {
@@ -316,7 +317,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var12 string
 			templ_7745c5c3_Var12, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(r.Protocol))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 130, Col: 126}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 131, Col: 126}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var12)
 			if templ_7745c5c3_Err != nil {
@@ -329,7 +330,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var13 string
 			templ_7745c5c3_Var13, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(r.Protocol))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 131, Col: 67}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 132, Col: 67}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var13)
 			if templ_7745c5c3_Err != nil {
@@ -342,7 +343,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var14 string
 			templ_7745c5c3_Var14, templ_7745c5c3_Err = templ.ResolveAttributeValue(r.Preset)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 133, Col: 55}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 134, Col: 55}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var14)
 			if templ_7745c5c3_Err != nil {
@@ -355,7 +356,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var15 string
 			templ_7745c5c3_Var15, templ_7745c5c3_Err = templ.ResolveAttributeValue(r.BaseURL)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 140, Col: 86}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 141, Col: 86}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var15)
 			if templ_7745c5c3_Err != nil {
@@ -368,7 +369,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var16 string
 			templ_7745c5c3_Var16, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-region-new-" + r.ID)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 150, Col: 148}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 151, Col: 148}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var16)
 			if templ_7745c5c3_Err != nil {
@@ -381,7 +382,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var17 string
 			templ_7745c5c3_Var17, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-region-new-" + r.ID)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 151, Col: 41}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 152, Col: 41}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var17)
 			if templ_7745c5c3_Err != nil {
@@ -415,7 +416,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var18 string
 			templ_7745c5c3_Var18, templ_7745c5c3_Err = templ.ResolveAttributeValue(r.BaseURL)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 177, Col: 86}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 178, Col: 86}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var18)
 			if templ_7745c5c3_Err != nil {
@@ -449,7 +450,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var19 string
 			templ_7745c5c3_Var19, templ_7745c5c3_Err = templ.ResolveAttributeValue(r.BaseURL)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 255, Col: 86}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 256, Col: 86}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var19)
 			if templ_7745c5c3_Err != nil {
@@ -483,7 +484,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var20 string
 			templ_7745c5c3_Var20, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(r.Protocol))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 297, Col: 105}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 298, Col: 105}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var20)
 			if templ_7745c5c3_Err != nil {
@@ -496,7 +497,7 @@ func ProviderRecipeForm(r recipe) templ.Component {
 			var templ_7745c5c3_Var21 string
 			templ_7745c5c3_Var21, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(r.Protocol))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 298, Col: 67}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 299, Col: 67}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var21)
 			if templ_7745c5c3_Err != nil {
@@ -539,7 +540,7 @@ func providerEditSaveCancel(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var23 string
 		templ_7745c5c3_Var23, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/row")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 333, Col: 107}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 334, Col: 107}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var23)
 		if templ_7745c5c3_Err != nil {
@@ -552,7 +553,7 @@ func providerEditSaveCancel(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var24 string
 		templ_7745c5c3_Var24, templ_7745c5c3_Err = templ.ResolveAttributeValue("#provider-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 333, Col: 164}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 334, Col: 164}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var24)
 		if templ_7745c5c3_Err != nil {
@@ -625,7 +626,7 @@ func kiroEditOAuthBlock(p *domain.Provider) templ.Component {
 			var templ_7745c5c3_Var27 string
 			templ_7745c5c3_Var27, templ_7745c5c3_Err = templ.JoinStringErrs(oauthLabel(p.OAuthCreds))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 345, Col: 59}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 346, Col: 59}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var27))
 			if templ_7745c5c3_Err != nil {
@@ -643,7 +644,7 @@ func kiroEditOAuthBlock(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var28 string
 		templ_7745c5c3_Var28, templ_7745c5c3_Err = templ.ResolveAttributeValue(kiroAuthOrBuilderID(c))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 347, Col: 69}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 348, Col: 69}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var28)
 		if templ_7745c5c3_Err != nil {
@@ -656,7 +657,7 @@ func kiroEditOAuthBlock(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var29 string
 		templ_7745c5c3_Var29, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-region-edit-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 353, Col: 175}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 354, Col: 175}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var29)
 		if templ_7745c5c3_Err != nil {
@@ -669,7 +670,7 @@ func kiroEditOAuthBlock(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var30 string
 		templ_7745c5c3_Var30, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-region-edit-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 354, Col: 62}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 355, Col: 62}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var30)
 		if templ_7745c5c3_Err != nil {
@@ -690,7 +691,7 @@ func kiroEditOAuthBlock(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var31 string
 		templ_7745c5c3_Var31, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-refresh-result-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 363, Col: 69}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 364, Col: 69}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var31)
 		if templ_7745c5c3_Err != nil {
@@ -703,7 +704,7 @@ func kiroEditOAuthBlock(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var32 string
 		templ_7745c5c3_Var32, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-refresh-result-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 368, Col: 66}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 369, Col: 66}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var32)
 		if templ_7745c5c3_Err != nil {
@@ -759,7 +760,7 @@ func CheckResult(ok bool, msg string) templ.Component {
 			var templ_7745c5c3_Var34 string
 			templ_7745c5c3_Var34, templ_7745c5c3_Err = templ.JoinStringErrs(msg)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 382, Col: 30}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 383, Col: 30}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var34))
 			if templ_7745c5c3_Err != nil {
@@ -777,7 +778,7 @@ func CheckResult(ok bool, msg string) templ.Component {
 			var templ_7745c5c3_Var35 string
 			templ_7745c5c3_Var35, templ_7745c5c3_Err = templ.JoinStringErrs(msg)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 384, Col: 31}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 385, Col: 31}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var35))
 			if templ_7745c5c3_Err != nil {
@@ -903,7 +904,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var38 string
 		templ_7745c5c3_Var38, templ_7745c5c3_Err = templ.ResolveAttributeValue("provider-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 432, Col: 51}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 433, Col: 51}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var38)
 		if templ_7745c5c3_Err != nil {
@@ -916,7 +917,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var39 string
 		templ_7745c5c3_Var39, templ_7745c5c3_Err = templ.JoinStringErrs(p.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 433, Col: 14}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 434, Col: 14}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var39))
 		if templ_7745c5c3_Err != nil {
@@ -929,7 +930,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var40 string
 		templ_7745c5c3_Var40, templ_7745c5c3_Err = templ.JoinStringErrs(p.BaseURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 434, Col: 30}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 435, Col: 30}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var40))
 		if templ_7745c5c3_Err != nil {
@@ -950,7 +951,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var41 string
 		templ_7745c5c3_Var41, templ_7745c5c3_Err = templ.JoinStringErrs(string(p.Protocol))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 436, Col: 26}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 437, Col: 26}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var41))
 		if templ_7745c5c3_Err != nil {
@@ -963,7 +964,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var42 string
 		templ_7745c5c3_Var42, templ_7745c5c3_Err = templ.JoinStringErrs(string(p.Auth()))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 437, Col: 24}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 438, Col: 24}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var42))
 		if templ_7745c5c3_Err != nil {
@@ -976,7 +977,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var43 string
 		templ_7745c5c3_Var43, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/edit")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 439, Col: 96}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 440, Col: 96}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var43)
 		if templ_7745c5c3_Err != nil {
@@ -989,7 +990,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var44 string
 		templ_7745c5c3_Var44, templ_7745c5c3_Err = templ.ResolveAttributeValue("#provider-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 439, Col: 153}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 440, Col: 153}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var44)
 		if templ_7745c5c3_Err != nil {
@@ -1002,7 +1003,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var45 string
 		templ_7745c5c3_Var45, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/archive")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 440, Col: 100}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 441, Col: 100}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var45)
 		if templ_7745c5c3_Err != nil {
@@ -1015,7 +1016,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var46 string
 		templ_7745c5c3_Var46, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/delete")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 441, Col: 106}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 442, Col: 106}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var46)
 		if templ_7745c5c3_Err != nil {
@@ -1028,7 +1029,7 @@ func ProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var47 string
 		templ_7745c5c3_Var47, templ_7745c5c3_Err = templ.ResolveAttributeValue("Delete provider \"" + p.Name + "\" and its combos?")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 441, Col: 221}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 442, Col: 221}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var47)
 		if templ_7745c5c3_Err != nil {
@@ -1070,7 +1071,7 @@ func ArchivedProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var49 string
 		templ_7745c5c3_Var49, templ_7745c5c3_Err = templ.ResolveAttributeValue("provider-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 447, Col: 51}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 448, Col: 51}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var49)
 		if templ_7745c5c3_Err != nil {
@@ -1083,7 +1084,7 @@ func ArchivedProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var50 string
 		templ_7745c5c3_Var50, templ_7745c5c3_Err = templ.JoinStringErrs(p.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 448, Col: 14}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 449, Col: 14}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var50))
 		if templ_7745c5c3_Err != nil {
@@ -1096,7 +1097,7 @@ func ArchivedProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var51 string
 		templ_7745c5c3_Var51, templ_7745c5c3_Err = templ.JoinStringErrs(p.BaseURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 449, Col: 30}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 450, Col: 30}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var51))
 		if templ_7745c5c3_Err != nil {
@@ -1117,7 +1118,7 @@ func ArchivedProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var52 string
 		templ_7745c5c3_Var52, templ_7745c5c3_Err = templ.JoinStringErrs(string(p.Protocol))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 451, Col: 26}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 452, Col: 26}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var52))
 		if templ_7745c5c3_Err != nil {
@@ -1130,7 +1131,7 @@ func ArchivedProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var53 string
 		templ_7745c5c3_Var53, templ_7745c5c3_Err = templ.JoinStringErrs(string(p.Auth()))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 452, Col: 24}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 453, Col: 24}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var53))
 		if templ_7745c5c3_Err != nil {
@@ -1143,7 +1144,7 @@ func ArchivedProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var54 string
 		templ_7745c5c3_Var54, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/restore")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 454, Col: 100}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 455, Col: 100}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var54)
 		if templ_7745c5c3_Err != nil {
@@ -1156,7 +1157,7 @@ func ArchivedProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var55 string
 		templ_7745c5c3_Var55, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/delete")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 455, Col: 106}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 456, Col: 106}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var55)
 		if templ_7745c5c3_Err != nil {
@@ -1169,7 +1170,7 @@ func ArchivedProviderRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var56 string
 		templ_7745c5c3_Var56, templ_7745c5c3_Err = templ.ResolveAttributeValue("Delete provider \"" + p.Name + "\" and its combos?")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 455, Col: 221}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 456, Col: 221}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var56)
 		if templ_7745c5c3_Err != nil {
@@ -1211,7 +1212,7 @@ func ProviderEditRow(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var58 string
 		templ_7745c5c3_Var58, templ_7745c5c3_Err = templ.ResolveAttributeValue("provider-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 461, Col: 51}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 462, Col: 51}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var58)
 		if templ_7745c5c3_Err != nil {
@@ -1278,7 +1279,7 @@ func providerEditRowGenericAPIKey(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var60 string
 		templ_7745c5c3_Var60, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(p.Protocol))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 477, Col: 103}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 478, Col: 103}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var60)
 		if templ_7745c5c3_Err != nil {
@@ -1291,7 +1292,7 @@ func providerEditRowGenericAPIKey(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var61 string
 		templ_7745c5c3_Var61, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 477, Col: 169}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 478, Col: 169}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var61)
 		if templ_7745c5c3_Err != nil {
@@ -1304,7 +1305,7 @@ func providerEditRowGenericAPIKey(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var62 string
 		templ_7745c5c3_Var62, templ_7745c5c3_Err = templ.ResolveAttributeValue(strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 478, Col: 68}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 479, Col: 68}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var62)
 		if templ_7745c5c3_Err != nil {
@@ -1317,7 +1318,7 @@ func providerEditRowGenericAPIKey(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var63 string
 		templ_7745c5c3_Var63, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(p.Protocol))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 479, Col: 65}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 480, Col: 65}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var63)
 		if templ_7745c5c3_Err != nil {
@@ -1330,7 +1331,7 @@ func providerEditRowGenericAPIKey(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var64 string
 		templ_7745c5c3_Var64, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 483, Col: 36}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 484, Col: 36}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var64)
 		if templ_7745c5c3_Err != nil {
@@ -1343,7 +1344,7 @@ func providerEditRowGenericAPIKey(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var65 string
 		templ_7745c5c3_Var65, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.BaseURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 487, Col: 43}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 488, Col: 43}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var65)
 		if templ_7745c5c3_Err != nil {
@@ -1413,7 +1414,7 @@ func providerEditRowKiro(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var67 string
 		templ_7745c5c3_Var67, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(p.Method()))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 516, Col: 34}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 517, Col: 34}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var67)
 		if templ_7745c5c3_Err != nil {
@@ -1426,7 +1427,7 @@ func providerEditRowKiro(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var68 string
 		templ_7745c5c3_Var68, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 519, Col: 65}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 520, Col: 65}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var68)
 		if templ_7745c5c3_Err != nil {
@@ -1439,7 +1440,7 @@ func providerEditRowKiro(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var69 string
 		templ_7745c5c3_Var69, templ_7745c5c3_Err = templ.ResolveAttributeValue(strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 523, Col: 68}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 524, Col: 68}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var69)
 		if templ_7745c5c3_Err != nil {
@@ -1452,7 +1453,7 @@ func providerEditRowKiro(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var70 string
 		templ_7745c5c3_Var70, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 527, Col: 36}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 528, Col: 36}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var70)
 		if templ_7745c5c3_Err != nil {
@@ -1465,7 +1466,7 @@ func providerEditRowKiro(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var71 string
 		templ_7745c5c3_Var71, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.BaseURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 531, Col: 43}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 532, Col: 43}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var71)
 		if templ_7745c5c3_Err != nil {
@@ -1478,7 +1479,7 @@ func providerEditRowKiro(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var72 string
 		templ_7745c5c3_Var72, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.ProfileArn)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 536, Col: 103}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 537, Col: 103}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var72)
 		if templ_7745c5c3_Err != nil {
@@ -1491,7 +1492,7 @@ func providerEditRowKiro(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var73 string
 		templ_7745c5c3_Var73, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.Region)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 540, Col: 73}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 541, Col: 73}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var73)
 		if templ_7745c5c3_Err != nil {
@@ -1574,7 +1575,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var75 string
 		templ_7745c5c3_Var75, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 573, Col: 65}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 574, Col: 65}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var75)
 		if templ_7745c5c3_Err != nil {
@@ -1587,7 +1588,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var76 string
 		templ_7745c5c3_Var76, templ_7745c5c3_Err = templ.ResolveAttributeValue(strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 577, Col: 68}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 578, Col: 68}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var76)
 		if templ_7745c5c3_Err != nil {
@@ -1600,7 +1601,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var77 string
 		templ_7745c5c3_Var77, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 583, Col: 36}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 584, Col: 36}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var77)
 		if templ_7745c5c3_Err != nil {
@@ -1613,7 +1614,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var78 string
 		templ_7745c5c3_Var78, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.BaseURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 587, Col: 43}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 588, Col: 43}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var78)
 		if templ_7745c5c3_Err != nil {
@@ -1631,7 +1632,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 			var templ_7745c5c3_Var79 string
 			templ_7745c5c3_Var79, templ_7745c5c3_Err = templ.JoinStringErrs(c.DisplayName)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 590, Col: 53}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 591, Col: 53}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var79))
 			if templ_7745c5c3_Err != nil {
@@ -1644,7 +1645,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 			var templ_7745c5c3_Var80 string
 			templ_7745c5c3_Var80, templ_7745c5c3_Err = templ.JoinStringErrs(c.Email)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 590, Col: 65}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 591, Col: 65}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var80))
 			if templ_7745c5c3_Err != nil {
@@ -1662,7 +1663,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var81 string
 		templ_7745c5c3_Var81, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-region-edit-qoder-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 600, Col: 183}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 601, Col: 183}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var81)
 		if templ_7745c5c3_Err != nil {
@@ -1675,7 +1676,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var82 string
 		templ_7745c5c3_Var82, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-region-edit-qoder-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 601, Col: 69}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 602, Col: 69}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var82)
 		if templ_7745c5c3_Err != nil {
@@ -1696,7 +1697,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var83 string
 		templ_7745c5c3_Var83, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.UserID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 609, Col: 87}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 610, Col: 87}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var83)
 		if templ_7745c5c3_Err != nil {
@@ -1709,7 +1710,7 @@ func providerEditRowQoder(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var84 string
 		templ_7745c5c3_Var84, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.MachineID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 613, Col: 98}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 614, Col: 98}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var84)
 		if templ_7745c5c3_Err != nil {
@@ -1772,7 +1773,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var86 string
 		templ_7745c5c3_Var86, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(p.Protocol))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 629, Col: 36}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 630, Col: 36}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var86)
 		if templ_7745c5c3_Err != nil {
@@ -1785,7 +1786,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var87 string
 		templ_7745c5c3_Var87, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/providers/" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 631, Col: 65}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 632, Col: 65}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var87)
 		if templ_7745c5c3_Err != nil {
@@ -1798,7 +1799,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var88 string
 		templ_7745c5c3_Var88, templ_7745c5c3_Err = templ.ResolveAttributeValue(strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 635, Col: 68}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 636, Col: 68}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var88)
 		if templ_7745c5c3_Err != nil {
@@ -1811,7 +1812,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var89 string
 		templ_7745c5c3_Var89, templ_7745c5c3_Err = templ.ResolveAttributeValue(string(p.Protocol))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 636, Col: 65}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 637, Col: 65}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var89)
 		if templ_7745c5c3_Err != nil {
@@ -1829,7 +1830,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 			var templ_7745c5c3_Var90 string
 			templ_7745c5c3_Var90, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.Preset)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 639, Col: 54}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 640, Col: 54}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var90)
 			if templ_7745c5c3_Err != nil {
@@ -1847,7 +1848,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var91 string
 		templ_7745c5c3_Var91, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.AuthURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 641, Col: 56}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 642, Col: 56}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var91)
 		if templ_7745c5c3_Err != nil {
@@ -1860,7 +1861,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var92 string
 		templ_7745c5c3_Var92, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.TokenURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 642, Col: 58}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 643, Col: 58}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var92)
 		if templ_7745c5c3_Err != nil {
@@ -1873,7 +1874,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var93 string
 		templ_7745c5c3_Var93, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.ClientID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 643, Col: 58}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 644, Col: 58}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var93)
 		if templ_7745c5c3_Err != nil {
@@ -1886,7 +1887,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var94 string
 		templ_7745c5c3_Var94, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.ClientSecret)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 644, Col: 66}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 645, Col: 66}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var94)
 		if templ_7745c5c3_Err != nil {
@@ -1899,7 +1900,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var95 string
 		templ_7745c5c3_Var95, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.Scopes)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 645, Col: 53}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 646, Col: 53}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var95)
 		if templ_7745c5c3_Err != nil {
@@ -1912,7 +1913,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var96 string
 		templ_7745c5c3_Var96, templ_7745c5c3_Err = templ.ResolveAttributeValue(redirectOr(c.RedirectURI))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 646, Col: 76}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 647, Col: 76}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var96)
 		if templ_7745c5c3_Err != nil {
@@ -1925,7 +1926,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var97 string
 		templ_7745c5c3_Var97, templ_7745c5c3_Err = templ.ResolveAttributeValue(boolStr(c.PKCE))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 647, Col: 58}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 648, Col: 58}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var97)
 		if templ_7745c5c3_Err != nil {
@@ -1938,7 +1939,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var98 string
 		templ_7745c5c3_Var98, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 650, Col: 36}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 651, Col: 36}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var98)
 		if templ_7745c5c3_Err != nil {
@@ -1951,7 +1952,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var99 string
 		templ_7745c5c3_Var99, templ_7745c5c3_Err = templ.ResolveAttributeValue(p.BaseURL)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 654, Col: 43}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 655, Col: 43}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var99)
 		if templ_7745c5c3_Err != nil {
@@ -1964,39 +1965,62 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		var templ_7745c5c3_Var100 string
 		templ_7745c5c3_Var100, templ_7745c5c3_Err = templ.JoinStringErrs(oauthLabel(p.OAuthCreds))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 656, Col: 59}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 657, Col: 59}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var100))
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 146, ". Reconnect only if the refresh token is revoked.</span> <label class=\"field\"><span class=\"field-name\">Auth mode</span> <select class=\"oauth-mode\" onchange=\"airouterToggleOAuthMode(this)\" aria-label=\"how to obtain tokens\"><option value=\"web\" selected>Web auth</option> <option value=\"manual\">Manual</option></select></label><div class=\"oauth-web\"><button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/oauth/begin\" hx-include=\"closest form\" hx-target=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 146, ". Reconnect only if the refresh token is revoked.</span> ")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		var templ_7745c5c3_Var101 string
-		templ_7745c5c3_Var101, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-region-edit-" + strconv.FormatInt(p.ID, 10))
-		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 665, Col: 170}
+		if c.ProjectID != "" {
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 147, "<p class=\"field-hint\">Cloud Code project: ")
+			if templ_7745c5c3_Err != nil {
+				return templ_7745c5c3_Err
+			}
+			var templ_7745c5c3_Var101 string
+			templ_7745c5c3_Var101, templ_7745c5c3_Err = templ.JoinStringErrs(c.ProjectID)
+			if templ_7745c5c3_Err != nil {
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 659, Col: 58}
+			}
+			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var101))
+			if templ_7745c5c3_Err != nil {
+				return templ_7745c5c3_Err
+			}
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 148, "</p>")
+			if templ_7745c5c3_Err != nil {
+				return templ_7745c5c3_Err
+			}
 		}
-		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var101)
-		if templ_7745c5c3_Err != nil {
-			return templ_7745c5c3_Err
-		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 147, "\" hx-swap=\"innerHTML\">Reconnect</button><div id=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 149, "<label class=\"field\"><span class=\"field-name\">Auth mode</span> <select class=\"oauth-mode\" onchange=\"airouterToggleOAuthMode(this)\" aria-label=\"how to obtain tokens\"><option value=\"web\" selected>Web auth</option> <option value=\"manual\">Manual</option></select></label><div class=\"oauth-web\"><button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/oauth/begin\" hx-include=\"closest form\" hx-target=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var102 string
-		templ_7745c5c3_Var102, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-region-edit-" + strconv.FormatInt(p.ID, 10))
+		templ_7745c5c3_Var102, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-region-edit-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 666, Col: 63}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 669, Col: 170}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var102)
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 148, "\" class=\"oauth-region\" aria-live=\"polite\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 150, "\" hx-swap=\"innerHTML\">Reconnect</button><div id=\"")
+		if templ_7745c5c3_Err != nil {
+			return templ_7745c5c3_Err
+		}
+		var templ_7745c5c3_Var103 string
+		templ_7745c5c3_Var103, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-region-edit-" + strconv.FormatInt(p.ID, 10))
+		if templ_7745c5c3_Err != nil {
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 670, Col: 63}
+		}
+		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var103)
+		if templ_7745c5c3_Err != nil {
+			return templ_7745c5c3_Err
+		}
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 151, "\" class=\"oauth-region\" aria-live=\"polite\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -2004,33 +2028,33 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 149, "</div><button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/oauth/refresh\" hx-include=\"closest form\" hx-vals='{\"refresh_view\":\"status\"}' hx-target=\"")
-		if templ_7745c5c3_Err != nil {
-			return templ_7745c5c3_Err
-		}
-		var templ_7745c5c3_Var103 string
-		templ_7745c5c3_Var103, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-refresh-result-" + strconv.FormatInt(p.ID, 10))
-		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 675, Col: 70}
-		}
-		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var103)
-		if templ_7745c5c3_Err != nil {
-			return templ_7745c5c3_Err
-		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 150, "\" hx-swap=\"innerHTML\" hx-indicator=\"next .refresh-indicator\">Refresh token</button> <span class=\"refresh-indicator htmx-indicator\">refreshing...</span> <span id=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 152, "</div><button type=\"button\" class=\"link\" hx-post=\"/dashboard/providers/oauth/refresh\" hx-include=\"closest form\" hx-vals='{\"refresh_view\":\"status\"}' hx-target=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var104 string
-		templ_7745c5c3_Var104, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-refresh-result-" + strconv.FormatInt(p.ID, 10))
+		templ_7745c5c3_Var104, templ_7745c5c3_Err = templ.ResolveAttributeValue("#oauth-refresh-result-" + strconv.FormatInt(p.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 680, Col: 67}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 679, Col: 70}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var104)
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 151, "\" class=\"oauth-refresh-result\" aria-live=\"polite\"></span></div><div class=\"oauth-manual\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 153, "\" hx-swap=\"innerHTML\" hx-indicator=\"next .refresh-indicator\">Refresh token</button> <span class=\"refresh-indicator htmx-indicator\">refreshing...</span> <span id=\"")
+		if templ_7745c5c3_Err != nil {
+			return templ_7745c5c3_Err
+		}
+		var templ_7745c5c3_Var105 string
+		templ_7745c5c3_Var105, templ_7745c5c3_Err = templ.ResolveAttributeValue("oauth-refresh-result-" + strconv.FormatInt(p.ID, 10))
+		if templ_7745c5c3_Err != nil {
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 684, Col: 67}
+		}
+		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var105)
+		if templ_7745c5c3_Err != nil {
+			return templ_7745c5c3_Err
+		}
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 154, "\" class=\"oauth-refresh-result\" aria-live=\"polite\"></span></div><div class=\"oauth-manual\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -2038,11 +2062,30 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
+		if p.Protocol == domain.ProtocolAntigravity {
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 155, "<label class=\"field\"><span class=\"field-name\">Project id</span> <input name=\"project_id\" class=\"oauth-cfg mono\" placeholder=\"optional override\" value=\"")
+			if templ_7745c5c3_Err != nil {
+				return templ_7745c5c3_Err
+			}
+			var templ_7745c5c3_Var106 string
+			templ_7745c5c3_Var106, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.ProjectID)
+			if templ_7745c5c3_Err != nil {
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/providers.templ`, Line: 691, Col: 104}
+			}
+			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var106)
+			if templ_7745c5c3_Err != nil {
+				return templ_7745c5c3_Err
+			}
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 156, "\" aria-label=\"project id\"></label>")
+			if templ_7745c5c3_Err != nil {
+				return templ_7745c5c3_Err
+			}
+		}
 		templ_7745c5c3_Err = providerEditCheck().Render(ctx, templ_7745c5c3_Buffer)
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 152, "</div><div class=\"form-actions\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 157, "</div><div class=\"form-actions\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -2050,7 +2093,7 @@ func providerEditRowInteractiveOAuth(p *domain.Provider) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 153, "</div></form>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 158, "</div></form>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

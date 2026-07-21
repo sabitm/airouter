@@ -11,6 +11,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
@@ -52,6 +53,8 @@ func newCodexSessionID() string {
 //   - Kiro: injects the provider's CodeWhisperer profile ARN into the request.
 //   - Qoder: injects live model_config and WAF-encodes the body (COSY signs
 //     these wire bytes in applyUpstreamHeaders).
+//   - Antigravity: injects OAuthCreds.ProjectID into the Cloud Code envelope
+//     (fail-closed when missing).
 //
 // Other backends return the body unchanged. A non-nil error is terminal for the
 // attempt (e.g. Qoder model_config unknown).
@@ -82,9 +85,19 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 			}
 		}
 		return wire, nil
+	case "antigravity":
+		return antigravity.InjectProjectID(body, antigravityProjectID(provider))
 	default:
 		return body, nil
 	}
+}
+
+// antigravityProjectID returns the Cloud Code project id from OAuthCreds.
+func antigravityProjectID(provider *domain.Provider) string {
+	if provider != nil && provider.OAuthCreds != nil {
+		return provider.OAuthCreds.ProjectID
+	}
+	return ""
 }
 
 // kiroProfileArn returns the CodeWhisperer profile ARN configured for a Kiro
@@ -167,6 +180,10 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	// Must run last so Cosy-* and Accept-Encoding: identity win.
 	if provider.Protocol == domain.ProtocolQoder {
 		applyQoderHeaders(req, provider, ctx, body)
+	}
+	// Antigravity forces the IDE User-Agent after the client-header copy.
+	if provider.Protocol == domain.ProtocolAntigravity {
+		req.Header.Set("User-Agent", antigravity.UserAgent)
 	}
 }
 

@@ -70,7 +70,8 @@ func providerEditInteractiveOAuth(proto domain.Protocol) bool {
 	return proto == domain.ProtocolOpenAI ||
 		proto == domain.ProtocolOpenAICodex ||
 		proto == domain.ProtocolOpenAIResponses ||
-		proto == domain.ProtocolAnthropic
+		proto == domain.ProtocolAnthropic ||
+		proto == domain.ProtocolAntigravity
 }
 
 func kiroAuthOrBuilderID(c *domain.OAuthCreds) string {
@@ -654,6 +655,9 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 			<input name="base_url" value={ p.BaseURL } required/>
 		</label>
 		<span class="muted">Connected: { oauthLabel(p.OAuthCreds) }. Reconnect only if the refresh token is revoked.</span>
+		if c.ProjectID != "" {
+			<p class="field-hint">Cloud Code project: { c.ProjectID }</p>
+		}
 		<label class="field">
 			<span class="field-name">Auth mode</span>
 			<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
@@ -681,6 +685,12 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 		</div>
 		<div class="oauth-manual">
 			@oauthTokenFields(&domain.OAuthCreds{}, "", "")
+			if p.Protocol == domain.ProtocolAntigravity {
+				<label class="field">
+					<span class="field-name">Project id</span>
+					<input name="project_id" class="oauth-cfg mono" placeholder="optional override" value={ c.ProjectID } aria-label="project id"/>
+				</label>
+			}
 			@providerEditCheck()
 		</div>
 		<div class="form-actions">

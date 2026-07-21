@@ -129,7 +129,19 @@ func applyManualTokens(c *domain.OAuthCreds, r *http.Request) bool {
 		c.AccountID = accountID
 	}
 	c.ExpiresAt = parseExpiresAt(r.FormValue("expires_at"))
+	if v := strings.TrimSpace(r.FormValue("project_id")); v != "" {
+		c.ProjectID = v
+	}
 	return true
+}
+
+// applyAntigravityConfig marks the connection and optionally overlays a manual
+// project_id from the form (paste/edit path).
+func applyAntigravityConfig(c *domain.OAuthCreds, r *http.Request) {
+	c.AntigravityAuth = true
+	if v := strings.TrimSpace(r.FormValue("project_id")); v != "" {
+		c.ProjectID = v
+	}
 }
 
 // parseExpiresAt reads an access-token expiry as either a unix-seconds integer or
@@ -382,6 +394,12 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 			}
 			if !creds.QoderAuth {
 				creds.QoderAuth = stored.QoderAuth
+			}
+			if !creds.AntigravityAuth {
+				creds.AntigravityAuth = stored.AntigravityAuth
+			}
+			if creds.ProjectID == "" {
+				creds.ProjectID = stored.ProjectID
 			}
 			if creds.UserID == "" {
 				creds.UserID = stored.UserID

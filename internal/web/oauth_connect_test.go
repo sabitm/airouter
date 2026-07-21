@@ -282,6 +282,30 @@ func TestOAuthPresetCreatesQoderConfig(t *testing.T) {
 	}
 }
 
+func TestOAuthPresetCreatesAntigravityConfig(t *testing.T) {
+	form := url.Values{}
+	form.Set("preset", "antigravity")
+	creds, err := credsFromConnectForm(reqWithForm(form))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !creds.AntigravityAuth {
+		t.Error("antigravity preset should set AntigravityAuth")
+	}
+	if creds.ClientID == "" || creds.ClientSecret == "" {
+		t.Fatalf("client credentials missing: %+v", creds)
+	}
+	if creds.PKCE {
+		t.Error("antigravity should not use PKCE")
+	}
+	if creds.ExtraAuthParams["access_type"] != "offline" {
+		t.Fatalf("extra params: %+v", creds.ExtraAuthParams)
+	}
+	if recipe, ok := recipeByID("antigravity"); !ok || recipe.Protocol != domain.ProtocolAntigravity || recipe.Kind != kindInteractiveOAuth {
+		t.Fatalf("recipe missing or wrong: %+v", recipe)
+	}
+}
+
 func reqWithForm(form url.Values) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
@@ -177,5 +178,53 @@ func TestApplyQoderHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Model-Source"); got != "system" {
 		t.Errorf("x-model-source = %q", got)
+	}
+}
+
+func TestApplyAntigravityHeadersAndProject(t *testing.T) {
+	body, err := antigravity.EncodeRequest(&ir.Request{
+		Model: "gemini-3-flash",
+		Messages: []ir.Message{{
+			Role:    ir.RoleUser,
+			Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &domain.Provider{
+		Protocol: domain.ProtocolAntigravity,
+		APIKey:   "tok",
+		OAuthCreds: &domain.OAuthCreds{
+			AntigravityAuth: true,
+			ProjectID:        "proj-1",
+		},
+	}
+	body, err = prepareUpstreamRequest(context.Background(), antigravityCodec, provider, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env map[string]any
+	if json.Unmarshal(body, &env) != nil || env["project"] != "proj-1" {
+		t.Fatalf("project inject: %+v", env)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("User-Agent", "client/1")
+	applyUpstreamHeaders(req, provider, http.Header{"User-Agent": {"client/1"}}, context.Background(), body)
+	if got := req.Header.Get("User-Agent"); got != antigravity.UserAgent {
+		t.Fatalf("user-agent = %q", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer tok" {
+		t.Fatalf("auth = %q", got)
+	}
+
+	// Missing project is terminal.
+	provider.OAuthCreds.ProjectID = ""
+	if _, err := prepareUpstreamRequest(context.Background(), antigravityCodec, provider, body); err == nil {
+		t.Fatal("expected missing project error")
 	}
 }

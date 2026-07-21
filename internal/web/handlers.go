@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/store"
@@ -196,6 +197,9 @@ func kiroBaseURLOr(proto domain.Protocol, base string) string {
 	if proto == domain.ProtocolQoder && strings.TrimSpace(base) == "" {
 		return qoder.DefaultBaseURL
 	}
+	if proto == domain.ProtocolAntigravity && strings.TrimSpace(base) == "" {
+		return antigravity.DefaultBaseURL
+	}
 	return base
 }
 
@@ -275,6 +279,17 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 	}
 	if proto == domain.ProtocolQoder {
 		applyQoderConfig(creds, r)
+	}
+	if proto == domain.ProtocolAntigravity {
+		applyAntigravityConfig(creds, r)
+		if err := oauth.EnsureAntigravityProject(r.Context(), creds); err != nil {
+			htmxBadRequest(w, r, "provider-flash", err.Error())
+			return
+		}
+		if strings.TrimSpace(creds.ProjectID) == "" {
+			htmxBadRequest(w, r, "provider-flash", "antigravity: missing project id; reconnect OAuth")
+			return
+		}
 	}
 	p := &domain.Provider{
 		Name:       r.FormValue("name"),
@@ -411,6 +426,17 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	}
 	if proto == domain.ProtocolQoder {
 		applyQoderConfig(cur.OAuthCreds, r)
+	}
+	if proto == domain.ProtocolAntigravity {
+		applyAntigravityConfig(cur.OAuthCreds, r)
+		if err := oauth.EnsureAntigravityProject(r.Context(), cur.OAuthCreds); err != nil {
+			htmxBadRequest(w, r, "provider-flash", err.Error())
+			return
+		}
+		if strings.TrimSpace(cur.OAuthCreds.ProjectID) == "" {
+			htmxBadRequest(w, r, "provider-flash", "antigravity: missing project id; reconnect OAuth")
+			return
+		}
 	}
 	cur.Name = r.FormValue("name")
 	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))

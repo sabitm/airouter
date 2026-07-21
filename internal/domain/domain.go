@@ -22,10 +22,15 @@ const (
 	// OAuth, COSY-signed WAF-encoded chat against api3.qoder.sh, SSE-only responses.
 	// Every request translates through the IR; device tokens do not refresh.
 	ProtocolQoder Protocol = "qoder"
+	// ProtocolAntigravity is Google Antigravity / Cloud Code. Backend only: Gemini
+	// generateContent-like body in a Cloud Code envelope, SSE-only chat, Google OAuth
+	// with loadCodeAssist/onboardUser project bootstrap. Every request translates
+	// through the IR.
+	ProtocolAntigravity Protocol = "antigravity"
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It
@@ -148,6 +153,14 @@ type OAuthCreds struct {
 	OrganizationID string `json:"organization_id,omitempty"`
 	// DisplayName is the profile name from userinfo, used in COSY user-info payload.
 	DisplayName string `json:"display_name,omitempty"`
+
+	// AntigravityAuth marks a Google Antigravity OAuth connection. When true,
+	// post-exchange runs loadCodeAssist/onboardUser and chat requires ProjectID
+	// on every request envelope.
+	AntigravityAuth bool `json:"antigravity_auth,omitempty"`
+	// ProjectID is the GCP / cloudaicompanion project id required on Antigravity
+	// chat bodies. Empty means the connection is incomplete (fail closed).
+	ProjectID string `json:"project_id,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

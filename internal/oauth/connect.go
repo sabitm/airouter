@@ -264,6 +264,18 @@ func (c *Connect) exchange(ctx context.Context, code string) (*domain.OAuthCreds
 		c.mu.Unlock()
 		return nil, err
 	}
+	// Antigravity needs a Cloud Code project id before the connection is usable.
+	if err := finalizeAntigravity(ctx, &cp); err != nil {
+		c.mu.Lock()
+		c.result = exchangeResult{err: err}
+		select {
+		case <-c.done:
+		default:
+			close(c.done)
+		}
+		c.mu.Unlock()
+		return nil, err
+	}
 	c.mu.Lock()
 	c.creds = &cp
 	c.result = exchangeResult{creds: &cp}

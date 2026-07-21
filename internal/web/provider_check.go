@@ -150,6 +150,9 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	if p.Protocol == domain.ProtocolQoder {
 		return checkQoderUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
+	if p.Protocol == domain.ProtocolAntigravity {
+		return checkAntigravityUpstream(ctx, p, trace, fileTrace, stderrTrace)
+	}
 	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
 		return checkClineUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
@@ -371,4 +374,62 @@ func traceBody(body []byte, limit int) string {
 		return fmt.Sprintf("%s... (truncated, %d bytes total)", body[:limit], len(body))
 	}
 	return string(body)
+}
+
+// checkAntigravityUpstream validates token + project via loadCodeAssist.
+func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+	const url = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+	meta := map[string]int{"ideType": 9, "platform": 3, "pluginType": 2}
+	payload, _ := json.Marshal(map[string]any{"metadata": meta})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(payload)))
+	if err != nil {
+		return false, "invalid request"
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "google-api-nodejs-client/9.15.1")
+	req.Header.Set("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+	mb, _ := json.Marshal(meta)
+	req.Header.Set("Client-Metadata", string(mb))
+
+	if trace {
+		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> POST %s", url)
+	}
+	resp, err := upstreamClient.Do(req)
+	if err != nil {
+		if trace {
+			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< POST %s: %v", url, err)
+		}
+		return false, "could not reach URL: " + err.Error()
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if trace {
+		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+	}
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("token rejected (HTTP %d)", resp.StatusCode)
+	case resp.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	}
+	var data map[string]any
+	_ = json.Unmarshal(body, &data)
+	project := ""
+	switch v := data["cloudaicompanionProject"].(type) {
+	case string:
+		project = strings.TrimSpace(v)
+	case map[string]any:
+		if id, ok := v["id"].(string); ok {
+			project = strings.TrimSpace(id)
+		}
+	}
+	if project == "" && p.OAuthCreds != nil {
+		project = p.OAuthCreds.ProjectID
+	}
+	if project == "" {
+		return false, "OK token, but no Cloud Code project - reconnect OAuth"
+	}
+	return true, fmt.Sprintf("OK - reachable, project %s", project)
 }

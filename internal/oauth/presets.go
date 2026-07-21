@@ -8,7 +8,10 @@
 package oauth
 
 import (
+	"strings"
+
 	"airouter/internal/domain"
+	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
 )
@@ -46,6 +49,8 @@ type Preset struct {
 	ClineAuth bool
 	// QoderAuth marks a Qoder device-flow connection (no refresh; COSY identity).
 	QoderAuth bool
+	// AntigravityAuth marks a Google Antigravity connection (project bootstrap).
+	AntigravityAuth bool
 }
 
 // Presets is the set of built-in OAuth configurations. Add an entry here to
@@ -132,6 +137,32 @@ var Presets = []Preset{
 		APIBase:     "https://api.cline.bot/api/v1",
 		Protocol:    domain.ProtocolOpenAI,
 	},
+	// Antigravity is Google Cloud Code via the public IDE OAuth client. Chat is
+	// SSE-only at cloudcode-pa; connect finalizes a ProjectID via loadCodeAssist.
+	{
+		Name:         "antigravity",
+		Label:        "Antigravity (Google)",
+		AuthURL:      "https://accounts.google.com/o/oauth2/v2/auth",
+		TokenURL:     "https://oauth2.googleapis.com/token",
+		ClientID:     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+		ClientSecret: "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",
+		Scopes: strings.Join([]string{
+			"https://www.googleapis.com/auth/cloud-platform",
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/userinfo.profile",
+			"https://www.googleapis.com/auth/cclog",
+			"https://www.googleapis.com/auth/experimentsandconfigs",
+		}, " "),
+		RedirectURI: "http://127.0.0.1:56123/callback",
+		PKCE:        false,
+		ExtraAuthParams: map[string]string{
+			"access_type": "offline",
+			"prompt":      "consent",
+		},
+		APIBase:          antigravity.DefaultBaseURL,
+		Protocol:         domain.ProtocolAntigravity,
+		AntigravityAuth: true,
+	},
 }
 
 // PresetByName returns the preset with the given name, or false.
@@ -165,7 +196,8 @@ func Apply(p Preset) (provider *domain.Provider, creds *domain.OAuthCreds) {
 			ExtraAuthParams: p.ExtraAuthParams,
 			RefreshJSON:     p.RefreshJSON,
 			RefreshURL:      p.RefreshURL,
-			ClineAuth:       p.ClineAuth,
-			QoderAuth:       p.QoderAuth,
+			ClineAuth:         p.ClineAuth,
+			QoderAuth:         p.QoderAuth,
+			AntigravityAuth:  p.AntigravityAuth,
 		}
 }

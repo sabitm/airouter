@@ -155,6 +155,14 @@ Responses IR mapping but has Codex-specific upstream behavior:
   Bearer rather than COSY. UserID/MachineID live on `OAuthCreds` and feed COSY
   via `CredsFromProvider`. Preserve the prepare-then-sign order, fail-closed
   model_config, and no-refresh behavior when touching Qoder paths.
+- Antigravity (`ProtocolAntigravity`) is backend-only Google Cloud Code chat:
+  Google OAuth auth-code + `loadCodeAssist`/`onboardUser` project bootstrap; chat
+  is SSE-only (`streamOnly`) through codec id `antigravity`. `prepareUpstreamRequest`
+  fail-closes without `OAuthCreds.ProjectID` and injects it into the envelope;
+  headers force the IDE User-Agent. Encode applies schema clean, thoughtSignature
+  backfill, then `_ide` tool cloaking + native decoys; decode strips `_ide` on tool
+  names. Refresh is generic Google form OAuth. Preserve fail-closed project,
+  cloak/decloak pair, and finalize-on-connect when touching Antigravity paths.
 - Streaming uses a no-timeout HTTP client (`Proxy.streamClient`) so long streams
   are bounded by the request context, not a client timeout.
 - Errors before the first streamed byte fall back to the ingress format's unary
