@@ -10,6 +10,7 @@ package oauth
 import (
 	"airouter/internal/domain"
 	"airouter/internal/proxy/kiro"
+	"airouter/internal/proxy/qoder"
 )
 
 // Preset is a built-in OAuth configuration used to prefill a provider's
@@ -43,6 +44,8 @@ type Preset struct {
 	RefreshURL string
 	// ClineAuth marks a Cline/ClinePass connection (non-standard OAuth + headers).
 	ClineAuth bool
+	// QoderAuth marks a Qoder device-flow connection (no refresh; COSY identity).
+	QoderAuth bool
 }
 
 // Presets is the set of built-in OAuth configurations. Add an entry here to
@@ -91,6 +94,15 @@ var Presets = []Preset{
 		Label:    "Kiro (import tokens)",
 		APIBase:  kiro.DefaultBaseURL,
 		Protocol: domain.ProtocolKiro,
+	},
+	// Qoder uses a custom device flow (not auth-code). Tokens and COSY identity
+	// fields are filled by QoderDeviceConnect; this preset only prefills base URL.
+	{
+		Name:      "qoder",
+		Label:     "Qoder",
+		APIBase:   qoder.DefaultBaseURL,
+		Protocol:  domain.ProtocolQoder,
+		QoderAuth: true,
 	},
 	// Cline is the cline.bot OAuth provider. It speaks OpenAI Chat Completions but
 	// uses a non-standard authorization-code flow (no client_id/PKCE; tokens often
@@ -154,5 +166,6 @@ func Apply(p Preset) (provider *domain.Provider, creds *domain.OAuthCreds) {
 			RefreshJSON:     p.RefreshJSON,
 			RefreshURL:      p.RefreshURL,
 			ClineAuth:       p.ClineAuth,
+			QoderAuth:       p.QoderAuth,
 		}
 }

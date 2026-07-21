@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
 )
 
@@ -71,6 +72,13 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 	// static catalog so combo autocomplete still offers the known model ids.
 	if p.Protocol == domain.ProtocolKiro {
 		return kiroModels(), nil
+	}
+	if p.Protocol == domain.ProtocolQoder {
+		ids, err := qoder.ListModelIDs(ctx, p)
+		if err != nil || len(ids) == 0 {
+			return append([]string(nil), qoder.StaticModels...), nil
+		}
+		return ids, nil
 	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

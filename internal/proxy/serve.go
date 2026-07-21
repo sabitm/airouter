@@ -287,7 +287,10 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
 	}
-	upstreamBody = prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
+	upstreamBody, err = prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
+	if err != nil {
+		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
+	}
 	if backend.streamOnly {
 		return p.serveStreamOnlyUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody)
 	}

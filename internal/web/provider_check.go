@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/proxy/qoder"
 )
 
 // checkProvider validates a base URL + credential + protocol against the live
@@ -146,6 +147,9 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	if p.Protocol == domain.ProtocolKiro {
 		return checkKiroUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
+	if p.Protocol == domain.ProtocolQoder {
+		return checkQoderUpstream(ctx, p, trace, fileTrace, stderrTrace)
+	}
 	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
 		return checkClineUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
@@ -205,6 +209,44 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 		return false, "reachable, but response shape unexpected - protocol may not match"
 	}
 	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
+}
+
+// checkQoderUpstream validates a Qoder device token against openapi userinfo.
+// Uses plain Bearer auth (not COSY); refresh is not attempted.
+func checkQoderUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+	url := qoder.UserInfoURL
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, "invalid request"
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Go-http-client/2.0")
+
+	if trace {
+		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
+	}
+	resp, err := upstreamClient.Do(req)
+	if err != nil {
+		if trace {
+			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
+		}
+		return false, "could not reach URL: " + err.Error()
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if trace {
+		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+	}
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		return false, "token invalid or revoked (HTTP 401)"
+	case resp.StatusCode == http.StatusForbidden:
+		return false, "access denied (HTTP 403)"
+	case resp.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	}
+	return true, "OK - reachable, token accepted"
 }
 
 // checkClineUpstream validates a Cline/ClinePass OAuth token against Cline's

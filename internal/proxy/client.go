@@ -12,6 +12,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/kiro"
+	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
 )
 
@@ -49,20 +50,40 @@ func newCodexSessionID() string {
 //     prompt_cache_key; the id is saved on the trace context so applyCodexHeaders
 //     emits it as the session_id header.
 //   - Kiro: injects the provider's CodeWhisperer profile ARN into the request.
+//   - Qoder: injects live model_config and WAF-encodes the body (COSY signs
+//     these wire bytes in applyUpstreamHeaders).
 //
-// Other backends return the body unchanged.
-func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain.Provider, body []byte) []byte {
+// Other backends return the body unchanged. A non-nil error is terminal for the
+// attempt (e.g. Qoder model_config unknown).
+func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain.Provider, body []byte) ([]byte, error) {
 	switch backend.id {
 	case "oai-codex":
 		id := newCodexSessionID()
 		if t := traceInfoFrom(ctx); t != nil {
 			t.CodexSessionID = id
 		}
-		return responses.InjectCodexRequestKey(body, id)
+		return responses.InjectCodexRequestKey(body, id), nil
 	case "kiro":
-		return kiro.InjectProfileArn(body, kiroProfileArn(provider))
+		return kiro.InjectProfileArn(body, kiroProfileArn(provider)), nil
+	case "qoder":
+		wire, err := qoder.PrepareWireBody(ctx, provider, body)
+		if err != nil {
+			return nil, err
+		}
+		// Stash model key/source from plaintext before encode for header emission.
+		// PrepareWireBody already encoded; re-read key from original body.
+		if t := traceInfoFrom(ctx); t != nil {
+			t.QoderModelKey = qoder.ModelKeyFromBody(body)
+			if cfg, lerr := qoder.LookupModelConfig(ctx, provider, t.QoderModelKey); lerr == nil {
+				t.QoderModelSource = qoder.ModelSourceFromConfig(cfg)
+			}
+			if t.QoderModelSource == "" {
+				t.QoderModelSource = "system"
+			}
+		}
+		return wire, nil
 	default:
-		return body
+		return body, nil
 	}
 }
 
@@ -97,7 +118,9 @@ var hopByHopOrControlled = map[string]bool{
 // x-stainless-*), which some providers require: an Anthropic upstream may reject
 // a request that does not look like it came from the official client. ctx is the
 // per-request context so codex headers (session_id) can read the trace session id.
-func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHeaders http.Header, ctx context.Context) {
+// body is the exact POST body that will be sent; Qoder COSY signing hashes it.
+// Non-Qoder backends ignore body.
+func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHeaders http.Header, ctx context.Context, body []byte) {
 	for name, vals := range clientHeaders {
 		if hopByHopOrControlled[http.CanonicalHeaderKey(name)] {
 			continue
@@ -139,6 +162,42 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	// headers; set after the auth-scheme switch so Authorization is rewritten.
 	if provider.OAuthCreds != nil && provider.OAuthCreds.ClineAuth {
 		applyClineHeaders(req, provider)
+	}
+	// Qoder overwrites Authorization with COSY and sets identity / model headers.
+	// Must run last so Cosy-* and Accept-Encoding: identity win.
+	if provider.Protocol == domain.ProtocolQoder {
+		applyQoderHeaders(req, provider, ctx, body)
+	}
+}
+
+// applyQoderHeaders COSY-signs the wire body and sets Qoder identity headers.
+func applyQoderHeaders(req *http.Request, provider *domain.Provider, ctx context.Context, body []byte) {
+	reqURL := req.URL.String()
+	if !req.URL.IsAbs() {
+		// NewRequest with absolute URL sets scheme/host; prefer that form.
+		reqURL = req.URL.RequestURI()
+		if req.URL.Scheme != "" && req.URL.Host != "" {
+			reqURL = req.URL.Scheme + "://" + req.URL.Host + req.URL.RequestURI()
+		}
+	}
+	headers, err := qoder.BuildCosyHeaders(body, reqURL, qoder.CredsFromProvider(provider))
+	if err != nil {
+		// Leave prior Authorization; upstream will 401 and surface reconnect.
+		return
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	if t := traceInfoFrom(ctx); t != nil {
+		if t.QoderModelKey != "" {
+			req.Header.Set("X-Model-Key", t.QoderModelKey)
+		}
+		src := t.QoderModelSource
+		if src == "" {
+			src = "system"
+		}
+		req.Header.Set("X-Model-Source", src)
 	}
 }
 
@@ -194,7 +253,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if err != nil {
 			return 0, nil, err
 		}
-		applyUpstreamHeaders(req, provider, clientHeaders, ctx)
+		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
 		resp, err := p.client.Do(req)
 		if err != nil {
 			return 0, nil, err
@@ -244,7 +303,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		if err != nil {
 			return nil, err
 		}
-		applyUpstreamHeaders(req, provider, clientHeaders, ctx)
+		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
 		req.Header.Set("Accept", accept)
 		return p.streamClient.Do(req)
 	}

@@ -52,6 +52,14 @@ templ KiroDeviceView(state, verificationURI, userCode string) {
 	</div>
 }
 
+templ QoderDeviceView(state, verificationURI string) {
+	<div class="oauth-connect">
+		<p class="muted">Open the Qoder authorization page and approve the request. This page detects completion automatically.</p>
+		<a class="button" href={ templ.SafeURL(verificationURI) } target="_blank" rel="noopener">Open Qoder authorization page</a>
+		@OAuthStatusLine(state, true, "pending", "", "")
+	</div>
+}
+
 // OAuthConnectIdle is the empty connect region shown before Connect is pressed
 // and after a cancel.
 templ OAuthConnectIdle() {

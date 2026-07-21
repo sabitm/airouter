@@ -81,8 +81,9 @@ func isInvalidGrantCode(code string) bool {
 
 // shouldRefresh reports whether the access token should be refreshed before use.
 // A zero ExpiresAt (unknown expiry) is left to the reactive 401 path.
+// Qoder device tokens cannot refresh; never proactively attempt it.
 func shouldRefresh(c *domain.OAuthCreds, now time.Time) bool {
-	if c == nil || c.ExpiresAt == 0 {
+	if c == nil || c.ExpiresAt == 0 || c.QoderAuth {
 		return false
 	}
 	return time.Unix(c.ExpiresAt, 0).Sub(now) < refreshLead
@@ -95,6 +96,10 @@ func shouldRefresh(c *domain.OAuthCreds, now time.Time) bool {
 func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	if c.RefreshToken == "" {
 		return errors.New("oauth: no refresh token")
+	}
+	// Qoder device tokens cannot refresh (center.qoder.sh returns 403).
+	if c.QoderAuth {
+		return refreshQoder(ctx, c, now)
 	}
 	// Kiro social/OIDC refresh uses JSON bodies with camelCase responses the
 	// generic OAuth2 path cannot parse. external_idp is excluded: it refreshes

@@ -142,6 +142,19 @@ Responses IR mapping but has Codex-specific upstream behavior:
   Codex/Kiro (`applyUpstreamHeaders` and dashboard probes), not inside
   `Service.Resolve`. Preserve the marker + header-seam split when touching
   connect/refresh or upstream construction.
+- Qoder (`ProtocolQoder`) is a backend-only protocol: device-flow OAuth against
+  `openapi.qoder.sh`, chat against `api3.qoder.sh` with COSY-signed WAF-encoded
+  bodies and SSE-only responses (`streamOnly`). The codec id is `qoder`, so every
+  ingress translates through the IR. `prepareUpstreamRequest` injects the live
+  `model_config` (fail-closed when unknown) and WAF-encodes; `applyUpstreamHeaders`
+  then COSY-signs those wire bytes last (overwriting Authorization) and sets
+  `X-Model-Key`/`X-Model-Source` from the request-local `TraceInfo`.
+  `OAuthCreds.QoderAuth` marks the connection: `shouldRefresh` skips it,
+  `refreshQoder` returns `ErrInvalidGrant` (device tokens do not refresh; the
+  reactive 401 path surfaces reconnect), and Check probes userinfo with plain
+  Bearer rather than COSY. UserID/MachineID live on `OAuthCreds` and feed COSY
+  via `CredsFromProvider`. Preserve the prepare-then-sign order, fail-closed
+  model_config, and no-refresh behavior when touching Qoder paths.
 - Streaming uses a no-timeout HTTP client (`Proxy.streamClient`) so long streams
   are bounded by the request context, not a client timeout.
 - Errors before the first streamed byte fall back to the ingress format's unary

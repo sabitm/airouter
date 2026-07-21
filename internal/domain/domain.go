@@ -18,10 +18,14 @@ const (
 	// JSON on request and a binary AWS EventStream (not SSE) on response, so every
 	// request to it translates through the IR and the upstream is stream-only.
 	ProtocolKiro Protocol = "kiro"
+	// ProtocolQoder is the Qoder (qoder.com) backend. It is backend only: device-flow
+	// OAuth, COSY-signed WAF-encoded chat against api3.qoder.sh, SSE-only responses.
+	// Every request translates through the IR; device tokens do not refresh.
+	ProtocolQoder Protocol = "qoder"
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It
@@ -131,6 +135,19 @@ type OAuthCreds struct {
 	// does not. "external_idp" is left to the generic form refresh (it targets a
 	// standard Microsoft token endpoint).
 	KiroAuth string `json:"kiro_auth,omitempty"`
+
+	// QoderAuth marks a Qoder device-flow OAuth connection. When true, proactive
+	// and reactive refresh are no-ops that surface reconnect (device tokens cannot
+	// refresh against center.qoder.sh). UserID and MachineID feed COSY signing.
+	QoderAuth bool `json:"qoder_auth,omitempty"`
+	// UserID is the stable Qoder user id from the device token poll (COSY uid).
+	UserID string `json:"user_id,omitempty"`
+	// MachineID is a UUID generated at connect time and reused on every COSY request.
+	MachineID string `json:"machine_id,omitempty"`
+	// OrganizationID is optional org scope from userinfo.
+	OrganizationID string `json:"organization_id,omitempty"`
+	// DisplayName is the profile name from userinfo, used in COSY user-info payload.
+	DisplayName string `json:"display_name,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

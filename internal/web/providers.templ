@@ -241,6 +241,58 @@ templ ProviderRecipeForm(r recipe) {
 					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
 				</div>
 			</form>
+		case kindQoder:
+			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="web" data-protocol="qoder" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+				<input type="hidden" name="protocol" value="qoder"/>
+				<input type="hidden" name="auth_method" value="oauth"/>
+				<input type="hidden" name="preset" value="qoder"/>
+				<label class="field">
+					<span class="field-name">Name</span>
+					<input name="name" placeholder="e.g. qoder" required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Base URL</span>
+					<input name="base_url" placeholder="https://api3.qoder.sh/algo" value={ r.BaseURL } required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Auth mode</span>
+					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
+						<option value="web" selected>Device auth</option>
+						<option value="manual">Manual</option>
+					</select>
+				</label>
+				<div class="oauth-web">
+					<button type="button" class="link" hx-post="/dashboard/providers/qoder/device/begin" hx-include="closest form" hx-target="#oauth-region-new-qoder" hx-swap="innerHTML">Connect (Qoder)</button>
+					<div id="oauth-region-new-qoder" class="oauth-region" aria-live="polite">
+						@OAuthConnectIdle()
+					</div>
+					<p class="field-hint">Save after Connect succeeds, or switch to Manual and paste tokens.</p>
+				</div>
+				<div class="oauth-manual">
+					<span class="muted">Paste a device access token plus the user id and machine id from a prior connect.</span>
+					<label class="field">
+						<span class="field-name">User id</span>
+						<input name="user_id" class="oauth-cfg mono" placeholder="user id" aria-label="user id"/>
+					</label>
+					<label class="field">
+						<span class="field-name">Machine id</span>
+						<input name="machine_id" class="oauth-cfg mono" placeholder="machine uuid" aria-label="machine id"/>
+					</label>
+					@oauthTokenFields(&domain.OAuthCreds{}, "", "")
+					<div class="form-actions">
+						<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+						<span class="check-indicator htmx-indicator">checking...</span>
+						<span class="check-result" aria-live="polite"></span>
+					</div>
+				</div>
+				<div class="form-actions">
+					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+					<span class="check-indicator htmx-indicator">checking...</span>
+					<span class="check-result" aria-live="polite"></span>
+					<button type="submit">Add</button>
+					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				</div>
+			</form>
 		case kindGenericAPIKey:
 			<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
@@ -410,6 +462,8 @@ templ ProviderEditRow(p *domain.Provider) {
 		<td colspan="6">
 			if p.Protocol == domain.ProtocolKiro {
 				@providerEditRowKiro(p)
+			} else if p.Protocol == domain.ProtocolQoder {
+				@providerEditRowQoder(p)
 			} else if p.Method() == domain.AuthOAuth && providerEditInteractiveOAuth(p.Protocol) {
 				@providerEditRowInteractiveOAuth(p)
 			} else {
@@ -501,6 +555,64 @@ templ providerEditRowKiro(p *domain.Provider) {
 		</div>
 		<div class="oauth-fields">
 			@kiroEditOAuthBlock(p)
+		</div>
+		<div class="form-actions">
+			@providerEditCheck()
+			@providerEditSaveCancel(p)
+		</div>
+	</form>
+}
+
+templ providerEditRowQoder(p *domain.Provider) {
+	{{ c := orEmptyCreds(p.OAuthCreds) }}
+	<form
+		class="provider-form provider-form-grid"
+		data-method="oauth"
+		data-protocol="qoder"
+		data-oauth-mode="web"
+		hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) }
+		hx-target="#provider-list"
+		hx-swap="outerHTML"
+	>
+		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
+		<input type="hidden" name="protocol" value="qoder"/>
+		<input type="hidden" name="auth_method" value="oauth"/>
+		<input type="hidden" name="preset" value="qoder"/>
+		<label class="field">
+			<span class="field-name">Name</span>
+			<input name="name" value={ p.Name } required/>
+		</label>
+		<label class="field">
+			<span class="field-name">Base URL</span>
+			<input name="base_url" value={ p.BaseURL } required/>
+		</label>
+		if c.Email != "" || c.DisplayName != "" {
+			<p class="field-hint">Connected as { c.DisplayName } { c.Email }</p>
+		}
+		<label class="field">
+			<span class="field-name">Auth mode</span>
+			<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
+				<option value="web" selected>Device auth</option>
+				<option value="manual">Manual</option>
+			</select>
+		</label>
+		<div class="oauth-web">
+			<button type="button" class="link" hx-post="/dashboard/providers/qoder/device/begin" hx-include="closest form" hx-target={ "#oauth-region-edit-qoder-" + strconv.FormatInt(p.ID, 10) } hx-swap="innerHTML">Reconnect (Qoder)</button>
+			<div id={ "oauth-region-edit-qoder-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
+				@OAuthConnectIdle()
+			</div>
+			<p class="field-hint">Device tokens last ~30 days and cannot be refreshed. Reconnect when Check fails.</p>
+		</div>
+		<div class="oauth-manual">
+			<label class="field">
+				<span class="field-name">User id</span>
+				<input name="user_id" class="oauth-cfg mono" placeholder="user id" value={ c.UserID } aria-label="user id"/>
+			</label>
+			<label class="field">
+				<span class="field-name">Machine id</span>
+				<input name="machine_id" class="oauth-cfg mono" placeholder="machine uuid" value={ c.MachineID } aria-label="machine id"/>
+			</label>
+			@oauthTokenFields(&domain.OAuthCreds{}, "", "")
 		</div>
 		<div class="form-actions">
 			@providerEditCheck()

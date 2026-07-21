@@ -21,14 +21,18 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 			return nil, fieldError("unknown preset")
 		}
 		// Interactive presets (with an authorize URL) are fully self-configured.
-		// Import presets (Kiro) have no authorize endpoint: their client config comes
-		// from the form fields, tagged with the preset name for display.
+		// Import/device presets (Kiro, Qoder) have no authorize endpoint on this form:
+		// their client config comes from the form fields, tagged with the preset name.
 		if p.AuthURL != "" {
 			_, creds := oauth.Apply(p)
 			return creds, nil
 		}
 		c := manualCredsFromForm(r)
 		c.Preset = name
+		// Device-flow markers must still land on the creds even without AuthURL.
+		if p.QoderAuth {
+			c.QoderAuth = true
+		}
 		return c, nil
 	}
 	return manualCredsFromForm(r), nil
@@ -67,6 +71,40 @@ func applyKiroConfig(c *domain.OAuthCreds, r *http.Request) {
 	if v := strings.TrimSpace(r.FormValue("kiro_auth")); v != "" {
 		c.KiroAuth = v
 	}
+}
+
+// applyQoderConfig overlays Qoder identity fields from the form (manual import)
+// and marks the connection as QoderAuth so refresh/COSY routes correctly.
+func applyQoderConfig(c *domain.OAuthCreds, r *http.Request) {
+	c.QoderAuth = true
+	if v := strings.TrimSpace(r.FormValue("user_id")); v != "" {
+		c.UserID = v
+	}
+	if v := strings.TrimSpace(r.FormValue("machine_id")); v != "" {
+		c.MachineID = v
+	}
+	if v := strings.TrimSpace(r.FormValue("display_name")); v != "" {
+		c.DisplayName = v
+	}
+}
+
+func (h *Handler) qoderDeviceBegin(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		render(w, r, OAuthConnectError("invalid form"))
+		return
+	}
+	conn, err := oauth.NewQoderDeviceConnect()
+	if err != nil {
+		render(w, r, OAuthConnectError(err.Error()))
+		return
+	}
+	if err := conn.Start(r.Context()); err != nil {
+		conn.Close()
+		render(w, r, OAuthConnectError(err.Error()))
+		return
+	}
+	h.sessions.put(conn.State(), &connectSession{conn: conn, created: time.Now()}, time.Now())
+	render(w, r, QoderDeviceView(conn.State(), conn.VerificationURI()))
 }
 
 // applyManualTokens overlays user-pasted tokens onto a config-only creds, for
@@ -342,6 +380,21 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 			if !creds.ClineAuth {
 				creds.ClineAuth = stored.ClineAuth
 			}
+			if !creds.QoderAuth {
+				creds.QoderAuth = stored.QoderAuth
+			}
+			if creds.UserID == "" {
+				creds.UserID = stored.UserID
+			}
+			if creds.MachineID == "" {
+				creds.MachineID = stored.MachineID
+			}
+			if creds.DisplayName == "" {
+				creds.DisplayName = stored.DisplayName
+			}
+			if creds.OrganizationID == "" {
+				creds.OrganizationID = stored.OrganizationID
+			}
 			if creds.IDToken == "" {
 				creds.IDToken = stored.IDToken
 			}
@@ -357,7 +410,10 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	kiroFlow := creds.KiroAuth != "" && creds.KiroAuth != "external_idp"
 	clineFlow := creds.ClineAuth
+	qoderFlow := creds.QoderAuth
 	switch {
+	case qoderFlow:
+		// Device tokens cannot refresh; fall through to RefreshTokens which returns invalid_grant.
 	case kiroFlow:
 		// Kiro social/OIDC does not require client_id on this form path.
 	case clineFlow:

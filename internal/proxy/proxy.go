@@ -18,6 +18,7 @@ import (
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/openai"
+	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/sse"
 	"airouter/internal/store"
@@ -138,6 +139,18 @@ var kiroCodec = codec{
 	streamAccept:  kiro.EventStreamAccept,
 }
 
+// qoderCodec is the Qoder backend: COSY-signed WAF-encoded chat, SSE-only.
+// Backend-only; every request translates through the IR. Unary clients collect
+// from the stream. Device tokens do not refresh.
+var qoderCodec = codec{
+	id:            "qoder",
+	protocol:      domain.ProtocolQoder,
+	encodeRequest: qoder.EncodeRequest,
+	upstreamPath:  qoder.UpstreamPath,
+	decodeStream:  qoder.DecodeStream,
+	streamOnly:    true,
+}
+
 func backendCodec(p domain.Protocol) codec {
 	switch p {
 	case domain.ProtocolAnthropic:
@@ -148,6 +161,8 @@ func backendCodec(p domain.Protocol) codec {
 		return codexCodec
 	case domain.ProtocolKiro:
 		return kiroCodec
+	case domain.ProtocolQoder:
+		return qoderCodec
 	default:
 		return openaiCodec
 	}

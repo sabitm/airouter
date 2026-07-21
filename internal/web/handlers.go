@@ -15,6 +15,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/kiro"
+	"airouter/internal/proxy/qoder"
 	"airouter/internal/store"
 )
 
@@ -83,6 +84,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/providers/oauth/refresh", h.oauthRefreshTokens)
 	mux.HandleFunc("POST /dashboard/providers/oauth/refresh-all", h.refreshAllOAuth)
 	mux.HandleFunc("POST /dashboard/providers/kiro/device/begin", h.kiroDeviceBegin)
+	mux.HandleFunc("POST /dashboard/providers/qoder/device/begin", h.qoderDeviceBegin)
 
 	// Combos
 	mux.HandleFunc("GET /dashboard/combos", h.combosPage)
@@ -191,6 +193,9 @@ func kiroBaseURLOr(proto domain.Protocol, base string) string {
 	if proto == domain.ProtocolKiro && strings.TrimSpace(base) == "" {
 		return kiro.DefaultBaseURL
 	}
+	if proto == domain.ProtocolQoder && strings.TrimSpace(base) == "" {
+		return qoder.DefaultBaseURL
+	}
 	return base
 }
 
@@ -267,6 +272,9 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 	// that routes token refresh to Kiro's flow.
 	if proto == domain.ProtocolKiro {
 		applyKiroConfig(creds, r)
+	}
+	if proto == domain.ProtocolQoder {
+		applyQoderConfig(creds, r)
 	}
 	p := &domain.Provider{
 		Name:       r.FormValue("name"),
@@ -400,6 +408,9 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	}
 	if proto == domain.ProtocolKiro {
 		applyKiroConfig(cur.OAuthCreds, r)
+	}
+	if proto == domain.ProtocolQoder {
+		applyQoderConfig(cur.OAuthCreds, r)
 	}
 	cur.Name = r.FormValue("name")
 	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))

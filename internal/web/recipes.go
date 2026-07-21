@@ -3,6 +3,7 @@ package web
 import (
 	"airouter/internal/domain"
 	"airouter/internal/proxy/kiro"
+	"airouter/internal/proxy/qoder"
 )
 
 type recipeKind string
@@ -10,6 +11,7 @@ type recipeKind string
 const (
 	kindInteractiveOAuth recipeKind = "interactive-oauth"
 	kindKiro             recipeKind = "kiro"
+	kindQoder            recipeKind = "qoder"
 	kindGenericAPIKey    recipeKind = "generic-apikey"
 )
 
@@ -33,6 +35,7 @@ var recipes = []recipe{
 	{ID: "cline", Label: "Cline", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "cline", BaseURL: "https://api.cline.bot/api/v1"},
 	{ID: "clinepass", Label: "ClinePass", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "clinepass", BaseURL: "https://api.cline.bot/api/v1"},
 	{ID: "kiro", Label: "Kiro", Sublabel: "AWS CodeWhisperer", Tag: "API key / OAuth", Kind: kindKiro, Protocol: domain.ProtocolKiro, BaseURL: kiro.DefaultBaseURL},
+	{ID: "qoder", Label: "Qoder", Sublabel: "qoder.com", Tag: "OAuth device", Kind: kindQoder, Protocol: domain.ProtocolQoder, Method: domain.AuthOAuth, Preset: "qoder", BaseURL: qoder.DefaultBaseURL},
 	{ID: "openai", Label: "OpenAI-compatible", Sublabel: "OpenRouter, OpenAI, vLLM...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAI, Method: domain.AuthAPIKey},
 	{ID: "openai-responses", Label: "OpenAI Responses", Sublabel: "Responses API upstreams", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAIResponses, Method: domain.AuthAPIKey},
 	{ID: "anthropic", Label: "Anthropic-compatible", Sublabel: "Claude API...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolAnthropic, Method: domain.AuthAPIKey},

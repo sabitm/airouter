@@ -10,9 +10,14 @@ import "context"
 // CodexSessionID is the per-request id the codex backend translate path sets
 // for the session_id header and prompt_cache_key (the two must match upstream).
 // Empty for non-codex requests.
+//
+// QoderModelKey/Source are set by prepareUpstreamRequest for the Qoder backend
+// so applyUpstreamHeaders can emit X-Model-Key / X-Model-Source after COSY sign.
 type TraceInfo struct {
-	UpstreamURL    string
-	CodexSessionID string
+	UpstreamURL      string
+	CodexSessionID   string
+	QoderModelKey    string
+	QoderModelSource string
 }
 
 type traceKeyT struct{}

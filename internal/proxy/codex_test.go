@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
 )
 
@@ -25,7 +27,10 @@ func TestCodexEncodeRequestEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body = prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), codexCodec, &domain.Provider{}, body)
+	body, err = prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), codexCodec, &domain.Provider{}, body)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
@@ -81,7 +86,7 @@ func TestApplyCodexHeaders(t *testing.T) {
 		},
 	}
 	clientHeaders := http.Header{"User-Agent": []string{"bad-client"}}
-	applyUpstreamHeaders(req, provider, clientHeaders, ctx)
+	applyUpstreamHeaders(req, provider, clientHeaders, ctx, nil)
 
 	if got := req.Header.Get("Authorization"); got != "Bearer tok" {
 		t.Errorf("authorization = %q", got)
@@ -113,7 +118,7 @@ func TestApplyClineHeaders(t *testing.T) {
 		},
 	}
 	clientHeaders := http.Header{"User-Agent": []string{"bad-client"}}
-	applyUpstreamHeaders(req, provider, clientHeaders, context.Background())
+	applyUpstreamHeaders(req, provider, clientHeaders, context.Background(), nil)
 
 	if got := req.Header.Get("Authorization"); got != "Bearer workos:raw-token" {
 		t.Errorf("authorization = %q", got)
@@ -129,5 +134,48 @@ func TestApplyClineHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("User-Agent"); !strings.HasPrefix(got, "airouter/") {
 		t.Errorf("user-agent = %q, want airouter/ prefix", got)
+	}
+}
+
+func TestApplyQoderHeaders(t *testing.T) {
+	body := []byte(`{"stream":true}`)
+	req, err := http.NewRequest(http.MethodPost, qoder.ChatURL, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &domain.Provider{
+		Protocol: domain.ProtocolQoder,
+		APIKey:   "dt-token",
+		OAuthCreds: &domain.OAuthCreds{
+			QoderAuth:  true,
+			UserID:     "u-1",
+			MachineID:  "m-1",
+			DisplayName: "Ada",
+			Email:      "a@b.c",
+		},
+	}
+	ctx := WithTraceInfo(context.Background(), &TraceInfo{
+		QoderModelKey:    "auto",
+		QoderModelSource: "system",
+	})
+	applyUpstreamHeaders(req, provider, nil, ctx, body)
+
+	if auth := req.Header.Get("Authorization"); !strings.HasPrefix(auth, "Bearer COSY.") {
+		t.Fatalf("authorization = %q", auth)
+	}
+	if got := req.Header.Get("Cosy-User"); got != "u-1" {
+		t.Errorf("cosy-user = %q", got)
+	}
+	if got := req.Header.Get("Cosy-Machineid"); got != "m-1" {
+		t.Errorf("cosy-machineid = %q", got)
+	}
+	if got := req.Header.Get("Accept-Encoding"); got != "identity" {
+		t.Errorf("accept-encoding = %q", got)
+	}
+	if got := req.Header.Get("X-Model-Key"); got != "auto" {
+		t.Errorf("x-model-key = %q", got)
+	}
+	if got := req.Header.Get("X-Model-Source"); got != "system" {
+		t.Errorf("x-model-source = %q", got)
 	}
 }

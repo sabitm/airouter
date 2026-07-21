@@ -263,6 +263,25 @@ func TestOAuthPresetCreatesClineConfig(t *testing.T) {
 	}
 }
 
+func TestOAuthPresetCreatesQoderConfig(t *testing.T) {
+	form := url.Values{}
+	form.Set("preset", "qoder")
+	creds, err := credsFromConnectForm(reqWithForm(form))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !creds.QoderAuth {
+		t.Error("qoder preset should set QoderAuth")
+	}
+	if creds.Preset != "qoder" {
+		t.Errorf("preset = %q", creds.Preset)
+	}
+	// Device flow does not need interactive OAuth endpoints on the form.
+	if recipe, ok := recipeByID("qoder"); !ok || recipe.Protocol != domain.ProtocolQoder || recipe.Kind != kindQoder {
+		t.Fatalf("recipe missing or wrong: %+v", recipe)
+	}
+}
+
 func reqWithForm(form url.Values) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
