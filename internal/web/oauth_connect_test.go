@@ -306,6 +306,100 @@ func TestOAuthPresetCreatesAntigravityConfig(t *testing.T) {
 	}
 }
 
+func TestOAuthPresetCreatesCursorConfig(t *testing.T) {
+	form := url.Values{}
+	form.Set("preset", "cursor")
+	creds, err := credsFromConnectForm(reqWithForm(form))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !creds.CursorAuth {
+		t.Error("cursor preset should set CursorAuth")
+	}
+	if creds.Preset != "cursor" {
+		t.Errorf("preset = %q", creds.Preset)
+	}
+	if recipe, ok := recipeByID("cursor"); !ok || recipe.Protocol != domain.ProtocolCursor || recipe.Kind != kindCursor {
+		t.Fatalf("recipe missing or wrong: %+v", recipe)
+	}
+}
+
+func TestCreateCursorProviderPersistsCreds(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "my-cursor")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("access_token", "ide-tok")
+	form.Set("machine_id", "m-uuid")
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, reqWithForm(form))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	providers, _ := h.store.ListProviders(context.Background())
+	if len(providers) != 1 {
+		t.Fatalf("providers = %d, want 1", len(providers))
+	}
+	p := providers[0]
+	if p.Protocol != domain.ProtocolCursor || p.Method() != domain.AuthOAuth {
+		t.Errorf("protocol/method = %q/%q", p.Protocol, p.Method())
+	}
+	if p.OAuthCreds == nil || !p.OAuthCreds.CursorAuth {
+		t.Fatalf("creds missing CursorAuth: %+v", p.OAuthCreds)
+	}
+	if p.OAuthCreds.AccessToken != "ide-tok" {
+		t.Errorf("access token = %q", p.OAuthCreds.AccessToken)
+	}
+	if p.OAuthCreds.MachineID != "m-uuid" {
+		t.Errorf("machine id = %q", p.OAuthCreds.MachineID)
+	}
+}
+
+func TestCreateCursorProviderMissingMachineIDRejected(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "my-cursor")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("access_token", "ide-tok")
+	// machine_id intentionally omitted
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, reqWithForm(form))
+	body := rec.Body.String()
+	if !strings.Contains(body, "machine id") {
+		t.Fatalf("want machine id error, got: %s", body)
+	}
+	providers, _ := h.store.ListProviders(context.Background())
+	if len(providers) != 0 {
+		t.Errorf("provider should not be saved, got %d", len(providers))
+	}
+}
+
+func TestCreateCursorProviderMissingAccessTokenRejected(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "my-cursor")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("machine_id", "m-uuid")
+	// access_token intentionally omitted: the generic paste-token guard rejects
+	// the save before the Cursor-specific check runs.
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, reqWithForm(form))
+	body := rec.Body.String()
+	if !strings.Contains(strings.ToLower(body), "paste") {
+		t.Fatalf("want a paste-token rejection, got: %s", body)
+	}
+	providers, _ := h.store.ListProviders(context.Background())
+	if len(providers) != 0 {
+		t.Errorf("provider should not be saved, got %d", len(providers))
+	}
+}
+
 func reqWithForm(form url.Values) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")

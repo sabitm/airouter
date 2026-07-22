@@ -163,6 +163,20 @@ Responses IR mapping but has Codex-specific upstream behavior:
   backfill, then `_ide` tool cloaking + native decoys; decode strips `_ide` on tool
   names. Refresh is generic Google form OAuth. Preserve fail-closed project,
   cloak/decloak pair, and finalize-on-connect when touching Antigravity paths.
+- Cursor (`ProtocolCursor`) is a backend-only protocol for the Cursor IDE: Connect-RPC
+  protobuf chat (ChatService `StreamUnifiedChatWithTools`), stream-only, codec id
+  `cursor` so every ingress translates through the IR. Auth is a pasted IDE access
+  token + machine id (no OAuth flow, no refresh); `CursorAuth` marks the connection
+  and `MachineID` feeds the jyh-cipher `x-cursor-checksum` header (use
+  `cursorChecksum.js`, not the older `oauth/services/cursor.js` cipher that omits
+  the `+i%256` term). `applyUpstreamHeaders` overwrites the full identity header set
+  after the client-header copy. Tool results are flattened to XML text in user
+  messages (protobuf `tool_results` loop on partial schemas); tools encode as
+  `mcp_custom_*` and decode strips that prefix. `CanRefresh` is false (mirrors
+  Qoder); `refreshCursor` returns `ErrInvalidGrant` so the reactive 401 path prompts
+  re-paste. v1 ships ChatService only; the AgentService text path (HTTP/2 duplex)
+  is deferred. Preserve the manual-paste/no-refresh contract and the XML-tool-result
+  invariant when touching Cursor paths.
 - Streaming uses a no-timeout HTTP client (`Proxy.streamClient`) so long streams
   are bounded by the request context, not a client timeout.
 - Errors before the first streamed byte fall back to the ingress format's unary

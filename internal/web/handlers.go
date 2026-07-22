@@ -15,6 +15,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/store"
@@ -147,7 +148,6 @@ func renderHXFlash(w http.ResponseWriter, r *http.Request, flashID, msg string) 
 	}
 }
 
-
 func pathID(r *http.Request) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -199,6 +199,9 @@ func kiroBaseURLOr(proto domain.Protocol, base string) string {
 	}
 	if proto == domain.ProtocolAntigravity && strings.TrimSpace(base) == "" {
 		return antigravity.DefaultBaseURL
+	}
+	if proto == domain.ProtocolCursor && strings.TrimSpace(base) == "" {
+		return cursor.DefaultBaseURL
 	}
 	return base
 }
@@ -288,6 +291,17 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 		}
 		if strings.TrimSpace(creds.ProjectID) == "" {
 			htmxBadRequest(w, r, "provider-flash", "antigravity: missing project id; reconnect OAuth")
+			return
+		}
+	}
+	if proto == domain.ProtocolCursor {
+		applyCursorConfig(creds, r)
+		if strings.TrimSpace(creds.AccessToken) == "" {
+			htmxBadRequest(w, r, "provider-flash", "cursor: paste an access token before saving")
+			return
+		}
+		if strings.TrimSpace(creds.MachineID) == "" {
+			htmxBadRequest(w, r, "provider-flash", "cursor: paste the machine id before saving")
 			return
 		}
 	}
@@ -435,6 +449,17 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		}
 		if strings.TrimSpace(cur.OAuthCreds.ProjectID) == "" {
 			htmxBadRequest(w, r, "provider-flash", "antigravity: missing project id; reconnect OAuth")
+			return
+		}
+	}
+	if proto == domain.ProtocolCursor {
+		applyCursorConfig(cur.OAuthCreds, r)
+		if strings.TrimSpace(cur.OAuthCreds.AccessToken) == "" {
+			htmxBadRequest(w, r, "provider-flash", "cursor: paste an access token before saving")
+			return
+		}
+		if strings.TrimSpace(cur.OAuthCreds.MachineID) == "" {
+			htmxBadRequest(w, r, "provider-flash", "cursor: paste the machine id before saving")
 			return
 		}
 	}

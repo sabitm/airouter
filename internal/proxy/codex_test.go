@@ -10,6 +10,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
@@ -148,11 +149,11 @@ func TestApplyQoderHeaders(t *testing.T) {
 		Protocol: domain.ProtocolQoder,
 		APIKey:   "dt-token",
 		OAuthCreds: &domain.OAuthCreds{
-			QoderAuth:  true,
-			UserID:     "u-1",
-			MachineID:  "m-1",
+			QoderAuth:   true,
+			UserID:      "u-1",
+			MachineID:   "m-1",
 			DisplayName: "Ada",
-			Email:      "a@b.c",
+			Email:       "a@b.c",
 		},
 	}
 	ctx := WithTraceInfo(context.Background(), &TraceInfo{
@@ -197,7 +198,7 @@ func TestApplyAntigravityHeadersAndProject(t *testing.T) {
 		APIKey:   "tok",
 		OAuthCreds: &domain.OAuthCreds{
 			AntigravityAuth: true,
-			ProjectID:        "proj-1",
+			ProjectID:       "proj-1",
 		},
 	}
 	body, err = prepareUpstreamRequest(context.Background(), antigravityCodec, provider, body)
@@ -226,5 +227,50 @@ func TestApplyAntigravityHeadersAndProject(t *testing.T) {
 	provider.OAuthCreds.ProjectID = ""
 	if _, err := prepareUpstreamRequest(context.Background(), antigravityCodec, provider, body); err == nil {
 		t.Fatal("expected missing project error")
+	}
+}
+
+func TestApplyCursorHeaders(t *testing.T) {
+	body, err := cursor.EncodeRequest(&ir.Request{
+		Model:    "gpt-5.2",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &domain.Provider{
+		Protocol: domain.ProtocolCursor,
+		APIKey:   "sess::ide-tok",
+		OAuthCreds: &domain.OAuthCreds{
+			CursorAuth: true,
+			MachineID:  "m-1",
+		},
+	}
+	req, err := http.NewRequest(http.MethodPost, cursor.DefaultBaseURL+cursor.UpstreamPath, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A forwarded client User-Agent must be overwritten by the Cursor identity set.
+	applyUpstreamHeaders(req, provider, http.Header{"User-Agent": {"bad-client"}}, context.Background(), body)
+	if got := req.Header.Get("Authorization"); got != "Bearer ide-tok" {
+		t.Errorf("authorization = %q, want stripped Bearer ide-tok", got)
+	}
+	if got := req.Header.Get("Content-Type"); got != cursor.ConnectContentType {
+		t.Errorf("content-type = %q", got)
+	}
+	if got := req.Header.Get("User-Agent"); got != cursor.UserAgent {
+		t.Errorf("user-agent = %q, want %s (identity overwrite)", got, cursor.UserAgent)
+	}
+	if got := req.Header.Get("X-Cursor-Checksum"); !strings.HasSuffix(got, "m-1") {
+		t.Errorf("checksum = %q, want suffix m-1", got)
+	}
+	if got := req.Header.Get("X-Cursor-Client-Version"); got != cursor.ClientVersion {
+		t.Errorf("client-version = %q", got)
+	}
+	if got := req.Header.Get("X-Session-Id"); got == "" {
+		t.Error("session-id empty")
+	}
+	if got := req.Header.Get("Connect-Protocol-Version"); got != "1" {
+		t.Errorf("connect-protocol-version = %q", got)
 	}
 }

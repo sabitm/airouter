@@ -29,9 +29,13 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 		}
 		c := manualCredsFromForm(r)
 		c.Preset = name
-		// Device-flow markers must still land on the creds even without AuthURL.
+		// Device-flow / import markers must still land on the creds even without
+		// an authorize URL (Qoder device, Cursor token import).
 		if p.QoderAuth {
 			c.QoderAuth = true
+		}
+		if p.CursorAuth {
+			c.CursorAuth = true
 		}
 		return c, nil
 	}
@@ -141,6 +145,16 @@ func applyAntigravityConfig(c *domain.OAuthCreds, r *http.Request) {
 	c.AntigravityAuth = true
 	if v := strings.TrimSpace(r.FormValue("project_id")); v != "" {
 		c.ProjectID = v
+	}
+}
+
+// applyCursorConfig marks the connection as an imported Cursor IDE token and
+// overlays the machine id from the form. The access token comes in via
+// applyManualTokens; both are required at save time (validated by handlers).
+func applyCursorConfig(c *domain.OAuthCreds, r *http.Request) {
+	c.CursorAuth = true
+	if v := strings.TrimSpace(r.FormValue("machine_id")); v != "" {
+		c.MachineID = v
 	}
 }
 
@@ -398,6 +412,9 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 			if !creds.AntigravityAuth {
 				creds.AntigravityAuth = stored.AntigravityAuth
 			}
+			if !creds.CursorAuth {
+				creds.CursorAuth = stored.CursorAuth
+			}
 			if creds.ProjectID == "" {
 				creds.ProjectID = stored.ProjectID
 			}
@@ -429,9 +446,11 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 	kiroFlow := creds.KiroAuth != "" && creds.KiroAuth != "external_idp"
 	clineFlow := creds.ClineAuth
 	qoderFlow := creds.QoderAuth
+	cursorFlow := creds.CursorAuth
 	switch {
-	case qoderFlow:
-		// Device tokens cannot refresh; fall through to RefreshTokens which returns invalid_grant.
+	case qoderFlow, cursorFlow:
+		// Device / imported tokens cannot refresh; fall through to RefreshTokens
+		// which returns invalid_grant (reconnect / re-paste required).
 	case kiroFlow:
 		// Kiro social/OIDC does not require client_id on this form path.
 	case clineFlow:

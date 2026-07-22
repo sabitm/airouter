@@ -12,6 +12,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
 )
@@ -51,6 +52,8 @@ type Preset struct {
 	QoderAuth bool
 	// AntigravityAuth marks a Google Antigravity connection (project bootstrap).
 	AntigravityAuth bool
+	// CursorAuth marks an imported Cursor IDE token connection (no refresh).
+	CursorAuth bool
 }
 
 // Presets is the set of built-in OAuth configurations. Add an entry here to
@@ -159,9 +162,19 @@ var Presets = []Preset{
 			"access_type": "offline",
 			"prompt":      "consent",
 		},
-		APIBase:          antigravity.DefaultBaseURL,
-		Protocol:         domain.ProtocolAntigravity,
+		APIBase:         antigravity.DefaultBaseURL,
+		Protocol:        domain.ProtocolAntigravity,
 		AntigravityAuth: true,
+	},
+	// Cursor IDE: import a logged-in access token + machine id from the IDE's
+	// local state. No OAuth flow and no refresh (tokens are short-lived IDE
+	// sessions); this preset only prefills the base URL and the marker.
+	{
+		Name:       "cursor",
+		Label:      "Cursor IDE",
+		APIBase:    cursor.DefaultBaseURL,
+		Protocol:   domain.ProtocolCursor,
+		CursorAuth: true,
 	},
 }
 
@@ -196,8 +209,9 @@ func Apply(p Preset) (provider *domain.Provider, creds *domain.OAuthCreds) {
 			ExtraAuthParams: p.ExtraAuthParams,
 			RefreshJSON:     p.RefreshJSON,
 			RefreshURL:      p.RefreshURL,
-			ClineAuth:         p.ClineAuth,
-			QoderAuth:         p.QoderAuth,
-			AntigravityAuth:  p.AntigravityAuth,
+			ClineAuth:       p.ClineAuth,
+			QoderAuth:       p.QoderAuth,
+			AntigravityAuth: p.AntigravityAuth,
+			CursorAuth:      p.CursorAuth,
 		}
 }

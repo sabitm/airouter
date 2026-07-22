@@ -27,10 +27,15 @@ const (
 	// with loadCodeAssist/onboardUser project bootstrap. Every request translates
 	// through the IR.
 	ProtocolAntigravity Protocol = "antigravity"
+	// ProtocolCursor is the Cursor IDE backend. Backend only: Connect-RPC protobuf
+	// chat (ChatService StreamUnifiedChatWithTools), stream-only. Auth is a pasted
+	// IDE access token plus a machine id (no OAuth refresh); every request
+	// translates through the IR. Tokens are short-lived and cannot be refreshed.
+	ProtocolCursor Protocol = "cursor"
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity || p == ProtocolCursor
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It
@@ -161,6 +166,13 @@ type OAuthCreds struct {
 	// ProjectID is the GCP / cloudaicompanion project id required on Antigravity
 	// chat bodies. Empty means the connection is incomplete (fail closed).
 	ProjectID string `json:"project_id,omitempty"`
+
+	// CursorAuth marks an imported Cursor IDE token connection. When true,
+	// refresh is a no-op that surfaces reconnect (tokens are short-lived IDE
+	// sessions with no refresh endpoint). MachineID feeds the x-cursor-checksum
+	// header; AccessToken (with any "::" prefix stripped at header-build time) is
+	// sent as the bearer credential.
+	CursorAuth bool `json:"cursor_auth,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

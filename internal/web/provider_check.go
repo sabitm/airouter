@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/qoder"
 )
 
@@ -152,6 +153,9 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	}
 	if p.Protocol == domain.ProtocolAntigravity {
 		return checkAntigravityUpstream(ctx, p, trace, fileTrace, stderrTrace)
+	}
+	if p.Protocol == domain.ProtocolCursor {
+		return checkCursorUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
 	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
 		return checkClineUpstream(ctx, p, trace, fileTrace, stderrTrace)
@@ -432,4 +436,54 @@ func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace boo
 		return false, "OK token, but no Cloud Code project - reconnect OAuth"
 	}
 	return true, fmt.Sprintf("OK - reachable, project %s", project)
+}
+
+// checkCursorUpstream validates a Cursor IDE token against the AgentService
+// GetUsableModels endpoint. Cursor's ChatService is Connect-RPC protobuf and
+// has no /models REST endpoint; GetUsableModels is the lighter liveness probe
+// (an unframed application/proto unary call). Tokens are short-lived and not
+// refreshable, so a 401/403 means re-paste, not refresh.
+func checkCursorUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+	token := strings.TrimSpace(p.APIKey)
+	if token == "" {
+		return false, "no access token - paste one or reconnect"
+	}
+	machineID := ""
+	if p.OAuthCreds != nil {
+		machineID = strings.TrimSpace(p.OAuthCreds.MachineID)
+	}
+	url := cursor.AgentBaseURL + cursor.ModelsPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(""))
+	if err != nil {
+		return false, "invalid request"
+	}
+	h := cursor.BuildModelsHeaders(token, machineID, true)
+	for k, vv := range h {
+		for _, v := range vv {
+			req.Header.Set(k, v)
+		}
+	}
+	if trace {
+		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> POST %s", url)
+	}
+	resp, err := upstreamClient.Do(req)
+	if err != nil {
+		if trace {
+			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< POST %s: %v", url, err)
+		}
+		return false, "could not reach Cursor: " + err.Error()
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if trace {
+		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+	}
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("token rejected (HTTP %d) - re-paste required", resp.StatusCode)
+	case resp.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	}
+	ids := cursor.ParseUsableModels(body)
+	return true, fmt.Sprintf("OK - reachable, token accepted (%d models)", len(ids))
 }

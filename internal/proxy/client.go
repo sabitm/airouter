@@ -12,6 +12,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
@@ -87,6 +88,10 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 		return wire, nil
 	case "antigravity":
 		return antigravity.InjectProjectID(body, antigravityProjectID(provider))
+	case "cursor":
+		// Cursor needs no body mutation; headers (checksum, identity) are applied
+		// in applyUpstreamHeaders after the client-header copy.
+		return body, nil
 	default:
 		return body, nil
 	}
@@ -185,6 +190,12 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	if provider.Protocol == domain.ProtocolAntigravity {
 		req.Header.Set("User-Agent", antigravity.UserAgent)
 	}
+	// Cursor overwrites the full identity header set (Content-Type, checksum,
+	// x-cursor-* identity) after the client-header copy so forwarded values the
+	// Cursor backend would reject do not leak through.
+	if provider.Protocol == domain.ProtocolCursor {
+		applyCursorHeaders(req, provider)
+	}
 }
 
 // applyQoderHeaders COSY-signs the wire body and sets Qoder identity headers.
@@ -224,6 +235,24 @@ func applyQoderHeaders(req *http.Request, provider *domain.Provider, ctx context
 func applyClineHeaders(req *http.Request, provider *domain.Provider) {
 	for k, v := range oauth.ClineIdentityHeaders("", provider.APIKey) {
 		req.Header.Set(k, v)
+	}
+}
+
+// applyCursorHeaders sets the Cursor Connect-RPC identity headers (checksum,
+// x-cursor-* fingerprint, Content-Type) overwriting any forwarded client
+// values. The bearer token has any "::" prefix stripped; the machine id comes
+// from OAuthCreds, falling back to a token-derived hash.
+func applyCursorHeaders(req *http.Request, provider *domain.Provider) {
+	token := strings.TrimSpace(provider.APIKey)
+	machineID := ""
+	if provider.OAuthCreds != nil {
+		machineID = strings.TrimSpace(provider.OAuthCreds.MachineID)
+	}
+	h := cursor.BuildHeaders(token, machineID, true)
+	for k, vv := range h {
+		for _, v := range vv {
+			req.Header.Set(k, v)
+		}
 	}
 }
 

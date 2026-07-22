@@ -16,6 +16,7 @@ import (
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/openai"
@@ -163,6 +164,20 @@ var antigravityCodec = codec{
 	streamOnly:    true,
 }
 
+// cursorCodec is the Cursor IDE backend: Connect-RPC protobuf chat
+// (ChatService StreamUnifiedChatWithTools), stream-only. Backend-only; every
+// request translates through the IR. Auth is a pasted IDE token + machine id;
+// tokens are not refreshable.
+var cursorCodec = codec{
+	id:            "cursor",
+	protocol:      domain.ProtocolCursor,
+	encodeRequest: cursor.EncodeRequest,
+	upstreamPath:  cursor.UpstreamPath,
+	decodeStream:  cursor.DecodeStream,
+	streamOnly:    true,
+	streamAccept:  cursor.StreamAccept,
+}
+
 func backendCodec(p domain.Protocol) codec {
 	switch p {
 	case domain.ProtocolAnthropic:
@@ -177,6 +192,8 @@ func backendCodec(p domain.Protocol) codec {
 		return qoderCodec
 	case domain.ProtocolAntigravity:
 		return antigravityCodec
+	case domain.ProtocolCursor:
+		return cursorCodec
 	default:
 		return openaiCodec
 	}

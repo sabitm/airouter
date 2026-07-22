@@ -301,6 +301,8 @@ func TestCanRefresh(t *testing.T) {
 		{"nil", nil, false},
 		{"qoder device", &domain.OAuthCreds{QoderAuth: true, RefreshToken: "rt"}, false},
 		{"qoder even when expired", &domain.OAuthCreds{QoderAuth: true, ExpiresAt: 1}, false},
+		{"cursor import", &domain.OAuthCreds{CursorAuth: true, RefreshToken: "rt"}, false},
+		{"cursor even when expired", &domain.OAuthCreds{CursorAuth: true, ExpiresAt: 1}, false},
 		{"plain oauth", &domain.OAuthCreds{RefreshToken: "rt"}, true},
 		{"kiro", &domain.OAuthCreds{KiroAuth: "builder-id", RefreshToken: "rt"}, true},
 		{"cline", &domain.OAuthCreds{ClineAuth: true, RefreshToken: "rt"}, true},
@@ -580,5 +582,56 @@ func TestRefreshNoRefreshToken(t *testing.T) {
 	c.RefreshToken = ""
 	if err := refresh(context.Background(), c, time.Now()); err == nil {
 		t.Fatal("want error when no refresh token is present")
+	}
+}
+
+// TestRefreshCursorSurfacesInvalidGrant confirms Cursor IDE tokens (imported,
+// short-lived, no refresh endpoint) classify as ErrInvalidGrant on a forced
+// refresh, so the reactive 401 path prompts re-paste rather than retrying.
+func TestRefreshCursorSurfacesInvalidGrant(t *testing.T) {
+	srv, _ := tokenTestServer(t, func(url.Values) (int, string) {
+		t.Error("cursor refresh must not hit the token endpoint")
+		return 500, ""
+	})
+	c := &domain.OAuthCreds{
+		Mode: domain.OAuthManual, CursorAuth: true,
+		AccessToken: "ide-tok", RefreshToken: "ignored",
+		TokenURL: srv.URL, ClientID: "cid",
+	}
+	if err := refresh(context.Background(), c, time.Unix(1000, 0)); !IsInvalidGrant(err) {
+		t.Fatalf("err = %v, want ErrInvalidGrant", err)
+	}
+	if c.AccessToken != "ide-tok" {
+		t.Errorf("access changed on failure: %q", c.AccessToken)
+	}
+}
+
+// TestResolveForcedCursorSurfacesInvalidGrant mirrors the Qoder regression: a
+// forced Resolve on a Cursor imported token returns ErrInvalidGrant + the
+// fallback token, with zero token-endpoint hits, so the reactive 401 path can
+// surface reconnect without weakening the bulk-refresh skip.
+func TestResolveForcedCursorSurfacesInvalidGrant(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
+		t.Error("cursor refresh must not hit the token endpoint")
+		return 500, ""
+	})
+	store := newFakeStore()
+	creds := &domain.OAuthCreds{
+		Mode: domain.OAuthManual, CursorAuth: true,
+		AccessToken: "ide-tok", RefreshToken: "ignored",
+		TokenURL: srv.URL, ClientID: "cid",
+	}
+	store.creds[1] = creds
+	s := New(store)
+	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: creds}
+	tok, err := s.Resolve(context.Background(), p, true)
+	if !IsInvalidGrant(err) {
+		t.Fatalf("err = %v, want ErrInvalidGrant", err)
+	}
+	if tok != "ide-tok" {
+		t.Errorf("token = %q, want fallback ide-tok", tok)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("token endpoint hits = %d, want 0", hits.Load())
 	}
 }

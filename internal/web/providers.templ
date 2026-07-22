@@ -294,6 +294,36 @@ templ ProviderRecipeForm(r recipe) {
 					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
 				</div>
 			</form>
+		case kindCursor:
+			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="manual" data-protocol="cursor" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+				<input type="hidden" name="protocol" value="cursor"/>
+				<input type="hidden" name="auth_method" value="oauth"/>
+				<input type="hidden" name="preset" value="cursor"/>
+				<label class="field">
+					<span class="field-name">Name</span>
+					<input name="name" placeholder="e.g. cursor" required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Base URL</span>
+					<input name="base_url" placeholder="https://api2.cursor.sh" value={ r.BaseURL } required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Access token</span>
+					<input name="access_token" type="password" class="mono" placeholder="cursorAuth/accessToken" required aria-label="access token"/>
+				</label>
+				<label class="field">
+					<span class="field-name">Machine id</span>
+					<input name="machine_id" class="mono" placeholder="storage.serviceMachineId" required aria-label="machine id"/>
+				</label>
+				<p class="field-hint">Export from a logged-in Cursor IDE: state.vscdb keys cursorAuth/accessToken and storage.serviceMachineId. Tokens last about 24 hours and cannot be refreshed - re-paste when Check fails. v1 uses Cursor's ChatService only; if upstream rejects plain text turns, chat may fail until a later update.</p>
+				<div class="form-actions">
+					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+					<span class="check-indicator htmx-indicator">checking...</span>
+					<span class="check-result" aria-live="polite"></span>
+					<button type="submit">Add</button>
+					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				</div>
+			</form>
 		case kindGenericAPIKey:
 			<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
@@ -465,6 +495,8 @@ templ ProviderEditRow(p *domain.Provider) {
 				@providerEditRowKiro(p)
 			} else if p.Protocol == domain.ProtocolQoder {
 				@providerEditRowQoder(p)
+			} else if p.Protocol == domain.ProtocolCursor {
+				@providerEditRowCursor(p)
 			} else if p.Method() == domain.AuthOAuth && providerEditInteractiveOAuth(p.Protocol) {
 				@providerEditRowInteractiveOAuth(p)
 			} else {
@@ -615,6 +647,45 @@ templ providerEditRowQoder(p *domain.Provider) {
 			</label>
 			@oauthTokenFields(&domain.OAuthCreds{}, "", "")
 		</div>
+		<div class="form-actions">
+			@providerEditCheck()
+			@providerEditSaveCancel(p)
+		</div>
+	</form>
+}
+
+templ providerEditRowCursor(p *domain.Provider) {
+	{{ c := orEmptyCreds(p.OAuthCreds) }}
+	<form
+		class="provider-form provider-form-grid"
+		data-method="oauth"
+		data-protocol="cursor"
+		data-oauth-mode="manual"
+		hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) }
+		hx-target="#provider-list"
+		hx-swap="outerHTML"
+	>
+		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
+		<input type="hidden" name="protocol" value="cursor"/>
+		<input type="hidden" name="auth_method" value="oauth"/>
+		<input type="hidden" name="preset" value="cursor"/>
+		<label class="field">
+			<span class="field-name">Name</span>
+			<input name="name" value={ p.Name } required/>
+		</label>
+		<label class="field">
+			<span class="field-name">Base URL</span>
+			<input name="base_url" value={ p.BaseURL } required/>
+		</label>
+		<label class="field">
+			<span class="field-name">Access token</span>
+			<input name="access_token" type="password" class="mono" placeholder="leave blank to keep current" aria-label="access token"/>
+		</label>
+		<label class="field">
+			<span class="field-name">Machine id</span>
+			<input name="machine_id" class="mono" placeholder="storage.serviceMachineId" value={ c.MachineID } required aria-label="machine id"/>
+		</label>
+		<p class="field-hint">Tokens last about 24 hours and cannot be refreshed. Re-paste the access token when Check fails.</p>
 		<div class="form-actions">
 			@providerEditCheck()
 			@providerEditSaveCancel(p)

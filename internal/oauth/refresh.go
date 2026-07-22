@@ -80,15 +80,16 @@ func isInvalidGrantCode(code string) bool {
 }
 
 // CanRefresh reports whether creds support token-endpoint rotation. False for
-// nil and device-token connections (QoderAuth): their tokens cannot be rotated,
-// so the bulk-refresh control skips them rather than reporting a false failure.
-// Resolve(force=true) does NOT consult this — a dead device token must still
-// surface ErrInvalidGrant so the reactive 401 path can prompt reconnect.
+// nil and device/token-import connections (QoderAuth, CursorAuth): their tokens
+// cannot be rotated, so the bulk-refresh control skips them rather than
+// reporting a false failure. Resolve(force=true) does NOT consult this — a dead
+// device/imported token must still surface ErrInvalidGrant so the reactive 401
+// path can prompt reconnect.
 func CanRefresh(c *domain.OAuthCreds) bool {
 	if c == nil {
 		return false
 	}
-	return !c.QoderAuth
+	return !c.QoderAuth && !c.CursorAuth
 }
 
 // shouldRefresh reports whether the access token should be refreshed before use.
@@ -112,6 +113,10 @@ func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	// Qoder device tokens cannot refresh (center.qoder.sh returns 403).
 	if c.QoderAuth {
 		return refreshQoder(ctx, c, now)
+	}
+	// Cursor IDE tokens are short-lived sessions with no refresh endpoint.
+	if c.CursorAuth {
+		return refreshCursor(ctx, c, now)
 	}
 	// Kiro social/OIDC refresh uses JSON bodies with camelCase responses the
 	// generic OAuth2 path cannot parse. external_idp is excluded: it refreshes
