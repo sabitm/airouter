@@ -79,11 +79,23 @@ func isInvalidGrantCode(code string) bool {
 	return false
 }
 
+// CanRefresh reports whether creds support token-endpoint rotation. False for
+// nil and device-token connections (QoderAuth): their tokens cannot be rotated,
+// so the bulk-refresh control skips them rather than reporting a false failure.
+// Resolve(force=true) does NOT consult this — a dead device token must still
+// surface ErrInvalidGrant so the reactive 401 path can prompt reconnect.
+func CanRefresh(c *domain.OAuthCreds) bool {
+	if c == nil {
+		return false
+	}
+	return !c.QoderAuth
+}
+
 // shouldRefresh reports whether the access token should be refreshed before use.
 // A zero ExpiresAt (unknown expiry) is left to the reactive 401 path.
-// Qoder device tokens cannot refresh; never proactively attempt it.
+// Non-refreshable device tokens (see CanRefresh) never proactive refresh.
 func shouldRefresh(c *domain.OAuthCreds, now time.Time) bool {
-	if c == nil || c.ExpiresAt == 0 || c.QoderAuth {
+	if c == nil || c.ExpiresAt == 0 || !CanRefresh(c) {
 		return false
 	}
 	return time.Unix(c.ExpiresAt, 0).Sub(now) < refreshLead

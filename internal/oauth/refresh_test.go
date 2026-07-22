@@ -292,6 +292,28 @@ func TestRefreshKiroExternalIDPUsesGenericPath(t *testing.T) {
 	}
 }
 
+func TestCanRefresh(t *testing.T) {
+	cases := []struct {
+		name  string
+		creds *domain.OAuthCreds
+		want  bool
+	}{
+		{"nil", nil, false},
+		{"qoder device", &domain.OAuthCreds{QoderAuth: true, RefreshToken: "rt"}, false},
+		{"qoder even when expired", &domain.OAuthCreds{QoderAuth: true, ExpiresAt: 1}, false},
+		{"plain oauth", &domain.OAuthCreds{RefreshToken: "rt"}, true},
+		{"kiro", &domain.OAuthCreds{KiroAuth: "builder-id", RefreshToken: "rt"}, true},
+		{"cline", &domain.OAuthCreds{ClineAuth: true, RefreshToken: "rt"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanRefresh(tc.creds); got != tc.want {
+				t.Errorf("CanRefresh = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestShouldRefreshGate(t *testing.T) {
 	now := time.Unix(10000, 0)
 	cases := []struct {
@@ -455,6 +477,36 @@ func TestResolveForcedFailureReturnsOldToken(t *testing.T) {
 	}
 	if tok != "tok-stale" {
 		t.Errorf("token = %q, want fallback tok-stale", tok)
+	}
+}
+
+// TestResolveForcedQoderSurfacesInvalidGrant confirms the reactive 401 path is
+// not weakened by the bulk-refresh skip: a forced Resolve on a Qoder device
+// token still returns ErrInvalidGrant (so the proxy can prompt reconnect) and
+// falls back to the current token. No token-endpoint HTTP is made.
+func TestResolveForcedQoderSurfacesInvalidGrant(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
+		t.Error("qoder refresh must not hit the token endpoint")
+		return 500, ""
+	})
+	store := newFakeStore()
+	creds := &domain.OAuthCreds{
+		Mode: domain.OAuthManual, QoderAuth: true,
+		AccessToken: "device-tok", RefreshToken: "ignored",
+		TokenURL: srv.URL, ClientID: "cid",
+	}
+	store.creds[1] = creds
+	s := New(store)
+	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: creds}
+	tok, err := s.Resolve(context.Background(), p, true)
+	if !IsInvalidGrant(err) {
+		t.Fatalf("err = %v, want ErrInvalidGrant", err)
+	}
+	if tok != "device-tok" {
+		t.Errorf("token = %q, want fallback device-tok", tok)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("token endpoint hits = %d, want 0", hits.Load())
 	}
 }
 

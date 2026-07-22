@@ -623,6 +623,19 @@ func TestRefreshAllOAuth(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// A Qoder device-token provider cannot be refreshed; bulk refresh must skip
+	// it (no token-endpoint hit) rather than report a false reconnect-required.
+	if err := h.store.CreateProvider(context.Background(), &domain.Provider{
+		Name: "qoder", BaseURL: "https://api3.qoder.sh", Protocol: domain.ProtocolQoder,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			Mode: domain.OAuthManual, QoderAuth: true,
+			AccessToken: "device-tok", RefreshToken: "ignored",
+			TokenURL: srv.URL + "/should-not-hit", ClientID: "cid",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/oauth/refresh-all", nil)
 	rec := httptest.NewRecorder()
@@ -631,14 +644,27 @@ func TestRefreshAllOAuth(t *testing.T) {
 	if *hits != 2 {
 		t.Errorf("token endpoint hits = %d, want 2", *hits)
 	}
-	if !strings.Contains(rec.Body.String(), "refreshed 2 oauth provider(s)") {
-		t.Fatalf("result = %s, want refreshed 2", rec.Body.String())
+	body := rec.Body.String()
+	if !strings.Contains(body, "refreshed 2 oauth provider(s)") {
+		t.Fatalf("result = %s, want refreshed 2", body)
+	}
+	if !strings.Contains(body, "skipped 1 (non-refreshable)") {
+		t.Errorf("result = %s, want skipped 1", body)
+	}
+	if strings.Contains(body, "qoder: reconnect required") || strings.Contains(body, "failed") {
+		t.Errorf("result = %s, qoder must not be failed", body)
 	}
 
 	providers, _ := h.store.ListProviders(context.Background())
 	for _, p := range providers {
 		switch p.Method() {
 		case domain.AuthOAuth:
+			if p.OAuthCreds.QoderAuth {
+				if p.OAuthCreds.AccessToken != "device-tok" {
+					t.Errorf("qoder access token = %q, want unchanged device-tok", p.OAuthCreds.AccessToken)
+				}
+				continue
+			}
 			if p.OAuthCreds.AccessToken != "rotated" {
 				t.Errorf("%s access token = %q, want rotated", p.Name, p.OAuthCreds.AccessToken)
 			}

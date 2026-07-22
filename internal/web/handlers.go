@@ -504,17 +504,24 @@ func (h *Handler) deleteAllArchived(w http.ResponseWriter, r *http.Request) {
 // refreshAllOAuth force-refreshes every saved oauth provider's access token,
 // persisting the rotated tokens, and reports a one-line summary. Failures are
 // collected per provider rather than aborting the batch, so one revoked refresh
-// token does not block refreshing the rest.
+// token does not block refreshing the rest. Non-refreshable device-token
+// providers (e.g. Qoder) are skipped, not failed: their tokens cannot rotate,
+// so attempting a refresh would always surface a false "reconnect required".
+// Liveness for those is the Check button / live upstream call, not bulk refresh.
 func (h *Handler) refreshAllOAuth(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.store.ListProviders(r.Context())
 	if err != nil {
 		render(w, r, CheckResult(false, err.Error()))
 		return
 	}
-	var refreshed, failed int
+	var refreshed, failed, skipped int
 	var problems []string
 	for _, p := range providers {
 		if p.Method() != domain.AuthOAuth || p.Archived {
+			continue
+		}
+		if !oauth.CanRefresh(p.OAuthCreds) {
+			skipped++
 			continue
 		}
 		if _, err := h.oauth.Resolve(r.Context(), p, true); err != nil {
@@ -529,10 +536,19 @@ func (h *Handler) refreshAllOAuth(w http.ResponseWriter, r *http.Request) {
 		refreshed++
 	}
 	if failed == 0 {
-		render(w, r, CheckResult(true, fmt.Sprintf("refreshed %d oauth provider(s)", refreshed)))
+		msg := fmt.Sprintf("refreshed %d oauth provider(s)", refreshed)
+		if skipped > 0 {
+			msg += fmt.Sprintf(", skipped %d (non-refreshable)", skipped)
+		}
+		render(w, r, CheckResult(true, msg))
 		return
 	}
-	render(w, r, CheckResult(false, fmt.Sprintf("refreshed %d, %d failed: %s", refreshed, failed, strings.Join(problems, "; "))))
+	msg := fmt.Sprintf("refreshed %d, %d failed", refreshed, failed)
+	if skipped > 0 {
+		msg += fmt.Sprintf(", %d skipped", skipped)
+	}
+	msg += ": " + strings.Join(problems, "; ")
+	render(w, r, CheckResult(false, msg))
 }
 
 func (h *Handler) renderProviderList(w http.ResponseWriter, r *http.Request) {
