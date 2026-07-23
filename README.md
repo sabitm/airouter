@@ -76,7 +76,7 @@ or `x-api-key: <key>`.
 |----------|----------------|-------|
 | `POST /v1/chat/completions` | OpenAI Chat Completions | unary + streaming |
 | `POST /v1/messages` | Anthropic Messages | unary + streaming |
-| `POST /v1/responses` | OpenAI Responses | unary + streaming; always translates |
+| `POST /v1/responses` | OpenAI Responses | unary + streaming; passes through to a Responses provider, translates otherwise |
 | `GET /v1/models` | - | lists configured combos |
 
 Each endpoint is also served without the `/v1` prefix (e.g. `/messages`,
