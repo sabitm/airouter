@@ -316,6 +316,53 @@ func TestStreamUsageRecorded(t *testing.T) {
 	}
 }
 
+// TestStreamUsageChunk asserts the client-facing SSE usage carries input
+// tokens on the translate path, not just output. TestStreamUsageRecorded only
+// checks the log (res.inTok), which is set from the IR and can be correct while
+// the ingress encoder drops input on the wire - exactly the OpenAI encoder bug
+// that left pi's context gauge tracking output length instead of context size.
+func TestStreamUsageChunk(t *testing.T) {
+	cases := []struct {
+		name    string
+		backend domain.Protocol
+		ingress string
+		body    string
+		wantIn  int
+		wantOut int
+	}{
+		// OpenAI ingress encoder; Anthropic backend reports input at message_start.
+		{"openai<-anthropic", domain.ProtocolAnthropic, "/v1/chat/completions",
+			`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`, 13, 2},
+		// OpenAI ingress encoder; Responses backend reports input at finish.
+		{"openai<-responses", domain.ProtocolOpenAIResponses, "/v1/chat/completions",
+			`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`, 3, 2},
+		// Responses ingress encoder; OpenAI backend reports input at finish (late).
+		{"responses<-openai", domain.ProtocolOpenAI, "/v1/responses",
+			`{"model":"default","input":"hi","stream":true}`, 3, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, token, _ := setupStreamingWithStore(t, tc.backend, anthropicSSE)
+			resp, body := postStream(t, base+tc.ingress, token, tc.body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			in, out, total := -1, -1, -1
+			if strings.HasPrefix(tc.ingress, "/v1/responses") {
+				in, out, total = collectResponsesUsage(t, body)
+			} else {
+				in, out, total = collectOpenAIUsage(t, body)
+			}
+			if in != tc.wantIn || out != tc.wantOut {
+				t.Errorf("usage = in %d/out %d (total %d), want in %d/out %d", in, out, total, tc.wantIn, tc.wantOut)
+			}
+			if total != in+out {
+				t.Errorf("total = %d, want %d (in+out)", total, in+out)
+			}
+		})
+	}
+}
+
 func postStream(t *testing.T, url, token, body string) (*http.Response, string) {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
@@ -421,4 +468,73 @@ func collectOpenAIToolStream(t *testing.T, body string) (name, args, finish stri
 		}
 	}
 	return name, argBuf.String(), finish
+}
+
+// collectOpenAIUsage extracts the final usage-only chunk (empty choices) from an
+// OpenAI Chat Completions SSE stream.
+func collectOpenAIUsage(t *testing.T, body string) (in, out, total int) {
+	t.Helper()
+	reader := sse.NewReader(strings.NewReader(body))
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(ev.Data) == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct{} `json:"choices"`
+			Usage   *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(ev.Data, &chunk) != nil {
+			continue
+		}
+		if chunk.Usage != nil && len(chunk.Choices) == 0 {
+			return chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens, chunk.Usage.TotalTokens
+		}
+	}
+	return 0, 0, 0
+}
+
+// collectResponsesUsage extracts usage from the response.completed event of a
+// Responses SSE stream.
+func collectResponsesUsage(t *testing.T, body string) (in, out, total int) {
+	t.Helper()
+	reader := sse.NewReader(strings.NewReader(body))
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev.Name != "response.completed" {
+			continue
+		}
+		var d struct {
+			Response struct {
+				Usage *struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+					TotalTokens  int `json:"total_tokens"`
+				} `json:"usage"`
+			} `json:"response"`
+		}
+		if json.Unmarshal(ev.Data, &d) != nil {
+			continue
+		}
+		if d.Response.Usage != nil {
+			return d.Response.Usage.InputTokens, d.Response.Usage.OutputTokens, d.Response.Usage.TotalTokens
+		}
+	}
+	return 0, 0, 0
 }

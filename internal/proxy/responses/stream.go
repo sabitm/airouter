@@ -300,6 +300,12 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		})
 
 	case ir.EventFinish:
+		// OpenAI-family backends report input at finish; response.completed is the
+		// only Responses event carrying usage and it is emitted below, so a late
+		// input value can still be reflected.
+		if ev.InputTokens != 0 {
+			e.inputTokens = ev.InputTokens
+		}
 		e.usageOut = ev.OutputTokens
 		if err := e.ensureCreated(w); err != nil {
 			return err

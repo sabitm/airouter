@@ -112,6 +112,7 @@ type StreamEncoder struct {
 	created   int64
 	model     string
 	roleSent  bool
+	usageIn   int
 	usageOut  int
 	toolIndex map[int]int // IR tool Index -> OpenAI tool_calls index
 	nextTool  int
@@ -141,6 +142,11 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		if ev.Model != "" {
 			e.model = ev.Model
 		}
+		// Anthropic backends report input on message start; OpenAI-family backends
+		// report it on finish. Take it from whichever event carries a nonzero value.
+		if ev.InputTokens != 0 {
+			e.usageIn = ev.InputTokens
+		}
 		e.roleSent = true
 		return e.emit(w, chunkDelta{Role: "assistant"}, nil)
 	case ir.EventTextDelta:
@@ -161,6 +167,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		tc.Function.Arguments = ev.ArgsFrag
 		return e.emit(w, chunkDelta{ToolCalls: []chunkToolCall{tc}}, nil)
 	case ir.EventFinish:
+		if ev.InputTokens != 0 {
+			e.usageIn = ev.InputTokens
+		}
 		e.usageOut = ev.OutputTokens
 		fr := finishFromStopReason(ev.StopReason)
 		if err := e.emit(w, chunkDelta{}, &fr); err != nil {
@@ -179,7 +188,7 @@ func (e *StreamEncoder) emitUsage(w *sse.Writer) error {
 		ID:      e.id,
 		Model:   e.model,
 		Choices: []chunkChoice{},
-		Usage:   &chatUsage{CompletionTokens: e.usageOut, TotalTokens: e.usageOut},
+		Usage:   &chatUsage{PromptTokens: e.usageIn, CompletionTokens: e.usageOut, TotalTokens: e.usageIn + e.usageOut},
 	}
 	raw, _ := marshalChunk(chunk, e.created)
 	return w.WriteEvent("", raw)
