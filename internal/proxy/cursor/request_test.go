@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+	"unicode/utf8"
 
 	"airouter/internal/proxy/ir"
 )
@@ -222,4 +223,49 @@ func TestFormatToolName(t *testing.T) {
 
 func startsWith(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+func TestSanitizeToolResultText(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "hello world", "hello world"},
+		{"preserves tab and newline", "a\tb\nc", "a\tb\nc"},
+		{"drops other control chars", "a\x01b\x02c", "abc"},
+		{"drops del", "a\x7fb", "ab"},
+		{"drops rune error", "a" + string(utf8.RuneError) + "b", "ab"},
+		{"mixed", "ok\t\x01\n\x7f", "ok\t\n"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeToolResultText(tc.in); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEscapeXML(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "plain", "plain"},
+		{"ampersand", "a&b", "a&amp;b"},
+		{"less than", "a<b", "a&lt;b"},
+		{"greater than", "a>b", "a&gt;b"},
+		{"all three", "<&>", "&lt;&amp;&gt;"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := escapeXML(tc.in); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

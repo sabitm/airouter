@@ -2,6 +2,7 @@ package cursor
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"airouter/internal/proxy/ir"
@@ -205,4 +206,87 @@ func contains(s, sub string) bool {
 
 func bytesContains(s, sub string) bool {
 	return bytes.Contains([]byte(s), []byte(sub))
+}
+
+func TestParseCursorError(t *testing.T) {
+	t.Run("non-json raw fallback", func(t *testing.T) {
+		err := parseCursorError([]byte("Internal Server Error"))
+		if !strings.Contains(err.Error(), "Internal Server Error") {
+			t.Errorf("got %q, want raw body", err.Error())
+		}
+		if !strings.Contains(err.Error(), "cursor: upstream error") {
+			t.Errorf("got %q, want cursor prefix", err.Error())
+		}
+	})
+
+	t.Run("direct message", func(t *testing.T) {
+		body := []byte(`{"error":{"code":"internal","message":"boom"}}`)
+		err := parseCursorError(body)
+		if err.Error() != "cursor: boom" {
+			t.Errorf("got %q, want cursor: boom", err.Error())
+		}
+	})
+
+	t.Run("falls back to detail title when message empty", func(t *testing.T) {
+		body := []byte(`{"error":{"code":"x","message":"","details":[{"debug":{"details":{"title":"ttl"}}}]}}`)
+		err := parseCursorError(body)
+		if err.Error() != "cursor: ttl" {
+			t.Errorf("got %q, want cursor: ttl", err.Error())
+		}
+	})
+
+	t.Run("falls back to detail detail when title empty", func(t *testing.T) {
+		body := []byte(`{"error":{"code":"x","message":"","details":[{"debug":{"details":{"title":"","detail":"explanation"}}}]}}`)
+		err := parseCursorError(body)
+		if err.Error() != "cursor: explanation" {
+			t.Errorf("got %q, want cursor: explanation", err.Error())
+		}
+	})
+
+	t.Run("resource exhausted with message", func(t *testing.T) {
+		body := []byte(`{"error":{"code":"resource_exhausted","message":"slow down"}}`)
+		err := parseCursorError(body)
+		if !strings.Contains(err.Error(), "rate limited") {
+			t.Errorf("got %q, want rate limited", err.Error())
+		}
+		if !strings.Contains(err.Error(), "slow down") {
+			t.Errorf("got %q, want message preserved", err.Error())
+		}
+	})
+
+	t.Run("resource exhausted without message defaults", func(t *testing.T) {
+		body := []byte(`{"error":{"code":"resource_exhausted","message":""}}`)
+		err := parseCursorError(body)
+		if !strings.Contains(err.Error(), "rate limit exceeded") {
+			t.Errorf("got %q, want default rate limit message", err.Error())
+		}
+	})
+
+	t.Run("empty message no details raw fallback", func(t *testing.T) {
+		body := []byte(`{"error":{"code":"x","message":""}}`)
+		err := parseCursorError(body)
+		if !strings.Contains(err.Error(), "cursor: upstream error") {
+			t.Errorf("got %q, want upstream error fallback", err.Error())
+		}
+	})
+}
+
+func TestDecloakToolName(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"mcp_custom_get_weather", "get_weather"},
+		{"mcp_custom_", ""},
+		{"plain_tool", "plain_tool"},
+		{"", ""},
+		{"mcp_custom", "mcp_custom"}, // prefix without trailing underscore stays
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := decloakToolName(tc.in); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
