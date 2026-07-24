@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"airouter/internal/crypto"
@@ -15,6 +16,16 @@ import (
 type Store struct {
 	db     *sql.DB
 	cipher *crypto.Cipher
+
+	// hasKeys caches whether any access keys exist, so the proxy's per-request
+	// open-mode check need not hit the DB on every unauthenticated request. The
+	// count changes only via NewAccessKey/DeleteAccessKey, which invalidate it.
+	hasKeysMu sync.RWMutex
+	hasKeys   *bool // nil = unknown; non-nil = last known presence
+
+	// countKeysFn counts access_keys rows; swapped in tests to assert the cache
+	// short-circuits DB hits. Production leaves it nil and countAccessKeysDB runs.
+	countKeysFn func(ctx context.Context) (int, error)
 }
 
 func Open(path string, cipher *crypto.Cipher) (*Store, error) {
