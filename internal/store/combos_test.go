@@ -277,3 +277,48 @@ func TestSwapComboNames(t *testing.T) {
 		t.Errorf("missing id: err = %v, want ErrNotFound", err)
 	}
 }
+
+func TestDeleteComboRemovesRowAndCascadesTargets(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{Name: "p", BaseURL: "http://a", APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	c := &domain.Combo{
+		Name:     "del",
+		Strategy: domain.StrategyFailover,
+		Targets: []domain.ComboTarget{
+			{ProviderID: p.ID, UpstreamModel: "m1", Enabled: true},
+			{ProviderID: p.ID, UpstreamModel: "m2", Enabled: true},
+		},
+	}
+	if err := st.CreateCombo(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm targets were inserted.
+	var n int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM combo_targets WHERE combo_id = ?", c.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("target rows before delete = %d, want 2", n)
+	}
+
+	if err := st.DeleteCombo(ctx, c.ID); err != nil {
+		t.Fatalf("DeleteCombo: %v", err)
+	}
+
+	// Combo row gone.
+	if _, err := st.GetCombo(ctx, c.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetCombo after delete err = %v, want ErrNotFound", err)
+	}
+	// Targets cascade-deleted (FK ON DELETE CASCADE).
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM combo_targets WHERE combo_id = ?", c.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("target rows after delete = %d, want 0 (cascade)", n)
+	}
+}

@@ -159,3 +159,85 @@ func TestPruneRequestLogs(t *testing.T) {
 		t.Fatalf("remaining = %v, want [%d]", ids, recent.ID)
 	}
 }
+
+func TestClearRequestLogsWipesAll(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		seedLog(t, st, "combo", "prov", 200, "")
+	}
+	// Sanity: logs were seeded.
+	got, err := st.ListRequestLogs(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("seeded = %d, want 3", len(got))
+	}
+
+	if err := st.ClearRequestLogs(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err = st.ListRequestLogs(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("after clear = %d, want 0", len(got))
+	}
+	totalReqs, totalIn, totalOut, err := st.RequestLogStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totalReqs != 0 || totalIn != 0 || totalOut != 0 {
+		t.Errorf("stats after clear = (%d,%d,%d), want all zero", totalReqs, totalIn, totalOut)
+	}
+}
+
+func TestRequestLogStatsAggregates(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	// Seed logs with explicit token counts; seedLog defaults to zero.
+	logs := []struct{ in, out int }{{10, 20}, {5, 7}, {3, 4}}
+	for _, l := range logs {
+		rl := &domain.RequestLog{
+			AccessKeyName: "key",
+			Combo:         "c",
+			Provider:      "p",
+			Format:        "oai-chat",
+			Status:        200,
+			InputTokens:   l.in,
+			OutputTokens:  l.out,
+		}
+		if err := st.CreateRequestLog(ctx, rl); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	totalReqs, totalIn, totalOut, err := st.RequestLogStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totalReqs != 3 {
+		t.Errorf("totalReqs = %d, want 3", totalReqs)
+	}
+	if totalIn != 18 {
+		t.Errorf("totalIn = %d, want 18", totalIn)
+	}
+	if totalOut != 31 {
+		t.Errorf("totalOut = %d, want 31", totalOut)
+	}
+}
+
+func TestRequestLogStatsEmptyReturnsZero(t *testing.T) {
+	st := testStore(t)
+	// COALESCE must yield 0, not NULL, on an empty table.
+	totalReqs, totalIn, totalOut, err := st.RequestLogStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totalReqs != 0 || totalIn != 0 || totalOut != 0 {
+		t.Errorf("empty stats = (%d,%d,%d), want all zero", totalReqs, totalIn, totalOut)
+	}
+}

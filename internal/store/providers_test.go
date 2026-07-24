@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"airouter/internal/domain"
@@ -216,5 +217,85 @@ func TestImportOAuthMissingCreds(t *testing.T) {
 	err := st.Import(ctx, bytes.NewReader([]byte(cfg)))
 	if err == nil {
 		t.Fatal("import succeeded, want error for oauth without creds")
+	}
+}
+
+func TestUpdateProviderPersistsAllFields(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{Name: "orig", BaseURL: "http://a", APIKey: "k1", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate every updatable field.
+	p.Name = "renamed"
+	p.BaseURL = "http://b"
+	p.APIKey = "k2-rotated"
+	p.Protocol = domain.ProtocolAnthropic
+	p.AuthScheme = domain.AuthXAPIKey
+	p.AuthMethod = domain.AuthOAuth
+	p.OAuthCreds = &domain.OAuthCreds{AccessToken: "tok", RefreshToken: "rt", ExpiresAt: 123}
+	p.Archived = true
+	if err := st.UpdateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "renamed" || got.BaseURL != "http://b" || got.APIKey != "k2-rotated" {
+		t.Errorf("basic fields = %+v", got)
+	}
+	if got.Protocol != domain.ProtocolAnthropic || got.AuthScheme != domain.AuthXAPIKey || got.AuthMethod != domain.AuthOAuth {
+		t.Errorf("auth fields = proto=%q scheme=%q method=%q", got.Protocol, got.AuthScheme, got.AuthMethod)
+	}
+	if !got.Archived {
+		t.Error("Archived = false, want true")
+	}
+	if got.OAuthCreds == nil || got.OAuthCreds.AccessToken != "tok" || got.OAuthCreds.RefreshToken != "rt" {
+		t.Errorf("OAuthCreds = %+v", got.OAuthCreds)
+	}
+}
+
+func TestDeleteProviderRemovesRowAndCascadesTargets(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{Name: "p", BaseURL: "http://a", APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	c := &domain.Combo{
+		Name:     "c",
+		Strategy: domain.StrategyFailover,
+		Targets:  []domain.ComboTarget{{ProviderID: p.ID, UpstreamModel: "m", Enabled: true}},
+	}
+	if err := st.CreateCombo(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+
+	// Target row exists referencing the provider.
+	var n int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM combo_targets WHERE provider_id = ?", p.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("target rows before delete = %d, want 1", n)
+	}
+
+	if err := st.DeleteProvider(ctx, p.ID); err != nil {
+		t.Fatalf("DeleteProvider: %v", err)
+	}
+
+	if _, err := st.GetProvider(ctx, p.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetProvider after delete err = %v, want ErrNotFound", err)
+	}
+	// FK ON DELETE CASCADE removed the orphaned target.
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM combo_targets WHERE provider_id = ?", p.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("target rows after delete = %d, want 0 (cascade)", n)
 	}
 }
