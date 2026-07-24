@@ -131,3 +131,36 @@ func TestExtractProjectID(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestTruncateBody(t *testing.T) {
+	t.Run("short unchanged", func(t *testing.T) {
+		s := "short body"
+		if got := truncateBody([]byte(s)); got != s {
+			t.Errorf("got %q, want %q", got, s)
+		}
+	})
+	t.Run("exactly at limit unchanged", func(t *testing.T) {
+		s := strings.Repeat("x", 200)
+		if got := truncateBody([]byte(s)); got != s {
+			t.Errorf("len = %d, want %d", len(got), len(s))
+		}
+	})
+	t.Run("over limit truncates with marker", func(t *testing.T) {
+		s := strings.Repeat("x", 250)
+		got := truncateBody([]byte(s))
+		if !strings.HasSuffix(got, "...") {
+			t.Errorf("expected ... suffix, got %q", got)
+		}
+		if len(got) > 203 {
+			t.Errorf("len = %d, want <= 203 (200 + ...)", len(got))
+		}
+		if !strings.HasPrefix(got, strings.Repeat("x", 200)) {
+			t.Errorf("expected first 200 bytes preserved, got %q", got)
+		}
+	})
+	t.Run("empty unchanged", func(t *testing.T) {
+		if got := truncateBody(nil); got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+}

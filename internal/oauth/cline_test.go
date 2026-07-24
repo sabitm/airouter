@@ -298,3 +298,130 @@ func TestHandleCallbackSkipsMissingStateForCline(t *testing.T) {
 		t.Errorf("access = %q", got.AccessToken)
 	}
 }
+
+func TestDecodeClineBase64Code(t *testing.T) {
+	payload := clineTokenPayload{
+		AccessToken:  "tok-123",
+		RefreshToken: "rt-456",
+		Email:        "u@e.com",
+		ExpiresAt:    "2025-01-01T00:00:00Z",
+	}
+	raw, _ := json.Marshal(payload)
+
+	t.Run("padded standard base64", func(t *testing.T) {
+		code := base64.StdEncoding.EncodeToString(raw)
+		got, ok := decodeClineBase64Code(code)
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if got.unwrap().AccessToken != "tok-123" {
+			t.Errorf("AccessToken = %q", got.unwrap().AccessToken)
+		}
+		if got.unwrap().RefreshToken != "rt-456" {
+			t.Errorf("RefreshToken = %q", got.unwrap().RefreshToken)
+		}
+	})
+
+	t.Run("unpadded base64", func(t *testing.T) {
+		// Cline codes are often unpadded; the decoder must add "=" back.
+		code := base64.StdEncoding.EncodeToString(raw)
+		code = strings.TrimRight(code, "=")
+		got, ok := decodeClineBase64Code(code)
+		if !ok {
+			t.Fatal("ok = false for unpadded, want true")
+		}
+		if got.unwrap().AccessToken != "tok-123" {
+			t.Errorf("AccessToken = %q", got.unwrap().AccessToken)
+		}
+	})
+
+	t.Run("url-safe base64 fallback", func(t *testing.T) {
+		code := base64.URLEncoding.EncodeToString(raw)
+		got, ok := decodeClineBase64Code(code)
+		if !ok {
+			t.Fatal("ok = false for url-safe, want true")
+		}
+		if got.unwrap().AccessToken != "tok-123" {
+			t.Errorf("AccessToken = %q", got.unwrap().AccessToken)
+		}
+	})
+
+	t.Run("trailing junk after json", func(t *testing.T) {
+		// The Cline redirect code may carry trailing bytes after the JSON object.
+		embedded := string(raw) + "<<<junk>>>"
+		code := base64.StdEncoding.EncodeToString([]byte(embedded))
+		got, ok := decodeClineBase64Code(code)
+		if !ok {
+			t.Fatal("ok = false with trailing junk, want true")
+		}
+		if got.unwrap().AccessToken != "tok-123" {
+			t.Errorf("AccessToken = %q", got.unwrap().AccessToken)
+		}
+	})
+
+	t.Run("nested under data", func(t *testing.T) {
+		nested := map[string]any{"data": payload}
+		nraw, _ := json.Marshal(nested)
+		code := base64.StdEncoding.EncodeToString(nraw)
+		got, ok := decodeClineBase64Code(code)
+		if !ok {
+			t.Fatal("ok = false for nested data, want true")
+		}
+		if got.unwrap().AccessToken != "tok-123" {
+			t.Errorf("AccessToken = %q", got.unwrap().AccessToken)
+		}
+	})
+
+	t.Run("invalid base64", func(t *testing.T) {
+		if _, ok := decodeClineBase64Code("!!!not-base64!!!"); ok {
+			t.Error("ok = true for invalid base64, want false")
+		}
+	})
+
+	t.Run("valid json but missing access token", func(t *testing.T) {
+		bad, _ := json.Marshal(clineTokenPayload{RefreshToken: "rt"})
+		code := base64.StdEncoding.EncodeToString(bad)
+		if _, ok := decodeClineBase64Code(code); ok {
+			t.Error("ok = true for missing accessToken, want false")
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		if _, ok := decodeClineBase64Code(""); ok {
+			t.Error("ok = true for empty, want false")
+		}
+		if _, ok := decodeClineBase64Code("   "); ok {
+			t.Error("ok = true for whitespace, want false")
+		}
+	})
+
+	t.Run("decoded but no json object", func(t *testing.T) {
+		code := base64.StdEncoding.EncodeToString([]byte("no braces here"))
+		if _, ok := decodeClineBase64Code(code); ok {
+			t.Error("ok = true for non-json, want false")
+		}
+	})
+}
+
+func TestParseClineExpiresAt(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int64
+	}{
+		{"empty", "", 0},
+		{"whitespace", "   ", 0},
+		{"rfc3339", "2025-01-01T00:00:00Z", 1735689600},
+		{"rfc3339 nano", "2025-01-01T00:00:00.5Z", 1735689600},
+		{"unparseable", "not-a-date", 0},
+		{"partial date", "2025-01-01", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseClineExpiresAt(tc.in, time.Time{})
+			if got != tc.want {
+				t.Errorf("parseClineExpiresAt(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
