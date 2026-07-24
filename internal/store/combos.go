@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"time"
 
 	"airouter/internal/domain"
 )
@@ -206,4 +208,53 @@ func insertTargets(ctx context.Context, tx *sql.Tx, comboID int64, targets []dom
 func (s *Store) DeleteCombo(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM combos WHERE id = ?", id)
 	return err
+}
+
+// SwapComboNames atomically exchanges the names of two combos. SQLite enforces
+// the combos.name UNIQUE constraint per-statement even inside a transaction, so
+// a direct two-way rename fails mid-swap; the exchange instead routes one row
+// through a guaranteed-unique temp name within a single tx. Targets, strategy,
+// and row ids are untouched (combo ids never move, so combo_targets FKs stay
+// valid), and the hot-path GetComboByName sees only the pre- or post-commit
+// state, never an intermediate rename.
+func (s *Store) SwapComboNames(ctx context.Context, idA, idB int64) error {
+	if idA == idB {
+		return fmt.Errorf("cannot swap a combo with itself")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var nameA, nameB string
+	row := tx.QueryRowContext(ctx, "SELECT name FROM combos WHERE id=?", idA)
+	if err := row.Scan(&nameA); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: combo %d", ErrNotFound, idA)
+		}
+		return err
+	}
+	row = tx.QueryRowContext(ctx, "SELECT name FROM combos WHERE id=?", idB)
+	if err := row.Scan(&nameB); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: combo %d", ErrNotFound, idB)
+		}
+		return err
+	}
+
+	// Nanosecond suffix avoids a collision with a combo literally named like the
+	// placeholder; the three updates commit atomically so readers never observe it.
+	tmp := fmt.Sprintf("__airouter_swap_tmp_%d_%d_%d__", idA, idB, time.Now().UnixNano())
+	steps := []struct {
+		name string
+		id   int64
+	}{{tmp, idA}, {nameA, idB}, {nameB, idA}}
+	for _, st := range steps {
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE combos SET name=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", st.name, st.id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

@@ -194,6 +194,7 @@ templ ComboRow(c *domain.Combo) {
 		</td>
 		<td class="actions">
 			<button class="link" hx-get={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/edit" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML">Edit</button>
+			<button class="link" hx-get={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/swap" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML">Swap</button>
 			<button class="link danger" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/delete" } hx-target="#combo-list" hx-swap="outerHTML" hx-confirm={ "Delete combo \"" + c.Name + "\"?" }>Delete</button>
 		</td>
 	</tr>
@@ -224,6 +225,35 @@ templ ComboEditRow(c *domain.Combo, providers []*domain.Provider) {
 				<div class="row-form">
 					<button type="button" class="link" onclick="addComboTarget(this)">+ Add target</button>
 					<button type="submit">Save</button>
+					<button type="button" class="link" hx-get={ "/dashboard/combos/" + id + "/row" } hx-target={ "#combo-" + id } hx-swap="outerHTML">Cancel</button>
+				</div>
+			</form>
+		</td>
+	</tr>
+}
+
+// ComboSwapRow replaces a combo row with a one-line form to swap its name with
+// another combo's. Mirrors ComboEditRow's shape (colspan=4 tr, #combo-<id>) so
+// the scroll-preservation helper still matches; success re-renders the whole
+// #combo-list because ListCombos orders by name and both rows can move.
+templ ComboSwapRow(c *domain.Combo, others []*domain.Combo) {
+	{{ id := strconv.FormatInt(c.ID, 10) }}
+	<tr id={ "combo-" + id }>
+		<td colspan="4">
+			<form class="combo-form" hx-post={ "/dashboard/combos/" + id + "/swap" } hx-target="#combo-list" hx-swap="outerHTML">
+				<div class="row-form">
+					<span>Swap name <span class="mono">{ c.Name }</span> with</span>
+					if len(others) == 0 {
+						<span class="muted">no other combos to swap with</span>
+					} else {
+						<select name="other" aria-label="combo to swap names with" required>
+							<option value="" selected>select a combo...</option>
+							for _, o := range others {
+								<option value={ strconv.FormatInt(o.ID, 10) }>{ o.Name }</option>
+							}
+						</select>
+						<button type="submit">Swap names</button>
+					}
 					<button type="button" class="link" hx-get={ "/dashboard/combos/" + id + "/row" } hx-target={ "#combo-" + id } hx-swap="outerHTML">Cancel</button>
 				</div>
 			</form>

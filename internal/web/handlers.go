@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -96,6 +97,8 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/combos/{id}", h.updateCombo)
 	mux.HandleFunc("POST /dashboard/combos/{id}/delete", h.deleteCombo)
 	mux.HandleFunc("POST /dashboard/combos/{id}/targets/{tid}/toggle", h.toggleComboTarget)
+	mux.HandleFunc("GET /dashboard/combos/{id}/swap", h.swapComboForm)
+	mux.HandleFunc("POST /dashboard/combos/{id}/swap", h.swapCombo)
 
 	// Access keys
 	mux.HandleFunc("GET /dashboard/keys", h.keysPage)
@@ -825,6 +828,57 @@ func (h *Handler) toggleComboTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	render(w, r, ComboRow(combo))
+}
+
+func (h *Handler) swapComboForm(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		badRequest(w, "bad id")
+		return
+	}
+	c, err := h.store.GetCombo(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	combos, err := h.store.ListCombos(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	others := make([]*domain.Combo, 0, len(combos))
+	for _, o := range combos {
+		if o.ID != id {
+			others = append(others, o)
+		}
+	}
+	render(w, r, ComboSwapRow(c, others))
+}
+
+func (h *Handler) swapCombo(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		htmxBadRequest(w, r, "combo-flash", "bad id")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		htmxBadRequest(w, r, "combo-flash", "invalid form")
+		return
+	}
+	other, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("other")), 10, 64)
+	if err != nil || other <= 0 {
+		htmxBadRequest(w, r, "combo-flash", "pick a combo to swap with")
+		return
+	}
+	if err := h.store.SwapComboNames(r.Context(), id, other); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			htmxBadRequest(w, r, "combo-flash", "combo not found")
+			return
+		}
+		htmxBadRequest(w, r, "combo-flash", err.Error())
+		return
+	}
+	h.renderComboList(w, r)
 }
 
 func (h *Handler) renderComboList(w http.ResponseWriter, r *http.Request) {

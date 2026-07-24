@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -185,4 +186,94 @@ func TestLegacyComboMigration(t *testing.T) {
 		t.Fatalf("second open failed: %v", err)
 	}
 	again.Close()
+}
+
+func TestSwapComboNames(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "p1", BaseURL: "http://a", APIKey: "k1", Protocol: domain.ProtocolOpenAI}
+	p2 := &domain.Provider{Name: "p2", BaseURL: "http://b", APIKey: "k2", Protocol: domain.ProtocolAnthropic}
+	for _, p := range []*domain.Provider{p1, p2} {
+		if err := st.CreateProvider(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alpha := &domain.Combo{
+		Name:     "alpha",
+		Strategy: domain.StrategyFailover,
+		Targets:  []domain.ComboTarget{{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true}},
+	}
+	beta := &domain.Combo{
+		Name:     "beta",
+		Strategy: domain.StrategyRoundRobin,
+		Targets:  []domain.ComboTarget{{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true}},
+	}
+	for _, c := range []*domain.Combo{alpha, beta} {
+		if err := st.CreateCombo(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := st.SwapComboNames(ctx, alpha.ID, beta.ID); err != nil {
+		t.Fatalf("SwapComboNames: %v", err)
+	}
+
+	gotAlpha, err := st.GetCombo(ctx, alpha.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBeta, err := st.GetCombo(ctx, beta.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAlpha.Name != "beta" {
+		t.Errorf("alpha name = %q, want beta", gotAlpha.Name)
+	}
+	if gotBeta.Name != "alpha" {
+		t.Errorf("beta name = %q, want alpha", gotBeta.Name)
+	}
+	// ids, targets, and strategy stay with the original combo identities.
+	if gotAlpha.Strategy != domain.StrategyFailover || len(gotAlpha.Targets) != 1 ||
+		gotAlpha.Targets[0].UpstreamModel != "m1" || gotAlpha.Targets[0].Provider.Name != "p1" {
+		t.Errorf("alpha identity changed: %+v", gotAlpha)
+	}
+	if gotBeta.Strategy != domain.StrategyRoundRobin || len(gotBeta.Targets) != 1 ||
+		gotBeta.Targets[0].UpstreamModel != "m2" || gotBeta.Targets[0].Provider.Name != "p2" {
+		t.Errorf("beta identity changed: %+v", gotBeta)
+	}
+
+	// Hot path resolves the swapped names to the exchanged ids.
+	byName, err := st.GetComboByName(ctx, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byName.ID != beta.ID {
+		t.Errorf("GetComboByName(alpha).ID = %d, want %d", byName.ID, beta.ID)
+	}
+	byName, err = st.GetComboByName(ctx, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byName.ID != alpha.ID {
+		t.Errorf("GetComboByName(beta).ID = %d, want %d", byName.ID, alpha.ID)
+	}
+
+	// Swapping back restores the original names.
+	if err := st.SwapComboNames(ctx, alpha.ID, beta.ID); err != nil {
+		t.Fatalf("swap back: %v", err)
+	}
+	gotAlpha, _ = st.GetCombo(ctx, alpha.ID)
+	gotBeta, _ = st.GetCombo(ctx, beta.ID)
+	if gotAlpha.Name != "alpha" || gotBeta.Name != "beta" {
+		t.Errorf("after swap-back: alpha=%q beta=%q", gotAlpha.Name, gotBeta.Name)
+	}
+
+	// Self-swap is rejected.
+	if err := st.SwapComboNames(ctx, alpha.ID, alpha.ID); err == nil {
+		t.Errorf("swapping a combo with itself should error")
+	}
+	// Missing id surfaces ErrNotFound.
+	if err := st.SwapComboNames(ctx, alpha.ID, 999); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing id: err = %v, want ErrNotFound", err)
+	}
 }
