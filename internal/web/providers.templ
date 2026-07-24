@@ -509,7 +509,18 @@ templ ProviderEditRow(p *domain.Provider) {
 templ providerEditRowGenericAPIKey(p *domain.Provider) {
 	<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(p.Protocol) } hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
 		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
-		<input type="hidden" name="protocol" value={ string(p.Protocol) }/>
+		if genericProtocolEditable(p.Protocol) {
+			<label class="field">
+				<span class="field-name">Protocol</span>
+				<select name="protocol" title="wire format" aria-label="wire format">
+					<option value="openai" selected?={ p.Protocol == domain.ProtocolOpenAI }>openai</option>
+					<option value="openai-responses" selected?={ p.Protocol == domain.ProtocolOpenAIResponses }>openai-responses</option>
+					<option value="anthropic" selected?={ p.Protocol == domain.ProtocolAnthropic }>anthropic</option>
+				</select>
+			</label>
+		} else {
+			<input type="hidden" name="protocol" value={ string(p.Protocol) }/>
+		}
 		<input type="hidden" name="auth_method" value="apikey"/>
 		<label class="field">
 			<span class="field-name">Name</span>

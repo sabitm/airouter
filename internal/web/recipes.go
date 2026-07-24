@@ -54,3 +54,10 @@ func recipeByID(id string) (recipe, bool) {
 	}
 	return recipe{}, false
 }
+
+// genericProtocolEditable reports whether a provider's protocol can be switched
+// from the generic API-key edit row. Only the three wire-format-equivalent
+// protocols are interchangeable; specific providers keep a locked field.
+func genericProtocolEditable(p domain.Protocol) bool {
+	return p == domain.ProtocolOpenAI || p == domain.ProtocolOpenAIResponses || p == domain.ProtocolAnthropic
+}
