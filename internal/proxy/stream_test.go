@@ -363,6 +363,61 @@ func TestStreamUsageChunk(t *testing.T) {
 	}
 }
 
+// TestStreamErrorBodyCapped asserts an upstream error body is not buffered in
+// full: only upstreamErrorMax bytes are read before being surfaced in the
+// ingress error envelope. The passthrough path returns the upstream status and a
+// best-effort message, so we assert the client sees the upstream status and no
+// more than upstreamErrorMax bytes of body are held.
+func TestStreamErrorBodyCapped(t *testing.T) {
+	// Upstream returns a huge error body on a streaming request.
+	bigErr := strings.Repeat("x", upstreamErrorMax+1<<20) // 1 MiB over the cap
+	bigErrLen := len(bigErr)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, bigErr)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "m", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, false, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	// The non-JSON error body is surfaced verbatim as the error.message, so the
+	// cap directly bounds the client-facing envelope: it must be no larger than
+	// upstreamErrorMax plus the small JSON envelope overhead, and strictly less
+	// than the full upstream body.
+	if len(body) > upstreamErrorMax+512 {
+		t.Fatalf("client body %d bytes exceeds cap+envelope; want <= %d", len(body), upstreamErrorMax+512)
+	}
+	if len(body) >= bigErrLen {
+		t.Fatalf("client body %d not capped (full upstream was %d)", len(body), bigErrLen)
+	}
+	if !strings.Contains(body, "error") {
+		t.Fatalf("want error envelope, got: %s", body)
+	}
+}
+
 func postStream(t *testing.T, url, token, body string) (*http.Response, string) {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))

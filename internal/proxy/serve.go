@@ -18,6 +18,12 @@ import (
 
 const maxBodyBytes = 16 << 20 // 16 MiB ceiling on inbound request bodies
 
+// upstreamErrorMax caps how many bytes of an upstream error body are read for
+// surfacing in the ingress error envelope. Error bodies are only used to
+// extract a JSON error.message and for truncated debug logging, so a small cap
+// bounds memory under a failover storm.
+const upstreamErrorMax = 1 << 20 // 1 MiB
+
 // reqResult accumulates the outcome of one request for logging. Each serve path
 // fills it in; serve records a RequestLog once on completion.
 type reqResult struct {
@@ -336,7 +342,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
 		p.debugf("stream-only unary %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
 			ingress.id, backend.id, backend.upstreamPath, resp.StatusCode, upstreamBody, errBody)
 		return retryable(resp.StatusCode, upstreamErrorMessage(errBody), "api_error")

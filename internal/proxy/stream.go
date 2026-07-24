@@ -29,7 +29,7 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
 		p.debugf("stream passthrough %s %s: upstream %d\nresponse: %s", ingress.id, ingress.upstreamPath, resp.StatusCode, errBody)
 		return retryable(resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
 	}
@@ -138,7 +138,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
 		p.debugf("stream translate %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
 			ingress.id, backend.id, backend.upstreamPath, resp.StatusCode, upstreamBody, errBody)
 		return retryable(resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
