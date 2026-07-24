@@ -27,6 +27,10 @@ func Open(path string, cipher *crypto.Cipher) (*Store, error) {
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
+	// SQLite serializes writes through a single write lock; an unbounded pool
+	// just multiplies lock contenders and file handles. database/sql queues
+	// concurrent queries on one connection rather than racing for the lock.
+	db.SetMaxOpenConns(1)
 	s := &Store{db: db, cipher: cipher}
 	if err := s.migrate(); err != nil {
 		return nil, err
