@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"airouter/internal/domain"
 )
@@ -20,6 +21,16 @@ func (s *Store) CreateRequestLog(ctx context.Context, l *domain.RequestLog) erro
 	}
 	l.ID, err = res.LastInsertId()
 	return err
+}
+
+// PruneRequestLogs deletes request logs older than the given cutoff and returns
+// the number of rows removed. Uses idx_request_logs_created_at for the scan.
+func (s *Store) PruneRequestLogs(ctx context.Context, before time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM request_logs WHERE created_at < ?`, before)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // RequestLogQuery filters and pages request logs. Empty string fields are ignored.

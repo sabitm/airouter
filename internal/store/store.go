@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"time"
 
 	"airouter/internal/crypto"
 
@@ -35,10 +37,27 @@ func Open(path string, cipher *crypto.Cipher) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		return nil, err
 	}
+	// Prune stale request logs once at boot. Runs before traffic arrives and
+	// bounds table growth on long-running deployments without a background
+	// ticker; the dashboard is newest-first and paginated, so old rows are not
+	// operationally useful. A failure only logs and never blocks startup.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cutoff := time.Now().Add(-defaultLogRetention)
+	if n, err := s.PruneRequestLogs(ctx, cutoff); err != nil {
+		log.Printf("prune request logs: %v", err)
+	} else if n > 0 {
+		log.Printf("pruned %d request log(s) older than %s", n, defaultLogRetention)
+	}
 	return s, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// defaultLogRetention is how long request logs are kept before a startup prune
+// removes them. The dashboard is newest-first and paginated; older rows are
+// not operationally useful and unbounded growth slows the stats scans.
+const defaultLogRetention = 30 * 24 * time.Hour
 
 const schema = `
 CREATE TABLE IF NOT EXISTS providers (

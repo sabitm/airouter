@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 
 	"airouter/internal/domain"
 )
@@ -118,5 +119,43 @@ func TestDistinctRequestLogValues(t *testing.T) {
 	}
 	if _, err := st.DistinctRequestLogValues(ctx, "nope"); err == nil {
 		t.Fatal("expected error for bad column")
+	}
+}
+
+func TestPruneRequestLogs(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	old := seedLog(t, st, "old-combo", "p", 200, "")
+	recent := seedLog(t, st, "recent-combo", "p", 200, "")
+
+	// Backdate one row's created_at so it predates the cutoff. The column has a
+	// DEFAULT CURRENT_TIMESTAMP, so an explicit insert is the simplest way to
+	// place a row in the past.
+	oldTime := time.Now().Add(-31 * 24 * time.Hour).UTC()
+	if _, err := st.db.ExecContext(ctx,
+		`UPDATE request_logs SET created_at = ? WHERE id = ?`, oldTime, old.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := time.Now().Add(-30 * 24 * time.Hour)
+	n, err := st.PruneRequestLogs(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned = %d, want 1", n)
+	}
+
+	remaining, err := st.ListRequestLogs(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 || remaining[0].ID != recent.ID {
+		var ids []int64
+		for _, l := range remaining {
+			ids = append(ids, l.ID)
+		}
+		t.Fatalf("remaining = %v, want [%d]", ids, recent.ID)
 	}
 }
