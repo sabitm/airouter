@@ -66,6 +66,12 @@ func main() {
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: server.New(st, cfg.DebugLevel, logFile).Handler(),
+		// ReadHeaderTimeout bounds header reads (slowloris hardening) without
+		// capping the body or the response stream. ReadTimeout is deliberately
+		// omitted: it is a total deadline over the whole request including
+		// uploads and would cut off long SSE streams and slow large prompts.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
