@@ -4,6 +4,7 @@ package sse
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,13 +89,19 @@ func NewWriter(w http.ResponseWriter) (*Writer, bool) {
 }
 
 // WriteEvent writes a named event with a data payload and flushes. An empty name
-// produces a data-only event (OpenAI style).
+// produces a data-only event (OpenAI style). Per the SSE spec, a payload
+// containing newlines is split into multiple data: lines, which a reader
+// rejoins with a newline; emitting an embedded newline as a single data: line
+// would corrupt the stream (a client sees the newline as an event boundary).
 func (w *Writer) WriteEvent(name string, data []byte) error {
 	var b strings.Builder
 	if name != "" {
 		fmt.Fprintf(&b, "event: %s\n", name)
 	}
-	fmt.Fprintf(&b, "data: %s\n\n", data)
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		fmt.Fprintf(&b, "data: %s\n", line)
+	}
+	b.WriteByte('\n')
 	if _, err := io.WriteString(w.w, b.String()); err != nil {
 		return err
 	}
