@@ -434,3 +434,143 @@ func TestBuildUser(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildTurns(t *testing.T) {
+	t.Run("single user message with system prepended", func(t *testing.T) {
+		msgs := []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}}
+		turns := buildTurns(msgs, "sys")
+		if len(turns) != 1 || turns[0].user == nil {
+			t.Fatalf("turns = %+v, want single user turn", turns)
+		}
+		if turns[0].user.Content != "sys\n\nhi" {
+			t.Errorf("content = %q, want sys joined with hi", turns[0].user.Content)
+		}
+	})
+
+	t.Run("consecutive assistant messages merge content and tool uses", func(t *testing.T) {
+		msgs := []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "first"},
+				{Type: ir.BlockToolUse, ToolID: "t1", ToolName: "f"},
+			}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "second"},
+				{Type: ir.BlockToolUse, ToolID: "t2", ToolName: "g"},
+			}},
+		}
+		turns := buildTurns(msgs, "")
+		if len(turns) != 1 || turns[0].assistant == nil {
+			t.Fatalf("turns = %+v, want single merged assistant turn", turns)
+		}
+		a := turns[0].assistant
+		if a.Content != "first\n\nsecond" {
+			t.Errorf("content = %q, want first joined with second", a.Content)
+		}
+		if len(a.ToolUses) != 2 || a.ToolUses[0].ToolUseID != "t1" || a.ToolUses[1].ToolUseID != "t2" {
+			t.Errorf("toolUses = %+v, want [t1 t2]", a.ToolUses)
+		}
+	})
+
+	t.Run("consecutive user messages merge content and images", func(t *testing.T) {
+		msgs := []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "a"},
+				{Type: ir.BlockImage, Image: &ir.Image{Data: "B1", MediaType: "image/png"}},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "b"},
+				{Type: ir.BlockImage, Image: &ir.Image{Data: "B2", MediaType: "image/jpeg"}},
+			}},
+		}
+		turns := buildTurns(msgs, "")
+		if len(turns) != 1 || turns[0].user == nil {
+			t.Fatalf("turns = %+v, want single merged user turn", turns)
+		}
+		u := turns[0].user
+		if u.Content != "a\n\nb" {
+			t.Errorf("content = %q, want a joined with b", u.Content)
+		}
+		if len(u.Images) != 2 || u.Images[0].Source.Bytes != "B1" || u.Images[1].Source.Bytes != "B2" {
+			t.Errorf("images = %+v, want [B1 B2]", u.Images)
+		}
+	})
+
+	t.Run("consecutive user messages with tool results merge into existing context", func(t *testing.T) {
+		msgs := []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "tu1", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "r1"}}},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "tu2", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "r2"}}},
+			}},
+		}
+		turns := buildTurns(msgs, "")
+		if len(turns) != 1 || turns[0].user == nil {
+			t.Fatalf("turns = %+v, want single merged user turn", turns)
+		}
+		u := turns[0].user
+		if u.UserInputMessageContext == nil || len(u.UserInputMessageContext.ToolResults) != 2 {
+			t.Fatalf("toolResults = %+v, want 2 merged", u.UserInputMessageContext)
+		}
+		if u.UserInputMessageContext.ToolResults[0].ToolUseID != "tu1" || u.UserInputMessageContext.ToolResults[1].ToolUseID != "tu2" {
+			t.Errorf("toolResults order = %+v", u.UserInputMessageContext.ToolResults)
+		}
+	})
+
+	t.Run("assistant first ordering no system attached", func(t *testing.T) {
+		msgs := []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "reply"}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "q"}}},
+		}
+		turns := buildTurns(msgs, "sys")
+		if len(turns) != 2 {
+			t.Fatalf("turns = %d, want 2", len(turns))
+		}
+		if turns[0].assistant == nil || turns[0].assistant.Content != "reply" {
+			t.Errorf("first turn = %+v, want assistant reply", turns[0])
+		}
+		// System attaches to the first user turn, which is the second turn here.
+		if turns[1].user == nil || turns[1].user.Content != "sys\n\nq" {
+			t.Errorf("second turn = %+v, want user with system prepended", turns[1])
+		}
+	})
+
+	t.Run("system with no user messages emits lone user turn", func(t *testing.T) {
+		turns := buildTurns(nil, "sys")
+		if len(turns) != 1 || turns[0].user == nil {
+			t.Fatalf("turns = %+v, want single lone user turn", turns)
+		}
+		if turns[0].user.Content != "sys" {
+			t.Errorf("content = %q, want sys", turns[0].user.Content)
+		}
+	})
+
+	t.Run("system with only assistant messages emits lone user turn", func(t *testing.T) {
+		msgs := []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "reply"}}},
+		}
+		turns := buildTurns(msgs, "sys")
+		if len(turns) != 2 {
+			t.Fatalf("turns = %d, want 2 (assistant + lone system user)", len(turns))
+		}
+		if turns[1].user == nil || turns[1].user.Content != "sys" {
+			t.Errorf("second turn = %+v, want lone system user turn", turns[1])
+		}
+	})
+
+	t.Run("single assistant message no merge", func(t *testing.T) {
+		msgs := []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "solo"},
+				{Type: ir.BlockToolUse, ToolID: "t1", ToolName: "f"},
+			}},
+		}
+		turns := buildTurns(msgs, "")
+		if len(turns) != 1 || turns[0].assistant == nil {
+			t.Fatalf("turns = %+v, want single assistant turn", turns)
+		}
+		if turns[0].assistant.Content != "solo" || len(turns[0].assistant.ToolUses) != 1 {
+			t.Errorf("assistant = %+v", turns[0].assistant)
+		}
+	})
+}
