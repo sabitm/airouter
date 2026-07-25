@@ -241,3 +241,158 @@ func TestRequestLogStatsEmptyReturnsZero(t *testing.T) {
 		t.Errorf("empty stats = (%d,%d,%d), want all zero", totalReqs, totalIn, totalOut)
 	}
 }
+
+func TestBuildLogWhere(t *testing.T) {
+	cases := []struct {
+		name     string
+		q        RequestLogQuery
+		wantSQL  string
+		wantArgs []any
+	}{
+		{
+			"empty query",
+			RequestLogQuery{},
+			"",
+			nil,
+		},
+		{
+			"combo only",
+			RequestLogQuery{Combo: "c1"},
+			" WHERE combo = ?",
+			[]any{"c1"},
+		},
+		{
+			"provider only",
+			RequestLogQuery{Provider: "p1"},
+			" WHERE provider = ?",
+			[]any{"p1"},
+		},
+		{
+			"status ok",
+			RequestLogQuery{StatusClass: "ok"},
+			" WHERE status >= 200 AND status < 300",
+			nil,
+		},
+		{
+			"status client",
+			RequestLogQuery{StatusClass: "client"},
+			" WHERE status >= 400 AND status < 500",
+			nil,
+		},
+		{
+			"status server",
+			RequestLogQuery{StatusClass: "server"},
+			" WHERE status >= 500",
+			nil,
+		},
+		{
+			"status error",
+			RequestLogQuery{StatusClass: "error"},
+			" WHERE status >= 400",
+			nil,
+		},
+		{
+			"whitespace padded status class trimmed",
+			RequestLogQuery{StatusClass: "  ok  "},
+			" WHERE status >= 200 AND status < 300",
+			nil,
+		},
+		{
+			"whitespace padded combo trimmed",
+			RequestLogQuery{Combo: "  c1  "},
+			" WHERE combo = ?",
+			[]any{"c1"},
+		},
+		{
+			"unknown status class adds no fragment",
+			RequestLogQuery{StatusClass: "weird"},
+			"",
+			nil,
+		},
+		{
+			"combo plus provider combined",
+			RequestLogQuery{Combo: "c1", Provider: "p1"},
+			" WHERE combo = ? AND provider = ?",
+			[]any{"c1", "p1"},
+		},
+		{
+			"combo plus status combined",
+			RequestLogQuery{Combo: "c1", StatusClass: "server"},
+			" WHERE combo = ? AND status >= 500",
+			[]any{"c1"},
+		},
+		{
+			"all three combined",
+			RequestLogQuery{Combo: "c1", Provider: "p1", StatusClass: "ok"},
+			" WHERE combo = ? AND provider = ? AND status >= 200 AND status < 300",
+			[]any{"c1", "p1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotSQL, gotArgs := buildLogWhere(tc.q)
+			if gotSQL != tc.wantSQL {
+				t.Errorf("SQL = %q, want %q", gotSQL, tc.wantSQL)
+			}
+			if !equalArgs(gotArgs, tc.wantArgs) {
+				t.Errorf("args = %+v, want %+v", gotArgs, tc.wantArgs)
+			}
+		})
+	}
+}
+
+func equalArgs(a, b []any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestClampLogLimit(t *testing.T) {
+	cases := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero returns default", 0, defaultLogLimit},
+		{"negative returns default", -5, defaultLogLimit},
+		{"in range passthrough", 50, 50},
+		{"over max clamped", 200, maxLogLimit},
+		{"exactly max", maxLogLimit, maxLogLimit},
+		{"exactly default", defaultLogLimit, defaultLogLimit},
+		{"one passthrough", 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clampLogLimit(tc.in); got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClampLogPage(t *testing.T) {
+	cases := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero returns 1", 0, 1},
+		{"negative returns 1", -3, 1},
+		{"positive passthrough", 5, 5},
+		{"exactly 1", 1, 1},
+		{"large positive", 1000, 1000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clampLogPage(tc.in); got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
