@@ -648,3 +648,79 @@ func TestInjectProfileArnErrorPaths(t *testing.T) {
 		}
 	})
 }
+
+func TestEncodeTools(t *testing.T) {
+	t.Run("nil parameters uses default schema", func(t *testing.T) {
+		tools := encodeTools([]ir.Tool{{Name: "f", Description: "do f"}})
+		if len(tools) != 1 {
+			t.Fatalf("len = %d, want 1", len(tools))
+		}
+		got := string(tools[0].ToolSpecification.InputSchema.JSON)
+		if got != `{"type":"object","properties":{}}` {
+			t.Errorf("schema = %s, want default empty object schema", got)
+		}
+	})
+
+	t.Run("empty parameters uses default schema", func(t *testing.T) {
+		tools := encodeTools([]ir.Tool{{Name: "f", Parameters: json.RawMessage("")}})
+		got := string(tools[0].ToolSpecification.InputSchema.JSON)
+		if got != `{"type":"object","properties":{}}` {
+			t.Errorf("schema = %s, want default empty object schema", got)
+		}
+	})
+
+	t.Run("non-empty parameters passthrough verbatim", func(t *testing.T) {
+		schema := json.RawMessage(`{"type":"object","properties":{"x":{"type":"string"}}}`)
+		tools := encodeTools([]ir.Tool{{Name: "f", Parameters: schema}})
+		got := tools[0].ToolSpecification.InputSchema.JSON
+		if string(got) != string(schema) {
+			t.Errorf("schema = %s, want verbatim passthrough", got)
+		}
+	})
+
+	t.Run("name and description propagated", func(t *testing.T) {
+		tools := encodeTools([]ir.Tool{{Name: "search", Description: "search the web"}})
+		ts := tools[0].ToolSpecification
+		if ts.Name != "search" {
+			t.Errorf("Name = %q, want search", ts.Name)
+		}
+		if ts.Description != "search the web" {
+			t.Errorf("Description = %q, want search the web", ts.Description)
+		}
+	})
+
+	t.Run("multiple tools preserve order", func(t *testing.T) {
+		tools := encodeTools([]ir.Tool{
+			{Name: "a", Parameters: json.RawMessage(`{}`)},
+			{Name: "b", Parameters: json.RawMessage(`{}`)},
+			{Name: "c", Parameters: json.RawMessage(`{}`)},
+		})
+		if len(tools) != 3 {
+			t.Fatalf("len = %d, want 3", len(tools))
+		}
+		if tools[0].ToolSpecification.Name != "a" || tools[1].ToolSpecification.Name != "b" || tools[2].ToolSpecification.Name != "c" {
+			t.Errorf("order = %s %s %s",
+				tools[0].ToolSpecification.Name,
+				tools[1].ToolSpecification.Name,
+				tools[2].ToolSpecification.Name)
+		}
+	})
+
+	t.Run("empty tools slice returns empty result", func(t *testing.T) {
+		tools := encodeTools(nil)
+		if len(tools) != 0 {
+			t.Errorf("len = %d, want 0", len(tools))
+		}
+		// make([]cwTool, 0, 0) returns non-nil empty slice.
+		if tools == nil {
+			t.Error("got nil, want non-nil empty slice")
+		}
+	})
+
+	t.Run("description omitted propagates as empty", func(t *testing.T) {
+		tools := encodeTools([]ir.Tool{{Name: "f", Parameters: json.RawMessage(`{}`)}})
+		if tools[0].ToolSpecification.Description != "" {
+			t.Errorf("Description = %q, want empty when omitted", tools[0].ToolSpecification.Description)
+		}
+	})
+}
