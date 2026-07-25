@@ -304,3 +304,133 @@ func TestJoinContent(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildUser(t *testing.T) {
+	t.Run("text only joined", func(t *testing.T) {
+		content, images, toolResults := buildUser([]ir.ContentBlock{
+			{Type: ir.BlockText, Text: "hello"},
+			{Type: ir.BlockText, Text: "world"},
+		})
+		if content != "hello\nworld" {
+			t.Errorf("content = %q, want hello\\nworld", content)
+		}
+		if len(images) != 0 || len(toolResults) != 0 {
+			t.Errorf("images=%d toolResults=%d, want 0/0", len(images), len(toolResults))
+		}
+	})
+
+	t.Run("empty text block skipped", func(t *testing.T) {
+		content, _, _ := buildUser([]ir.ContentBlock{
+			{Type: ir.BlockText, Text: ""},
+			{Type: ir.BlockText, Text: "keep"},
+		})
+		if content != "keep" {
+			t.Errorf("content = %q, want keep", content)
+		}
+	})
+
+	t.Run("single text block", func(t *testing.T) {
+		content, _, _ := buildUser([]ir.ContentBlock{{Type: ir.BlockText, Text: "solo"}})
+		if content != "solo" {
+			t.Errorf("content = %q", content)
+		}
+	})
+
+	t.Run("inline base64 image emits cwImage with format", func(t *testing.T) {
+		content, images, _ := buildUser([]ir.ContentBlock{
+			{Type: ir.BlockImage, Image: &ir.Image{Data: "BASE64", MediaType: "image/png"}},
+		})
+		if content != "" {
+			t.Errorf("content = %q, want empty", content)
+		}
+		if len(images) != 1 {
+			t.Fatalf("images len = %d, want 1", len(images))
+		}
+		if images[0].Format != "png" {
+			t.Errorf("format = %q, want png", images[0].Format)
+		}
+		if images[0].Source.Bytes != "BASE64" {
+			t.Errorf("bytes = %q, want BASE64", images[0].Source.Bytes)
+		}
+	})
+
+	t.Run("remote url image degrades to text marker", func(t *testing.T) {
+		content, images, _ := buildUser([]ir.ContentBlock{
+			{Type: ir.BlockImage, Image: &ir.Image{URL: "https://e.com/a.png"}},
+		})
+		if content != "[Image: https://e.com/a.png]" {
+			t.Errorf("content = %q, want image marker", content)
+		}
+		if len(images) != 0 {
+			t.Errorf("images len = %d, want 0 (url not inlined)", len(images))
+		}
+	})
+
+	t.Run("nil image on BlockImage skipped", func(t *testing.T) {
+		content, images, _ := buildUser([]ir.ContentBlock{
+			{Type: ir.BlockImage, Image: nil},
+			{Type: ir.BlockText, Text: "after"},
+		})
+		if content != "after" {
+			t.Errorf("content = %q, want after", content)
+		}
+		if len(images) != 0 {
+			t.Errorf("images len = %d, want 0", len(images))
+		}
+	})
+
+	t.Run("tool result success status", func(t *testing.T) {
+		_, _, toolResults := buildUser([]ir.ContentBlock{
+			{Type: ir.BlockToolResult, ToolUseID: "tu1", IsError: false,
+				ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "ok"}}},
+		})
+		if len(toolResults) != 1 {
+			t.Fatalf("toolResults len = %d, want 1", len(toolResults))
+		}
+		tr := toolResults[0]
+		if tr.ToolUseID != "tu1" {
+			t.Errorf("ToolUseID = %q", tr.ToolUseID)
+		}
+		if tr.Status != "success" {
+			t.Errorf("Status = %q, want success", tr.Status)
+		}
+		if len(tr.Content) != 1 || tr.Content[0].Text != "ok" {
+			t.Errorf("Content = %+v, want [ok]", tr.Content)
+		}
+	})
+
+	t.Run("tool result error status", func(t *testing.T) {
+		_, _, toolResults := buildUser([]ir.ContentBlock{
+			{Type: ir.BlockToolResult, ToolUseID: "tu2", IsError: true,
+				ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "boom"}}},
+		})
+		if len(toolResults) != 1 {
+			t.Fatalf("toolResults len = %d, want 1", len(toolResults))
+		}
+		if toolResults[0].Status != "error" {
+			t.Errorf("Status = %q, want error", toolResults[0].Status)
+		}
+		if toolResults[0].Content[0].Text != "boom" {
+			t.Errorf("Content = %q, want boom", toolResults[0].Content[0].Text)
+		}
+	})
+
+	t.Run("mixed blocks populate all outputs", func(t *testing.T) {
+		content, images, toolResults := buildUser([]ir.ContentBlock{
+			{Type: ir.BlockText, Text: "before"},
+			{Type: ir.BlockImage, Image: &ir.Image{Data: "B64", MediaType: "image/jpeg"}},
+			{Type: ir.BlockToolResult, ToolUseID: "tu3", IsError: false,
+				ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "r"}}},
+			{Type: ir.BlockText, Text: "after"},
+		})
+		if content != "before\nafter" {
+			t.Errorf("content = %q, want before\\nafter", content)
+		}
+		if len(images) != 1 || images[0].Format != "jpeg" {
+			t.Errorf("images = %+v", images)
+		}
+		if len(toolResults) != 1 || toolResults[0].ToolUseID != "tu3" {
+			t.Errorf("toolResults = %+v", toolResults)
+		}
+	})
+}
