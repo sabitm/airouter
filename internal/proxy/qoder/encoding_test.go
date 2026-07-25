@@ -43,3 +43,34 @@ func TestComputeSigPath(t *testing.T) {
 		t.Fatalf("model list sigpath=%q", got)
 	}
 }
+
+func TestComputeSigPathEdges(t *testing.T) {
+	t.Run("path without algo prefix returned unchanged", func(t *testing.T) {
+		got := computeSigPath("https://api.qoder.sh/api/v2/other")
+		if got != "/api/v2/other" {
+			t.Errorf("got %q, want /api/v2/other", got)
+		}
+	})
+
+	t.Run("algo prefix stripped", func(t *testing.T) {
+		got := computeSigPath("https://api.qoder.sh/algo/api/v2/model/list")
+		if got != "/api/v2/model/list" {
+			t.Errorf("got %q, want /api/v2/model/list", got)
+		}
+	})
+
+	t.Run("malformed url returns empty", func(t *testing.T) {
+		// url.Parse rejects control characters in the URL.
+		got := computeSigPath("://\x7f bad url")
+		if got != "" {
+			t.Errorf("got %q, want empty for malformed URL", got)
+		}
+	})
+
+	t.Run("empty path returns empty path", func(t *testing.T) {
+		got := computeSigPath("https://api.qoder.sh")
+		if got != "" {
+			t.Errorf("got %q, want empty path", got)
+		}
+	})
+}
