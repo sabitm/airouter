@@ -3,6 +3,7 @@ package cursor
 import (
 	"bytes"
 	"compress/gzip"
+	"compress/zlib"
 	"testing"
 )
 
@@ -87,4 +88,67 @@ func TestReadFramePartial(t *testing.T) {
 	if err == nil {
 		t.Error("partial header should error")
 	}
+}
+
+func TestDecompressPayloadZlibFallback(t *testing.T) {
+	payload := []byte("zlib compressed payload")
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	zw.Write(payload)
+	zw.Close()
+	// Pass flagGzip so gzip reader is tried first and fails, then zlib succeeds.
+	out := decompressPayload(buf.Bytes(), flagGzip)
+	if !bytes.Equal(out, payload) {
+		t.Errorf("zlib fallback: got %q, want %q", out, payload)
+	}
+}
+
+func TestDecompressPayloadRawDeflateFallback(t *testing.T) {
+	payload := []byte("raw deflate payload")
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	zw.Write(payload)
+	zw.Close()
+	// Strip the 2-byte zlib header but keep the adler32 trailer: this is the
+	// raw-deflate shape inflateRaw expects (zlib body without its header).
+	stripped := buf.Bytes()[2:]
+	// Raw deflate: gzip and zlib readers both fail, falling through to inflateRaw.
+	out := decompressPayload(stripped, flagGzip)
+	if !bytes.Equal(out, payload) {
+		t.Errorf("raw deflate fallback: got %q, want %q", out, payload)
+	}
+}
+
+func TestDecompressPayloadGarbageReturnsAsIs(t *testing.T) {
+	garbage := []byte{0xff, 0xfe, 0xfd, 0x00, 0x01}
+	out := decompressPayload(garbage, flagGzip)
+	if !bytes.Equal(out, garbage) {
+		t.Errorf("garbage: got %q, want passthrough %q", out, garbage)
+	}
+}
+
+func TestInflateRaw(t *testing.T) {
+	t.Run("zlib body without header decompresses", func(t *testing.T) {
+		payload := []byte("inflate raw test")
+		var buf bytes.Buffer
+		zw := zlib.NewWriter(&buf)
+		zw.Write(payload)
+		zw.Close()
+		// inflateRaw expects a zlib stream with its 2-byte header stripped,
+		// keeping the adler32 trailer.
+		stripped := buf.Bytes()[2:]
+		out, err := inflateRaw(stripped)
+		if err != nil {
+			t.Fatalf("inflateRaw: %v", err)
+		}
+		if !bytes.Equal(out, payload) {
+			t.Errorf("got %q, want %q", out, payload)
+		}
+	})
+
+	t.Run("invalid deflate returns error", func(t *testing.T) {
+		if _, err := inflateRaw([]byte{0xff, 0xff, 0xff}); err == nil {
+			t.Error("got nil error, want error for invalid deflate stream")
+		}
+	})
 }
