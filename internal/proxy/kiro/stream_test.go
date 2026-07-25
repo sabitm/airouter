@@ -3,6 +3,7 @@ package kiro
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"hash/crc32"
 	"io"
 	"testing"
@@ -341,4 +342,29 @@ func TestParseHeaders(t *testing.T) {
 			t.Errorf("got %v, want value truncated", err)
 		}
 	})
+}
+
+func TestToolInputFragment(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  json.RawMessage
+		want string
+	}{
+		{"empty", json.RawMessage(``), ""},
+		{"json string", json.RawMessage(`"hello"`), "hello"},
+		{"json object", json.RawMessage(`{"k":"v"}`), `{"k":"v"}`},
+		{"json number", json.RawMessage(`42`), "42"},
+		{"json array", json.RawMessage(`[1,2]`), "[1,2]"},
+		{"json bool", json.RawMessage(`true`), "true"},
+		{"json null", json.RawMessage(`null`), "null"},
+		{"raw non-json bytes", json.RawMessage(`notjson`), "notjson"},
+		{"empty json string", json.RawMessage(`""`), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := toolInputFragment(tc.raw); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

@@ -574,3 +574,77 @@ func TestBuildTurns(t *testing.T) {
 		}
 	})
 }
+
+func TestLastUserTurn(t *testing.T) {
+	t.Run("single user turn returns 0", func(t *testing.T) {
+		turns := []turn{{user: &cwUserInputMessage{}}}
+		if got := lastUserTurn(turns); got != 0 {
+			t.Errorf("got %d, want 0", got)
+		}
+	})
+
+	t.Run("user then assistant skips assistant", func(t *testing.T) {
+		turns := []turn{
+			{user: &cwUserInputMessage{}},
+			{assistant: &cwAssistantResponseMessage{}},
+		}
+		if got := lastUserTurn(turns); got != 0 {
+			t.Errorf("got %d, want 0 (skip trailing assistant)", got)
+		}
+	})
+
+	t.Run("assistant then user returns 1", func(t *testing.T) {
+		turns := []turn{
+			{assistant: &cwAssistantResponseMessage{}},
+			{user: &cwUserInputMessage{}},
+		}
+		if got := lastUserTurn(turns); got != 1 {
+			t.Errorf("got %d, want 1", got)
+		}
+	})
+
+	t.Run("no user turns returns -1", func(t *testing.T) {
+		turns := []turn{
+			{assistant: &cwAssistantResponseMessage{}},
+			{assistant: &cwAssistantResponseMessage{}},
+		}
+		if got := lastUserTurn(turns); got != -1 {
+			t.Errorf("got %d, want -1", got)
+		}
+	})
+
+	t.Run("empty slice returns -1", func(t *testing.T) {
+		if got := lastUserTurn(nil); got != -1 {
+			t.Errorf("got %d, want -1", got)
+		}
+	})
+
+	t.Run("multiple user turns returns last", func(t *testing.T) {
+		turns := []turn{
+			{user: &cwUserInputMessage{Content: "first"}},
+			{assistant: &cwAssistantResponseMessage{}},
+			{user: &cwUserInputMessage{Content: "last"}},
+		}
+		if got := lastUserTurn(turns); got != 2 {
+			t.Errorf("got %d, want 2 (last user)", got)
+		}
+	})
+}
+
+func TestInjectProfileArnErrorPaths(t *testing.T) {
+	t.Run("empty arn returns body unchanged byte-for-byte", func(t *testing.T) {
+		body := []byte(`{"content":"hi"}`)
+		got := InjectProfileArn(body, "")
+		if string(got) != string(body) {
+			t.Errorf("got %s, want body unchanged", got)
+		}
+	})
+
+	t.Run("invalid json body returns unchanged", func(t *testing.T) {
+		body := []byte(`not valid json`)
+		got := InjectProfileArn(body, "arn:aws:codewhisperer:us-east-1:123:profile/ABC")
+		if string(got) != string(body) {
+			t.Errorf("got %s, want body unchanged for invalid JSON", got)
+		}
+	})
+}
