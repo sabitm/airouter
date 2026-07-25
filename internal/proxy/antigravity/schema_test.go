@@ -341,3 +341,96 @@ func TestDeepCopyMap(t *testing.T) {
 		}
 	})
 }
+
+func TestFlattenTypeArrays(t *testing.T) {
+	t.Run("array with null and scalar keeps scalar", func(t *testing.T) {
+		m := map[string]any{"type": []any{"string", "null"}}
+		flattenTypeArrays(m)
+		if m["type"] != "string" {
+			t.Errorf("got %v, want string", m["type"])
+		}
+	})
+
+	t.Run("all null array defaults to string", func(t *testing.T) {
+		m := map[string]any{"type": []any{"null", "null"}}
+		flattenTypeArrays(m)
+		if m["type"] != "string" {
+			t.Errorf("got %v, want string default", m["type"])
+		}
+	})
+
+	t.Run("single non-null in array", func(t *testing.T) {
+		m := map[string]any{"type": []any{"integer"}}
+		flattenTypeArrays(m)
+		if m["type"] != "integer" {
+			t.Errorf("got %v, want integer", m["type"])
+		}
+	})
+
+	t.Run("non-string element skipped", func(t *testing.T) {
+		m := map[string]any{"type": []any{42, "string"}}
+		flattenTypeArrays(m)
+		if m["type"] != "string" {
+			t.Errorf("got %v, want string (non-string 42 skipped)", m["type"])
+		}
+	})
+
+	t.Run("empty type array defaults to string", func(t *testing.T) {
+		m := map[string]any{"type": []any{}}
+		flattenTypeArrays(m)
+		if m["type"] != "string" {
+			t.Errorf("got %v, want string default", m["type"])
+		}
+	})
+
+	t.Run("nested property type array flattened", func(t *testing.T) {
+		m := map[string]any{
+			"properties": map[string]any{
+				"field": map[string]any{"type": []any{"null", "boolean"}},
+			},
+		}
+		flattenTypeArrays(m)
+		props := m["properties"].(map[string]any)
+		field := props["field"].(map[string]any)
+		if field["type"] != "boolean" {
+			t.Errorf("got %v, want boolean", field["type"])
+		}
+	})
+
+	t.Run("array root recurses into elements", func(t *testing.T) {
+		var arr []any
+		if err := json.Unmarshal([]byte(`[{"type":["null","integer"]}]`), &arr); err != nil {
+			t.Fatal(err)
+		}
+		flattenTypeArrays(arr)
+		first := arr[0].(map[string]any)
+		if first["type"] != "integer" {
+			t.Errorf("got %v, want integer", first["type"])
+		}
+	})
+
+	t.Run("non-map root is no-op", func(t *testing.T) {
+		flattenTypeArrays("just a string")
+		flattenTypeArrays(42)
+		flattenTypeArrays(nil)
+	})
+
+	t.Run("no type field unchanged", func(t *testing.T) {
+		m := map[string]any{"description": "no type here"}
+		flattenTypeArrays(m)
+		if m["description"] != "no type here" {
+			t.Errorf("description changed")
+		}
+		if _, ok := m["type"]; ok {
+			t.Error("type field should not be added")
+		}
+	})
+
+	t.Run("scalar string type unchanged", func(t *testing.T) {
+		m := map[string]any{"type": "string"}
+		flattenTypeArrays(m)
+		if m["type"] != "string" {
+			t.Errorf("got %v, want string", m["type"])
+		}
+	})
+}
