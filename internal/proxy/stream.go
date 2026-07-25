@@ -25,6 +25,9 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	}
 	resp, err := p.forwardStream(ctx, provider, ingress.upstreamPath, rewritten, clientHeaders, ingress.streamAccept)
 	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	defer resp.Body.Close()
@@ -134,6 +137,9 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	}
 	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
 	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	defer resp.Body.Close()
