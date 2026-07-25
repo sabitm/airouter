@@ -327,3 +327,25 @@ func TestInjectCodexRequestKey(t *testing.T) {
 		}
 	})
 }
+
+func TestOutputToText(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  json.RawMessage
+		want string
+	}{
+		{"empty", json.RawMessage(``), ""},
+		{"null", json.RawMessage(`null`), ""},
+		{"string", json.RawMessage(`"hello"`), "hello"},
+		{"array of text parts", json.RawMessage(`[{"type":"text","text":"hi "},{"type":"text","text":"there"}]`), "hi there"},
+		{"array with non-text parts skipped", json.RawMessage(`[{"type":"image_url"},{"type":"text","text":"keep"}]`), "keep"},
+		{"invalid json", json.RawMessage(`{bad`), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := outputToText(tc.raw); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

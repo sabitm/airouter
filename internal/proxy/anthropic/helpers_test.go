@@ -293,3 +293,25 @@ func mustJSONRaw(v any) json.RawMessage {
 	}
 	return raw
 }
+
+func TestTotalInput(t *testing.T) {
+	cases := []struct {
+		name string
+		u    anthUsage
+		want int
+	}{
+		{"all zero", anthUsage{}, 0},
+		{"input only", anthUsage{InputTokens: 10}, 10},
+		{"cache creation only", anthUsage{CacheCreationInputTokens: 5}, 5},
+		{"cache read only", anthUsage{CacheReadInputTokens: 7}, 7},
+		{"all three summed", anthUsage{InputTokens: 10, CacheCreationInputTokens: 5, CacheReadInputTokens: 7}, 22},
+		{"output tokens excluded", anthUsage{InputTokens: 10, OutputTokens: 100}, 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.u.TotalInput(); got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

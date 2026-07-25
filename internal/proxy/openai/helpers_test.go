@@ -283,3 +283,41 @@ func TestFinishFromStopReason(t *testing.T) {
 		}
 	}
 }
+
+func TestEncodeErrorOpenAI(t *testing.T) {
+	t.Run("default type when empty", func(t *testing.T) {
+		raw := EncodeError("bad request", "")
+		var got struct {
+			Error struct {
+				Message string          `json:"message"`
+				Type    string          `json:"type"`
+				Code    json.RawMessage `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, raw)
+		}
+		if got.Error.Message != "bad request" {
+			t.Errorf("message = %q", got.Error.Message)
+		}
+		if got.Error.Type != "invalid_request_error" {
+			t.Errorf("type = %q, want invalid_request_error", got.Error.Type)
+		}
+		if string(got.Error.Code) != "null" {
+			t.Errorf("code = %s, want null", got.Error.Code)
+		}
+	})
+
+	t.Run("explicit type preserved", func(t *testing.T) {
+		raw := EncodeError("overloaded", "overloaded_error")
+		var got struct {
+			Error struct {
+				Type string `json:"type"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &got)
+		if got.Error.Type != "overloaded_error" {
+			t.Errorf("type = %q, want overloaded_error", got.Error.Type)
+		}
+	})
+}
