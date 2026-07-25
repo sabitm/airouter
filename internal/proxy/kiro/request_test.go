@@ -213,3 +213,94 @@ func contentOf(m *cwUserInputMessage) string {
 	}
 	return m.Content
 }
+
+func TestImageFormat(t *testing.T) {
+	cases := []struct {
+		mediaType string
+		want      string
+	}{
+		{"image/png", "png"},
+		{"image/jpeg", "jpeg"},
+		{"image/svg+xml", "svg+xml"},
+		{"image/gif", "gif"},
+		{"application/pdf", "pdf"},
+		{"noprefix", "png"},
+		{"", "png"},
+		{"image/", "png"},
+		{"/", "png"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mediaType, func(t *testing.T) {
+			if got := imageFormat(tc.mediaType); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestToolResultStatus(t *testing.T) {
+	if got := toolResultStatus(true); got != "error" {
+		t.Errorf("error case: got %q, want error", got)
+	}
+	if got := toolResultStatus(false); got != "success" {
+		t.Errorf("success case: got %q, want success", got)
+	}
+}
+
+func TestCompactJSON(t *testing.T) {
+	t.Run("valid json with whitespace compacted", func(t *testing.T) {
+		got := compactJSON(json.RawMessage(`{ "a" : 1 , "b" : [ 2 , 3 ] }`))
+		if string(got) != `{"a":1,"b":[2,3]}` {
+			t.Errorf("got %s, want compacted", got)
+		}
+	})
+
+	t.Run("empty input returns empty object", func(t *testing.T) {
+		got := compactJSON(json.RawMessage(``))
+		if string(got) != `{}` {
+			t.Errorf("got %s, want {}", got)
+		}
+	})
+
+	t.Run("invalid json returns empty object", func(t *testing.T) {
+		got := compactJSON(json.RawMessage(`{not valid`))
+		if string(got) != `{}` {
+			t.Errorf("got %s, want {}", got)
+		}
+	})
+
+	t.Run("already compact unchanged", func(t *testing.T) {
+		got := compactJSON(json.RawMessage(`{"a":1}`))
+		if string(got) != `{"a":1}` {
+			t.Errorf("got %s, want {\"a\":1}", got)
+		}
+	})
+
+	t.Run("nested object compacted", func(t *testing.T) {
+		got := compactJSON(json.RawMessage(`{ "outer" : { "inner" : "v" } }`))
+		if string(got) != `{"outer":{"inner":"v"}}` {
+			t.Errorf("got %s, want compacted nested", got)
+		}
+	})
+}
+
+func TestJoinContent(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b string
+		want string
+	}{
+		{"both non-empty", "hello", "world", "hello\n\nworld"},
+		{"a empty returns b", "", "world", "world"},
+		{"b empty returns a", "hello", "", "hello"},
+		{"both empty returns empty", "", "", ""},
+		{"single char each", "a", "b", "a\n\nb"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := joinContent(tc.a, tc.b); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
