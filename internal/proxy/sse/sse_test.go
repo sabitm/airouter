@@ -3,6 +3,7 @@ package sse
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -187,5 +188,47 @@ func TestNewWriterSetsHeaders(t *testing.T) {
 		if got := h.Get(k); got != want {
 			t.Errorf("%s = %q, want %q", k, got, want)
 		}
+	}
+}
+
+// failingWriter is an http.ResponseWriter + http.Flusher that fails all writes.
+type failingWriter struct{}
+
+func (failingWriter) Header() http.Header                 { return http.Header{} }
+func (failingWriter) Write([]byte) (int, error)           { return 0, io.ErrShortWrite }
+func (failingWriter) WriteHeader(statusCode int)          {}
+func (failingWriter) Flush()                              {}
+
+// nonFlusherWriter implements http.ResponseWriter but NOT http.Flusher.
+type nonFlusherWriter struct{}
+
+func (nonFlusherWriter) Header() http.Header        { return http.Header{} }
+func (nonFlusherWriter) Write([]byte) (int, error)  { return 0, nil }
+func (nonFlusherWriter) WriteHeader(statusCode int) {}
+
+func TestNewWriterRejectsNonFlusher(t *testing.T) {
+	w, ok := NewWriter(nonFlusherWriter{})
+	if ok || w != nil {
+		t.Errorf("got (%+v, %v), want (nil, false) for non-Flusher writer", w, ok)
+	}
+}
+
+func TestWriterWriteEventPropagatesWriteError(t *testing.T) {
+	w, ok := NewWriter(failingWriter{})
+	if !ok {
+		t.Fatal("NewWriter: failingWriter should implement Flusher")
+	}
+	if err := w.WriteEvent("ping", []byte("data")); err == nil {
+		t.Error("got nil error, want write error propagated")
+	}
+}
+
+func TestWriterWriteRawPropagatesWriteError(t *testing.T) {
+	w, ok := NewWriter(failingWriter{})
+	if !ok {
+		t.Fatal("NewWriter: failingWriter should implement Flusher")
+	}
+	if err := w.WriteRaw([]byte("data: raw\n\n")); err == nil {
+		t.Error("got nil error, want write error propagated")
 	}
 }
