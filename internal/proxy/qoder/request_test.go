@@ -362,3 +362,168 @@ func TestModelKeyFromBodyEdges(t *testing.T) {
 		}
 	})
 }
+
+func TestEncodeMessages(t *testing.T) {
+	t.Run("user text only", func(t *testing.T) {
+		out, lastUser := encodeMessages([]ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		})
+		if len(out) != 1 {
+			t.Fatalf("len = %d, want 1", len(out))
+		}
+		if out[0]["role"] != "user" || out[0]["content"] != "hi" {
+			t.Errorf("msg = %+v", out[0])
+		}
+		if lastUser != "hi" {
+			t.Errorf("lastUser = %q, want hi", lastUser)
+		}
+	})
+
+	t.Run("user text plus image degrades to marker", func(t *testing.T) {
+		out, lastUser := encodeMessages([]ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "look"},
+				{Type: ir.BlockImage, Image: &ir.Image{Data: "B64"}},
+			}},
+		})
+		if len(out) != 1 {
+			t.Fatalf("len = %d, want 1", len(out))
+		}
+		want := "look\n[image omitted]"
+		if out[0]["content"] != want {
+			t.Errorf("content = %q, want %q", out[0]["content"], want)
+		}
+		if lastUser != want {
+			t.Errorf("lastUser = %q, want %q", lastUser, want)
+		}
+	})
+
+	t.Run("user tool result only emits role tool message", func(t *testing.T) {
+		out, lastUser := encodeMessages([]ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "tu1",
+					ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "r"}}},
+			}},
+		})
+		if len(out) != 1 {
+			t.Fatalf("len = %d, want 1", len(out))
+		}
+		if out[0]["role"] != "tool" {
+			t.Errorf("role = %v, want tool", out[0]["role"])
+		}
+		if out[0]["tool_call_id"] != "tu1" {
+			t.Errorf("tool_call_id = %v", out[0]["tool_call_id"])
+		}
+		if out[0]["content"] != "r" {
+			t.Errorf("content = %v, want r", out[0]["content"])
+		}
+		if lastUser != "" {
+			t.Errorf("lastUser = %q, want empty (no user text)", lastUser)
+		}
+	})
+
+	t.Run("user mixed tool result text and image", func(t *testing.T) {
+		out, lastUser := encodeMessages([]ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "tu1",
+					ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "r"}}},
+				{Type: ir.BlockText, Text: "after"},
+				{Type: ir.BlockImage, Image: &ir.Image{Data: "B"}},
+			}},
+		})
+		// tool result -> role:tool; text+image joined -> role:user
+		if len(out) != 2 {
+			t.Fatalf("len = %d, want 2", len(out))
+		}
+		if out[0]["role"] != "tool" || out[0]["tool_call_id"] != "tu1" {
+			t.Errorf("msg0 = %+v", out[0])
+		}
+		if out[1]["role"] != "user" || out[1]["content"] != "after\n[image omitted]" {
+			t.Errorf("msg1 = %+v", out[1])
+		}
+		if lastUser != "after\n[image omitted]" {
+			t.Errorf("lastUser = %q", lastUser)
+		}
+	})
+
+	t.Run("assistant text only", func(t *testing.T) {
+		out, _ := encodeMessages([]ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "reply"}}},
+		})
+		if len(out) != 1 {
+			t.Fatalf("len = %d, want 1", len(out))
+		}
+		if out[0]["role"] != "assistant" || out[0]["content"] != "reply" {
+			t.Errorf("msg = %+v", out[0])
+		}
+		if _, has := out[0]["tool_calls"]; has {
+			t.Error("tool_calls should be absent")
+		}
+	})
+
+	t.Run("assistant tool use only defaults empty input to {}", func(t *testing.T) {
+		out, _ := encodeMessages([]ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolUse, ToolID: "t1", ToolName: "f", ToolInput: nil},
+			}},
+		})
+		if len(out) != 1 {
+			t.Fatalf("len = %d, want 1", len(out))
+		}
+		if out[0]["content"] != "" {
+			t.Errorf("content = %q, want empty for tool-only assistant", out[0]["content"])
+		}
+		tcs, ok := out[0]["tool_calls"].([]map[string]any)
+		if !ok || len(tcs) != 1 {
+			t.Fatalf("tool_calls = %+v", out[0]["tool_calls"])
+		}
+		tc := tcs[0]
+		if tc["id"] != "t1" || tc["type"] != "function" {
+			t.Errorf("tc = %+v", tc)
+		}
+		fn := tc["function"].(map[string]any)
+		if fn["name"] != "f" || fn["arguments"] != "{}" {
+			t.Errorf("function = %+v, want name=f arguments={}", fn)
+		}
+	})
+
+	t.Run("assistant text plus tool use", func(t *testing.T) {
+		out, _ := encodeMessages([]ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "calling"},
+				{Type: ir.BlockToolUse, ToolID: "t1", ToolName: "f", ToolInput: json.RawMessage(`{"x":1}`)},
+			}},
+		})
+		if len(out) != 1 {
+			t.Fatalf("len = %d, want 1", len(out))
+		}
+		if out[0]["content"] != "calling" {
+			t.Errorf("content = %q, want calling", out[0]["content"])
+		}
+		tcs := out[0]["tool_calls"].([]map[string]any)
+		if len(tcs) != 1 {
+			t.Fatalf("tool_calls len = %d", len(tcs))
+		}
+		fn := tcs[0]["function"].(map[string]any)
+		if fn["arguments"] != `{"x":1}` {
+			t.Errorf("arguments = %q, want raw args", fn["arguments"])
+		}
+	})
+
+	t.Run("multiple messages preserve order and lastUser", func(t *testing.T) {
+		out, lastUser := encodeMessages([]ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "first"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "mid"}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "last"}}},
+		})
+		if len(out) != 3 {
+			t.Fatalf("len = %d, want 3", len(out))
+		}
+		if out[0]["role"] != "user" || out[1]["role"] != "assistant" || out[2]["role"] != "user" {
+			t.Errorf("roles = %v %v %v", out[0]["role"], out[1]["role"], out[2]["role"])
+		}
+		if lastUser != "last" {
+			t.Errorf("lastUser = %q, want last", lastUser)
+		}
+	})
+}
