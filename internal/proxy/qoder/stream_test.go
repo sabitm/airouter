@@ -35,3 +35,32 @@ func TestDecodeStreamUnwrapsEnvelope(t *testing.T) {
 	}
 }
 
+
+func TestTruncate(t *testing.T) {
+	t.Run("short unchanged", func(t *testing.T) {
+		if got := truncate("short", 100); got != "short" {
+			t.Errorf("got %q", got)
+		}
+	})
+	t.Run("over limit truncates with marker", func(t *testing.T) {
+		s := strings.Repeat("x", 50)
+		got := truncate(s, 10)
+		if !strings.HasPrefix(got, "xxxxxxxxxx") {
+			t.Errorf("expected first 10 bytes, got %q", got)
+		}
+		if !strings.HasSuffix(got, "...") {
+			t.Errorf("expected ... suffix, got %q", got)
+		}
+	})
+	t.Run("empty unchanged", func(t *testing.T) {
+		if got := truncate("", 10); got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+	t.Run("exactly at limit unchanged", func(t *testing.T) {
+		s := strings.Repeat("x", 10)
+		if got := truncate(s, 10); got != s {
+			t.Errorf("got %q, want %q", got, s)
+		}
+	})
+}
