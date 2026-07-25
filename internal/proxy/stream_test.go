@@ -115,6 +115,26 @@ data: {"type":"response.completed","response":{"id":"resp_2","model":"up","statu
 
 `
 
+// openAIToolSSE streams a single tool_call whose function.arguments arrive
+// in two fragments, mirroring how OpenAI Chat Completions backends stream a
+// tool call. Used to exercise the OpenAI stream decoder's fragment reassembly
+// on a translate path to an Anthropic ingress.
+const openAIToolSSE = `data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"paris\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":9,"total_tokens":12}}
+
+data: [DONE]
+
+`
+
 func streamingUpstream(t *testing.T, anthropicBody string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +279,59 @@ func TestStreamToolResponsesToOpenAI(t *testing.T) {
 	}
 	if finish != "tool_calls" {
 		t.Errorf("finish_reason = %q", finish)
+	}
+}
+
+// A backend OpenAI Chat Completions tool_call stream translated to an Anthropic
+// ingress should reassemble into an Anthropic tool_use block (content_block_start
+// + input_json_delta fragments + content_block_stop) and terminate with
+// stop_reason "tool_use" on message_delta. Mirrors the Anthropic/Responses
+// backend tool-stream tests but for the OpenAI backend direction, exercising
+// openai.DecodeStream's fragment reassembly (EventToolCallStart/Delta by Index)
+// and anthropic.StreamEncoder's tool_use emission end-to-end.
+func TestStreamToolOpenAIToAnthropic(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openAIToolSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "real-model", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, false, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/messages", key.Token, `{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"weather?"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	name, args, stop, stopped := collectAnthropicToolStream(t, body)
+	if name != "get_weather" {
+		t.Errorf("tool name = %q", name)
+	}
+	if args != `{"city":"paris"}` {
+		t.Errorf("tool args = %q", args)
+	}
+	if stop != "tool_use" {
+		t.Errorf("stop_reason = %q, want tool_use", stop)
+	}
+	if !stopped {
+		t.Error("stream did not signal message_stop")
 	}
 }
 
@@ -415,6 +488,89 @@ func TestStreamErrorBodyCapped(t *testing.T) {
 	}
 	if !strings.Contains(body, "error") {
 		t.Fatalf("want error envelope, got: %s", body)
+	}
+}
+
+// TestStreamErrorEnvelopePerIngress verifies a pre-commit upstream error on a
+// translate streaming path is surfaced in the ingress format's own error
+// envelope. streamTranslated returns retryable on a non-2xx upstream status; the
+// resolution loop (single target here) then calls res.fail -> writeErr ->
+// c.encodeError, which must render the ingress format's envelope shape. The
+// upstream error.message is extracted and forwarded; errType is always "api_error"
+// for upstream failures.
+func TestStreamErrorEnvelopePerIngress(t *testing.T) {
+	cases := []struct {
+		name    string
+		ingress string
+		backend domain.Protocol
+	}{
+		{"openai ingress", "/v1/chat/completions", domain.ProtocolAnthropic},
+		{"anthropic ingress", "/v1/messages", domain.ProtocolOpenAI},
+		{"responses ingress", "/v1/responses", domain.ProtocolOpenAI},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = io.WriteString(w, `{"error":{"message":"upstream is down","type":"overloaded_error"}}`)
+			}))
+			t.Cleanup(upstream.Close)
+
+			st := newTestStore(t)
+			ctx := context.Background()
+			prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: "up-key", Protocol: tc.backend}
+			if err := st.CreateProvider(ctx, prov); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "real-model", Enabled: true}}}); err != nil {
+				t.Fatal(err)
+			}
+			key, err := st.NewAccessKey(ctx, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			New(st, false, nil).Mount(mux)
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+
+			reqBody := `{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`
+			if strings.HasPrefix(tc.ingress, "/v1/responses") {
+				reqBody = `{"model":"default","input":"hi","stream":true}`
+			}
+			resp, body := postStream(t, ts.URL+tc.ingress, key.Token, reqBody)
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body = %s", resp.StatusCode, body)
+			}
+			ct := resp.Header.Get("Content-Type")
+			if !strings.HasPrefix(ct, "application/json") {
+				t.Errorf("content-type = %q, want application/json", ct)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(body), &got); err != nil {
+				t.Fatalf("body not valid JSON in ingress envelope: %s", body)
+			}
+			errObj, ok := got["error"]
+			if !ok {
+				t.Fatalf("missing top-level error object: %s", body)
+			}
+			var e struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+				Code    any    `json:"code"`
+				Param   any    `json:"param"`
+			}
+			if err := json.Unmarshal(errObj, &e); err != nil {
+				t.Fatalf("error object malformed: %s", body)
+			}
+			if e.Message != "upstream is down" {
+				t.Errorf("error.message = %q, want upstream is down", e.Message)
+			}
+			if e.Type != "api_error" {
+				t.Errorf("error.type = %q, want api_error", e.Type)
+			}
+		})
 	}
 }
 
@@ -592,4 +748,63 @@ func collectResponsesUsage(t *testing.T, body string) (in, out, total int) {
 		}
 	}
 	return 0, 0, 0
+}
+
+// collectAnthropicToolStream reconstructs an Anthropic tool_use block from a
+// client SSE response: the tool name from content_block_start, the arguments
+// from concatenated input_json_delta fragments, the stop_reason from
+// message_delta, and whether message_stop terminated the stream.
+func collectAnthropicToolStream(t *testing.T, body string) (name, args, stop string, stopped bool) {
+	t.Helper()
+	reader := sse.NewReader(strings.NewReader(body))
+	var argBuf strings.Builder
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch ev.Name {
+		case "content_block_start":
+			var d struct {
+				Index        int `json:"index"`
+				ContentBlock struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"content_block"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			if d.ContentBlock.Type == "tool_use" {
+				name = d.ContentBlock.Name
+			}
+		case "content_block_delta":
+			var d struct {
+				Index int `json:"index"`
+				Delta struct {
+					Type        string `json:"type"`
+					PartialJSON string `json:"partial_json"`
+				} `json:"delta"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			if d.Delta.Type == "input_json_delta" {
+				argBuf.WriteString(d.Delta.PartialJSON)
+			}
+		case "message_delta":
+			var d struct {
+				Delta struct {
+					StopReason string `json:"stop_reason"`
+				} `json:"delta"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			if d.Delta.StopReason != "" {
+				stop = d.Delta.StopReason
+			}
+		case "message_stop":
+			stopped = true
+		}
+	}
+	return name, argBuf.String(), stop, stopped
 }

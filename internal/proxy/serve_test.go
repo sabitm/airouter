@@ -29,6 +29,7 @@ type capturedUpstream struct {
 	model     string
 	userAgent string
 	beta      string
+	body      []byte
 }
 
 // newUpstream returns a mock provider that answers in the format matching the
@@ -47,6 +48,7 @@ func newUpstream(t *testing.T, cap *capturedUpstream) *httptest.Server {
 		cap.model = m.Model
 		cap.userAgent = r.Header.Get("User-Agent")
 		cap.beta = r.Header.Get("anthropic-beta")
+		cap.body = body
 
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -432,5 +434,33 @@ func TestRequestLogUnknownCombo(t *testing.T) {
 	}
 	if l.Combo != "nope" || l.ErrMsg == "" {
 		t.Errorf("expected failed log for unknown combo, got %+v", l)
+	}
+}
+
+// TestPassthroughPreservesUnknownFields verifies an OpenAI->OpenAI passthrough
+// relays provider-specific request fields the IR does not model (here "user"
+// and "top_p") untouched, alongside the model field rewritten to the upstream
+// model. This pins the AGENTS.md passthrough invariant: same-id ingress/backend
+// rewrites only the model; everything else is forwarded as-is.
+func TestPassthroughPreservesUnknownFields(t *testing.T) {
+	var cap capturedUpstream
+	base, token := setup(t, domain.ProtocolOpenAI, &cap)
+	body := `{"model":"default","messages":[{"role":"user","content":"hi"}],"top_p":0.9,"user":"u-123"}`
+	resp, out := post(t, base+"/v1/chat/completions", token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	var fwd map[string]json.RawMessage
+	if err := json.Unmarshal(cap.body, &fwd); err != nil {
+		t.Fatalf("forwarded body not valid JSON: %s", cap.body)
+	}
+	if m := string(fwd["model"]); m != `"real-model"` {
+		t.Errorf("model = %s, want \"real-model\"", m)
+	}
+	if tp := string(fwd["top_p"]); tp != "0.9" {
+		t.Errorf("top_p = %s, want 0.9 (unknown field must be preserved)", tp)
+	}
+	if u := string(fwd["user"]); u != `"u-123"` {
+		t.Errorf("user = %s, want \"u-123\" (unknown field must be preserved)", u)
 	}
 }
