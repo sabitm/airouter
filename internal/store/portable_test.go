@@ -105,3 +105,57 @@ func TestImportLegacyComboShape(t *testing.T) {
 		t.Errorf("legacy import target = %+v", got.Targets)
 	}
 }
+
+func TestPortableComboResolveTargets(t *testing.T) {
+	t.Run("new format targets returned verbatim", func(t *testing.T) {
+		pc := portableCombo{
+			Targets: []portableTarget{{Provider: "p1", UpstreamModel: "m1"}},
+		}
+		got := pc.resolveTargets()
+		if len(got) != 1 || got[0].Provider != "p1" || got[0].UpstreamModel != "m1" {
+			t.Errorf("got %+v, want [{p1 m1}]", got)
+		}
+	})
+
+	t.Run("legacy single provider folded into one target", func(t *testing.T) {
+		pc := portableCombo{Provider: "p1", UpstreamModel: "m1"}
+		got := pc.resolveTargets()
+		if len(got) != 1 || got[0].Provider != "p1" || got[0].UpstreamModel != "m1" {
+			t.Errorf("got %+v, want [{p1 m1}]", got)
+		}
+	})
+
+	t.Run("legacy with empty upstream model carried not defaulted", func(t *testing.T) {
+		pc := portableCombo{Provider: "p1"}
+		got := pc.resolveTargets()
+		if len(got) != 1 || got[0].Provider != "p1" || got[0].UpstreamModel != "" {
+			t.Errorf("got %+v, want [{p1 }]", got)
+		}
+	})
+
+	t.Run("both empty returns nil", func(t *testing.T) {
+		pc := portableCombo{}
+		if got := pc.resolveTargets(); got != nil {
+			t.Errorf("got %+v, want nil", got)
+		}
+	})
+
+	t.Run("empty targets slice falls through to legacy", func(t *testing.T) {
+		pc := portableCombo{Targets: []portableTarget{}, Provider: "p1", UpstreamModel: "m1"}
+		got := pc.resolveTargets()
+		if len(got) != 1 || got[0].Provider != "p1" {
+			t.Errorf("got %+v, want legacy fold (empty Targets != nil)", got)
+		}
+	})
+
+	t.Run("new format targets take precedence over legacy", func(t *testing.T) {
+		pc := portableCombo{
+			Targets:  []portableTarget{{Provider: "new", UpstreamModel: "mn"}},
+			Provider: "legacy", UpstreamModel: "ml",
+		}
+		got := pc.resolveTargets()
+		if len(got) != 1 || got[0].Provider != "new" {
+			t.Errorf("got %+v, want new-format precedence", got)
+		}
+	})
+}
