@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"airouter/internal/domain"
 	"airouter/internal/proxy/ir"
 )
 
@@ -213,6 +214,151 @@ func TestClampMaxTokens(t *testing.T) {
 		body := []byte(`not json`)
 		if got := clampMaxTokens(body, cfg); string(got) != `not json` {
 			t.Errorf("got %s, want unchanged for bad body", got)
+		}
+	})
+}
+
+func TestCredsFromProvider(t *testing.T) {
+	t.Run("nil returns empty", func(t *testing.T) {
+		c := CredsFromProvider(nil)
+		if c.UserID != "" || c.AuthToken != "" || c.MachineID != "" || c.Name != "" || c.Email != "" {
+			t.Errorf("got %+v, want empty", c)
+		}
+	})
+	t.Run("apikey only sets AuthToken", func(t *testing.T) {
+		p := &domain.Provider{APIKey: "static-key"}
+		c := CredsFromProvider(p)
+		if c.AuthToken != "static-key" {
+			t.Errorf("AuthToken = %q", c.AuthToken)
+		}
+		if c.UserID != "" || c.MachineID != "" {
+			t.Errorf("identity fields should be empty: %+v", c)
+		}
+	})
+	t.Run("oauth only uses AccessToken and copies identity", func(t *testing.T) {
+		p := &domain.Provider{
+			OAuthCreds: &domain.OAuthCreds{
+				AccessToken:  "tok",
+				UserID:       "u1",
+				MachineID:    "mid",
+				DisplayName:  "Alice",
+				Email:        "a@e.com",
+			},
+		}
+		c := CredsFromProvider(p)
+		if c.AuthToken != "tok" {
+			t.Errorf("AuthToken = %q, want tok", c.AuthToken)
+		}
+		if c.UserID != "u1" || c.MachineID != "mid" || c.Name != "Alice" || c.Email != "a@e.com" {
+			t.Errorf("identity = %+v", c)
+		}
+	})
+	t.Run("both apikey and oauth: apikey wins for AuthToken, identity still copied", func(t *testing.T) {
+		p := &domain.Provider{
+			APIKey: "resolved-token",
+			OAuthCreds: &domain.OAuthCreds{
+				AccessToken: "tok",
+				UserID:      "u1",
+				MachineID:   "mid",
+				DisplayName: "Alice",
+				Email:       "a@e.com",
+			},
+		}
+		c := CredsFromProvider(p)
+		if c.AuthToken != "resolved-token" {
+			t.Errorf("AuthToken = %q, want resolved-token (apikey wins)", c.AuthToken)
+		}
+		if c.UserID != "u1" || c.MachineID != "mid" || c.Name != "Alice" || c.Email != "a@e.com" {
+			t.Errorf("identity = %+v, want copied from OAuth", c)
+		}
+	})
+}
+
+func TestModelSourceFromConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  string
+		want string
+	}{
+		{"present source", `{"source":"catalog"}`, "catalog"},
+		{"empty source", `{"source":""}`, "system"},
+		{"missing field", `{"key":"x"}`, "system"},
+		{"invalid json", `{bad`, "system"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ModelSourceFromConfig(json.RawMessage(tc.cfg)); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestModelKeyAndSource(t *testing.T) {
+	// Reuse the EncodeRequest + InjectModelConfig shape to build a body with
+	// both the nested modelConfig.key and a top-level model_config.
+	plain, err := EncodeRequest(&ir.Request{
+		Model:    "qoder/qmodel_latest",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "x"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("both key and source present", func(t *testing.T) {
+		cfg := json.RawMessage(`{"key":"qmodel_latest","source":"catalog"}`)
+		injected, err := InjectModelConfig(plain, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, source := ModelKeyAndSource(injected)
+		if key != "qmodel_latest" {
+			t.Errorf("key = %q", key)
+		}
+		if source != "catalog" {
+			t.Errorf("source = %q", source)
+		}
+	})
+	t.Run("source absent defaults to system", func(t *testing.T) {
+		cfg := json.RawMessage(`{"key":"qmodel_latest"}`)
+		injected, err := InjectModelConfig(plain, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, source := ModelKeyAndSource(injected)
+		if key != "qmodel_latest" {
+			t.Errorf("key = %q", key)
+		}
+		if source != "system" {
+			t.Errorf("source = %q, want system", source)
+		}
+	})
+	t.Run("invalid body returns empty key and system", func(t *testing.T) {
+		key, source := ModelKeyAndSource([]byte(`not json`))
+		if key != "" {
+			t.Errorf("key = %q, want empty", key)
+		}
+		if source != "system" {
+			t.Errorf("source = %q, want system", source)
+		}
+	})
+}
+
+func TestModelKeyFromBodyEdges(t *testing.T) {
+	t.Run("malformed json returns empty", func(t *testing.T) {
+		if got := ModelKeyFromBody([]byte(`{not valid`)); got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+	t.Run("missing nested path returns empty", func(t *testing.T) {
+		if got := ModelKeyFromBody([]byte(`{"chat_context":{}}`)); got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+	t.Run("valid nested key", func(t *testing.T) {
+		body := []byte(`{"chat_context":{"extra":{"modelConfig":{"key":"k1"}}}}`)
+		if got := ModelKeyFromBody(body); got != "k1" {
+			t.Errorf("got %q, want k1", got)
 		}
 	})
 }
