@@ -107,12 +107,15 @@ func logging(level int, logFile io.Writer, next http.Handler) http.Handler {
 			reqBody []byte
 			tinfo   *proxy.TraceInfo
 		)
+		// TraceInfo carries per-request cross-stage state (the resolved upstream
+		// URL; the Codex/Claude Code session id shared between the request body and
+		// an upstream header). It must be attached regardless of debug level so
+		// the prepare and header seams can round-trip the session id even when body
+		// tracing is off; only the body capture/logging below stays level-gated.
+		tinfo = &proxy.TraceInfo{}
+		r = r.WithContext(proxy.WithTraceInfo(r.Context(), tinfo))
 		if trace {
 			reqBody = drainRequestBody(r)
-			// The serve path records the resolved upstream URL into tinfo so the
-			// trace can show the provider hit rather than the inbound path.
-			tinfo = &proxy.TraceInfo{}
-			r = r.WithContext(proxy.WithTraceInfo(r.Context(), tinfo))
 		}
 
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}

@@ -127,7 +127,7 @@ func providerEditInteractiveOAuth(proto domain.Protocol) bool {
 		proto == domain.ProtocolOpenAICodex ||
 		proto == domain.ProtocolOpenAIResponses ||
 		proto == domain.ProtocolAnthropic ||
-		proto == domain.ProtocolAntigravity
+		proto == domain.ProtocolAntigravity || proto == domain.ProtocolClaudeCode
 }
 
 func kiroAuthOrBuilderID(c *domain.OAuthCreds) string {

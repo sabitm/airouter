@@ -13,11 +13,17 @@ import "context"
 //
 // QoderModelKey/Source are set by prepareUpstreamRequest for the Qoder backend
 // so applyUpstreamHeaders can emit X-Model-Key / X-Model-Source after COSY sign.
+//
+// ClaudeCodeSessionID is the per-request session id the claude-code backend
+// prepare path generates, carried as X-Claude-Code-Session-Id and embedded in
+// metadata.user_id.session_id (the two must match upstream). Empty for
+// non-claude-code requests.
 type TraceInfo struct {
-	UpstreamURL      string
-	CodexSessionID   string
-	QoderModelKey    string
-	QoderModelSource string
+	UpstreamURL         string
+	CodexSessionID      string
+	QoderModelKey       string
+	QoderModelSource    string
+	ClaudeCodeSessionID string
 }
 
 type traceKeyT struct{}

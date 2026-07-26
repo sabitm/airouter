@@ -12,6 +12,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
@@ -54,6 +55,10 @@ type Preset struct {
 	AntigravityAuth bool
 	// CursorAuth marks an imported Cursor IDE token connection (no refresh).
 	CursorAuth bool
+	// ClaudeCodeAuth marks a Claude Code (claude.ai) connection: JSON token
+	// exchange and the CLI identity/cloak profile. Refresh reuses the generic
+	// JSON path (RefreshJSON).
+	ClaudeCodeAuth bool
 }
 
 // Presets is the set of built-in OAuth configurations. Add an entry here to
@@ -176,6 +181,33 @@ var Presets = []Preset{
 		Protocol:   domain.ProtocolCursor,
 		CursorAuth: true,
 	},
+	// Claude Code is the Anthropic Messages API spoken with the Claude Code CLI
+	// identity. The client id is public (embedded in the CLI); authorize carries
+	// code=true, the token exchange posts JSON, and refresh reuses the generic
+	// JSON path. We mirror 9router's proven config: the claude.ai/oauth/authorize
+	// consent endpoint with the 3-scope inference grant (org:create_api_key
+	// user:profile user:inference), which issues a valid sk-ant-oat token the
+	// cloak gates on and the Messages API accepts. The real CLI's newer
+	// claude.com/cai gateway + 6-scope flow needs first-party gateway session
+	// context (anti-bot/attestation state) that a direct browser hit from the
+	// connect page cannot establish, so it rejects third-party authorize hits; we
+	// do not use it. The proxy applies the CLI fingerprint and the OAuth-only tool
+	// cloak/decoy transform on upstream requests.
+	{
+		Name:            "claude",
+		Label:           "Claude Code",
+		AuthURL:         "https://claude.ai/oauth/authorize",
+		TokenURL:        "https://api.anthropic.com/v1/oauth/token",
+		ClientID:        "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+		Scopes:          "org:create_api_key user:profile user:inference",
+		RedirectURI:     "http://localhost:56124/callback",
+		PKCE:            true,
+		ExtraAuthParams: map[string]string{"code": "true"},
+		RefreshJSON:     true,
+		APIBase:         claudecode.DefaultBaseURL,
+		Protocol:        domain.ProtocolClaudeCode,
+		ClaudeCodeAuth:  true,
+	},
 }
 
 // PresetByName returns the preset with the given name, or false.
@@ -213,5 +245,6 @@ func Apply(p Preset) (provider *domain.Provider, creds *domain.OAuthCreds) {
 			QoderAuth:       p.QoderAuth,
 			AntigravityAuth: p.AntigravityAuth,
 			CursorAuth:      p.CursorAuth,
+			ClaudeCodeAuth:  p.ClaudeCodeAuth,
 		}
 }

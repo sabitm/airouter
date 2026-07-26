@@ -32,8 +32,13 @@ func challengeS256(verifier string) string {
 }
 
 // newState returns an opaque state parameter for CSRF protection during connect.
+// 32 bytes -> 43-char base64url, mirroring the Claude Code client and 9router.
+// claude.ai's consent flow rejected a shorter (16-byte/22-char) state as
+// "Invalid request format"; matching the client's state length resolves it. The
+// value is opaque and compared by string equality in handleCallback, so a longer
+// state only adds entropy and is safe across all providers.
 func newState() (string, error) {
-	b := make([]byte, 16)
+	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}

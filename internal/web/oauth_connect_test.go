@@ -282,6 +282,49 @@ func TestOAuthPresetCreatesQoderConfig(t *testing.T) {
 	}
 }
 
+func TestOAuthPresetCreatesClaudeCodeConfig(t *testing.T) {
+	form := url.Values{}
+	form.Set("preset", "claude")
+	creds, err := credsFromConnectForm(reqWithForm(form))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !creds.ClaudeCodeAuth {
+		t.Error("claude preset should set ClaudeCodeAuth")
+	}
+	if creds.ClientID != "9d1c250a-e61b-44d9-88ed-5944d1962f5e" {
+		t.Errorf("client id = %q", creds.ClientID)
+	}
+	if creds.RedirectURI != "http://localhost:56124/callback" {
+		t.Errorf("redirect uri = %q, want localhost loopback", creds.RedirectURI)
+	}
+	wantScopes := "org:create_api_key user:profile user:inference"
+	if creds.Scopes != wantScopes {
+		t.Errorf("scopes = %q\nwant       %q", creds.Scopes, wantScopes)
+	}
+	if !creds.PKCE {
+		t.Error("claude should use PKCE")
+	}
+	if !creds.RefreshJSON {
+		t.Error("claude refresh should be JSON")
+	}
+	if creds.ExtraAuthParams["code"] != "true" {
+		t.Errorf("extra params: %+v", creds.ExtraAuthParams)
+	}
+	if creds.AuthURL != "https://claude.ai/oauth/authorize" {
+		t.Errorf("auth url = %q, want claude.ai consent endpoint", creds.AuthURL)
+	}
+	if creds.TokenURL != "https://api.anthropic.com/v1/oauth/token" {
+		t.Errorf("token url = %q, want api.anthropic.com", creds.TokenURL)
+	}
+	if recipe, ok := recipeByID("claude"); !ok || recipe.Protocol != domain.ProtocolClaudeCode || recipe.Kind != kindInteractiveOAuth {
+		t.Fatalf("recipe missing or wrong: %+v", recipe)
+	}
+	if !providerEditInteractiveOAuth(domain.ProtocolClaudeCode) {
+		t.Error("claude-code should use the interactive OAuth edit row")
+	}
+}
+
 func TestOAuthPresetCreatesAntigravityConfig(t *testing.T) {
 	form := url.Values{}
 	form.Set("preset", "antigravity")

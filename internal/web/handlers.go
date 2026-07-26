@@ -16,6 +16,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
@@ -205,6 +206,9 @@ func kiroBaseURLOr(proto domain.Protocol, base string) string {
 	}
 	if proto == domain.ProtocolCursor && strings.TrimSpace(base) == "" {
 		return cursor.DefaultBaseURL
+	}
+	if proto == domain.ProtocolClaudeCode && strings.TrimSpace(base) == "" {
+		return claudecode.DefaultBaseURL
 	}
 	return base
 }

@@ -12,6 +12,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
@@ -56,6 +57,10 @@ func newCodexSessionID() string {
 //     these wire bytes in applyUpstreamHeaders).
 //   - Antigravity: injects OAuthCreds.ProjectID into the Cloud Code envelope
 //     (fail-closed when missing).
+//   - Claude Code: generates the per-request session id (saved on the trace
+//     context for the X-Claude-Code-Session-Id header) and applies the OAuth-only
+//     cloak/decoy transform. The cloak gate and seed read OAuthCreds directly
+//     because the access token is resolved later, inside forward/forwardStream.
 //
 // Other backends return the body unchanged. A non-nil error is terminal for the
 // attempt (e.g. Qoder model_config unknown).
@@ -88,6 +93,12 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 		return wire, nil
 	case "antigravity":
 		return antigravity.InjectProjectID(body, antigravityProjectID(provider))
+	case "claude-code":
+		sid := newUUID()
+		if t := traceInfoFrom(ctx); t != nil {
+			t.ClaudeCodeSessionID = sid
+		}
+		return claudecode.ApplyOAuthCloaking(body, claudeCodeToken(provider), sid, claudeCodeSeed(provider))
 	case "cursor":
 		// Cursor needs no body mutation; headers (checksum, identity) are applied
 		// in applyUpstreamHeaders after the client-header copy.
@@ -103,6 +114,31 @@ func antigravityProjectID(provider *domain.Provider) string {
 		return provider.OAuthCreds.ProjectID
 	}
 	return ""
+}
+
+// claudeCodeToken returns the stored Claude OAuth access token, used only for the
+// sk-ant-oat cloak gate. The actual Authorization header uses the resolved
+// (refreshed) token set by forward; the stored token's marker is stable across
+// refresh, so reading it at prepare time (before resolve) is correct.
+func claudeCodeToken(provider *domain.Provider) string {
+	if provider != nil && provider.OAuthCreds != nil {
+		return provider.OAuthCreds.AccessToken
+	}
+	return ""
+}
+
+// claudeCodeSeed returns a stable per-account seed for metadata.user_id,
+// preferring the refresh token (stable across access-token refresh) and falling
+// back to the access token. Empty when unset, in which case the cloak helper
+// generates random device/account values.
+func claudeCodeSeed(provider *domain.Provider) string {
+	if provider == nil || provider.OAuthCreds == nil {
+		return ""
+	}
+	if s := strings.TrimSpace(provider.OAuthCreds.RefreshToken); s != "" {
+		return s
+	}
+	return provider.OAuthCreds.AccessToken
 }
 
 // kiroProfileArn returns the CodeWhisperer profile ARN configured for a Kiro
@@ -196,6 +232,14 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	if provider.Protocol == domain.ProtocolCursor {
 		applyCursorHeaders(req, provider)
 	}
+	// Claude Code overwrites the CLI fingerprint (anthropic-version/beta,
+	// User-Agent, X-Stainless-*) and sets X-Claude-Code-Session-Id after the
+	// client-header copy so a forwarded client identity the Anthropic backend
+	// would reject does not leak through. Auth is already set by the scheme
+	// switch above; this does not touch Authorization.
+	if provider.Protocol == domain.ProtocolClaudeCode {
+		applyClaudeCodeHeaders(req, ctx)
+	}
 }
 
 // applyQoderHeaders COSY-signs the wire body and sets Qoder identity headers.
@@ -271,8 +315,21 @@ func applyKiroHeaders(req *http.Request, provider *domain.Provider) {
 	}
 }
 
+// applyClaudeCodeHeaders sets the Claude Code CLI identity fingerprint and the
+// per-request X-Claude-Code-Session-Id (which must match metadata.user_id.session_id
+// in the body). Runs after the client-header copy so it overwrites forwarded
+// values. Authorization is left to the auth-scheme switch.
+func applyClaudeCodeHeaders(req *http.Request, ctx context.Context) {
+	for k, v := range claudecode.IdentityHeaders() {
+		req.Header.Set(k, v)
+	}
+	if t := traceInfoFrom(ctx); t != nil && t.ClaudeCodeSessionID != "" {
+		req.Header.Set(claudecode.SessionIDHeader, t.ClaudeCodeSessionID)
+	}
+}
+
 // newUUID returns a random RFC 4122 version-4 UUID string for the
-// Amz-Sdk-Invocation-Id header.
+// Amz-Sdk-Invocation-Id header and the Claude Code session id.
 func newUUID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])

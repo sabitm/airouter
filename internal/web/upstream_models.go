@@ -13,6 +13,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/antigravity"
+	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
@@ -93,6 +94,13 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 		ids := cursor.ListModelIDs(ctx, p)
 		if len(ids) == 0 {
 			return append([]string(nil), cursor.StaticModels...), nil
+		}
+		return ids, nil
+	}
+	if p.Protocol == domain.ProtocolClaudeCode {
+		ids, err := claudecode.ListModelIDs(ctx, p.BaseURL, p.APIKey)
+		if err != nil || len(ids) == 0 {
+			return append([]string(nil), claudecode.StaticModels...), nil
 		}
 		return ids, nil
 	}

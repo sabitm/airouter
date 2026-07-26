@@ -177,6 +177,33 @@ Responses IR mapping but has Codex-specific upstream behavior:
   re-paste. v1 ships ChatService only; the AgentService text path (HTTP/2 duplex)
   is deferred. Preserve the manual-paste/no-refresh contract and the XML-tool-result
   invariant when touching Cursor paths.
+- Claude Code (`ProtocolClaudeCode`) is a backend-only protocol that speaks the
+  Anthropic Messages wire format while impersonating the Claude Code CLI: it
+  reuses the `anthropic` codec's encoder/stream-encoder/error envelope but has a
+  distinct codec id (`claude-code`) so Anthropic ingress never passes through and
+  always translates through the cloak prepare step. `prepareUpstreamRequest`
+  generates a per-request session id (stored on `TraceInfo.ClaudeCodeSessionID`)
+  and calls `claudecode.ApplyOAuthCloaking`, gated on the `sk-ant-oat` marker of
+  the stored access token (read from `OAuthCreds` at prepare time, since the
+  resolved token lands on `provider.APIKey` only later inside `forward`). The
+  cloak injects an `x-anthropic-billing-header` system block (cch over the
+  pre-injection body), a fake `metadata.user_id` seeded from the refresh token
+  (stable across access-token refresh), and the `_ide` tool suffix + CC decoy
+  tools; `decodeResponse`/`decodeStream` strip one `_ide` (`DecloakName`) so the
+  client sees its original tool names. `applyUpstreamHeaders` sets the CLI
+  fingerprint (anthropic-version/beta, User-Agent, X-Stainless-*) and
+  `X-Claude-Code-Session-Id` (matching `metadata.user_id.session_id`) after the
+  client-header copy. OAuth is claude.ai auth-code + PKCE with a JSON token
+  exchange (`ClaudeCodeAuth` routes `exchangeClaudeCode`) against
+  `api.anthropic.com/v1/oauth/token`, mirroring 9router's proven config: the
+  3-scope inference grant (org:create_api_key user:profile user:inference)
+  issues a valid sk-ant-oat token the cloak gates on. The real CLI's newer
+  claude.com/cai gateway + 6-scope flow needs first-party gateway session context
+  a direct browser hit from the connect page cannot establish, so it is not used;
+  refresh reuses the generic `RefreshJSON` path. apikey providers get identity
+  headers but no cloak.
+  Preserve the prepare-then-header session-id pairing, the OAuth-only cloak gate,
+  and the distinct-id/never-passthrough rule when touching Claude Code paths.
 - Streaming uses a no-timeout HTTP client (`Proxy.streamClient`) so long streams
   are bounded by the request context, not a client timeout.
 - Errors before the first streamed byte fall back to the ingress format's unary

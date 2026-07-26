@@ -32,10 +32,18 @@ const (
 	// IDE access token plus a machine id (no OAuth refresh); every request
 	// translates through the IR. Tokens are short-lived and cannot be refreshed.
 	ProtocolCursor Protocol = "cursor"
+	// ProtocolClaudeCode is the Claude Code CLI-backed Anthropic Messages backend.
+	// Backend only: same Messages wire format as ProtocolAnthropic, but it
+	// impersonates the Claude Code CLI (identity headers, claude.ai OAuth with a
+	// JSON token exchange) and applies an OAuth-only anti-ban tool cloak/decoy
+	// transform. Its codec id is distinct from anth-msg so an Anthropic ingress
+	// request never passes through and always translates through the cloak
+	// prepare step rather than forwarding the raw body.
+	ProtocolClaudeCode Protocol = "claude-code"
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity || p == ProtocolCursor
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity || p == ProtocolCursor || p == ProtocolClaudeCode
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It
@@ -173,6 +181,13 @@ type OAuthCreds struct {
 	// header; AccessToken (with any "::" prefix stripped at header-build time) is
 	// sent as the bearer credential.
 	CursorAuth bool `json:"cursor_auth,omitempty"`
+
+	// ClaudeCodeAuth marks a Claude Code (claude.ai) OAuth connection. When true,
+	// the authorization-code exchange posts a JSON body (not form-urlencoded) and
+	// the proxy applies the Claude Code CLI identity headers plus the OAuth-only
+	// cloak/decoy transform. The cloak gate itself is the sk-ant-oat marker on the
+	// resolved access token, not this flag; refresh reuses the generic JSON path.
+	ClaudeCodeAuth bool `json:"claude_code_auth,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

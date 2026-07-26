@@ -253,7 +253,7 @@ func (c *Connect) exchange(ctx context.Context, code string) (*domain.OAuthCreds
 	c.mu.Unlock()
 
 	cp := *c.creds
-	if err := exchangeCode(ctx, &cp, code, c.verifier, c.baseURL); err != nil {
+	if err := exchangeCode(ctx, &cp, code, c.verifier, c.state, c.baseURL); err != nil {
 		c.mu.Lock()
 		c.result = exchangeResult{err: err}
 		select {
@@ -317,10 +317,15 @@ func (c *Connect) Close() error {
 
 // exchangeCode posts the authorization-code grant, populating creds with the
 // response. baseURL overrides the token URL in tests (empty in production).
-// ClineAuth routes to the Cline-specific exchange (base64 code or JSON body).
-func exchangeCode(ctx context.Context, c *domain.OAuthCreds, code, verifier, baseURL string) error {
+// state is the connect state token, sent in the body by providers that require
+// it (Claude). ClineAuth routes to the Cline-specific exchange (base64 code or
+// JSON body); ClaudeCodeAuth routes to the Claude JSON exchange.
+func exchangeCode(ctx context.Context, c *domain.OAuthCreds, code, verifier, state, baseURL string) error {
 	if c.ClineAuth {
 		return exchangeClineCode(ctx, c, code, baseURL)
+	}
+	if c.ClaudeCodeAuth {
+		return exchangeClaudeCode(ctx, c, code, verifier, state, baseURL)
 	}
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -366,23 +371,6 @@ func exchangeCode(ctx context.Context, c *domain.OAuthCreds, code, verifier, bas
 		return fmt.Errorf("oauth: exchange: empty access_token (HTTP %d)", resp.StatusCode)
 	}
 
-	c.AccessToken = tr.AccessToken
-	if tr.RefreshToken != "" {
-		c.RefreshToken = tr.RefreshToken
-	}
-	if tr.IDToken != "" {
-		c.IDToken = tr.IDToken
-		if claims, ok := claimsFromIDToken(tr.IDToken); ok {
-			if claims.Email != "" {
-				c.Email = claims.Email
-			}
-			if claims.AccountID != "" {
-				c.AccountID = claims.AccountID
-			}
-		}
-	}
-	if tr.ExpiresIn > 0 {
-		c.ExpiresAt = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second).Unix()
-	}
+	applyExchangeToken(c, tr, time.Now())
 	return nil
 }

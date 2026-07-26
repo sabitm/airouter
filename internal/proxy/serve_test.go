@@ -145,6 +145,10 @@ func TestMatrix(t *testing.T) {
 			`{"model":"default","messages":[{"role":"user","content":"hi"}]}`, "hello from responses", "/responses"},
 		{"anthropic->responses translate", domain.ProtocolOpenAIResponses, "/v1/messages",
 			`{"model":"default","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, "hello from responses", "/responses"},
+		{"openai->claude-code translate", domain.ProtocolClaudeCode, "/v1/chat/completions",
+			`{"model":"default","messages":[{"role":"user","content":"hi"}]}`, "hello from anthropic", "/messages"},
+		{"anthropic->claude-code translate", domain.ProtocolClaudeCode, "/v1/messages",
+			`{"model":"default","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, "hello from anthropic", "/messages"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

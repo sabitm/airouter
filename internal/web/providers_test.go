@@ -62,6 +62,7 @@ func TestProviderEditRowGenericAPIKeyProtocolLockedForSpecific(t *testing.T) {
 		{"cursor", domain.ProtocolCursor},
 		{"antigravity", domain.ProtocolAntigravity},
 		{"codex", domain.ProtocolOpenAICodex},
+		{"claude-code", domain.ProtocolClaudeCode},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := &domain.Provider{ID: 2, Name: "p", BaseURL: "https://x", Protocol: tc.proto, AuthMethod: domain.AuthAPIKey}

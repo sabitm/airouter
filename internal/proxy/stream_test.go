@@ -195,6 +195,8 @@ func TestStreamMatrix(t *testing.T) {
 		{"anthropic->openai", domain.ProtocolOpenAI, "/v1/messages"},
 		{"openai->responses", domain.ProtocolOpenAIResponses, "/v1/chat/completions"},
 		{"anthropic->responses", domain.ProtocolOpenAIResponses, "/v1/messages"},
+		{"openai->claude-code", domain.ProtocolClaudeCode, "/v1/chat/completions"},
+		{"anthropic->claude-code", domain.ProtocolClaudeCode, "/v1/messages"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -214,6 +216,28 @@ func TestStreamMatrix(t *testing.T) {
 				t.Errorf("stream did not signal completion")
 			}
 		})
+	}
+}
+
+// TestStreamToolClaudeCodeDecloak verifies a claude-code backend stream with a
+// cloaked tool_use name is decloaked to the original on the way to an OpenAI
+// ingress.
+func TestStreamToolClaudeCodeDecloak(t *testing.T) {
+	cloaked := strings.Replace(anthropicToolSSE, `"name":"get_weather"`, `"name":"get_weather_ide"`, 1)
+	base, token := setupStreaming(t, domain.ProtocolClaudeCode, cloaked)
+	resp, body := postStream(t, base+"/v1/chat/completions", token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"weather?"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	name, args, finish := collectOpenAIToolStream(t, body)
+	if name != "get_weather" {
+		t.Errorf("tool name = %q, want get_weather (decloaked)", name)
+	}
+	if !strings.Contains(args, "paris") {
+		t.Errorf("tool args = %q, want paris", args)
+	}
+	if finish == "" {
+		t.Error("stream did not finish")
 	}
 }
 

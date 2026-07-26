@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/qoder"
 )
@@ -157,6 +158,9 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	if p.Protocol == domain.ProtocolCursor {
 		return checkCursorUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
+	if p.Protocol == domain.ProtocolClaudeCode {
+		return checkClaudeCodeUpstream(ctx, p, trace, fileTrace, stderrTrace)
+	}
 	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
 		return checkClineUpstream(ctx, p, trace, fileTrace, stderrTrace)
 	}
@@ -216,6 +220,56 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 		return false, "reachable, but response shape unexpected - protocol may not match"
 	}
 	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
+}
+
+// checkClaudeCodeUpstream validates a Claude Code OAuth token against the
+// Anthropic /models endpoint using the Claude Code CLI identity fingerprint, so
+// a passing Check implies the credential and client profile will be accepted on
+// real traffic. OAuth tokens are resolved/refreshed by the caller before this
+// runs, so p.APIKey holds the live access token.
+func checkClaudeCodeUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+	url := strings.TrimRight(p.BaseURL, "/") + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, "invalid base URL"
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	for k, v := range claudecode.IdentityHeaders() {
+		req.Header.Set(k, v)
+	}
+
+	if trace {
+		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
+	}
+	resp, err := upstreamClient.Do(req)
+	if err != nil {
+		if trace {
+			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
+		}
+		return false, "could not reach URL: " + err.Error()
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if trace {
+		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+	}
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("token rejected (HTTP %d)", resp.StatusCode)
+	case resp.StatusCode == http.StatusNotFound:
+		return false, "not found (HTTP 404) - check base URL"
+	case resp.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Data == nil {
+		return false, "reachable, but response shape unexpected"
+	}
+	return true, fmt.Sprintf("OK - reachable, token accepted (%d models)", len(parsed.Data))
 }
 
 // checkQoderUpstream validates a Qoder device token against openapi userinfo.
