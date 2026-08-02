@@ -52,6 +52,9 @@ func main() {
 	case cfg.DebugLevel == 1:
 		log.Println("debug mode enabled; failed upstream exchanges will be logged (may include prompt content)")
 	}
+	if cfg.HARFile != "" {
+		log.Println("HAR capture enabled; full request/response bodies and verbatim credentials will be recorded (GET /debug/har; flushed on shutdown)")
+	}
 	cipher, err := crypto.New(secret)
 	if err != nil {
 		log.Fatalf("init cipher: %v", err)
@@ -63,9 +66,10 @@ func main() {
 	}
 	defer st.Close()
 
+	app := server.New(st, cfg.DebugLevel, logFile, cfg.HARFile, version)
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: server.New(st, cfg.DebugLevel, logFile).Handler(),
+		Handler: app.Handler(),
 		// ReadHeaderTimeout bounds header reads (slowloris hardening) without
 		// capping the body or the response stream. ReadTimeout is deliberately
 		// omitted: it is a total deadline over the whole request including
@@ -90,5 +94,12 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("shutdown: %v", err)
+	}
+	if rec := app.HAR(); rec != nil && cfg.HARFile != "" {
+		if err := rec.WriteFile(cfg.HARFile); err != nil {
+			log.Printf("write HAR file: %v", err)
+		} else {
+			log.Printf("wrote HAR capture to %s", cfg.HARFile)
+		}
 	}
 }

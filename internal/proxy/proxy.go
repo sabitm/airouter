@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/harlog"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/antigravity"
@@ -240,6 +241,9 @@ type Proxy struct {
 	fileLog   *log.Logger
 	stderrLog *log.Logger
 
+	// har, when non-nil, records both legs of every proxied exchange as HAR 1.2.
+	har *harlog.Recorder
+
 	// rr holds per-combo round-robin counters, keyed by combo id. In-memory only:
 	// the rotation resets on restart, which is acceptable for load spreading.
 	rrMu sync.Mutex
@@ -274,13 +278,14 @@ const (
 	backoffShiftCap = 30
 )
 
-func New(s *store.Store, debug bool, logFile io.Writer) *Proxy {
+func New(s *store.Store, debug bool, logFile io.Writer, har *harlog.Recorder) *Proxy {
 	p := &Proxy{
 		store:        s,
 		oauth:        oauth.New(s),
 		client:       &http.Client{Timeout: 5 * time.Minute},
 		streamClient: &http.Client{},
 		debug:        debug,
+		har:          har,
 		rr:           map[int64]uint64{},
 		bo:           map[int64]*backoffState{},
 	}
@@ -290,6 +295,8 @@ func New(s *store.Store, debug bool, logFile io.Writer) *Proxy {
 	}
 	return p
 }
+
+func (p *Proxy) harEnabled() bool { return p.har != nil }
 
 // nextRoundRobin returns the starting target index for a round-robin combo with
 // n targets, advancing the per-combo counter so successive requests rotate.

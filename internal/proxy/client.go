@@ -8,8 +8,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/harlog"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
@@ -352,11 +355,17 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		t.UpstreamURL = url
 	}
 	send := func() (int, []byte, error) {
+		started := time.Now()
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return 0, nil, err
 		}
 		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
+		// Snapshot headers after auth/identity so HAR sees the wire credentials.
+		var harHdr http.Header
+		if p.harEnabled() {
+			harHdr = req.Header.Clone()
+		}
 		resp, err := p.client.Do(req)
 		if err != nil {
 			return 0, nil, err
@@ -365,6 +374,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return resp.StatusCode, nil, err
+		}
+		if p.harEnabled() {
+			p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody))
 		}
 		return resp.StatusCode, respBody, nil
 	}
@@ -402,13 +414,39 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		accept = "text/event-stream"
 	}
 	send := func() (*http.Response, error) {
+		started := time.Now()
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
 		req.Header.Set("Accept", accept)
-		return p.streamClient.Do(req)
+		var harHdr http.Header
+		if p.harEnabled() {
+			harHdr = req.Header.Clone()
+		}
+		resp, err := p.streamClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if p.harEnabled() {
+			// Wrap so Close finalizes the upstream HAR entry (including the
+			// 401 body that is closed before an OAuth retry).
+			resp.Body = &harCaptureBody{
+				rc:      resp.Body,
+				started: started,
+				method:  req.Method,
+				url:     url,
+				reqHdr:  harHdr,
+				reqBody: body,
+				status:  resp.StatusCode,
+				respHdr: resp.Header.Clone(),
+				mime:    streamRespMIME(resp, accept),
+				record:  p.recordUpstreamHAR,
+				ctx:     ctx,
+			}
+		}
+		return resp, nil
 	}
 
 	if err := p.resolveToken(ctx, provider, false); err != nil {
@@ -427,6 +465,108 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		}
 	}
 	return resp, nil
+}
+
+// recordUpstreamHAR writes one upstream leg into the HAR recorder. pageID comes
+// from TraceInfo.RequestID so it shares a page with the ingress entry.
+// respBodySize is the full wire length (may exceed len(respBody) when a stream
+// tee already truncated).
+func (p *Proxy) recordUpstreamHAR(ctx context.Context, started time.Time, dur time.Duration, method, url string, reqHdr http.Header, reqBody []byte, status int, respHdr http.Header, respBody []byte, respMIME string, respBodySize int) {
+	if !p.harEnabled() {
+		return
+	}
+	pageID := ""
+	if t := traceInfoFrom(ctx); t != nil && t.RequestID != "" {
+		pageID = "page_" + t.RequestID
+	}
+	if pageID == "" {
+		return
+	}
+	title := method + " " + url
+	p.har.EnsurePage(pageID, title, started)
+	p.har.Record(harlog.RecordInput{
+		PageID:       pageID,
+		StartedAt:    started,
+		Duration:     dur,
+		Method:       method,
+		URL:          url,
+		ReqHeaders:   reqHdr,
+		ReqBody:      reqBody,
+		Status:       status,
+		RespHeaders:  respHdr,
+		RespBody:     respBody,
+		RespMIME:     respMIME,
+		RespBodySize: respBodySize,
+	})
+}
+
+func streamRespMIME(resp *http.Response, accept string) string {
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		return ct
+	}
+	if strings.Contains(strings.ToLower(accept), "event-stream") {
+		return "text/event-stream"
+	}
+	return accept
+}
+
+// harCaptureBody tees a bounded copy of a streaming upstream body and records
+// the HAR entry on Close. Read bytes are relayed unchanged; the tee buffer is
+// capped at harlog.MaxBody so large streams cannot grow without bound.
+type harCaptureBody struct {
+	rc      io.ReadCloser
+	started time.Time
+	method  string
+	url     string
+	reqHdr  http.Header
+	reqBody []byte
+	status  int
+	respHdr http.Header
+	mime    string
+	record  func(ctx context.Context, started time.Time, dur time.Duration, method, url string, reqHdr http.Header, reqBody []byte, status int, respHdr http.Header, respBody []byte, respMIME string, respBodySize int)
+	ctx     context.Context
+
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	total  int
+	closed bool
+}
+
+func (c *harCaptureBody) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	if n > 0 {
+		c.mu.Lock()
+		c.total += n
+		if c.buf.Len() < harlog.MaxBody {
+			room := harlog.MaxBody - c.buf.Len()
+			if room > n {
+				room = n
+			}
+			c.buf.Write(p[:room])
+		}
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *harCaptureBody) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return c.rc.Close()
+	}
+	c.closed = true
+	body := append([]byte(nil), c.buf.Bytes()...)
+	total := c.total
+	c.mu.Unlock()
+
+	// If nothing was read (e.g. closed after a 401 before the body was drained),
+	// still record headers/status with an empty body. total may exceed len(body)
+	// when the tee hit MaxBody.
+	if c.record != nil {
+		c.record(c.ctx, c.started, time.Since(c.started), c.method, c.url, c.reqHdr, c.reqBody, c.status, c.respHdr, body, c.mime, total)
+	}
+	return c.rc.Close()
 }
 
 // resolveToken sets provider.APIKey to the effective upstream credential. For

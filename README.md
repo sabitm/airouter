@@ -129,6 +129,7 @@ precedence.
 | `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys and OAuth tokens at rest |
 | `-debug` | `AIROUTER_DEBUG` | `off` | Log verbosity. Bare `-debug` or `=1` logs request lines, client-facing failures, and upstream error exchanges. `=2` additionally traces full request and response bodies plus the resolved upstream URL for each proxied call (includes prompt content) |
 | `-log-file` | `AIROUTER_LOG_FILE` | (stderr only) | Path to also append log output to, in addition to stderr. Captures everything `-debug` emits; at `=2` the file records full, untruncated request/response bodies while stderr stays truncated |
+| `-har-file` | `AIROUTER_HAR_FILE` | (disabled) | Capture both legs of every proxied request (client↔airouter and airouter↔provider) verbatim — headers and bodies, including secrets and prompt content — into a HAR 1.2 document. Independent of `-debug`. Download live at `GET /debug/har`; flushed to this path on shutdown. Import into Chrome DevTools Network tab |
 
 If `AIROUTER_SECRET` is unset, an insecure built-in key is used and a warning is
 logged. Set a real secret in any deployment you care about; rotating it makes

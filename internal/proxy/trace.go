@@ -24,6 +24,10 @@ type TraceInfo struct {
 	QoderModelKey       string
 	QoderModelSource    string
 	ClaudeCodeSessionID string
+	// RequestID correlates the ingress HAR entry with upstream attempt entries
+	// under one HAR page (page_<RequestID>). Set by the server middleware before
+	// the handler runs; empty when HAR capture is off.
+	RequestID string
 }
 
 type traceKeyT struct{}

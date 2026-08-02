@@ -20,6 +20,10 @@ type Config struct {
 	// LogFile, when set, is a path that log output is appended to in addition to
 	// stderr. Empty means stderr only.
 	LogFile string
+	// HARFile, when set, enables MitM-style HAR 1.2 capture of both legs of every
+	// proxied request (verbatim headers and bodies). The live document is served
+	// at GET /debug/har and flushed to this path on shutdown. Empty disables.
+	HARFile string
 	// Version, when true, prints the build version and exits.
 	Version bool
 }
@@ -64,6 +68,7 @@ func Load() Config {
 	level := debugLevel(envDebugLevel())
 	flag.Var(&level, "debug", "log verbosity: 1=access lines + upstream errors, 2=trace full request/response bodies")
 	flag.StringVar(&c.LogFile, "log-file", env("AIROUTER_LOG_FILE", ""), "also append logs to this file (in addition to stderr)")
+	flag.StringVar(&c.HARFile, "har-file", env("AIROUTER_HAR_FILE", ""), "capture proxied request/response pairs (both legs, verbatim) to this HAR file on shutdown; also served at GET /debug/har. Contains prompt content and provider secrets")
 	flag.BoolVar(&c.Version, "version", false, "print version and exit")
 	flag.Parse()
 	c.DebugLevel = int(level)
