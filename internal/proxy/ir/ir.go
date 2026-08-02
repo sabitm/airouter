@@ -79,6 +79,24 @@ type ToolChoice struct {
 	Name string // set when Type == ToolChoiceTool
 }
 
+// ThinkingMode is the unified reasoning/thinking intent kind on a request.
+type ThinkingMode string
+
+const (
+	ThinkingNone   ThinkingMode = "none"
+	ThinkingAuto   ThinkingMode = "auto"
+	ThinkingLevel  ThinkingMode = "level"
+	ThinkingBudget ThinkingMode = "budget"
+)
+
+// Thinking captures request-side reasoning effort. Nil on Request means the
+// client expressed no intent; Mode none is an explicit disable.
+type Thinking struct {
+	Mode   ThinkingMode
+	Level  string // minimal|low|medium|high|xhigh|max when Mode==level
+	Budget int    // token budget when Mode==budget
+}
+
 type Request struct {
 	Model         string
 	System        string
@@ -90,6 +108,7 @@ type Request struct {
 	Stream        bool
 	Tools         []Tool
 	ToolChoice    *ToolChoice
+	Thinking      *Thinking
 }
 
 type StopReason string

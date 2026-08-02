@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"airouter/internal/domain"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/thinking"
 )
 
 // DefaultMaxTokens is used when translating from a format that did not supply
@@ -44,6 +46,17 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		}
 		out.Messages = append(out.Messages, ir.Message{Role: role, Content: decodeBlocks(m.Content)})
 	}
+	var thType string
+	var budget int
+	if req.Thinking != nil {
+		thType = req.Thinking.Type
+		budget = req.Thinking.BudgetTokens
+	}
+	var effort string
+	if req.OutputConfig != nil {
+		effort = req.OutputConfig.Effort
+	}
+	out.Thinking = thinking.ToIR(thinking.FromAnthropic(thType, budget, effort))
 	return out, nil
 }
 
@@ -92,6 +105,16 @@ func decodeBlocks(raw json.RawMessage) []ir.ContentBlock {
 // EncodeRequest renders the IR as an Anthropic Messages request. Used when
 // Anthropic is the backend format.
 func EncodeRequest(req *ir.Request) ([]byte, error) {
+	return encodeRequest(req, domain.ProtocolAnthropic)
+}
+
+// EncodeRequestClaudeCode is EncodeRequest with Claude Code caps (always adaptive
+// thinking shape). Used by the claude-code backend codec.
+func EncodeRequestClaudeCode(req *ir.Request) ([]byte, error) {
+	return encodeRequest(req, domain.ProtocolClaudeCode)
+}
+
+func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 	out := messagesRequest{
 		Model:         req.Model,
 		Temperature:   req.Temperature,
@@ -124,7 +147,57 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 		content, _ := json.Marshal(encodeBlocks(m.Content))
 		out.Messages = append(out.Messages, anthMessage{Role: role, Content: content})
 	}
+	applyThinking(&out, req, protocol)
 	return json.Marshal(out)
+}
+
+// applyThinking writes Anthropic thinking fields from IR. Anthropic rejects
+// thinking when the last message is not a user turn, so intent is dropped then.
+// Budget thinking can exceed a small max_tokens; bump max_tokens when needed.
+func applyThinking(out *messagesRequest, req *ir.Request, protocol domain.Protocol) {
+	caps := thinking.CapsFor(req.Model, protocol)
+	cfg := thinking.Effective(thinking.FromIR(req.Thinking), caps)
+	if cfg == nil {
+		return
+	}
+	if n := len(req.Messages); n == 0 || req.Messages[n-1].Role != ir.RoleUser {
+		return
+	}
+	if cfg.Mode == thinking.ModeNone {
+		out.Thinking = &anthThinking{Type: "disabled"}
+		return
+	}
+	if caps.Format == thinking.FormatClaudeAdaptive {
+		out.Thinking = &anthThinking{Type: "adaptive"}
+		level := cfg.Level
+		switch cfg.Mode {
+		case thinking.ModeBudget:
+			level = thinking.BudgetToLevel(cfg.Budget)
+		case thinking.ModeAuto:
+			level = "auto"
+		}
+		if level == "xhigh" || level == "max" {
+			level = "high"
+		}
+		if level == "" {
+			level = "medium"
+		}
+		out.OutputConfig = &anthOutputConfig{Effort: level}
+		return
+	}
+	if cfg.Mode == thinking.ModeAuto {
+		out.Thinking = &anthThinking{Type: "enabled"}
+		return
+	}
+	budget := thinking.BudgetFor(cfg, caps.BudgetMin, caps.BudgetMax)
+	if budget <= 0 {
+		budget = 8192
+	}
+	out.Thinking = &anthThinking{Type: "enabled", BudgetTokens: budget}
+	// Thinking tokens count against max_tokens; leave headroom for the answer.
+	if out.MaxTokens < budget+1024 {
+		out.MaxTokens = budget + 1024
+	}
 }
 
 func encodeBlocks(blocks []ir.ContentBlock) []anthBlock {

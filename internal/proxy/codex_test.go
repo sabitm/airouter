@@ -274,3 +274,25 @@ func TestApplyCursorHeaders(t *testing.T) {
 		t.Errorf("connect-protocol-version = %q", got)
 	}
 }
+
+func TestCodexEncodeRequestIRThinkingOverridesHyphen(t *testing.T) {
+	body, err := responses.EncodeCodexRequest(&ir.Request{
+		Model: "gpt-5.3-codex-low",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["model"] != "gpt-5.3-codex" {
+		t.Errorf("model = %v", got["model"])
+	}
+	r, _ := got["reasoning"].(map[string]any)
+	if r == nil || r["effort"] != "high" {
+		t.Fatalf("reasoning = %v", got["reasoning"])
+	}
+}

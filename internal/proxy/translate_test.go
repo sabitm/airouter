@@ -175,3 +175,171 @@ func TestOpenAIToolResultToAnthropic(t *testing.T) {
 		t.Errorf("anthropic tool result = %s", out)
 	}
 }
+
+func TestThinkingOpenAIToAnthropicAdaptive(t *testing.T) {
+	in := []byte(`{
+		"model":"default",
+		"messages":[{"role":"user","content":"hi"}],
+		"reasoning_effort":"high"
+	}`)
+	req, err := openai.DecodeRequest(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Thinking == nil || req.Thinking.Mode != ir.ThinkingLevel || req.Thinking.Level != "high" {
+		t.Fatalf("thinking = %+v", req.Thinking)
+	}
+	req.Model = "claude-opus-4-7"
+	out, err := anthropic.EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Thinking *struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+		OutputConfig *struct {
+			Effort string `json:"effort"`
+		} `json:"output_config"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Thinking == nil || got.Thinking.Type != "adaptive" {
+		t.Fatalf("thinking = %+v", got.Thinking)
+	}
+	if got.OutputConfig == nil || got.OutputConfig.Effort != "high" {
+		t.Fatalf("output_config = %+v", got.OutputConfig)
+	}
+}
+
+func TestThinkingOpenAIToAnthropicBudget(t *testing.T) {
+	in := []byte(`{
+		"model":"default",
+		"messages":[{"role":"user","content":"hi"}],
+		"reasoning_effort":"high"
+	}`)
+	req, err := openai.DecodeRequest(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Model = "claude-haiku-4.5"
+	out, err := anthropic.EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Thinking *struct {
+			Type         string `json:"type"`
+			BudgetTokens int    `json:"budget_tokens"`
+		} `json:"thinking"`
+		MaxTokens int `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Thinking == nil || got.Thinking.Type != "enabled" || got.Thinking.BudgetTokens != 24576 {
+		t.Fatalf("thinking = %+v body=%s", got.Thinking, out)
+	}
+	if got.MaxTokens < 24576+1024 {
+		t.Fatalf("max_tokens = %d, want bump", got.MaxTokens)
+	}
+}
+
+func TestThinkingAnthropicToOpenAI(t *testing.T) {
+	in := []byte(`{
+		"model":"claude",
+		"max_tokens":1024,
+		"messages":[{"role":"user","content":"hi"}],
+		"thinking":{"type":"enabled","budget_tokens":8192}
+	}`)
+	req, err := anthropic.DecodeRequest(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Thinking == nil || req.Thinking.Mode != ir.ThinkingBudget || req.Thinking.Budget != 8192 {
+		t.Fatalf("thinking = %+v", req.Thinking)
+	}
+	req.Model = "gpt-5"
+	out, err := openai.EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ReasoningEffort != "medium" {
+		t.Fatalf("effort = %q", got.ReasoningEffort)
+	}
+}
+
+func TestThinkingSuffixOverridesBody(t *testing.T) {
+	in := []byte(`{
+		"model":"default",
+		"messages":[{"role":"user","content":"hi"}],
+		"reasoning_effort":"low"
+	}`)
+	req, err := openai.DecodeRequest(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyUpstreamModel(req, "gpt-5(high)")
+	if req.Model != "gpt-5" {
+		t.Fatalf("model = %q", req.Model)
+	}
+	if req.Thinking == nil || req.Thinking.Level != "high" {
+		t.Fatalf("thinking = %+v", req.Thinking)
+	}
+}
+
+func TestThinkingNoneToAnthropic(t *testing.T) {
+	req := &ir.Request{
+		Model:    "claude-haiku-4.5",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingNone},
+	}
+	out, err := anthropic.EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Thinking *struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Thinking == nil || got.Thinking.Type != "disabled" {
+		t.Fatalf("thinking = %+v", got.Thinking)
+	}
+}
+
+func TestRewriteModelWithThinkingPassthrough(t *testing.T) {
+	body := []byte(`{"model":"combo","messages":[],"foo":1,"reasoning_effort":"low"}`)
+	out, err := rewriteModelWithThinking(body, "gpt-5", "oai-chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["model"] != "gpt-5" || m["foo"] != float64(1) || m["reasoning_effort"] != "low" {
+		t.Fatalf("no-suffix passthrough broken: %s", out)
+	}
+
+	out, err = rewriteModelWithThinking(body, "gpt-5(high)", "oai-chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["model"] != "gpt-5" || m["reasoning_effort"] != "high" || m["foo"] != float64(1) {
+		t.Fatalf("suffix patch: %s", out)
+	}
+}

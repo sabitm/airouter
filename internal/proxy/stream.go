@@ -11,6 +11,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/sse"
+	"airouter/internal/proxy/thinking"
 )
 
 // streamPassthrough relays an upstream SSE response of the same protocol as the
@@ -19,7 +20,7 @@ import (
 // attemptResult so the resolution loop can fail over to the next target on a
 // pre-commit failure; once the 200 header is written the response is committed.
 func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header) attemptResult {
-	rewritten, err := rewriteModel(body, upstreamModel)
+	rewritten, err := rewriteModelWithThinking(body, upstreamModel, ingress.id)
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 	}
@@ -124,7 +125,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
-	req.Model = upstreamModel
+	applyUpstreamModel(req, upstreamModel)
 	req.Stream = true
 
 	upstreamBody, err := backend.encodeRequest(req)
@@ -201,4 +202,25 @@ func rewriteModel(body []byte, model string) ([]byte, error) {
 	}
 	generic["model"], _ = json.Marshal(model)
 	return json.Marshal(generic)
+}
+
+// applyUpstreamModel sets the backend model from a combo target, applying a
+// model(level) thinking suffix override when present (suffix wins over body).
+func applyUpstreamModel(req *ir.Request, upstreamModel string) {
+	base, override := thinking.ParseSuffix(upstreamModel)
+	req.Model = base
+	if override != nil {
+		req.Thinking = thinking.ToIR(thinking.Merge(thinking.FromIR(req.Thinking), override))
+	}
+}
+
+// rewriteModelWithThinking rewrites the model for passthrough. When the upstream
+// model carries a thinking suffix, known thinking fields are normalized to the
+// ingress wire shape; otherwise only the model field changes (passthrough invariant).
+func rewriteModelWithThinking(body []byte, upstreamModel, formatID string) ([]byte, error) {
+	base, override := thinking.ParseSuffix(upstreamModel)
+	if override == nil {
+		return rewriteModel(body, base)
+	}
+	return thinking.ApplyWire(formatID, body, base, override)
 }

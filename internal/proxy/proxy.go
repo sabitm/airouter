@@ -192,7 +192,7 @@ var claudeCodeCodec = codec{
 	id:               "claude-code",
 	protocol:         domain.ProtocolClaudeCode,
 	decodeRequest:    anthropic.DecodeRequest,
-	encodeRequest:    anthropic.EncodeRequest,
+	encodeRequest:    anthropic.EncodeRequestClaudeCode,
 	decodeResponse:   claudecode.DecodeResponse,
 	encodeResponse:   anthropic.EncodeResponse,
 	encodeError:      anthropic.EncodeError,

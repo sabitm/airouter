@@ -19,6 +19,12 @@ type request struct {
 	Stream          bool            `json:"stream"`
 	Tools           []tool          `json:"tools"`
 	ToolChoice      json.RawMessage `json:"tool_choice"` // string or object
+	Reasoning       *respReasoning  `json:"reasoning"`
+}
+
+type respReasoning struct {
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 type tool struct {

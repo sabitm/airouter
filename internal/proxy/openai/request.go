@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	"airouter/internal/domain"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/thinking"
 )
 
 // DecodeRequest parses an OpenAI Chat Completions request body into the IR.
@@ -30,6 +32,7 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 	out.StopSequences = parseStop(req.Stop)
 	out.Tools = decodeTools(req.Tools)
 	out.ToolChoice = decodeToolChoice(req.ToolChoice)
+	out.Thinking = thinking.ToIR(thinking.FromOpenAIEffort(req.ReasoningEffort))
 
 	var systemParts []string
 	// toolCarrier accumulates consecutive role:"tool" messages into a single
@@ -202,6 +205,11 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	}
 	if req.ToolChoice != nil {
 		out.ToolChoice = encodeToolChoice(req.ToolChoice)
+	}
+	if cfg := thinking.Effective(thinking.FromIR(req.Thinking), thinking.CapsFor(req.Model, domain.ProtocolOpenAI)); cfg != nil {
+		if level := thinking.LevelFor(cfg); level != "" {
+			out.ReasoningEffort = level
+		}
 	}
 	return json.Marshal(out)
 }

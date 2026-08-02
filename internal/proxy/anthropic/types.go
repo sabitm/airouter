@@ -8,16 +8,27 @@ import "encoding/json"
 // --- request ---
 
 type messagesRequest struct {
-	Model         string          `json:"model"`
-	System        json.RawMessage `json:"system,omitempty"` // string or []block
-	Messages      []anthMessage   `json:"messages"`
-	MaxTokens     int             `json:"max_tokens"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	StopSequences []string        `json:"stop_sequences,omitempty"`
-	Stream        bool            `json:"stream,omitempty"`
-	Tools         []anthTool      `json:"tools,omitempty"`
-	ToolChoice    *anthToolChoice `json:"tool_choice,omitempty"`
+	Model         string            `json:"model"`
+	System        json.RawMessage   `json:"system,omitempty"` // string or []block
+	Messages      []anthMessage     `json:"messages"`
+	MaxTokens     int               `json:"max_tokens"`
+	Temperature   *float64          `json:"temperature,omitempty"`
+	TopP          *float64          `json:"top_p,omitempty"`
+	StopSequences []string          `json:"stop_sequences,omitempty"`
+	Stream        bool              `json:"stream,omitempty"`
+	Tools         []anthTool        `json:"tools,omitempty"`
+	ToolChoice    *anthToolChoice   `json:"tool_choice,omitempty"`
+	Thinking      *anthThinking     `json:"thinking,omitempty"`
+	OutputConfig  *anthOutputConfig `json:"output_config,omitempty"`
+}
+
+type anthThinking struct {
+	Type         string `json:"type"` // disabled | adaptive | enabled
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
+type anthOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type anthMessage struct {

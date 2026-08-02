@@ -256,7 +256,7 @@ func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
 // preserving any provider-specific fields the IR does not model. The upstream
 // response is relayed as-is since its format already matches the ingress.
 func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header) attemptResult {
-	rewritten, err := rewriteModel(body, upstreamModel)
+	rewritten, err := rewriteModelWithThinking(body, upstreamModel, ingress.id)
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 	}
@@ -286,7 +286,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
-	req.Model = upstreamModel
+	applyUpstreamModel(req, upstreamModel)
 	req.Stream = false
 
 	upstreamBody, err := backend.encodeRequest(req)

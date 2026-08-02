@@ -128,7 +128,7 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	reqBuf = append(reqBuf, encodeField(reqUnifiedMode, wireVarint, unifiedModeFor(hasTools))...)
 	reqBuf = append(reqBuf, encodeField(reqUnknown47, wireLen, "")...)
 	reqBuf = append(reqBuf, encodeField(reqShouldDisableTools, wireVarint, boolVarint(!hasTools))...)
-	reqBuf = append(reqBuf, encodeField(reqThinkingLevel, wireVarint, uint64(thinkingUnspecified))...)
+	reqBuf = append(reqBuf, encodeField(reqThinkingLevel, wireVarint, uint64(cursorThinkingLevel(req.Thinking)))...)
 	reqBuf = append(reqBuf, encodeField(reqUnknown51, wireVarint, uint64(0))...)
 	reqBuf = append(reqBuf, encodeField(reqUnknown53, wireVarint, uint64(1))...)
 	modeName := "Ask"
@@ -278,6 +278,37 @@ func toolResultText(b ir.ContentBlock) string {
 		return "error"
 	}
 	return s
+}
+
+// cursorThinkingLevel maps IR thinking intent onto Cursor's 3-level enum.
+// Lossy by design: minimal/low/medium -> medium; high/xhigh/max -> high.
+func cursorThinkingLevel(t *ir.Thinking) int {
+	if t == nil {
+		return thinkingUnspecified
+	}
+	switch t.Mode {
+	case ir.ThinkingNone, ir.ThinkingAuto:
+		return thinkingUnspecified
+	case ir.ThinkingBudget:
+		switch {
+		case t.Budget <= 0:
+			return thinkingUnspecified
+		case t.Budget <= 16384:
+			return thinkingMedium
+		default:
+			return thinkingHigh
+		}
+	case ir.ThinkingLevel:
+		switch strings.ToLower(t.Level) {
+		case "high", "xhigh", "max":
+			return thinkingHigh
+		case "minimal", "low", "medium":
+			return thinkingMedium
+		default:
+			return thinkingMedium
+		}
+	}
+	return thinkingUnspecified
 }
 
 func sanitizeToolResultText(s string) string {

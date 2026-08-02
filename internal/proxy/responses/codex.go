@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/thinking"
 )
 
 // CodexCLIVersion is the Codex CLI version the upstream identifies us as; the
@@ -59,10 +60,13 @@ func codexEffortForModel(model string) (base, effort string) {
 // prompt_cache_key is injected by the proxy (it must be a stable per-request id
 // shared with the session_id header).
 func EncodeCodexRequest(req *ir.Request) ([]byte, error) {
-	base, effort := codexEffortForModel(req.Model)
+	// Prefer IR thinking (body intent or upstream model(level) suffix). Else the
+	// Codex-native hyphen suffix on the model id. Else default low.
+	base, hyphenEffort := codexEffortForModel(req.Model)
 	if base == "" {
 		base = codexDefaultModel
 	}
+	effort := resolveCodexEffort(req.Thinking, hyphenEffort, base)
 
 	out := map[string]any{
 		"model":  base,
@@ -101,6 +105,41 @@ func EncodeCodexRequest(req *ir.Request) ([]byte, error) {
 		out["tool_choice"] = encodeToolChoice(req.ToolChoice)
 	}
 	return json.Marshal(out)
+}
+
+// resolveCodexEffort picks the wire effort: IR thinking first, then the hyphen
+// suffix result from codexEffortForModel (already defaulted to low when absent).
+// Explicit none is honored (omits reasoning upstream). Codex cannot fully disable
+// on some accounts; callers that need clamp use thinking.Effective before IR.
+func resolveCodexEffort(t *ir.Thinking, hyphenEffort, base string) string {
+	if t != nil {
+		cfg := thinking.FromIR(t)
+		switch cfg.Mode {
+		case thinking.ModeNone:
+			return "none"
+		case thinking.ModeAuto:
+			return "medium"
+		case thinking.ModeBudget:
+			if lvl := thinking.BudgetToLevel(cfg.Budget); lvl != "" {
+				if lvl == "max" {
+					return "xhigh"
+				}
+				return lvl
+			}
+			return "medium"
+		case thinking.ModeLevel:
+			lvl := cfg.Level
+			if lvl == "max" {
+				return "xhigh"
+			}
+			if lvl == "minimal" {
+				return "low"
+			}
+			return lvl
+		}
+	}
+	_ = base
+	return hyphenEffort
 }
 
 // InjectCodexRequestKey sets prompt_cache_key on an already-encoded Codex

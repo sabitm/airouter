@@ -19,6 +19,7 @@ type chatRequest struct {
 	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
 	Tools               []chatTool      `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"` // string or object
+	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
 }
 
 type streamOptions struct {

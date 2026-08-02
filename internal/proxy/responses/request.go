@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"airouter/internal/domain"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/thinking"
 )
 
 // DecodeRequest parses an OpenAI Responses request into the IR.
@@ -31,6 +33,9 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 	}
 	out.ToolChoice = decodeToolChoice(req.ToolChoice)
 	out.Messages = decodeInput(req.Input, &out.System)
+	if req.Reasoning != nil {
+		out.Thinking = thinking.ToIR(thinking.FromOpenAIEffort(req.Reasoning.Effort))
+	}
 	return out, nil
 }
 
@@ -194,6 +199,16 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	}
 	if req.ToolChoice != nil {
 		out["tool_choice"] = encodeToolChoice(req.ToolChoice)
+	}
+	if cfg := thinking.Effective(thinking.FromIR(req.Thinking), thinking.CapsFor(req.Model, domain.ProtocolOpenAIResponses)); cfg != nil {
+		switch cfg.Mode {
+		case thinking.ModeNone:
+			out["reasoning"] = map[string]any{"effort": "none"}
+		default:
+			if level := thinking.LevelFor(cfg); level != "" && level != "none" {
+				out["reasoning"] = map[string]any{"effort": level}
+			}
+		}
 	}
 	return json.Marshal(out)
 }
