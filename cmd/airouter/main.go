@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -27,19 +26,6 @@ func main() {
 	if cfg.Version {
 		fmt.Printf("airouter %s\n", version)
 		return
-	}
-
-	// logFile, when non-nil, is the full-trace sink passed to the server; stderr
-	// keeps a truncated copy. nil means stderr-only (truncated) tracing.
-	var logFile io.Writer
-	if cfg.LogFile != "" {
-		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			log.Fatalf("open log file: %v", err)
-		}
-		defer f.Close()
-		log.SetOutput(io.MultiWriter(os.Stderr, f))
-		logFile = f
 	}
 
 	secret, isDev := cfg.EffectiveSecret()
@@ -66,7 +52,7 @@ func main() {
 	}
 	defer st.Close()
 
-	app := server.New(st, cfg.DebugLevel, logFile, cfg.HARFile, version)
+	app := server.New(st, cfg.DebugLevel, cfg.HARFile, version)
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: app.Handler(),

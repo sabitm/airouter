@@ -62,11 +62,11 @@ Supporting packages:
 - `internal/server` - HTTP wiring: CORS (answers browser preflights, reflects
   the request Origin) and the leveled request-logging middleware. At `-debug`
   (level 1) it logs access lines; at `-debug=2` it also traces request and
-  response bodies and the resolved upstream provider URL per proxied call. With
-  `-log-file`, the file sink receives full bodies while stderr stays truncated.
+  response bodies (truncated on stderr) and the resolved upstream provider URL
+  per proxied call. Full request/response forensics use `-har-file` (HAR 1.2).
 - `internal/web` - templ + HTMX dashboard. `.templ` files generate `*_templ.go`.
-  Dashboard outbound provider probes (Check/model autocomplete) follow the same
-  trace split: full bodies to `-log-file`, truncated bodies to stderr.
+  Dashboard outbound provider probes (Check/model autocomplete) at `-debug=2`
+  log truncated request/response bodies to stderr.
 - `cmd/airouter` - main: wires config, crypto, store, server; graceful shutdown.
 
 ## The passthrough vs translate rule

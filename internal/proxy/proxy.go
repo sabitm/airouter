@@ -6,9 +6,7 @@ package proxy
 
 import (
 	"io"
-	"log"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -235,12 +233,6 @@ type Proxy struct {
 	streamClient *http.Client
 	debug        bool
 
-	// fileLog/stderrLog split debug output when a log file is configured: the
-	// file receives the full message, stderr a truncated copy. Both nil means
-	// debug goes once to the default logger (stderr, truncated).
-	fileLog   *log.Logger
-	stderrLog *log.Logger
-
 	// har, when non-nil, records both legs of every proxied exchange as HAR 1.2.
 	har *harlog.Recorder
 
@@ -278,8 +270,8 @@ const (
 	backoffShiftCap = 30
 )
 
-func New(s *store.Store, debug bool, logFile io.Writer, har *harlog.Recorder) *Proxy {
-	p := &Proxy{
+func New(s *store.Store, debug bool, har *harlog.Recorder) *Proxy {
+	return &Proxy{
 		store:        s,
 		oauth:        oauth.New(s),
 		client:       &http.Client{Timeout: 5 * time.Minute},
@@ -289,11 +281,6 @@ func New(s *store.Store, debug bool, logFile io.Writer, har *harlog.Recorder) *P
 		rr:           map[int64]uint64{},
 		bo:           map[int64]*backoffState{},
 	}
-	if logFile != nil {
-		p.fileLog = log.New(logFile, "", log.LstdFlags)
-		p.stderrLog = log.New(os.Stderr, "", log.LstdFlags)
-	}
-	return p
 }
 
 func (p *Proxy) harEnabled() bool { return p.har != nil }

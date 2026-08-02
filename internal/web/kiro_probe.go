@@ -36,7 +36,7 @@ func kiroModels() []string {
 // the lightweight CodeWhisperer call that confirms a bearer token is accepted
 // without sending a chat request. Kiro API keys cannot use that admin API, so an
 // API-key provider reports stored-only and is validated on real traffic.
-func checkKiroUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+func checkKiroUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
 	if p.Method() == domain.AuthAPIKey {
 		return true, "OK - API key stored; validated on real traffic (no lightweight check endpoint accepts API keys)"
 	}
@@ -55,19 +55,19 @@ func checkKiroUpstream(ctx context.Context, p *domain.Provider, trace bool, file
 	req.Header.Set("Authorization", "Bearer "+p.APIKey)
 
 	if trace {
-		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> POST %s (ListAvailableProfiles)", url)
+		log.Printf("[trace] >>> POST %s (ListAvailableProfiles)", url)
 	}
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< POST %s: %v", url, err)
+			log.Printf("[trace] <<< POST %s: %v", url, err)
 		}
 		return false, "could not reach Kiro: " + err.Error()
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 
 	switch {

@@ -4,10 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 
@@ -33,21 +30,12 @@ type Handler struct {
 	sessions *connectSessions
 	// trace, set at -debug=2, logs the dashboard's outbound provider subcalls
 	// (e.g. the /models probe behind the Check button) that the request-logging
-	// middleware cannot see.
+	// middleware cannot see. Bodies are truncated on stderr.
 	trace bool
-	// fileTrace/stderrTrace split dashboard trace output when a log file is
-	// configured: the file receives the full message, stderr a truncated copy.
-	fileTrace   *log.Logger
-	stderrTrace *log.Logger
 }
 
-func NewHandler(s *store.Store, trace bool, logFile ...io.Writer) *Handler {
-	h := &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), trace: trace}
-	if len(logFile) > 0 && logFile[0] != nil {
-		h.fileTrace = log.New(logFile[0], "", log.LstdFlags)
-		h.stderrTrace = log.New(os.Stderr, "", log.LstdFlags)
-	}
-	return h
+func NewHandler(s *store.Store, trace bool) *Handler {
+	return &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), trace: trace}
 }
 
 // Mount registers all dashboard routes on the given mux.

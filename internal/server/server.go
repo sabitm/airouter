@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -20,15 +19,12 @@ import (
 
 // traceMaxBody caps how many bytes of a request or response body are logged to
 // stderr at trace level, so a long stream or large context cannot flood the
-// terminal. A configured -log-file captures the full, untruncated bodies.
+// terminal. Full request/response forensics live in HAR capture (-har-file).
 const traceMaxBody = 4 << 10
 
 type Server struct {
 	mux        *http.ServeMux
 	debugLevel int
-	// logFile, when non-nil, receives full untruncated trace bodies while stderr
-	// keeps a truncated copy. nil means stderr-only (truncated) tracing.
-	logFile io.Writer
 	// har records both legs of proxied exchanges when non-nil (enabled by
 	// -har-file). Independent of debugLevel.
 	har *harlog.Recorder
@@ -37,17 +33,17 @@ type Server struct {
 // New builds the HTTP mux. harFile, when non-empty, enables the in-memory HAR
 // recorder (creator version is creatorVersion) and mounts GET /debug/har.
 // The recorder is also passed to the proxy for upstream-leg capture.
-func New(s *store.Store, debugLevel int, logFile io.Writer, harFile, creatorVersion string) *Server {
+func New(s *store.Store, debugLevel int, harFile, creatorVersion string) *Server {
 	var har *harlog.Recorder
 	if harFile != "" {
 		har = harlog.New(creatorVersion)
 	}
 	mux := http.NewServeMux()
-	web.NewHandler(s, debugLevel >= 2, logFile).Mount(mux)
+	web.NewHandler(s, debugLevel >= 2).Mount(mux)
 	// The proxy only distinguishes on/off (level >= 1); body trace lives in the
 	// middleware below, which sees every path uniformly.
-	proxy.New(s, debugLevel >= 1, logFile, har).Mount(mux)
-	srv := &Server{mux: mux, debugLevel: debugLevel, logFile: logFile, har: har}
+	proxy.New(s, debugLevel >= 1, har).Mount(mux)
+	srv := &Server{mux: mux, debugLevel: debugLevel, har: har}
 	if har != nil {
 		mux.HandleFunc("GET /debug/har", srv.handleHAR)
 	}
@@ -62,7 +58,7 @@ func (s *Server) Handler() http.Handler {
 	// Always attach TraceInfo (and optionally HAR + debug logging). TraceInfo
 	// must be present on every request so prepare/header seams can round-trip
 	// session ids even when body tracing is off.
-	return requestMiddleware(s.debugLevel, s.logFile, s.har, h)
+	return requestMiddleware(s.debugLevel, s.har, h)
 }
 
 func (s *Server) handleHAR(w http.ResponseWriter, r *http.Request) {
@@ -121,12 +117,7 @@ func cors(next http.Handler) http.Handler {
 // requestMiddleware attaches TraceInfo to every request, optionally records the
 // ingress HAR leg, and (when level >= 1) emits the existing access/trace logs.
 // HAR capture is independent of debug level.
-func requestMiddleware(level int, logFile io.Writer, har *harlog.Recorder, next http.Handler) http.Handler {
-	var fileTrace, stderrTrace *log.Logger
-	if logFile != nil {
-		fileTrace = log.New(logFile, "", log.LstdFlags)
-		stderrTrace = log.New(os.Stderr, "", log.LstdFlags)
-	}
+func requestMiddleware(level int, har *harlog.Recorder, next http.Handler) http.Handler {
 	accessLog := level >= 1
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -154,9 +145,9 @@ func requestMiddleware(level int, logFile io.Writer, har *harlog.Recorder, next 
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		if trace || harCap {
 			sw.capture = &bytes.Buffer{}
-			// Full capture when a log file wants the whole body, or when HAR is
-			// on (harlog applies its own 1 MiB cap). Otherwise cap at traceMaxBody.
-			sw.captureFull = (trace && logFile != nil) || harCap
+			// Full capture only when HAR needs the whole body (harlog applies its
+			// own 1 MiB cap). Text trace truncates at emit time via traceMaxBody.
+			sw.captureFull = harCap
 		}
 		next.ServeHTTP(sw, r)
 
@@ -164,7 +155,11 @@ func requestMiddleware(level int, logFile io.Writer, har *harlog.Recorder, next 
 			log.Printf("%s %s %d %s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond))
 		}
 		if trace {
-			logTrace(fileTrace, stderrTrace, r, reqBody, sw, tinfo)
+			target := r.URL.Path
+			if tinfo.UpstreamURL != "" {
+				target = tinfo.UpstreamURL
+			}
+			emitTrace(log.Default(), r, reqBody, sw, target, traceMaxBody)
 		}
 		if harCap {
 			pageID := "page_" + tinfo.RequestID
@@ -247,22 +242,6 @@ func drainRequestBody(r *http.Request) []byte {
 	return b
 }
 
-// logTrace emits the captured request and response bodies. When fileTrace is
-// non-nil the bodies are written in full to the file and truncated to stderr;
-// otherwise a single truncated copy goes to the default logger (stderr).
-func logTrace(fileTrace, stderrTrace *log.Logger, r *http.Request, reqBody []byte, sw *statusWriter, tinfo *proxy.TraceInfo) {
-	target := r.URL.Path
-	if tinfo != nil && tinfo.UpstreamURL != "" {
-		target = tinfo.UpstreamURL
-	}
-	if fileTrace != nil {
-		emitTrace(fileTrace, r, reqBody, sw, target, 0)
-		emitTrace(stderrTrace, r, reqBody, sw, target, traceMaxBody)
-		return
-	}
-	emitTrace(log.Default(), r, reqBody, sw, target, traceMaxBody)
-}
-
 // emitTrace writes one request/response trace pair to l. limit caps each body's
 // logged length (<= 0 means unlimited). The request line shows the resolved
 // upstream provider URL when one was reached; otherwise (a local /models
@@ -318,7 +297,7 @@ type statusWriter struct {
 	status int
 	// capture, when non-nil (trace level or HAR), accumulates response bytes;
 	// bytesWritten tracks the full length for the truncation marker. When
-	// captureFull is set (log-file sink or HAR) capture grows unbounded;
+	// captureFull is set (HAR needs the whole body) capture grows unbounded;
 	// otherwise it stops at traceMaxBody.
 	capture      *bytes.Buffer
 	captureFull  bool

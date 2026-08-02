@@ -98,7 +98,7 @@ func TestCheckCodexUpstreamUsesModelsEndpoint(t *testing.T) {
 		OAuthCreds: &domain.OAuthCreds{
 			AccountID: "acct-1",
 		},
-	}, false, nil, nil)
+	}, false)
 	if !ok {
 		t.Fatalf("check failed: %s", msg)
 	}
@@ -113,7 +113,7 @@ func TestCheckCodexUpstreamUsesModelsEndpoint(t *testing.T) {
 	}
 }
 
-func TestCheckCodexUpstreamTraceSplitsFileAndStderr(t *testing.T) {
+func TestCheckCodexUpstreamTraceTruncatesStderr(t *testing.T) {
 	longID := strings.Repeat("x", traceMaxBody+64)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -122,24 +122,22 @@ func TestCheckCodexUpstreamTraceSplitsFileAndStderr(t *testing.T) {
 	}))
 	t.Cleanup(up.Close)
 
-	var fileBuf, stderrBuf bytes.Buffer
-	fileTrace := log.New(&fileBuf, "", 0)
-	stderrTrace := log.New(&stderrBuf, "", 0)
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
 	ok, msg := checkUpstream(context.Background(), &domain.Provider{
 		BaseURL:  up.URL,
 		APIKey:   "tok",
 		Protocol: domain.ProtocolOpenAICodex,
-	}, true, fileTrace, stderrTrace)
+	}, true)
 	if !ok {
 		t.Fatalf("check failed: %s", msg)
 	}
 
-	fileLog := fileBuf.String()
-	stderrLog := stderrBuf.String()
-	if !strings.Contains(fileLog, longID) || strings.Contains(fileLog, "truncated") {
-		t.Fatalf("file trace was not full: %s", fileLog)
-	}
-	if strings.Contains(stderrLog, longID) || !strings.Contains(stderrLog, "truncated") {
-		t.Fatalf("stderr trace was not truncated: %s", stderrLog)
+	out := buf.String()
+	if strings.Contains(out, longID) || !strings.Contains(out, "truncated") {
+		t.Fatalf("stderr trace was not truncated: %s", out)
 	}
 }

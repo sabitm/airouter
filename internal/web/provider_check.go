@@ -66,7 +66,7 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth}, h.trace, h.fileTrace, h.stderrTrace)
+	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth}, h.trace)
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -105,7 +105,7 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	} else {
 		probe.APIKey = creds.AccessToken
 	}
-	ok, msg := checkUpstream(r.Context(), probe, h.trace, h.fileTrace, h.stderrTrace)
+	ok, msg := checkUpstream(r.Context(), probe, h.trace)
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -131,8 +131,8 @@ func (h *Handler) oauthCheckCreds(r *http.Request) (creds *domain.OAuthCreds, fr
 }
 
 // traceMaxBody caps the outbound /models body logged to stderr at trace level so
-// a long model list cannot flood the terminal. A configured -log-file receives
-// the full, untruncated body.
+// a long model list cannot flood the terminal. Full request/response forensics
+// live in HAR capture (-har-file).
 const traceMaxBody = 16 << 10
 
 // checkUpstream performs a GET {base_url}/models with the protocol's auth
@@ -142,27 +142,27 @@ const traceMaxBody = 16 << 10
 //
 // When trace is set the request and response are logged; auth headers are never
 // logged, so the API key stays out of the log.
-func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
 	if p.Protocol == domain.ProtocolOpenAICodex {
-		return checkCodexUpstream(ctx, p, trace, fileTrace, stderrTrace)
+		return checkCodexUpstream(ctx, p, trace)
 	}
 	if p.Protocol == domain.ProtocolKiro {
-		return checkKiroUpstream(ctx, p, trace, fileTrace, stderrTrace)
+		return checkKiroUpstream(ctx, p, trace)
 	}
 	if p.Protocol == domain.ProtocolQoder {
-		return checkQoderUpstream(ctx, p, trace, fileTrace, stderrTrace)
+		return checkQoderUpstream(ctx, p, trace)
 	}
 	if p.Protocol == domain.ProtocolAntigravity {
-		return checkAntigravityUpstream(ctx, p, trace, fileTrace, stderrTrace)
+		return checkAntigravityUpstream(ctx, p, trace)
 	}
 	if p.Protocol == domain.ProtocolCursor {
-		return checkCursorUpstream(ctx, p, trace, fileTrace, stderrTrace)
+		return checkCursorUpstream(ctx, p, trace)
 	}
 	if p.Protocol == domain.ProtocolClaudeCode {
-		return checkClaudeCodeUpstream(ctx, p, trace, fileTrace, stderrTrace)
+		return checkClaudeCodeUpstream(ctx, p, trace)
 	}
 	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
-		return checkClineUpstream(ctx, p, trace, fileTrace, stderrTrace)
+		return checkClineUpstream(ctx, p, trace)
 	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -183,13 +183,13 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	applyClineProbeHeaders(req, p)
 
 	if trace {
-		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
+		log.Printf("[trace] >>> GET %s", url)
 	}
 
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
+			log.Printf("[trace] <<< GET %s: %v", url, err)
 		}
 		return false, "could not reach URL: " + err.Error()
 	}
@@ -199,7 +199,7 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 	// just the success path.
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 
 	switch {
@@ -227,7 +227,7 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrac
 // a passing Check implies the credential and client profile will be accepted on
 // real traffic. OAuth tokens are resolved/refreshed by the caller before this
 // runs, so p.APIKey holds the live access token.
-func checkClaudeCodeUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+func checkClaudeCodeUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -239,19 +239,19 @@ func checkClaudeCodeUpstream(ctx context.Context, p *domain.Provider, trace bool
 	}
 
 	if trace {
-		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
+		log.Printf("[trace] >>> GET %s", url)
 	}
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
+			log.Printf("[trace] <<< GET %s: %v", url, err)
 		}
 		return false, "could not reach URL: " + err.Error()
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
@@ -274,7 +274,7 @@ func checkClaudeCodeUpstream(ctx context.Context, p *domain.Provider, trace bool
 
 // checkQoderUpstream validates a Qoder device token against openapi userinfo.
 // Uses plain Bearer auth (not COSY); refresh is not attempted.
-func checkQoderUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+func checkQoderUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
 	url := qoder.UserInfoURL
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -285,19 +285,19 @@ func checkQoderUpstream(ctx context.Context, p *domain.Provider, trace bool, fil
 	req.Header.Set("User-Agent", "Go-http-client/2.0")
 
 	if trace {
-		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
+		log.Printf("[trace] >>> GET %s", url)
 	}
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
+			log.Printf("[trace] <<< GET %s: %v", url, err)
 		}
 		return false, "could not reach URL: " + err.Error()
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized:
@@ -314,7 +314,7 @@ func checkQoderUpstream(ctx context.Context, p *domain.Provider, trace bool, fil
 // /users/me endpoint. Plain Cline does not expose /models, so probing it (the
 // generic path) returns a misleading 404 even for a valid token. /users/me is
 // what 9router uses to verify the access token.
-func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/users/me"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -324,13 +324,13 @@ func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool, fil
 	req.Header.Set("Accept", "application/json")
 
 	if trace {
-		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> GET %s", url)
+		log.Printf("[trace] >>> GET %s", url)
 	}
 
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< GET %s: %v", url, err)
+			log.Printf("[trace] <<< GET %s: %v", url, err)
 		}
 		return false, "could not reach URL: " + err.Error()
 	}
@@ -338,7 +338,7 @@ func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool, fil
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 
 	switch {
@@ -357,8 +357,8 @@ func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool, fil
 // checkCodexUpstream validates the ChatGPT Codex model-discovery endpoint. It is
 // account-aware and avoids hardcoding a probe model that may not be available to
 // this ChatGPT account.
-func checkCodexUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
-	models, status, body, err := fetchCodexModels(ctx, p, trace, fileTrace, stderrTrace)
+func checkCodexUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+	models, status, body, err := fetchCodexModels(ctx, p, trace)
 	if err != nil {
 		switch {
 		case status == http.StatusUnauthorized || status == http.StatusForbidden:
@@ -404,24 +404,6 @@ func applyClineProbeHeaders(req *http.Request, p *domain.Provider) {
 	}
 }
 
-func logProviderTracef(fileTrace, stderrTrace *log.Logger, format string, args ...any) {
-	if fileTrace != nil {
-		fileTrace.Printf(format, args...)
-		stderrTrace.Printf(format, args...)
-		return
-	}
-	log.Printf(format, args...)
-}
-
-func logProviderTraceBody(fileTrace, stderrTrace *log.Logger, status int, body []byte) {
-	if fileTrace != nil {
-		fileTrace.Printf("[trace] <<< %d\n%s", status, traceBody(body, 0))
-		stderrTrace.Printf("[trace] <<< %d\n%s", status, traceBody(body, traceMaxBody))
-		return
-	}
-	log.Printf("[trace] <<< %d\n%s", status, traceBody(body, traceMaxBody))
-}
-
 // traceBody renders an outbound response body for the log, appending a marker
 // when the output was capped. limit <= 0 logs the whole body.
 func traceBody(body []byte, limit int) string {
@@ -435,7 +417,7 @@ func traceBody(body []byte, limit int) string {
 }
 
 // checkAntigravityUpstream validates token + project via loadCodeAssist.
-func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
 	const url = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 	meta := map[string]int{"ideType": 9, "platform": 3, "pluginType": 2}
 	payload, _ := json.Marshal(map[string]any{"metadata": meta})
@@ -452,19 +434,19 @@ func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace boo
 	req.Header.Set("Client-Metadata", string(mb))
 
 	if trace {
-		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> POST %s", url)
+		log.Printf("[trace] >>> POST %s", url)
 	}
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< POST %s: %v", url, err)
+			log.Printf("[trace] <<< POST %s: %v", url, err)
 		}
 		return false, "could not reach URL: " + err.Error()
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
@@ -497,7 +479,7 @@ func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace boo
 // has no /models REST endpoint; GetUsableModels is the lighter liveness probe
 // (an unframed application/proto unary call). Tokens are short-lived and not
 // refreshable, so a 401/403 means re-paste, not refresh.
-func checkCursorUpstream(ctx context.Context, p *domain.Provider, trace bool, fileTrace, stderrTrace *log.Logger) (bool, string) {
+func checkCursorUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
 	token := strings.TrimSpace(p.APIKey)
 	if token == "" {
 		return false, "no access token - paste one or reconnect"
@@ -518,19 +500,19 @@ func checkCursorUpstream(ctx context.Context, p *domain.Provider, trace bool, fi
 		}
 	}
 	if trace {
-		logProviderTracef(fileTrace, stderrTrace, "[trace] >>> POST %s", url)
+		log.Printf("[trace] >>> POST %s", url)
 	}
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		if trace {
-			logProviderTracef(fileTrace, stderrTrace, "[trace] <<< POST %s: %v", url, err)
+			log.Printf("[trace] <<< POST %s: %v", url, err)
 		}
 		return false, "could not reach Cursor: " + err.Error()
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if trace {
-		logProviderTraceBody(fileTrace, stderrTrace, resp.StatusCode, body)
+		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:

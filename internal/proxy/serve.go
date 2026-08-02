@@ -475,24 +475,17 @@ func upstreamErrorMessage(body []byte) string {
 }
 
 // debugMaxBody caps the length of a debug line written to stderr, so a large
-// echoed error exchange cannot flood the terminal. A configured log file keeps
-// the full message.
+// echoed error exchange cannot flood the terminal. Full request/response
+// forensics live in HAR capture (-har-file), not the text debug path.
 const debugMaxBody = 4 << 10
 
 // debugf logs an upstream error exchange when debug mode is on. No-op otherwise.
-// With a log file configured the full message goes to the file and a truncated
-// copy to stderr; otherwise a single truncated copy goes to stderr.
+// Bodies are truncated so a large exchange cannot flood the terminal.
 func (p *Proxy) debugf(format string, args ...any) {
 	if !p.debug {
 		return
 	}
-	msg := fmt.Sprintf("[debug] "+format, args...)
-	if p.fileLog != nil {
-		p.fileLog.Print(msg)
-		p.stderrLog.Print(truncateMsg(msg, debugMaxBody))
-		return
-	}
-	log.Print(truncateMsg(msg, debugMaxBody))
+	log.Print(truncateMsg(fmt.Sprintf("[debug] "+format, args...), debugMaxBody))
 }
 
 // truncateMsg shortens s to limit bytes, appending a marker noting the full
