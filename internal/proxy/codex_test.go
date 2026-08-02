@@ -296,3 +296,24 @@ func TestCodexEncodeRequestIRThinkingOverridesHyphen(t *testing.T) {
 		t.Fatalf("reasoning = %v", got["reasoning"])
 	}
 }
+
+func TestCodexEncodeRequestIRThinkingMaxMinimalPassThrough(t *testing.T) {
+	for _, lvl := range []string{"max", "minimal"} {
+		body, err := responses.EncodeCodexRequest(&ir.Request{
+			Model: "gpt-5.3-codex",
+			Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+			Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: lvl},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		r, _ := got["reasoning"].(map[string]any)
+		if r == nil || r["effort"] != lvl {
+			t.Fatalf("level %q: reasoning = %v", lvl, got["reasoning"])
+		}
+	}
+}

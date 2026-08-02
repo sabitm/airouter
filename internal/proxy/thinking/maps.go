@@ -42,8 +42,10 @@ func BudgetToLevel(budget int) string {
 	return "xhigh"
 }
 
-// LevelFor returns an OpenAI-style effort string for cfg.
-// "max" clamps to "xhigh" (OpenAI enum has no max). Empty when cfg is nil.
+// LevelFor returns an effort string for cfg. ModeLevel values are forwarded
+// verbatim (including max/minimal/xhigh); backends disagree on valid enums, so
+// per-model validity is the caller's responsibility. Budget mode still converts
+// via BudgetToLevel. Empty when cfg is nil.
 func LevelFor(cfg *Config) string {
 	if cfg == nil {
 		return ""
@@ -56,9 +58,6 @@ func LevelFor(cfg *Config) string {
 	case ModeBudget:
 		return BudgetToLevel(cfg.Budget)
 	case ModeLevel:
-		if cfg.Level == "max" {
-			return "xhigh"
-		}
 		return cfg.Level
 	}
 	return ""

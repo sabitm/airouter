@@ -65,9 +65,14 @@ func TestBudgetToLevel(t *testing.T) {
 	}
 }
 
-func TestLevelForMaxClamp(t *testing.T) {
-	if LevelFor(&Config{Mode: ModeLevel, Level: "max"}) != "xhigh" {
-		t.Fatal("max should clamp to xhigh")
+func TestLevelForPassThrough(t *testing.T) {
+	for _, lvl := range []string{"minimal", "low", "medium", "high", "xhigh", "max", "ultra"} {
+		if got := LevelFor(&Config{Mode: ModeLevel, Level: lvl}); got != lvl {
+			t.Fatalf("LevelFor(%q) = %q", lvl, got)
+		}
+	}
+	if LevelFor(&Config{Mode: ModeNone}) != "none" {
+		t.Fatal("ModeNone")
 	}
 }
 

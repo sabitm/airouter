@@ -109,8 +109,9 @@ func EncodeCodexRequest(req *ir.Request) ([]byte, error) {
 
 // resolveCodexEffort picks the wire effort: IR thinking first, then the hyphen
 // suffix result from codexEffortForModel (already defaulted to low when absent).
-// Explicit none is honored (omits reasoning upstream). Codex cannot fully disable
-// on some accounts; callers that need clamp use thinking.Effective before IR.
+// Explicit none is honored (omits reasoning upstream). Level strings are
+// forwarded verbatim; callers own per-model validity. CanDisable clamps still
+// live in thinking.Effective when used before IR is set.
 func resolveCodexEffort(t *ir.Thinking, hyphenEffort, base string) string {
 	if t != nil {
 		cfg := thinking.FromIR(t)
@@ -121,21 +122,11 @@ func resolveCodexEffort(t *ir.Thinking, hyphenEffort, base string) string {
 			return "medium"
 		case thinking.ModeBudget:
 			if lvl := thinking.BudgetToLevel(cfg.Budget); lvl != "" {
-				if lvl == "max" {
-					return "xhigh"
-				}
 				return lvl
 			}
 			return "medium"
 		case thinking.ModeLevel:
-			lvl := cfg.Level
-			if lvl == "max" {
-				return "xhigh"
-			}
-			if lvl == "minimal" {
-				return "low"
-			}
-			return lvl
+			return cfg.Level
 		}
 	}
 	_ = base

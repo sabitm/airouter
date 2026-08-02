@@ -343,3 +343,52 @@ func TestRewriteModelWithThinkingPassthrough(t *testing.T) {
 		t.Fatalf("suffix patch: %s", out)
 	}
 }
+
+func TestThinkingMaxPassesThroughOpenAI(t *testing.T) {
+	in := []byte(`{
+		"model":"default",
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	req, err := openai.DecodeRequest(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyUpstreamModel(req, "deepseek-v4-flash-free(max)")
+	if req.Model != "deepseek-v4-flash-free" {
+		t.Fatalf("model = %q", req.Model)
+	}
+	if req.Thinking == nil || req.Thinking.Level != "max" {
+		t.Fatalf("thinking = %+v", req.Thinking)
+	}
+	out, err := openai.EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ReasoningEffort != "max" {
+		t.Fatalf("reasoning_effort = %q, want max", got.ReasoningEffort)
+	}
+}
+
+func TestThinkingMaxPassesThroughApplyWire(t *testing.T) {
+	body := []byte(`{"model":"combo","messages":[],"foo":1}`)
+	out, err := rewriteModelWithThinking(body, "deepseek-v4-flash-free(max)", "oai-chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["model"] != "deepseek-v4-flash-free" {
+		t.Fatalf("model = %v", m["model"])
+	}
+	if m["reasoning_effort"] != "max" {
+		t.Fatalf("reasoning_effort = %v, want max", m["reasoning_effort"])
+	}
+}
