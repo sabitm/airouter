@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"airouter/internal/domain"
@@ -139,7 +140,7 @@ func TestImportLegacyAuthMethod(t *testing.T) {
 		"providers": [{"name":"p1","base_url":"http://a","api_key":"k1","protocol":"openai"}],
 		"combos": []
 	}`
-	if err := st.Import(ctx, bytes.NewReader([]byte(cfg))); err != nil {
+	if _, err := st.Import(ctx, bytes.NewReader([]byte(cfg))); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.GetProvider(ctx, 1)
@@ -190,7 +191,7 @@ func TestExportImportOAuthRoundTrip(t *testing.T) {
 	}
 
 	dst := testStore(t)
-	if err := dst.Import(ctx, bytes.NewReader(buf.Bytes())); err != nil {
+	if _, err := dst.Import(ctx, bytes.NewReader(buf.Bytes())); err != nil {
 		t.Fatal(err)
 	}
 	got, err := dst.GetProvider(ctx, 1)
@@ -205,7 +206,8 @@ func TestExportImportOAuthRoundTrip(t *testing.T) {
 	}
 }
 
-// TestImportOAuthMissingCreds rejects an oauth method with no oauth block.
+// TestImportOAuthMissingCreds skips an oauth method with no oauth block and
+// records the row in ImportSummary.Failures without aborting the import.
 func TestImportOAuthMissingCreds(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -214,9 +216,18 @@ func TestImportOAuthMissingCreds(t *testing.T) {
 		"providers": [{"name":"p1","base_url":"http://a","api_key":"","protocol":"openai","auth_method":"oauth"}],
 		"combos": []
 	}`
-	err := st.Import(ctx, bytes.NewReader([]byte(cfg)))
-	if err == nil {
-		t.Fatal("import succeeded, want error for oauth without creds")
+	sum, err := st.Import(ctx, bytes.NewReader([]byte(cfg)))
+	if err != nil {
+		t.Fatalf("import err = %v, want nil (row skipped, not fatal)", err)
+	}
+	if sum == nil || len(sum.Failures) != 1 {
+		t.Fatalf("Failures = %v, want 1 entry", sum)
+	}
+	if !strings.Contains(sum.Failures[0], `provider "p1"`) || !strings.Contains(sum.Failures[0], "oauth") {
+		t.Errorf("failure = %q, want provider \"p1\" and oauth", sum.Failures[0])
+	}
+	if _, err := st.GetProvider(ctx, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetProvider = %v, want ErrNotFound (row skipped)", err)
 	}
 }
 

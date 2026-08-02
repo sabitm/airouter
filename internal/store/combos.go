@@ -14,7 +14,12 @@ import (
 // ListCombos returns all combos with their ordered targets, each target's
 // provider hydrated (API key decrypted) for display and resolution.
 func (s *Store) ListCombos(ctx context.Context) ([]*domain.Combo, error) {
-	rows, err := s.db.QueryContext(ctx,
+	return s.listCombos(ctx, s.db)
+}
+
+// listCombos is the executor-parameterised body.
+func (s *Store) listCombos(ctx context.Context, ex executor) ([]*domain.Combo, error) {
+	rows, err := ex.QueryContext(ctx,
 		"SELECT id, name, strategy, created_at, updated_at FROM combos ORDER BY name")
 	if err != nil {
 		return nil, err
@@ -33,7 +38,7 @@ func (s *Store) ListCombos(ctx context.Context) ([]*domain.Combo, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if err := s.hydrateTargets(ctx, byID); err != nil {
+	if err := s.hydrateTargets(ctx, ex, byID); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -41,8 +46,9 @@ func (s *Store) ListCombos(ctx context.Context) ([]*domain.Combo, error) {
 
 // hydrateTargets loads every combo_targets row whose combo is in byID, joins the
 // provider, decrypts its key and OAuth credentials, and appends the target in
-// position order.
-func (s *Store) hydrateTargets(ctx context.Context, byID map[int64]*domain.Combo) error {
+// position order. ex is s.db outside a transaction, or the import *sql.Tx so
+// hydration sees uncommitted import state.
+func (s *Store) hydrateTargets(ctx context.Context, ex executor, byID map[int64]*domain.Combo) error {
 	if len(byID) == 0 {
 		return nil
 	}
@@ -51,7 +57,7 @@ SELECT t.combo_id, t.id, t.provider_id, t.upstream_model, t.position, t.enabled,
        p.id, p.name, p.base_url, p.api_key, p.protocol, p.auth_scheme, p.auth_method, p.oauth_creds, p.created_at, p.updated_at, p.archived
 FROM combo_targets t JOIN providers p ON p.id = t.provider_id
 ORDER BY t.combo_id, t.position, t.id`
-	rows, err := s.db.QueryContext(ctx, q)
+	rows, err := ex.QueryContext(ctx, q)
 	if err != nil {
 		return err
 	}
@@ -105,7 +111,7 @@ func (s *Store) GetComboByName(ctx context.Context, name string) (*domain.Combo,
 		}
 		return nil, err
 	}
-	if err := s.hydrateTargets(ctx, map[int64]*domain.Combo{c.ID: &c}); err != nil {
+	if err := s.hydrateTargets(ctx, s.db, map[int64]*domain.Combo{c.ID: &c}); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -122,22 +128,32 @@ func (s *Store) GetCombo(ctx context.Context, id int64) (*domain.Combo, error) {
 		}
 		return nil, err
 	}
-	if err := s.hydrateTargets(ctx, map[int64]*domain.Combo{c.ID: &c}); err != nil {
+	if err := s.hydrateTargets(ctx, s.db, map[int64]*domain.Combo{c.ID: &c}); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
 func (s *Store) CreateCombo(ctx context.Context, c *domain.Combo) error {
-	if c.Strategy == "" {
-		c.Strategy = domain.StrategyFailover
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx,
+	if err := s.createCombo(ctx, tx, c); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// createCombo is the executor-parameterised body; ex is the caller's *sql.Tx
+// normally and the import *sql.Tx during a transactional Import, so a combo
+// created mid-import is not committed independently of its providers.
+func (s *Store) createCombo(ctx context.Context, ex executor, c *domain.Combo) error {
+	if c.Strategy == "" {
+		c.Strategy = domain.StrategyFailover
+	}
+	res, err := ex.ExecContext(ctx,
 		"INSERT INTO combos (name, strategy) VALUES (?, ?)", c.Name, c.Strategy)
 	if err != nil {
 		return err
@@ -146,34 +162,36 @@ func (s *Store) CreateCombo(ctx context.Context, c *domain.Combo) error {
 	if err != nil {
 		return err
 	}
-	if err := insertTargets(ctx, tx, c.ID, c.Targets); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return insertTargets(ctx, ex, c.ID, c.Targets)
 }
 
 // UpdateCombo updates the combo metadata and replaces its target rows wholesale.
 func (s *Store) UpdateCombo(ctx context.Context, c *domain.Combo) error {
-	if c.Strategy == "" {
-		c.Strategy = domain.StrategyFailover
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
+	if err := s.updateCombo(ctx, tx, c); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// updateCombo is the executor-parameterised body; see createCombo.
+func (s *Store) updateCombo(ctx context.Context, ex executor, c *domain.Combo) error {
+	if c.Strategy == "" {
+		c.Strategy = domain.StrategyFailover
+	}
+	if _, err := ex.ExecContext(ctx,
 		"UPDATE combos SET name=?, strategy=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
 		c.Name, c.Strategy, c.ID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM combo_targets WHERE combo_id=?", c.ID); err != nil {
+	if _, err := ex.ExecContext(ctx, "DELETE FROM combo_targets WHERE combo_id=?", c.ID); err != nil {
 		return err
 	}
-	if err := insertTargets(ctx, tx, c.ID, c.Targets); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return insertTargets(ctx, ex, c.ID, c.Targets)
 }
 
 // SetTargetEnabled flips a single target's enabled flag without rewriting the
@@ -190,13 +208,13 @@ func (s *Store) SetTargetEnabled(ctx context.Context, targetID int64, enabled bo
 
 // insertTargets writes targets with position set to slice order, so the stored
 // position always reflects the caller's intended ordering.
-func insertTargets(ctx context.Context, tx *sql.Tx, comboID int64, targets []domain.ComboTarget) error {
+func insertTargets(ctx context.Context, ex executor, comboID int64, targets []domain.ComboTarget) error {
 	for i, t := range targets {
 		enabled := 0
 		if t.Enabled {
 			enabled = 1
 		}
-		if _, err := tx.ExecContext(ctx,
+		if _, err := ex.ExecContext(ctx,
 			"INSERT INTO combo_targets (combo_id, provider_id, upstream_model, position, enabled) VALUES (?, ?, ?, ?, ?)",
 			comboID, t.ProviderID, t.UpstreamModel, i, enabled); err != nil {
 			return err

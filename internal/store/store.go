@@ -13,6 +13,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// executor is satisfied by *sql.DB and *sql.Tx so store helpers can run either
+// standalone or inside Import's transaction.
+type executor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 type Store struct {
 	db     *sql.DB
 	cipher *crypto.Cipher

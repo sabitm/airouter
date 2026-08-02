@@ -1047,9 +1047,18 @@ func (h *Handler) importConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	if err := h.store.Import(r.Context(), file); err != nil {
+	sum, err := h.store.Import(r.Context(), file)
+	if err != nil {
 		render(w, r, flash("error", "import failed: "+err.Error()))
 		return
 	}
-	render(w, r, flash("ok", "Import complete — review Providers and Combos"))
+	msg := fmt.Sprintf("Import complete: %d providers (%d new, %d updated), %d combos (%d new, %d updated) — review Providers and Combos",
+		sum.ProvidersCreated+sum.ProvidersUpdated, sum.ProvidersCreated, sum.ProvidersUpdated,
+		sum.CombosCreated+sum.CombosUpdated, sum.CombosCreated, sum.CombosUpdated)
+	if len(sum.Failures) > 0 {
+		msg += fmt.Sprintf("; %d skipped: %s", len(sum.Failures), strings.Join(sum.Failures, "; "))
+		render(w, r, flash("warn", msg))
+		return
+	}
+	render(w, r, flash("ok", msg))
 }

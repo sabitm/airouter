@@ -42,7 +42,12 @@ func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provi
 const providerCols = "id, name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, archived, created_at, updated_at"
 
 func (s *Store) ListProviders(ctx context.Context) ([]*domain.Provider, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+providerCols+" FROM providers ORDER BY name")
+	return s.listProviders(ctx, s.db)
+}
+
+// listProviders is the executor-parameterised body.
+func (s *Store) listProviders(ctx context.Context, ex executor) ([]*domain.Provider, error) {
+	rows, err := ex.QueryContext(ctx, "SELECT "+providerCols+" FROM providers ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +85,12 @@ func (s *Store) encryptOAuth(creds *domain.OAuthCreds) (string, error) {
 }
 
 func (s *Store) CreateProvider(ctx context.Context, p *domain.Provider) error {
+	return s.createProvider(ctx, s.db, p)
+}
+
+// createProvider is the executor-parameterised body; ex is s.db normally and
+// the import *sql.Tx during a transactional Import.
+func (s *Store) createProvider(ctx context.Context, ex executor, p *domain.Provider) error {
 	enc, err := s.cipher.Encrypt(p.APIKey)
 	if err != nil {
 		return err
@@ -88,7 +99,7 @@ func (s *Store) CreateProvider(ctx context.Context, p *domain.Provider) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx,
+	res, err := ex.ExecContext(ctx,
 		"INSERT INTO providers (name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.Archived)
 	if err != nil {
@@ -99,6 +110,11 @@ func (s *Store) CreateProvider(ctx context.Context, p *domain.Provider) error {
 }
 
 func (s *Store) UpdateProvider(ctx context.Context, p *domain.Provider) error {
+	return s.updateProvider(ctx, s.db, p)
+}
+
+// updateProvider is the executor-parameterised body; see createProvider.
+func (s *Store) updateProvider(ctx context.Context, ex executor, p *domain.Provider) error {
 	enc, err := s.cipher.Encrypt(p.APIKey)
 	if err != nil {
 		return err
@@ -107,7 +123,7 @@ func (s *Store) UpdateProvider(ctx context.Context, p *domain.Provider) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx,
+	_, err = ex.ExecContext(ctx,
 		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, auth_scheme=?, auth_method=?, oauth_creds=?, archived=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
 		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.Archived, p.ID)
 	return err

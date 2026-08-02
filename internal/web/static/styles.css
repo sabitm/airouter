@@ -241,6 +241,14 @@ td.mono { overflow-wrap: anywhere; }
 .htmx-indicator { display: none; }
 .htmx-request .check-indicator.htmx-indicator,
 .htmx-request.check-indicator.htmx-indicator { display: inline; }
+.htmx-request .import-spinner.htmx-indicator,
+.htmx-request.import-spinner.htmx-indicator { display: inline; }
+.import-spinner {
+	font-size: 13px;
+	color: var(--muted);
+	align-self: center;
+	margin-bottom: 4px;
+}
 
 .stats { display: flex; gap: 16px; margin-top: 12px; flex-wrap: wrap; }
 .stat {
@@ -274,6 +282,7 @@ td.err { color: var(--danger); width: 260px; white-space: normal; overflow-wrap:
 .flash.created { border-color: var(--ok); background: rgba(63,185,80,0.1); }
 .flash.error { border-color: var(--danger); background: rgba(229,83,75,0.1); }
 .flash.ok { border-color: var(--ok); background: rgba(63,185,80,0.1); }
+.flash.warn { border-color: #d29922; background: rgba(210,153,34,0.1); }
 .flash code { display: block; margin-top: 6px; word-break: break-all; }
 .flash .flash-copy { display: flex; align-items: flex-start; gap: 8px; margin-top: 6px; }
 .flash .flash-copy code { display: block; margin-top: 0; flex: 1; }

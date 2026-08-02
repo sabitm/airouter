@@ -29,13 +29,17 @@ templ SettingsPage() {
 				hx-encoding="multipart/form-data"
 				hx-target="#import-result"
 				hx-swap="innerHTML"
+				hx-indicator="#import-spinner"
 				hx-confirm="Import will upsert providers and combos by name. Nothing is deleted. Continue?"
+				hx-on::before-request="this.querySelector('button[type=submit]').disabled=true"
+				hx-on::after-request="this.querySelector('button[type=submit]').disabled=false"
 			>
 				<label class="field import-file-field">
 					<span class="field-name">Config JSON</span>
 					<input id="config-file" type="file" name="config" accept="application/json,.json" required/>
 				</label>
 				<button type="submit">Import</button>
+				<span id="import-spinner" class="htmx-indicator import-spinner">Importing, do not refresh or close this page.</span>
 			</form>
 		</section>
 	}
