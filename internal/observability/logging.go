@@ -1,5 +1,6 @@
 // Package observability provides structured terminal logging and bounded body
-// capture shared by the server, proxy, and dashboard.
+// capture shared by the server, proxy, and dashboard. Terminal logs never include
+// HTTP request/response body bytes; payload forensics use -har-file.
 package observability
 
 import (
@@ -8,8 +9,9 @@ import (
 	"log/slog"
 )
 
-// LevelTrace is one step below Debug. It is used for truncated request/response
-// body dumps at -debug=2. Mapped from NewLogger when debugLevel >= 2.
+// LevelTrace is one step below Debug. It is used for detailed exchange metadata
+// at -debug=2 (sizes, content types, status, durations — never body bytes).
+// Mapped from NewLogger when debugLevel >= 2.
 const LevelTrace slog.Level = slog.LevelDebug - 4
 
 type requestIDKeyT struct{}

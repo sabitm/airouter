@@ -388,7 +388,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		observability.Logger(ctx, p.logger).Debug("oauth_resolve_failed",
 			"event", "oauth_resolve_failed",
 			"provider", provider.Name,
-			"error", err,
+			"error", "OAuth token resolution failed",
 		)
 	}
 	status, respBody, err := send()
@@ -403,7 +403,8 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 				"event", "oauth_forced_refresh_failed",
 				"provider", provider.Name,
 				"status", status,
-				"error", rerr,
+				"reconnect_required", oauth.IsInvalidGrant(rerr),
+				"error", "OAuth forced refresh failed",
 			)
 		}
 	}
@@ -463,7 +464,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		observability.Logger(ctx, p.logger).Debug("oauth_resolve_failed",
 			"event", "oauth_resolve_failed",
 			"provider", provider.Name,
-			"error", err,
+			"error", "OAuth token resolution failed",
 		)
 	}
 	resp, err := send()
@@ -479,7 +480,8 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 				"event", "oauth_forced_refresh_failed",
 				"provider", provider.Name,
 				"status", resp.StatusCode,
-				"error", rerr,
+				"reconnect_required", oauth.IsInvalidGrant(rerr),
+				"error", "OAuth forced refresh failed",
 			)
 		}
 	}

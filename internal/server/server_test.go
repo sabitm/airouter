@@ -6,11 +6,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"airouter/internal/harlog"
 	"airouter/internal/observability"
+	"airouter/internal/proxy"
 )
 
 // noopHandler returns 200 OK without touching CORS headers, so tests can
@@ -170,11 +172,13 @@ func TestIsProxyPath(t *testing.T) {
 }
 
 func TestStatusWriter(t *testing.T) {
+	const captureLimit = 64
+
 	t.Run("truncated caps capture but counts full bytes", func(t *testing.T) {
 		inner := httptest.NewRecorder()
-		cap := observability.NewCapture(traceMaxBody)
+		cap := observability.NewCapture(captureLimit)
 		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: cap}
-		body := bytes.Repeat([]byte("x"), traceMaxBody+64)
+		body := bytes.Repeat([]byte("x"), captureLimit+64)
 		n, err := sw.Write(body)
 		if err != nil {
 			t.Fatalf("Write: %v", err)
@@ -182,8 +186,8 @@ func TestStatusWriter(t *testing.T) {
 		if n != len(body) {
 			t.Errorf("wrote %d, want %d", n, len(body))
 		}
-		if len(cap.Bytes()) != traceMaxBody {
-			t.Errorf("capture = %d bytes, want %d (truncated)", len(cap.Bytes()), traceMaxBody)
+		if len(cap.Bytes()) != captureLimit {
+			t.Errorf("capture = %d bytes, want %d (truncated)", len(cap.Bytes()), captureLimit)
 		}
 		if sw.bytesWritten != int64(len(body)) {
 			t.Errorf("bytesWritten = %d, want %d", sw.bytesWritten, len(body))
@@ -235,7 +239,7 @@ func TestStatusWriter(t *testing.T) {
 
 	t.Run("small write under cap captured fully", func(t *testing.T) {
 		inner := httptest.NewRecorder()
-		cap := observability.NewCapture(traceMaxBody)
+		cap := observability.NewCapture(captureLimit)
 		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: cap}
 		body := []byte("hello")
 		if _, err := sw.Write(body); err != nil {
@@ -251,13 +255,13 @@ func TestStatusWriter(t *testing.T) {
 
 	t.Run("chunked writes accumulate then truncate", func(t *testing.T) {
 		inner := httptest.NewRecorder()
-		cap := observability.NewCapture(traceMaxBody)
+		cap := observability.NewCapture(captureLimit)
 		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: cap}
-		chunk := bytes.Repeat([]byte("z"), traceMaxBody/2+10)
+		chunk := bytes.Repeat([]byte("z"), captureLimit/2+10)
 		sw.Write(chunk)
 		sw.Write(chunk)
-		if len(cap.Bytes()) != traceMaxBody {
-			t.Errorf("capture = %d, want %d after overflow", len(cap.Bytes()), traceMaxBody)
+		if len(cap.Bytes()) != captureLimit {
+			t.Errorf("capture = %d, want %d after overflow", len(cap.Bytes()), captureLimit)
 		}
 		wantWritten := int64(len(chunk) * 2)
 		if sw.bytesWritten != wantWritten {
@@ -326,7 +330,8 @@ func TestRequestIDAlwaysSet(t *testing.T) {
 
 func TestDebugLevels(t *testing.T) {
 	body := `{"model":"x","messages":[]}`
-	long := strings.Repeat("A", traceMaxBody+32)
+	const secretSentinel = "unique-prompt-sentinel-xyz"
+	bodyWithSentinel := `{"model":"x","messages":[{"role":"user","content":"` + secretSentinel + `"}]}`
 
 	run := func(level int, path string, reqBody string, handler http.HandlerFunc) string {
 		var buf bytes.Buffer
@@ -346,49 +351,90 @@ func TestDebugLevels(t *testing.T) {
 		_, _ = w.Write(b)
 	})
 
-	t.Run("debug0 no access no body", func(t *testing.T) {
+	t.Run("debug0 no access no trace", func(t *testing.T) {
 		out := run(0, "/v1/chat/completions", body, echo)
-		if strings.Contains(out, "request_completed") || strings.Contains(out, "ingress_request_body") {
+		if strings.Contains(out, "request_completed") || strings.Contains(out, "ingress_exchange") {
 			t.Fatalf("unexpected logs: %s", out)
 		}
 	})
 
-	t.Run("debug1 completion no body", func(t *testing.T) {
-		out := run(1, "/v1/chat/completions", body, echo)
+	t.Run("debug1 completion no exchange", func(t *testing.T) {
+		out := run(1, "/v1/chat/completions", bodyWithSentinel, echo)
 		if !strings.Contains(out, "request_completed") {
 			t.Fatalf("missing request_completed: %s", out)
 		}
-		if strings.Contains(out, "ingress_request_body") || strings.Contains(out, "ingress_response_body") {
-			t.Fatalf("body events at debug=1: %s", out)
+		if strings.Contains(out, "ingress_exchange") {
+			t.Fatalf("exchange event at debug=1: %s", out)
 		}
-		if strings.Contains(out, body) {
+		if strings.Contains(out, secretSentinel) || strings.Contains(out, bodyWithSentinel) {
 			t.Fatalf("raw body leaked at debug=1: %s", out)
 		}
 	})
 
-	t.Run("debug2 body events and truncation", func(t *testing.T) {
-		out := run(2, "/v1/chat/completions", long, echo)
-		if !strings.Contains(out, "ingress_request_body") || !strings.Contains(out, "ingress_response_body") {
-			t.Fatalf("missing body events: %s", out)
+	t.Run("debug2 metadata exchange no body", func(t *testing.T) {
+		out := run(2, "/v1/chat/completions", bodyWithSentinel, echo)
+		if !strings.Contains(out, "ingress_exchange") {
+			t.Fatalf("missing ingress_exchange: %s", out)
 		}
-		if !strings.Contains(out, "truncated") {
-			t.Fatalf("expected truncation marker: %s", out)
+		if strings.Contains(out, "ingress_request_body") || strings.Contains(out, "ingress_response_body") {
+			t.Fatalf("legacy body events present: %s", out)
 		}
-		// Full long body must not appear untruncated.
-		if strings.Contains(out, long) {
-			t.Fatalf("full body dumped at TRACE")
+		if !strings.Contains(out, "request_bytes=") || !strings.Contains(out, "response_bytes=") {
+			t.Fatalf("missing size fields: %s", out)
+		}
+		if !strings.Contains(out, "request_content_type=application/json") {
+			t.Fatalf("missing request content type: %s", out)
+		}
+		if !strings.Contains(out, "response_content_type=application/json") {
+			t.Fatalf("missing response content type: %s", out)
+		}
+		wantSize := strconv.Itoa(len(bodyWithSentinel))
+		if !strings.Contains(out, "request_bytes="+wantSize) {
+			t.Fatalf("wrong request_bytes: %s", out)
+		}
+		if !strings.Contains(out, "response_bytes="+wantSize) {
+			t.Fatalf("wrong response_bytes: %s", out)
+		}
+		if strings.Contains(out, secretSentinel) || strings.Contains(out, " body=") || strings.Contains(out, "textual=") {
+			t.Fatalf("body payload leaked at TRACE: %s", out)
 		}
 	})
 
-	t.Run("non-proxy path no body capture at debug2", func(t *testing.T) {
+	t.Run("non-proxy path no exchange at debug2", func(t *testing.T) {
 		out := run(2, "/dashboard", body, echo)
-		if strings.Contains(out, "ingress_request_body") {
-			t.Fatalf("dashboard should not body-trace: %s", out)
+		if strings.Contains(out, "ingress_exchange") {
+			t.Fatalf("dashboard should not exchange-trace: %s", out)
 		}
 		if !strings.Contains(out, "request_completed") {
 			t.Fatalf("still want access log: %s", out)
 		}
 	})
+}
+
+func TestIngressExchangeUpstreamURL(t *testing.T) {
+	var buf bytes.Buffer
+	logger := observability.NewLogger(2, &buf)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set("Content-Type", "application/json")
+	sw := &statusWriter{ResponseWriter: httptest.NewRecorder(), status: http.StatusOK, bytesWritten: 12}
+	sw.Header().Set("Content-Type", "text/event-stream")
+	reqCap := observability.NewCapture(0)
+	_, _ = reqCap.Write([]byte("abcdefghij"))
+	tinfo := &proxy.TraceInfo{UpstreamURL: "https://provider.example/v1/messages"}
+	emitIngressExchange(req.Context(), logger, req, tinfo, reqCap, sw, 0)
+	out := buf.String()
+	if !strings.Contains(out, "event=ingress_exchange") {
+		t.Fatalf("missing event: %s", out)
+	}
+	if !strings.Contains(out, "upstream_url=https://provider.example/v1/messages") {
+		t.Fatalf("missing upstream_url: %s", out)
+	}
+	if !strings.Contains(out, "request_bytes=10") || !strings.Contains(out, "response_bytes=12") {
+		t.Fatalf("wrong sizes: %s", out)
+	}
+	if strings.Contains(out, " body=") {
+		t.Fatalf("body attr present: %s", out)
+	}
 }
 
 func TestRequestBodyNotEagerlyDrained(t *testing.T) {
@@ -412,8 +458,11 @@ func TestRequestBodyNotEagerlyDrained(t *testing.T) {
 		t.Fatalf("handler read %d, want 4", readN)
 	}
 	// Capture should only have observed 4 bytes.
-	if !strings.Contains(buf.String(), "size=4") {
-		t.Fatalf("expected observed size=4 in logs: %s", buf.String())
+	if !strings.Contains(buf.String(), "request_bytes=4") {
+		t.Fatalf("expected observed request_bytes=4 in logs: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), string(payload)) {
+		t.Fatalf("request body leaked into TRACE: %s", buf.String())
 	}
 }
 

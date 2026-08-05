@@ -60,21 +60,24 @@ Supporting packages:
   `web.NewHandler`, so neither constructor's signature changed.
 - `internal/config` - flags/env loading.
 - `internal/observability` - shared slog helpers (`NewLogger`, request-id
-  context, bounded `Capture`, `DescribeBody`) used by server/proxy/web. Levels:
-  Info (default), Debug (`-debug=1`), Trace (`-debug=2`, custom level below
-  Debug rendered as TRACE). Terminal output is slog text, not JSON.
+  context, bounded `Capture`) used by server/proxy/web. Levels: Info (default),
+  Debug (`-debug=1`), Trace (`-debug=2`, custom level below Debug rendered as
+  TRACE). Terminal output is slog text, not JSON, and never includes HTTP body
+  bytes at any level.
 - `internal/server` - HTTP wiring: CORS (answers browser preflights, reflects
   the request Origin, exposes `X-Airouter-Request-ID`) and request middleware.
   Every request gets a correlation id on the context, `TraceInfo.RequestID`,
   response header, and HAR page id. At `-debug` (level 1) it logs structured
-  `request_completed` access events; at `-debug=2` it also emits truncated
-  ingress body TRACE events (4 KiB). Full request/response forensics use
-  `-har-file` (HAR 1.2). Request bodies are tee-captured without eager drain so
-  proxy `MaxBytesReader` stays honest.
+  `request_completed` access events; at `-debug=2` it also emits metadata-only
+  `ingress_exchange` TRACE events (sizes, content types, status, duration,
+  upstream_url). Full request/response forensics use `-har-file` (HAR 1.2).
+  Request bodies are tee-observed without eager drain so proxy `MaxBytesReader`
+  stays honest; TRACE-only uses `Capture(0)` (count, no retain).
 - `internal/web` - templ + HTMX dashboard. `.templ` files generate `*_templ.go`.
   Dashboard outbound provider probes (Check/model autocomplete) share
-  `executeProbe`; at `-debug=2` they log truncated request/response bodies
-  (16 KiB display, 1 MiB capture) without auth headers.
+  `executeProbe`; at `-debug=2` they log metadata-only `probe_request` /
+  `probe_response` TRACE events (no bodies, no auth headers). Response bytes
+  are still retained up to 1 MiB for caller decoding.
 - `cmd/airouter` - main: wires config, crypto, store, slog default, server;
   graceful shutdown.
 

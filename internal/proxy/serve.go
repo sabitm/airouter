@@ -77,6 +77,18 @@ func retryableUpstreamStatus(status int, body []byte) attemptResult {
 	}
 }
 
+// retryableStreamDecode preserves protocol error detail for the client and
+// request history while keeping decoder payload snippets out of terminal logs.
+func retryableStreamDecode(err error) attemptResult {
+	return attemptResult{
+		retry:   true,
+		status:  http.StatusBadGateway,
+		errMsg:  "upstream stream decode failed: " + err.Error(),
+		logErr:  "upstream stream decode failed",
+		errType: "api_error",
+	}
+}
+
 func terminal(status int, message, errType string) attemptResult {
 	return attemptResult{status: status, errMsg: message, logErr: message, errType: errType}
 }
@@ -378,7 +390,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	}
 	irResp, err := collectStreamResponse(resp.Body, backend, upstreamModel)
 	if err != nil {
-		return retryable(http.StatusBadGateway, "upstream stream decode failed: "+err.Error(), "api_error")
+		return retryableStreamDecode(err)
 	}
 	out, err := ingress.encodeResponse(irResp)
 	if err != nil {

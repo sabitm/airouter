@@ -45,7 +45,7 @@ func main() {
 		mainLog.Info("debug_logging_enabled",
 			"event", "debug_logging_enabled",
 			"debug_level", cfg.DebugLevel,
-			"detail", "TRACE enabled; truncated ingress and probe bodies will be logged (includes prompt content)",
+			"detail", "TRACE enabled; detailed request and probe metadata will be logged (no bodies)",
 		)
 	case cfg.DebugLevel == 1:
 		mainLog.Info("debug_logging_enabled",

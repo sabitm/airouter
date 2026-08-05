@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -151,6 +152,17 @@ func TestRequestFailedPreUpstream(t *testing.T) {
 	}
 	if strings.Contains(out, "event=upstream_attempt_failed") {
 		t.Fatalf("unexpected upstream_attempt_failed:\n%s", out)
+	}
+}
+
+func TestRetryableStreamDecodeSeparatesTerminalError(t *testing.T) {
+	const payload = "upstream-payload-sentinel"
+	got := retryableStreamDecode(errors.New(payload))
+	if !strings.Contains(got.errMsg, payload) {
+		t.Fatalf("client/history error lost detail: %q", got.errMsg)
+	}
+	if strings.Contains(got.logErr, payload) || got.logErr != "upstream stream decode failed" {
+		t.Fatalf("terminal error contains payload detail: %q", got.logErr)
 	}
 }
 

@@ -113,12 +113,12 @@ func TestCheckCodexUpstreamUsesModelsEndpoint(t *testing.T) {
 	}
 }
 
-func TestCheckCodexUpstreamTraceTruncatesStderr(t *testing.T) {
-	longID := strings.Repeat("x", probeTraceDisplay+64)
+func TestCheckCodexUpstreamTraceMetadataOnly(t *testing.T) {
+	const sentinel = "codex-model-id-sentinel-should-not-log"
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"models":[{"id":"` + longID + `"}]}`))
+		w.Write([]byte(`{"models":[{"id":"` + sentinel + `"}]}`))
 	}))
 	t.Cleanup(up.Close)
 
@@ -135,7 +135,13 @@ func TestCheckCodexUpstreamTraceTruncatesStderr(t *testing.T) {
 	}
 
 	out := buf.String()
-	if strings.Contains(out, longID) || !strings.Contains(out, "truncated") {
-		t.Fatalf("stderr trace was not truncated: %s", out)
+	if !strings.Contains(out, "event=probe_request") || !strings.Contains(out, "event=probe_response") {
+		t.Fatalf("missing probe TRACE events: %s", out)
+	}
+	if strings.Contains(out, sentinel) || strings.Contains(out, " body=") {
+		t.Fatalf("probe body leaked into TRACE: %s", out)
+	}
+	if strings.Contains(out, "tok") && strings.Contains(out, "Authorization") {
+		t.Fatalf("auth leaked: %s", out)
 	}
 }

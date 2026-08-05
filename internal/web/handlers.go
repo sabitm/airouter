@@ -29,7 +29,7 @@ type Handler struct {
 	// sessions holds in-flight OAuth connect attempts between the begin request
 	// and the later status/exchange/save requests.
 	sessions *connectSessions
-	// logger is the component=web logger. TRACE enables outbound probe body dumps.
+	// logger is the component=web logger. TRACE enables outbound probe exchange metadata.
 	logger *slog.Logger
 }
 

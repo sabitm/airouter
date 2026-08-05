@@ -200,7 +200,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			"event", "stream_decode_failed",
 			"ingress", ingress.id,
 			"backend", backend.id,
-			"error", err,
+			"error", "upstream stream decode failed",
 		)
 		return committed()
 	}

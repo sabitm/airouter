@@ -15,9 +15,6 @@ import (
 // still reflects the full wire length.
 const probeCaptureMax = 1 << 20 // 1 MiB
 
-// probeTraceDisplay caps how many body bytes appear in TRACE log lines.
-const probeTraceDisplay = 16 << 10 // 16 KiB
-
 // probeResult is the outcome of one outbound dashboard probe.
 type probeResult struct {
 	StatusCode int
@@ -28,9 +25,10 @@ type probeResult struct {
 	Duration   time.Duration
 }
 
-// executeProbe runs req, captures a bounded body, and emits TRACE probe_request /
-// probe_response events. Transport and body-read errors are logged once here
-// (DEBUG) so callers must not re-log them. Auth headers are never logged.
+// executeProbe runs req, captures a bounded body, and emits metadata-only TRACE
+// probe_request / probe_response events. Transport and body-read errors are
+// logged once here (DEBUG) so callers must not re-log them. Auth headers and
+// body bytes are never logged.
 func executeProbe(ctx context.Context, logger *slog.Logger, client *http.Client, req *http.Request, operation string) (probeResult, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -42,21 +40,16 @@ func executeProbe(ctx context.Context, logger *slog.Logger, client *http.Client,
 	start := time.Now()
 
 	if log.Enabled(ctx, observability.LevelTrace) {
-		view := describeProbeRequest(req)
-		attrs := []any{
+		// ContentLength is -1 when unknown; do not clone/read GetBody just for logging.
+		size := req.ContentLength
+		log.Log(ctx, observability.LevelTrace, "probe_request",
 			"event", "probe_request",
 			"operation", operation,
 			"method", req.Method,
 			"url", req.URL.String(),
-			"content_type", view.ContentType,
-			"size", view.Size,
-			"truncated", view.Truncated,
-			"textual", view.Textual,
-		}
-		if view.Textual {
-			attrs = append(attrs, "body", view.Text)
-		}
-		log.Log(ctx, observability.LevelTrace, "probe_request", attrs...)
+			"content_type", req.Header.Get("Content-Type"),
+			"size", size,
+		)
 	}
 
 	resp, err := client.Do(req)
@@ -94,49 +87,19 @@ func executeProbe(ctx context.Context, logger *slog.Logger, client *http.Client,
 	}
 
 	if log.Enabled(ctx, observability.LevelTrace) {
-		ct := resp.Header.Get("Content-Type")
-		view := observability.DescribeBody(body, total, ct, probeTraceDisplay)
-		attrs := []any{
+		log.Log(ctx, observability.LevelTrace, "probe_response",
 			"event", "probe_response",
 			"operation", operation,
 			"method", req.Method,
 			"url", req.URL.String(),
 			"status", resp.StatusCode,
 			"duration_ms", pr.Duration.Milliseconds(),
-			"content_type", view.ContentType,
-			"size", view.Size,
-			"truncated", view.Truncated || truncated,
-			"textual", view.Textual,
-		}
-		if view.Textual {
-			attrs = append(attrs, "body", view.Text)
-		}
-		log.Log(ctx, observability.LevelTrace, "probe_response", attrs...)
+			"content_type", resp.Header.Get("Content-Type"),
+			"size", total,
+			"truncated", truncated,
+		)
 	}
 	return pr, nil
-}
-
-// describeProbeRequest inspects a replayable request body without consuming the
-// body that will be sent. Requests without GetBody still report ContentLength;
-// their unavailable bytes are marked truncated rather than read ahead.
-func describeProbeRequest(req *http.Request) observability.BodyView {
-	contentType := req.Header.Get("Content-Type")
-	total := req.ContentLength
-	if total < 0 {
-		total = 0
-	}
-	var body []byte
-	if req.GetBody != nil {
-		if clone, err := req.GetBody(); err == nil {
-			captured, observed, _, _ := readBounded(clone, probeCaptureMax)
-			body = captured
-			_ = clone.Close()
-			if observed > total {
-				total = observed
-			}
-		}
-	}
-	return observability.DescribeBody(body, total, contentType, probeTraceDisplay)
 }
 
 // readBounded retains at most limit bytes, drains the remainder to count the

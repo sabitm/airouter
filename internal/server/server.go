@@ -17,11 +17,6 @@ import (
 	"airouter/internal/web"
 )
 
-// traceMaxBody caps how many bytes of a request or response body are retained
-// for terminal TRACE dumps. Full request/response forensics live in HAR capture
-// (-har-file), which uses harlog.MaxBody.
-const traceMaxBody = 4 << 10
-
 // requestIDHeader is returned on every response and exposed via CORS so browser
 // clients can correlate with terminal logs / HAR pages.
 const requestIDHeader = "X-Airouter-Request-ID"
@@ -151,20 +146,20 @@ func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Hand
 		start := time.Now()
 		reqID := newRequestID()
 
-		// Body capture only for provider-facing ingress paths; dashboard asset
+		// Body observation only for provider-facing ingress paths; dashboard asset
 		// and HTMX-fragment exchanges would only clutter the log / HAR.
 		proxyPath := isProxyPath(r.URL.Path)
 		traceOn := proxyPath && logger.Enabled(r.Context(), observability.LevelTrace)
 		harCap := proxyPath && har != nil
 
-		// Capture limit: HAR needs the full body (subject to harlog.MaxBody);
-		// trace-only uses the terminal cap. Neither => no wrapper.
+		// HAR retains bodies up to harlog.MaxBody. TRACE-only counts bytes the
+		// handler actually reads without retaining them (Capture(0)).
 		var reqCap *observability.Capture
 		switch {
 		case harCap:
 			reqCap = observability.NewCapture(harlog.MaxBody)
 		case traceOn:
-			reqCap = observability.NewCapture(traceMaxBody)
+			reqCap = observability.NewCapture(0)
 		}
 		if reqCap != nil && r.Body != nil {
 			r.Body = &teeReadCloser{rc: r.Body, cap: reqCap}
@@ -184,8 +179,6 @@ func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Hand
 		var respCap *observability.Capture
 		if harCap {
 			respCap = observability.NewCapture(harlog.MaxBody)
-		} else if traceOn {
-			respCap = observability.NewCapture(traceMaxBody)
 		}
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK, capture: respCap}
 		next.ServeHTTP(sw, r)
@@ -202,7 +195,7 @@ func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Hand
 			)
 		}
 		if traceOn {
-			emitBodyTrace(r.Context(), log, r, tinfo, reqCap, sw)
+			emitIngressExchange(r.Context(), log, r, tinfo, reqCap, sw, dur)
 		}
 		if harCap {
 			pageID := "page_" + reqID
@@ -238,55 +231,30 @@ func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Hand
 	})
 }
 
-// emitBodyTrace writes ingress_request_body / ingress_response_body TRACE events.
-func emitBodyTrace(ctx context.Context, log *slog.Logger, r *http.Request, tinfo *proxy.TraceInfo, reqCap *observability.Capture, sw *statusWriter) {
-	reqCT := r.Header.Get("Content-Type")
-	var reqBytes []byte
-	var reqTotal int64
+// emitIngressExchange writes a metadata-only ingress_exchange TRACE event.
+// Request byte counts come from the tee Capture (bytes the handler consumed);
+// response byte counts use statusWriter.bytesWritten (no response body retention
+// for TRACE alone).
+func emitIngressExchange(ctx context.Context, log *slog.Logger, r *http.Request, tinfo *proxy.TraceInfo, reqCap *observability.Capture, sw *statusWriter, dur time.Duration) {
+	var reqBytes int64
 	if reqCap != nil {
-		reqBytes = reqCap.Bytes()
-		reqTotal = reqCap.Total()
+		reqBytes = reqCap.Total()
 	}
-	reqView := observability.DescribeBody(reqBytes, reqTotal, reqCT, traceMaxBody)
 	attrs := []any{
-		"event", "ingress_request_body",
+		"event", "ingress_exchange",
 		"method", r.Method,
 		"path", r.URL.Path,
-		"content_type", reqView.ContentType,
-		"size", reqView.Size,
-		"truncated", reqView.Truncated,
-		"textual", reqView.Textual,
+		"status", sw.status,
+		"duration_ms", dur.Milliseconds(),
+		"request_content_type", r.Header.Get("Content-Type"),
+		"request_bytes", reqBytes,
+		"response_content_type", sw.Header().Get("Content-Type"),
+		"response_bytes", sw.bytesWritten,
 	}
 	if tinfo != nil && tinfo.UpstreamURL != "" {
 		attrs = append(attrs, "upstream_url", tinfo.UpstreamURL)
 	}
-	if reqView.Textual {
-		attrs = append(attrs, "body", reqView.Text)
-	}
-	log.Log(ctx, observability.LevelTrace, "ingress_request_body", attrs...)
-
-	respCT := sw.Header().Get("Content-Type")
-	var respBytes []byte
-	var respTotal int64
-	if sw.capture != nil {
-		respBytes = sw.capture.Bytes()
-		respTotal = sw.capture.Total()
-	} else {
-		respTotal = sw.bytesWritten
-	}
-	respView := observability.DescribeBody(respBytes, respTotal, respCT, traceMaxBody)
-	rattrs := []any{
-		"event", "ingress_response_body",
-		"status", sw.status,
-		"content_type", respView.ContentType,
-		"size", respView.Size,
-		"truncated", respView.Truncated,
-		"textual", respView.Textual,
-	}
-	if respView.Textual {
-		rattrs = append(rattrs, "body", respView.Text)
-	}
-	log.Log(ctx, observability.LevelTrace, "ingress_response_body", rattrs...)
+	log.Log(ctx, observability.LevelTrace, "ingress_exchange", attrs...)
 }
 
 // absoluteRequestURL builds an absolute URL for the ingress HAR entry.

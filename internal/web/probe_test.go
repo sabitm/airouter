@@ -6,27 +6,31 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"airouter/internal/observability"
 )
 
-func TestExecuteProbeTracesAndTruncates(t *testing.T) {
-	long := strings.Repeat("x", probeTraceDisplay+64)
+func TestExecuteProbeTracesMetadataOnly(t *testing.T) {
+	const reqSentinel = "probe-request-sentinel-aaa"
+	const respSentinel = "probe-response-sentinel-bbb"
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"data":[{"id":"` + long + `"}]}`))
+		_, _ = w.Write([]byte(`{"ok":true,"marker":"` + respSentinel + `"}`))
 	}))
 	t.Cleanup(up.Close)
 
 	var buf bytes.Buffer
 	logger := observability.NewLogger(2, &buf)
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, up.URL+"/models", nil)
+	reqBody := `{"metadata":{"marker":"` + reqSentinel + `"}}`
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, up.URL+"/check", strings.NewReader(reqBody))
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer secret-token")
 
 	pr, err := executeProbe(context.Background(), logger, upstreamClient, req, "test_probe")
@@ -37,21 +41,114 @@ func TestExecuteProbeTracesAndTruncates(t *testing.T) {
 		t.Fatalf("status = %d", pr.StatusCode)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "probe_request") || !strings.Contains(out, "probe_response") {
+	requestLine := eventLine(out, "probe_request")
+	responseLine := eventLine(out, "probe_response")
+	if requestLine == "" || responseLine == "" {
 		t.Fatalf("missing probe events: %s", out)
+	}
+	if !strings.Contains(out, "operation=test_probe") {
+		t.Fatalf("missing operation: %s", out)
+	}
+	if !strings.Contains(out, "method=POST") {
+		t.Fatalf("missing method: %s", out)
+	}
+	if !strings.Contains(out, "content_type=application/json") {
+		t.Fatalf("missing content_type: %s", out)
+	}
+	if !strings.Contains(out, "status=200") {
+		t.Fatalf("missing status: %s", out)
+	}
+	if !strings.Contains(out, "duration_ms=") {
+		t.Fatalf("missing duration_ms: %s", out)
+	}
+	if !strings.Contains(requestLine, "size="+strconv.Itoa(len(reqBody))) {
+		t.Fatalf("wrong probe request size: %s", requestLine)
+	}
+	if !strings.Contains(responseLine, "size="+strconv.FormatInt(pr.BodySize, 10)) {
+		t.Fatalf("wrong probe response size: %s", responseLine)
 	}
 	if strings.Contains(out, "secret-token") {
 		t.Fatalf("auth header leaked: %s", out)
 	}
-	if strings.Contains(out, long) || !strings.Contains(out, "truncated") {
-		t.Fatalf("body not truncated in TRACE: %s", out)
+	if strings.Contains(out, reqSentinel) || strings.Contains(out, respSentinel) {
+		t.Fatalf("body sentinel leaked into TRACE: %s", out)
 	}
-	if pr.BodySize <= int64(probeTraceDisplay) {
-		t.Fatalf("BodySize = %d, want > display cap", pr.BodySize)
+	if strings.Contains(out, " body=") || strings.Contains(out, "textual=") {
+		t.Fatalf("body/textual attrs present: %s", out)
+	}
+	// Callers still receive retained response bytes.
+	if !bytes.Contains(pr.Body, []byte(respSentinel)) {
+		t.Fatalf("caller body missing retained bytes: %q", pr.Body)
+	}
+	if pr.BodySize != int64(len(pr.Body)) {
+		t.Fatalf("BodySize=%d len(Body)=%d", pr.BodySize, len(pr.Body))
+	}
+	if pr.Truncated {
+		t.Fatalf("unexpected truncation for small response")
 	}
 }
 
-func TestExecuteProbeRequestBodyTrace(t *testing.T) {
+func eventLine(out, event string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "event="+event) {
+			return line
+		}
+	}
+	return ""
+}
+
+func TestExecuteProbeResponseTruncationFlag(t *testing.T) {
+	// Response larger than probeCaptureMax: retained body truncates, size is full,
+	// TRACE truncated=true, and no body bytes in the log.
+	const marker = "huge-probe-body-marker"
+	payload := []byte(marker + strings.Repeat("x", probeCaptureMax+64))
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(up.Close)
+
+	var buf bytes.Buffer
+	logger := observability.NewLogger(2, &buf)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, up.URL+"/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pr, err := executeProbe(context.Background(), logger, upstreamClient, req, "big_probe")
+	if err != nil {
+		t.Fatalf("executeProbe: %v", err)
+	}
+	if !pr.Truncated {
+		t.Fatal("expected Truncated=true on probeResult")
+	}
+	if len(pr.Body) != probeCaptureMax {
+		t.Fatalf("retained body = %d, want %d", len(pr.Body), probeCaptureMax)
+	}
+	if pr.BodySize != int64(len(payload)) {
+		t.Fatalf("BodySize = %d, want %d", pr.BodySize, len(payload))
+	}
+	out := buf.String()
+	if !strings.Contains(out, "event=probe_response") {
+		t.Fatalf("missing probe_response: %s", out)
+	}
+	if !strings.Contains(out, "truncated=true") {
+		t.Fatalf("expected truncated=true: %s", out)
+	}
+	if !strings.Contains(out, "size="+strconv.FormatInt(int64(len(payload)), 10)) {
+		t.Fatalf("expected full size in TRACE: %s", out)
+	}
+	if strings.Contains(out, marker) {
+		t.Fatalf("response body leaked: %s", out)
+	}
+	// Prefix retained for caller.
+	if !bytes.HasPrefix(pr.Body, []byte(marker)) {
+		t.Fatalf("caller should still get retained prefix")
+	}
+}
+
+func TestExecuteProbeRequestContentLengthUnknown(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "application/json")
@@ -61,18 +158,26 @@ func TestExecuteProbeRequestBodyTrace(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := observability.NewLogger(2, &buf)
-	requestBody := `{"metadata":{"ideType":9}}`
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, up.URL, strings.NewReader(requestBody))
+	// Chunked body without ContentLength: leave size as -1.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, up.URL, strings.NewReader(`{"a":1}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if _, err := executeProbe(context.Background(), logger, upstreamClient, req, "body_probe"); err != nil {
+	req.ContentLength = -1
+	req.Body = io.NopCloser(strings.NewReader(`{"a":1}`))
+	if _, err := executeProbe(context.Background(), logger, upstreamClient, req, "len_unknown"); err != nil {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "event=probe_request") || !strings.Contains(out, "body=") || !strings.Contains(out, "ideType") {
-		t.Fatalf("request body missing from TRACE: %s", out)
+	if !strings.Contains(out, "event=probe_request") {
+		t.Fatalf("missing probe_request: %s", out)
+	}
+	if !strings.Contains(out, "size=-1") {
+		t.Fatalf("want size=-1 for unknown ContentLength: %s", out)
+	}
+	if strings.Contains(out, `{"a":1}`) || strings.Contains(out, " body=") {
+		t.Fatalf("request body leaked: %s", out)
 	}
 }
 
@@ -93,35 +198,6 @@ func TestExecuteProbeTransportErrorOnce(t *testing.T) {
 	}
 	if strings.Contains(out, "probe_response") {
 		t.Fatalf("unexpected probe_response on transport error: %s", out)
-	}
-}
-
-func TestExecuteProbeBinarySummary(t *testing.T) {
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte{0x00, 0x01, 0xff, 0xfe})
-	}))
-	t.Cleanup(up.Close)
-
-	var buf bytes.Buffer
-	logger := observability.NewLogger(2, &buf)
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, up.URL, nil)
-	pr, err := executeProbe(context.Background(), logger, upstreamClient, req, "bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pr.BodySize != 4 {
-		t.Fatalf("BodySize = %d", pr.BodySize)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "textual=false") {
-		t.Fatalf("expected textual=false: %s", out)
-	}
-	// Binary payload must not appear as a dumped body attr value of raw bytes
-	// in a way that includes the 0xff sequence as text; DescribeBody leaves body empty.
-	if strings.Contains(out, "body=") && strings.Contains(out, "\xff") {
-		t.Fatalf("binary dumped: %q", out)
 	}
 }
 
