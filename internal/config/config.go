@@ -59,7 +59,7 @@ const devSecret = "airouter-insecure-dev-secret"
 
 func Load() Config {
 	c := Config{}
-	flag.StringVar(&c.ListenAddr, "listen", env("AIROUTER_LISTEN", ":8080"), "HTTP listen address")
+	flag.StringVar(&c.ListenAddr, "listen", env("AIROUTER_LISTEN", ":31415"), "HTTP listen address")
 	flag.StringVar(&c.DBPath, "db", env("AIROUTER_DB", "airouter.db"), "SQLite database path")
 	flag.StringVar(&c.Secret, "secret", env("AIROUTER_SECRET", ""), "secret seeding the at-rest encryption key")
 	level := debugLevel(envDebugLevel())

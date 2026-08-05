@@ -114,7 +114,7 @@ go build -o airouter ./cmd/airouter
 AIROUTER_SECRET=$(openssl rand -hex 32) ./airouter
 ```
 
-Then open http://localhost:8080/dashboard, add a provider, create a combo, and
+Then open http://localhost:31415/dashboard, add a provider, create a combo, and
 generate an access key.
 
 ## Configuration
@@ -124,7 +124,7 @@ precedence.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `-listen` | `AIROUTER_LISTEN` | `:8080` | HTTP listen address |
+| `-listen` | `AIROUTER_LISTEN` | `:31415` | HTTP listen address |
 | `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
 | `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys and OAuth tokens at rest |
 | `-debug` | `AIROUTER_DEBUG` | `off` | Log verbosity. Bare `-debug` or `=1` logs request lines, client-facing failures, and upstream error exchanges. `=2` additionally traces request and response bodies (truncated on stderr) plus the resolved upstream URL for each proxied call (includes prompt content) |
@@ -140,13 +140,13 @@ After creating a combo named `default` and an access key:
 
 ```sh
 # OpenAI-format client
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:31415/v1/chat/completions \
   -H "Authorization: Bearer sk-air-..." \
   -H "Content-Type: application/json" \
   -d '{"model":"default","messages":[{"role":"user","content":"hello"}]}'
 
 # Anthropic-format client hitting the same combo
-curl http://localhost:8080/v1/messages \
+curl http://localhost:31415/v1/messages \
   -H "x-api-key: sk-air-..." \
   -H "Content-Type: application/json" \
   -d '{"model":"default","max_tokens":256,"messages":[{"role":"user","content":"hello"}]}'
