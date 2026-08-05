@@ -24,9 +24,9 @@ type TraceInfo struct {
 	QoderModelKey       string
 	QoderModelSource    string
 	ClaudeCodeSessionID string
-	// RequestID correlates the ingress HAR entry with upstream attempt entries
-	// under one HAR page (page_<RequestID>). Set by the server middleware before
-	// the handler runs; empty when HAR capture is off.
+	// RequestID correlates terminal logs, the X-Airouter-Request-ID response
+	// header, and HAR pages (page_<RequestID>). Always set by the server
+	// middleware before the handler runs.
 	RequestID string
 }
 

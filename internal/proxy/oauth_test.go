@@ -104,7 +104,7 @@ func setupOAuthCombo(t *testing.T, up *oauthUpstream, te *tokenEndpoint, accessT
 	}
 
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token
@@ -240,7 +240,7 @@ func TestOAuthStreamingReactiveRefresh(t *testing.T) {
 	}
 	key, _ := st.NewAccessKey(ctx, "test")
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 

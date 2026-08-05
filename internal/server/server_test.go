@@ -2,9 +2,15 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"airouter/internal/harlog"
+	"airouter/internal/observability"
 )
 
 // noopHandler returns 200 OK without touching CORS headers, so tests can
@@ -73,6 +79,9 @@ func TestCORS_Preflight(t *testing.T) {
 			if !containsHeader(rec.Header().Values("Vary"), "Origin") {
 				t.Errorf("Vary = %v, want to contain Origin", rec.Header().Values("Vary"))
 			}
+			if got := rec.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, requestIDHeader) {
+				t.Errorf("ACEH = %q, want to contain %s", got, requestIDHeader)
+			}
 			if rec.Body.Len() != 0 {
 				t.Errorf("preflight body = %q, want empty", rec.Body.String())
 			}
@@ -98,6 +107,9 @@ func TestCORS_NonPreflightWithOrigin(t *testing.T) {
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "" {
 		t.Errorf("ACA-Methods = %q, want none on non-preflight", got)
+	}
+	if got := rec.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, requestIDHeader) {
+		t.Errorf("ACEH = %q, want to contain %s", got, requestIDHeader)
 	}
 }
 
@@ -157,10 +169,11 @@ func TestIsProxyPath(t *testing.T) {
 	}
 }
 
-func TestStatusWriterTruncation(t *testing.T) {
+func TestStatusWriter(t *testing.T) {
 	t.Run("truncated caps capture but counts full bytes", func(t *testing.T) {
 		inner := httptest.NewRecorder()
-		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: &bytes.Buffer{}}
+		cap := observability.NewCapture(traceMaxBody)
+		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: cap}
 		body := bytes.Repeat([]byte("x"), traceMaxBody+64)
 		n, err := sw.Write(body)
 		if err != nil {
@@ -169,10 +182,10 @@ func TestStatusWriterTruncation(t *testing.T) {
 		if n != len(body) {
 			t.Errorf("wrote %d, want %d", n, len(body))
 		}
-		if sw.capture.Len() != traceMaxBody {
-			t.Errorf("capture = %d bytes, want %d (truncated)", sw.capture.Len(), traceMaxBody)
+		if len(cap.Bytes()) != traceMaxBody {
+			t.Errorf("capture = %d bytes, want %d (truncated)", len(cap.Bytes()), traceMaxBody)
 		}
-		if sw.bytesWritten != len(body) {
+		if sw.bytesWritten != int64(len(body)) {
 			t.Errorf("bytesWritten = %d, want %d", sw.bytesWritten, len(body))
 		}
 		if inner.Body.Len() != len(body) {
@@ -180,40 +193,26 @@ func TestStatusWriterTruncation(t *testing.T) {
 		}
 	})
 
-	t.Run("captureFull grows unbounded", func(t *testing.T) {
-		inner := httptest.NewRecorder()
-		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: &bytes.Buffer{}, captureFull: true}
-		body := bytes.Repeat([]byte("y"), traceMaxBody*3)
-		if _, err := sw.Write(body); err != nil {
-			t.Fatalf("Write: %v", err)
-		}
-		if sw.capture.Len() != len(body) {
-			t.Errorf("capture = %d, want %d (unbounded)", sw.capture.Len(), len(body))
-		}
-		if !bytes.Equal(sw.capture.Bytes(), body) {
-			t.Errorf("capture content mismatch")
-		}
-	})
-
-	t.Run("capture nil does not track", func(t *testing.T) {
+	t.Run("nil capture still counts written bytes", func(t *testing.T) {
 		inner := httptest.NewRecorder()
 		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK}
 		body := []byte("no capture")
 		if _, err := sw.Write(body); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
-		if sw.bytesWritten != 0 {
-			t.Errorf("bytesWritten = %d, want 0 when capture is nil", sw.bytesWritten)
-		}
 		if !bytes.Equal(inner.Body.Bytes(), body) {
 			t.Errorf("underlying body = %q, want %q", inner.Body.Bytes(), body)
 		}
+		if sw.bytesWritten != int64(len(body)) {
+			t.Errorf("bytesWritten = %d, want %d", sw.bytesWritten, len(body))
+		}
 	})
 
-	t.Run("WriteHeader records status", func(t *testing.T) {
+	t.Run("first WriteHeader wins", func(t *testing.T) {
 		inner := httptest.NewRecorder()
 		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK}
 		sw.WriteHeader(http.StatusTeapot)
+		sw.WriteHeader(http.StatusAccepted)
 		if sw.status != http.StatusTeapot {
 			t.Errorf("status = %d, want %d", sw.status, http.StatusTeapot)
 		}
@@ -222,33 +221,60 @@ func TestStatusWriterTruncation(t *testing.T) {
 		}
 	})
 
+	t.Run("implicit 200 on first Write", func(t *testing.T) {
+		inner := httptest.NewRecorder()
+		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK}
+		sw.Write([]byte("hi"))
+		if sw.status != http.StatusOK || !sw.wroteHeader {
+			t.Errorf("status=%d wroteHeader=%v", sw.status, sw.wroteHeader)
+		}
+		if inner.Code != http.StatusOK {
+			t.Errorf("underlying = %d", inner.Code)
+		}
+	})
+
 	t.Run("small write under cap captured fully", func(t *testing.T) {
 		inner := httptest.NewRecorder()
-		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: &bytes.Buffer{}}
+		cap := observability.NewCapture(traceMaxBody)
+		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: cap}
 		body := []byte("hello")
 		if _, err := sw.Write(body); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
-		if !bytes.Equal(sw.capture.Bytes(), body) {
-			t.Errorf("capture = %q, want %q", sw.capture.Bytes(), body)
+		if !bytes.Equal(cap.Bytes(), body) {
+			t.Errorf("capture = %q, want %q", cap.Bytes(), body)
 		}
-		if sw.bytesWritten != len(body) {
+		if sw.bytesWritten != int64(len(body)) {
 			t.Errorf("bytesWritten = %d, want %d", sw.bytesWritten, len(body))
 		}
 	})
 
 	t.Run("chunked writes accumulate then truncate", func(t *testing.T) {
 		inner := httptest.NewRecorder()
-		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: &bytes.Buffer{}}
+		cap := observability.NewCapture(traceMaxBody)
+		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: cap}
 		chunk := bytes.Repeat([]byte("z"), traceMaxBody/2+10)
-		sw.Write(chunk) // fills past half
-		sw.Write(chunk) // second push overflows, should truncate
-		if sw.capture.Len() != traceMaxBody {
-			t.Errorf("capture = %d, want %d after overflow", sw.capture.Len(), traceMaxBody)
+		sw.Write(chunk)
+		sw.Write(chunk)
+		if len(cap.Bytes()) != traceMaxBody {
+			t.Errorf("capture = %d, want %d after overflow", len(cap.Bytes()), traceMaxBody)
 		}
-		wantWritten := len(chunk) * 2
+		wantWritten := int64(len(chunk) * 2)
 		if sw.bytesWritten != wantWritten {
 			t.Errorf("bytesWritten = %d, want %d", sw.bytesWritten, wantWritten)
+		}
+	})
+
+	t.Run("Flush commits implicit 200", func(t *testing.T) {
+		inner := httptest.NewRecorder()
+		sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK}
+		sw.Flush()
+		sw.WriteHeader(http.StatusInternalServerError)
+		if !sw.wroteHeader || sw.status != http.StatusOK {
+			t.Errorf("status=%d wroteHeader=%v, want committed 200", sw.status, sw.wroteHeader)
+		}
+		if inner.Code != http.StatusOK {
+			t.Errorf("underlying status=%d, want 200", inner.Code)
 		}
 	})
 }
@@ -270,4 +296,251 @@ func TestCORS_NoDuplicateACAO(t *testing.T) {
 	if len(vals) != 1 {
 		t.Fatalf("ACAO = %v, want exactly one value", vals)
 	}
+}
+
+func TestRequestIDAlwaysSet(t *testing.T) {
+	var buf bytes.Buffer
+	logger := observability.NewLogger(0, &buf) // info only
+	var gotID string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID = observability.RequestID(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	})
+	h := requestMiddleware(logger, nil, inner)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	h.ServeHTTP(rec, req)
+
+	hdr := rec.Header().Get(requestIDHeader)
+	if hdr == "" {
+		t.Fatal("missing X-Airouter-Request-ID response header")
+	}
+	if gotID == "" || gotID != hdr {
+		t.Errorf("ctx id=%q header=%q", gotID, hdr)
+	}
+	// debug=0: no request_completed
+	if strings.Contains(buf.String(), "request_completed") {
+		t.Errorf("debug=0 should not log request_completed: %s", buf.String())
+	}
+}
+
+func TestDebugLevels(t *testing.T) {
+	body := `{"model":"x","messages":[]}`
+	long := strings.Repeat("A", traceMaxBody+32)
+
+	run := func(level int, path string, reqBody string, handler http.HandlerFunc) string {
+		var buf bytes.Buffer
+		logger := observability.NewLogger(level, &buf)
+		h := requestMiddleware(logger, nil, handler)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rec, req)
+		return buf.String()
+	}
+
+	echo := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(b)
+	})
+
+	t.Run("debug0 no access no body", func(t *testing.T) {
+		out := run(0, "/v1/chat/completions", body, echo)
+		if strings.Contains(out, "request_completed") || strings.Contains(out, "ingress_request_body") {
+			t.Fatalf("unexpected logs: %s", out)
+		}
+	})
+
+	t.Run("debug1 completion no body", func(t *testing.T) {
+		out := run(1, "/v1/chat/completions", body, echo)
+		if !strings.Contains(out, "request_completed") {
+			t.Fatalf("missing request_completed: %s", out)
+		}
+		if strings.Contains(out, "ingress_request_body") || strings.Contains(out, "ingress_response_body") {
+			t.Fatalf("body events at debug=1: %s", out)
+		}
+		if strings.Contains(out, body) {
+			t.Fatalf("raw body leaked at debug=1: %s", out)
+		}
+	})
+
+	t.Run("debug2 body events and truncation", func(t *testing.T) {
+		out := run(2, "/v1/chat/completions", long, echo)
+		if !strings.Contains(out, "ingress_request_body") || !strings.Contains(out, "ingress_response_body") {
+			t.Fatalf("missing body events: %s", out)
+		}
+		if !strings.Contains(out, "truncated") {
+			t.Fatalf("expected truncation marker: %s", out)
+		}
+		// Full long body must not appear untruncated.
+		if strings.Contains(out, long) {
+			t.Fatalf("full body dumped at TRACE")
+		}
+	})
+
+	t.Run("non-proxy path no body capture at debug2", func(t *testing.T) {
+		out := run(2, "/dashboard", body, echo)
+		if strings.Contains(out, "ingress_request_body") {
+			t.Fatalf("dashboard should not body-trace: %s", out)
+		}
+		if !strings.Contains(out, "request_completed") {
+			t.Fatalf("still want access log: %s", out)
+		}
+	})
+}
+
+func TestRequestBodyNotEagerlyDrained(t *testing.T) {
+	var buf bytes.Buffer
+	logger := observability.NewLogger(2, &buf)
+	var readN int
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read only 4 bytes; the rest must not have been pre-consumed.
+		p := make([]byte, 4)
+		n, _ := r.Body.Read(p)
+		readN = n
+		w.WriteHeader(http.StatusOK)
+	})
+	h := requestMiddleware(logger, nil, inner)
+	rec := httptest.NewRecorder()
+	payload := []byte(`{"model":"default","messages":[{"role":"user","content":"hello world"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rec, req)
+	if readN != 4 {
+		t.Fatalf("handler read %d, want 4", readN)
+	}
+	// Capture should only have observed 4 bytes.
+	if !strings.Contains(buf.String(), "size=4") {
+		t.Fatalf("expected observed size=4 in logs: %s", buf.String())
+	}
+}
+
+func TestHARBoundedBodySizes(t *testing.T) {
+	rec := harlog.New("test")
+	logger := observability.NewLogger(0, io.Discard)
+	payload := bytes.Repeat([]byte("p"), 100)
+	respBody := bytes.Repeat([]byte("r"), 80)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(respBody)
+	})
+	h := requestMiddleware(logger, rec, inner)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "text/plain")
+	req.Host = "localhost:31415"
+	h.ServeHTTP(rr, req)
+
+	data, err := rec.MarshalHAR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Log struct {
+			Entries []struct {
+				Request struct {
+					BodySize int64 `json:"bodySize"`
+					PostData *struct {
+						Text string `json:"text"`
+					} `json:"postData"`
+				} `json:"request"`
+				Response struct {
+					Content struct {
+						Size int64  `json:"size"`
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"response"`
+				PageRef string `json:"pageref"`
+			} `json:"entries"`
+		} `json:"log"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Log.Entries) != 1 {
+		t.Fatalf("entries = %d", len(doc.Log.Entries))
+	}
+	e := doc.Log.Entries[0]
+	if e.Request.BodySize != int64(len(payload)) {
+		t.Errorf("req bodySize = %d, want %d", e.Request.BodySize, len(payload))
+	}
+	if e.Response.Content.Size != int64(len(respBody)) {
+		t.Errorf("resp size = %d, want %d", e.Response.Content.Size, len(respBody))
+	}
+	if e.PageRef == "" || !strings.HasPrefix(e.PageRef, "page_") {
+		t.Errorf("pageref = %q", e.PageRef)
+	}
+	// Request id header matches page suffix.
+	rid := rr.Header().Get(requestIDHeader)
+	if e.PageRef != "page_"+rid {
+		t.Errorf("pageref %q != page_%s", e.PageRef, rid)
+	}
+}
+
+func TestMiddlewareSSEFlush(t *testing.T) {
+	logger := observability.NewLogger(1, io.Discard)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("ResponseWriter is not a Flusher")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: hi\n\n"))
+		fl.Flush()
+	})
+	h := requestMiddleware(logger, nil, inner)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "data: hi") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+func TestPartialWriteCountsActual(t *testing.T) {
+	cap := observability.NewCapture(100)
+	inner := &partialRW{n: 3}
+	sw := &statusWriter{ResponseWriter: inner, status: http.StatusOK, capture: cap}
+	body := []byte("abcdef")
+	n, err := sw.Write(body)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("n = %d, want 3", n)
+	}
+	if sw.bytesWritten != 3 {
+		t.Errorf("bytesWritten = %d, want 3", sw.bytesWritten)
+	}
+	if string(cap.Bytes()) != "abc" {
+		t.Errorf("capture = %q, want abc", cap.Bytes())
+	}
+}
+
+type partialRW struct {
+	n   int
+	hdr http.Header
+}
+
+func (p *partialRW) Header() http.Header {
+	if p.hdr == nil {
+		p.hdr = http.Header{}
+	}
+	return p.hdr
+}
+func (p *partialRW) WriteHeader(int) {}
+func (p *partialRW) Write(b []byte) (int, error) {
+	if len(b) > p.n {
+		return p.n, nil
+	}
+	return len(b), nil
 }

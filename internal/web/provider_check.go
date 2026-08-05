@@ -6,8 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,7 +65,7 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, msg := checkUpstream(r.Context(), &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth}, h.trace)
+	ok, msg := checkUpstream(r.Context(), h.logger, &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth})
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -105,7 +104,7 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	} else {
 		probe.APIKey = creds.AccessToken
 	}
-	ok, msg := checkUpstream(r.Context(), probe, h.trace)
+	ok, msg := checkUpstream(r.Context(), h.logger, probe)
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -130,39 +129,32 @@ func (h *Handler) oauthCheckCreds(r *http.Request) (creds *domain.OAuthCreds, fr
 	return nil, false
 }
 
-// traceMaxBody caps the outbound /models body logged to stderr at trace level so
-// a long model list cannot flood the terminal. Full request/response forensics
-// live in HAR capture (-har-file).
-const traceMaxBody = 16 << 10
-
-// checkUpstream performs a GET {base_url}/models with the protocol's auth
-// headers and classifies the outcome. The /models response shape is identical
-// across OpenAI and Anthropic, so protocol verification is a soft signal: a
-// mismatch surfaces only via a 404 or an unexpected body, not definitively.
-//
-// When trace is set the request and response are logged; auth headers are never
-// logged, so the API key stays out of the log.
-func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+// checkUpstream performs a protocol-appropriate liveness probe. The /models
+// response shape is identical across OpenAI and Anthropic, so protocol
+// verification is a soft signal: a mismatch surfaces only via a 404 or an
+// unexpected body, not definitively. Probe request/response tracing is handled
+// by executeProbe; auth headers are never logged.
+func checkUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	if p.Protocol == domain.ProtocolOpenAICodex {
-		return checkCodexUpstream(ctx, p, trace)
+		return checkCodexUpstream(ctx, logger, p)
 	}
 	if p.Protocol == domain.ProtocolKiro {
-		return checkKiroUpstream(ctx, p, trace)
+		return checkKiroUpstream(ctx, logger, p)
 	}
 	if p.Protocol == domain.ProtocolQoder {
-		return checkQoderUpstream(ctx, p, trace)
+		return checkQoderUpstream(ctx, logger, p)
 	}
 	if p.Protocol == domain.ProtocolAntigravity {
-		return checkAntigravityUpstream(ctx, p, trace)
+		return checkAntigravityUpstream(ctx, logger, p)
 	}
 	if p.Protocol == domain.ProtocolCursor {
-		return checkCursorUpstream(ctx, p, trace)
+		return checkCursorUpstream(ctx, logger, p)
 	}
 	if p.Protocol == domain.ProtocolClaudeCode {
-		return checkClaudeCodeUpstream(ctx, p, trace)
+		return checkClaudeCodeUpstream(ctx, logger, p)
 	}
 	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
-		return checkClineUpstream(ctx, p, trace)
+		return checkClineUpstream(ctx, logger, p)
 	}
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -182,33 +174,18 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, s
 	}
 	applyClineProbeHeaders(req, p)
 
-	if trace {
-		log.Printf("[trace] >>> GET %s", url)
-	}
-
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_models")
 	if err != nil {
-		if trace {
-			log.Printf("[trace] <<< GET %s: %v", url, err)
-		}
 		return false, "could not reach URL: " + err.Error()
-	}
-	defer resp.Body.Close()
-
-	// Read the body before classifying so the trace covers every status, not
-	// just the success path.
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return false, fmt.Sprintf("API key rejected (HTTP %d)", resp.StatusCode)
-	case resp.StatusCode == http.StatusNotFound:
+	case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("API key rejected (HTTP %d)", pr.StatusCode)
+	case pr.StatusCode == http.StatusNotFound:
 		return false, "not found (HTTP 404) - check base URL and protocol"
-	case resp.StatusCode >= 400:
-		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	case pr.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
 	}
 
 	var parsed struct {
@@ -216,7 +193,7 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, s
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Data == nil {
+	if err := json.Unmarshal(pr.Body, &parsed); err != nil || parsed.Data == nil {
 		return false, "reachable, but response shape unexpected - protocol may not match"
 	}
 	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
@@ -227,7 +204,7 @@ func checkUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, s
 // a passing Check implies the credential and client profile will be accepted on
 // real traffic. OAuth tokens are resolved/refreshed by the caller before this
 // runs, so p.APIKey holds the live access token.
-func checkClaudeCodeUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -238,35 +215,24 @@ func checkClaudeCodeUpstream(ctx context.Context, p *domain.Provider, trace bool
 		req.Header.Set(k, v)
 	}
 
-	if trace {
-		log.Printf("[trace] >>> GET %s", url)
-	}
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_claude_code")
 	if err != nil {
-		if trace {
-			log.Printf("[trace] <<< GET %s: %v", url, err)
-		}
 		return false, "could not reach URL: " + err.Error()
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
-	}
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return false, fmt.Sprintf("token rejected (HTTP %d)", resp.StatusCode)
-	case resp.StatusCode == http.StatusNotFound:
+	case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("token rejected (HTTP %d)", pr.StatusCode)
+	case pr.StatusCode == http.StatusNotFound:
 		return false, "not found (HTTP 404) - check base URL"
-	case resp.StatusCode >= 400:
-		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	case pr.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
 	}
 	var parsed struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Data == nil {
+	if err := json.Unmarshal(pr.Body, &parsed); err != nil || parsed.Data == nil {
 		return false, "reachable, but response shape unexpected"
 	}
 	return true, fmt.Sprintf("OK - reachable, token accepted (%d models)", len(parsed.Data))
@@ -274,7 +240,7 @@ func checkClaudeCodeUpstream(ctx context.Context, p *domain.Provider, trace bool
 
 // checkQoderUpstream validates a Qoder device token against openapi userinfo.
 // Uses plain Bearer auth (not COSY); refresh is not attempted.
-func checkQoderUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+func checkQoderUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	url := qoder.UserInfoURL
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -284,28 +250,17 @@ func checkQoderUpstream(ctx context.Context, p *domain.Provider, trace bool) (bo
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "Go-http-client/2.0")
 
-	if trace {
-		log.Printf("[trace] >>> GET %s", url)
-	}
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_qoder")
 	if err != nil {
-		if trace {
-			log.Printf("[trace] <<< GET %s: %v", url, err)
-		}
 		return false, "could not reach URL: " + err.Error()
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
-	}
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized:
+	case pr.StatusCode == http.StatusUnauthorized:
 		return false, "token invalid or revoked (HTTP 401)"
-	case resp.StatusCode == http.StatusForbidden:
+	case pr.StatusCode == http.StatusForbidden:
 		return false, "access denied (HTTP 403)"
-	case resp.StatusCode >= 400:
-		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	case pr.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
 	}
 	return true, "OK - reachable, token accepted"
 }
@@ -314,7 +269,7 @@ func checkQoderUpstream(ctx context.Context, p *domain.Provider, trace bool) (bo
 // /users/me endpoint. Plain Cline does not expose /models, so probing it (the
 // generic path) returns a misleading 404 even for a valid token. /users/me is
 // what 9router uses to verify the access token.
-func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+func checkClineUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/users/me"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -323,33 +278,20 @@ func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool) (bo
 	applyClineProbeHeaders(req, p)
 	req.Header.Set("Accept", "application/json")
 
-	if trace {
-		log.Printf("[trace] >>> GET %s", url)
-	}
-
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_cline")
 	if err != nil {
-		if trace {
-			log.Printf("[trace] <<< GET %s: %v", url, err)
-		}
 		return false, "could not reach URL: " + err.Error()
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized:
+	case pr.StatusCode == http.StatusUnauthorized:
 		return false, "token invalid or revoked (HTTP 401)"
-	case resp.StatusCode == http.StatusForbidden:
+	case pr.StatusCode == http.StatusForbidden:
 		return false, "access denied (HTTP 403)"
-	case resp.StatusCode == http.StatusNotFound:
+	case pr.StatusCode == http.StatusNotFound:
 		return false, "not found (HTTP 404) - check base URL"
-	case resp.StatusCode >= 400:
-		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	case pr.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
 	}
 	return true, "OK - reachable, token accepted"
 }
@@ -357,8 +299,8 @@ func checkClineUpstream(ctx context.Context, p *domain.Provider, trace bool) (bo
 // checkCodexUpstream validates the ChatGPT Codex model-discovery endpoint. It is
 // account-aware and avoids hardcoding a probe model that may not be available to
 // this ChatGPT account.
-func checkCodexUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
-	models, status, body, err := fetchCodexModels(ctx, p, trace)
+func checkCodexUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
+	models, status, body, err := fetchCodexModels(ctx, logger, p)
 	if err != nil {
 		switch {
 		case status == http.StatusUnauthorized || status == http.StatusForbidden:
@@ -404,20 +346,8 @@ func applyClineProbeHeaders(req *http.Request, p *domain.Provider) {
 	}
 }
 
-// traceBody renders an outbound response body for the log, appending a marker
-// when the output was capped. limit <= 0 logs the whole body.
-func traceBody(body []byte, limit int) string {
-	if len(body) == 0 {
-		return "(empty)"
-	}
-	if limit > 0 && len(body) > limit {
-		return fmt.Sprintf("%s... (truncated, %d bytes total)", body[:limit], len(body))
-	}
-	return string(body)
-}
-
 // checkAntigravityUpstream validates token + project via loadCodeAssist.
-func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+func checkAntigravityUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	const url = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 	meta := map[string]int{"ideType": 9, "platform": 3, "pluginType": 2}
 	payload, _ := json.Marshal(map[string]any{"metadata": meta})
@@ -433,29 +363,18 @@ func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace boo
 	mb, _ := json.Marshal(meta)
 	req.Header.Set("Client-Metadata", string(mb))
 
-	if trace {
-		log.Printf("[trace] >>> POST %s", url)
-	}
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_antigravity")
 	if err != nil {
-		if trace {
-			log.Printf("[trace] <<< POST %s: %v", url, err)
-		}
 		return false, "could not reach URL: " + err.Error()
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
-	}
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return false, fmt.Sprintf("token rejected (HTTP %d)", resp.StatusCode)
-	case resp.StatusCode >= 400:
-		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("token rejected (HTTP %d)", pr.StatusCode)
+	case pr.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
 	}
 	var data map[string]any
-	_ = json.Unmarshal(body, &data)
+	_ = json.Unmarshal(pr.Body, &data)
 	project := ""
 	switch v := data["cloudaicompanionProject"].(type) {
 	case string:
@@ -479,7 +398,7 @@ func checkAntigravityUpstream(ctx context.Context, p *domain.Provider, trace boo
 // has no /models REST endpoint; GetUsableModels is the lighter liveness probe
 // (an unframed application/proto unary call). Tokens are short-lived and not
 // refreshable, so a 401/403 means re-paste, not refresh.
-func checkCursorUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+func checkCursorUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	token := strings.TrimSpace(p.APIKey)
 	if token == "" {
 		return false, "no access token - paste one or reconnect"
@@ -499,27 +418,16 @@ func checkCursorUpstream(ctx context.Context, p *domain.Provider, trace bool) (b
 			req.Header.Set(k, v)
 		}
 	}
-	if trace {
-		log.Printf("[trace] >>> POST %s", url)
-	}
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_cursor")
 	if err != nil {
-		if trace {
-			log.Printf("[trace] <<< POST %s: %v", url, err)
-		}
 		return false, "could not reach Cursor: " + err.Error()
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
-	}
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return false, fmt.Sprintf("token rejected (HTTP %d) - re-paste required", resp.StatusCode)
-	case resp.StatusCode >= 400:
-		return false, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
+	case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("token rejected (HTTP %d) - re-paste required", pr.StatusCode)
+	case pr.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
 	}
-	ids := cursor.ParseUsableModels(body)
+	ids := cursor.ParseUsableModels(pr.Body)
 	return true, fmt.Sprintf("OK - reachable, token accepted (%d models)", len(ids))
 }

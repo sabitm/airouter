@@ -1,49 +1,56 @@
 package server
 
 import (
-	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"airouter/internal/harlog"
+	"airouter/internal/observability"
 	"airouter/internal/proxy"
 	"airouter/internal/store"
 	"airouter/internal/web"
 )
 
-// traceMaxBody caps how many bytes of a request or response body are logged to
-// stderr at trace level, so a long stream or large context cannot flood the
-// terminal. Full request/response forensics live in HAR capture (-har-file).
+// traceMaxBody caps how many bytes of a request or response body are retained
+// for terminal TRACE dumps. Full request/response forensics live in HAR capture
+// (-har-file), which uses harlog.MaxBody.
 const traceMaxBody = 4 << 10
 
+// requestIDHeader is returned on every response and exposed via CORS so browser
+// clients can correlate with terminal logs / HAR pages.
+const requestIDHeader = "X-Airouter-Request-ID"
+
 type Server struct {
-	mux        *http.ServeMux
-	debugLevel int
+	mux    *http.ServeMux
+	logger *slog.Logger
 	// har records both legs of proxied exchanges when non-nil (enabled by
-	// -har-file). Independent of debugLevel.
+	// -har-file). Independent of logger level.
 	har *harlog.Recorder
 }
 
-// New builds the HTTP mux. harFile, when non-empty, enables the in-memory HAR
-// recorder (creator version is creatorVersion) and mounts GET /debug/har.
-// The recorder is also passed to the proxy for upstream-leg capture.
-func New(s *store.Store, debugLevel int, harFile, creatorVersion string) *Server {
+// New builds the HTTP mux. logger may be nil (falls back to slog.Default).
+// harFile, when non-empty, enables the in-memory HAR recorder (creator version
+// is creatorVersion) and mounts GET /debug/har. The recorder is also passed to
+// the proxy for upstream-leg capture.
+func New(s *store.Store, logger *slog.Logger, harFile, creatorVersion string) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	var har *harlog.Recorder
 	if harFile != "" {
 		har = harlog.New(creatorVersion)
 	}
 	mux := http.NewServeMux()
-	web.NewHandler(s, debugLevel >= 2).Mount(mux)
-	// The proxy only distinguishes on/off (level >= 1); body trace lives in the
-	// middleware below, which sees every path uniformly.
-	proxy.New(s, debugLevel >= 1, har).Mount(mux)
-	srv := &Server{mux: mux, debugLevel: debugLevel, har: har}
+	httpLog := logger.With("component", "http")
+	web.NewHandler(s, logger.With("component", "web")).Mount(mux)
+	proxy.New(s, logger.With("component", "proxy"), har).Mount(mux)
+	srv := &Server{mux: mux, logger: httpLog, har: har}
 	if har != nil {
 		mux.HandleFunc("GET /debug/har", srv.handleHAR)
 	}
@@ -55,10 +62,10 @@ func (s *Server) HAR() *harlog.Recorder { return s.har }
 
 func (s *Server) Handler() http.Handler {
 	h := cors(s.mux)
-	// Always attach TraceInfo (and optionally HAR + debug logging). TraceInfo
-	// must be present on every request so prepare/header seams can round-trip
-	// session ids even when body tracing is off.
-	return requestMiddleware(s.debugLevel, s.har, h)
+	// Always attach TraceInfo + request id (and optionally HAR + debug/trace
+	// logging). TraceInfo must be present on every request so prepare/header
+	// seams can round-trip session ids even when body tracing is off.
+	return requestMiddleware(s.logger, s.har, h)
 }
 
 func (s *Server) handleHAR(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +103,8 @@ func cors(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", origin)
 		h.Add("Vary", "Origin")
+		// Expose the correlation header so browser JS can read it.
+		exposeRequestID(h)
 
 		// A real preflight carries Access-Control-Request-Method; a bare OPTIONS
 		// without it is not a preflight and falls through to the mux.
@@ -114,80 +123,170 @@ func cors(next http.Handler) http.Handler {
 	})
 }
 
-// requestMiddleware attaches TraceInfo to every request, optionally records the
-// ingress HAR leg, and (when level >= 1) emits the existing access/trace logs.
-// HAR capture is independent of debug level.
-func requestMiddleware(level int, har *harlog.Recorder, next http.Handler) http.Handler {
-	accessLog := level >= 1
+// exposeRequestID merges X-Airouter-Request-ID into Access-Control-Expose-Headers
+// without clobbering any value already present.
+func exposeRequestID(h http.Header) {
+	const expose = "Access-Control-Expose-Headers"
+	cur := h.Get(expose)
+	if cur == "" {
+		h.Set(expose, requestIDHeader)
+		return
+	}
+	for _, p := range strings.Split(cur, ",") {
+		if strings.EqualFold(strings.TrimSpace(p), requestIDHeader) {
+			return
+		}
+	}
+	h.Set(expose, cur+", "+requestIDHeader)
+}
+
+// requestMiddleware attaches TraceInfo and a request id to every request,
+// optionally records the ingress HAR leg, and emits access/trace logs gated by
+// the logger level. HAR capture is independent of log level.
+func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Handler) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		reqID := newRequestID()
 
-		// Trace bodies only for provider-facing ingress paths; dashboard asset
-		// and HTMX-fragment exchanges would only clutter the log.
-		trace := level >= 2 && isProxyPath(r.URL.Path)
-		harCap := har != nil && isProxyPath(r.URL.Path)
-		var reqBody []byte
-		// TraceInfo carries per-request cross-stage state (the resolved upstream
-		// URL; the Codex/Claude Code session id shared between the request body and
-		// an upstream header). It must be attached regardless of debug level so
-		// the prepare and header seams can round-trip the session id even when body
-		// tracing is off; only the body capture/logging below stays level-gated.
-		tinfo := &proxy.TraceInfo{}
-		if har != nil {
-			tinfo.RequestID = newRequestID()
-		}
-		r = r.WithContext(proxy.WithTraceInfo(r.Context(), tinfo))
+		// Body capture only for provider-facing ingress paths; dashboard asset
+		// and HTMX-fragment exchanges would only clutter the log / HAR.
+		proxyPath := isProxyPath(r.URL.Path)
+		traceOn := proxyPath && logger.Enabled(r.Context(), observability.LevelTrace)
+		harCap := proxyPath && har != nil
 
-		if trace || harCap {
-			reqBody = drainRequestBody(r)
+		// Capture limit: HAR needs the full body (subject to harlog.MaxBody);
+		// trace-only uses the terminal cap. Neither => no wrapper.
+		var reqCap *observability.Capture
+		switch {
+		case harCap:
+			reqCap = observability.NewCapture(harlog.MaxBody)
+		case traceOn:
+			reqCap = observability.NewCapture(traceMaxBody)
+		}
+		if reqCap != nil && r.Body != nil {
+			r.Body = &teeReadCloser{rc: r.Body, cap: reqCap}
 		}
 
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		if trace || harCap {
-			sw.capture = &bytes.Buffer{}
-			// Full capture only when HAR needs the whole body (harlog applies its
-			// own 1 MiB cap). Text trace truncates at emit time via traceMaxBody.
-			sw.captureFull = harCap
+		// TraceInfo carries per-request cross-stage state. RequestID is always
+		// populated so terminal logs, HAR pages, and the response header share it.
+		tinfo := &proxy.TraceInfo{RequestID: reqID}
+		ctx := proxy.WithTraceInfo(r.Context(), tinfo)
+		ctx = observability.WithRequestID(ctx, reqID)
+		r = r.WithContext(ctx)
+
+		// Set the correlation header before the handler runs so even early
+		// rejections carry it.
+		w.Header().Set(requestIDHeader, reqID)
+
+		var respCap *observability.Capture
+		if harCap {
+			respCap = observability.NewCapture(harlog.MaxBody)
+		} else if traceOn {
+			respCap = observability.NewCapture(traceMaxBody)
 		}
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK, capture: respCap}
 		next.ServeHTTP(sw, r)
 
-		if accessLog {
-			log.Printf("%s %s %d %s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond))
+		log := observability.Logger(r.Context(), logger)
+		dur := time.Since(start)
+		if log.Enabled(r.Context(), slog.LevelDebug) {
+			log.Debug("request_completed",
+				"event", "request_completed",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", sw.status,
+				"duration_ms", dur.Milliseconds(),
+			)
 		}
-		if trace {
-			target := r.URL.Path
-			if tinfo.UpstreamURL != "" {
-				target = tinfo.UpstreamURL
-			}
-			emitTrace(log.Default(), r, reqBody, sw, target, traceMaxBody)
+		if traceOn {
+			emitBodyTrace(r.Context(), log, r, tinfo, reqCap, sw)
 		}
 		if harCap {
-			pageID := "page_" + tinfo.RequestID
+			pageID := "page_" + reqID
 			title := r.Method + " " + r.URL.RequestURI()
 			har.EnsurePage(pageID, title, start)
-			// Prefer the scheme/host the client used so the HAR URL is absolute.
-			absURL := absoluteRequestURL(r)
-			// Snapshot response headers after the handler finished writing them.
+			var reqBody []byte
+			var reqSize int
+			if reqCap != nil {
+				reqBody = reqCap.Bytes()
+				reqSize = int(reqCap.Total())
+			}
+			var respBody []byte
+			var respSize int
+			if respCap != nil {
+				respBody = respCap.Bytes()
+				respSize = int(respCap.Total())
+			}
 			har.Record(harlog.RecordInput{
-				PageID:      pageID,
-				StartedAt:   start,
-				Duration:    time.Since(start),
-				Method:      r.Method,
-				URL:         absURL,
-				ReqHeaders:  r.Header.Clone(),
-				ReqBody:     reqBody,
-				Status:      sw.status,
-				RespHeaders: sw.Header().Clone(),
-				RespBody:    sw.capture.Bytes(),
+				PageID:       pageID,
+				StartedAt:    start,
+				Duration:     dur,
+				Method:       r.Method,
+				URL:          absoluteRequestURL(r),
+				ReqHeaders:   r.Header.Clone(),
+				ReqBody:      reqBody,
+				ReqBodySize:  reqSize,
+				Status:       sw.status,
+				RespHeaders:  sw.Header().Clone(),
+				RespBody:     respBody,
+				RespBodySize: respSize,
 			})
 		}
-		if sw.capture != nil && (trace || harCap) {
-			// Release the (possibly large) capture buffer now that it has been
-			// written. Peak memory is unavoidable: the full body must be buffered
-			// before the HAR/trace line can be formatted.
-			sw.capture = nil
-		}
 	})
+}
+
+// emitBodyTrace writes ingress_request_body / ingress_response_body TRACE events.
+func emitBodyTrace(ctx context.Context, log *slog.Logger, r *http.Request, tinfo *proxy.TraceInfo, reqCap *observability.Capture, sw *statusWriter) {
+	reqCT := r.Header.Get("Content-Type")
+	var reqBytes []byte
+	var reqTotal int64
+	if reqCap != nil {
+		reqBytes = reqCap.Bytes()
+		reqTotal = reqCap.Total()
+	}
+	reqView := observability.DescribeBody(reqBytes, reqTotal, reqCT, traceMaxBody)
+	attrs := []any{
+		"event", "ingress_request_body",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"content_type", reqView.ContentType,
+		"size", reqView.Size,
+		"truncated", reqView.Truncated,
+		"textual", reqView.Textual,
+	}
+	if tinfo != nil && tinfo.UpstreamURL != "" {
+		attrs = append(attrs, "upstream_url", tinfo.UpstreamURL)
+	}
+	if reqView.Textual {
+		attrs = append(attrs, "body", reqView.Text)
+	}
+	log.Log(ctx, observability.LevelTrace, "ingress_request_body", attrs...)
+
+	respCT := sw.Header().Get("Content-Type")
+	var respBytes []byte
+	var respTotal int64
+	if sw.capture != nil {
+		respBytes = sw.capture.Bytes()
+		respTotal = sw.capture.Total()
+	} else {
+		respTotal = sw.bytesWritten
+	}
+	respView := observability.DescribeBody(respBytes, respTotal, respCT, traceMaxBody)
+	rattrs := []any{
+		"event", "ingress_response_body",
+		"status", sw.status,
+		"content_type", respView.ContentType,
+		"size", respView.Size,
+		"truncated", respView.Truncated,
+		"textual", respView.Textual,
+	}
+	if respView.Textual {
+		rattrs = append(rattrs, "body", respView.Text)
+	}
+	log.Log(ctx, observability.LevelTrace, "ingress_response_body", rattrs...)
 }
 
 // absoluteRequestURL builds an absolute URL for the ingress HAR entry.
@@ -207,7 +306,7 @@ func absoluteRequestURL(r *http.Request) string {
 }
 
 // newRequestID returns a short random hex id used as TraceInfo.RequestID /
-// HAR page suffix.
+// HAR page suffix / X-Airouter-Request-ID.
 func newRequestID() string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
@@ -225,109 +324,62 @@ func isProxyPath(p string) bool {
 	return false
 }
 
-// drainRequestBody reads the full body so it can be logged, then restores it
-// from the buffer so the handler still sees the complete request. Trace mode is
-// operator-enabled, so buffering the body in memory is acceptable here.
-func drainRequestBody(r *http.Request) []byte {
-	if r.Body == nil {
-		return nil
-	}
-	b, err := io.ReadAll(r.Body)
-	r.Body.Close()
-	if err != nil {
-		r.Body = io.NopCloser(bytes.NewReader(nil))
-		return b
-	}
-	r.Body = io.NopCloser(bytes.NewReader(b))
-	return b
+// teeReadCloser observes bytes as the handler reads them without reading ahead.
+// This keeps MaxBytesReader and partial-body rejects honest for logging/HAR.
+type teeReadCloser struct {
+	rc  io.ReadCloser
+	cap *observability.Capture
 }
 
-// emitTrace writes one request/response trace pair to l. limit caps each body's
-// logged length (<= 0 means unlimited). The request line shows the resolved
-// upstream provider URL when one was reached; otherwise (a local /models
-// response or a pre-upstream rejection) it falls back to the inbound path.
-// Binary responses are summarized rather than dumped.
-func emitTrace(l *log.Logger, r *http.Request, reqBody []byte, sw *statusWriter, target string, limit int) {
-	l.Printf("[trace] >>> %s %s\n%s", r.Method, target, traceBody(reqBody, len(reqBody), limit))
-	if ct := sw.Header().Get("Content-Type"); sw.bytesWritten > 0 && !isTextual(ct) {
-		l.Printf("[trace] <<< %d (%s, %d bytes, not logged)", sw.status, ct, sw.bytesWritten)
-		return
+func (t *teeReadCloser) Read(p []byte) (int, error) {
+	n, err := t.rc.Read(p)
+	if n > 0 && t.cap != nil {
+		_, _ = t.cap.Write(p[:n])
 	}
-	var captured []byte
-	if sw.capture != nil {
-		captured = sw.capture.Bytes()
-	}
-	l.Printf("[trace] <<< %d\n%s", sw.status, traceBody(captured, sw.bytesWritten, limit))
+	return n, err
 }
 
-// traceBody renders captured bytes for the log, appending a marker when the
-// capture was truncated. total is the full body length; captured may be shorter.
-// limit caps the logged length; limit <= 0 logs everything captured.
-func traceBody(captured []byte, total, limit int) string {
-	if total == 0 {
-		return "(empty)"
-	}
-	if limit > 0 && len(captured) > limit {
-		captured = captured[:limit]
-	}
-	if total > len(captured) {
-		return fmt.Sprintf("%s... (truncated, %d bytes total)", captured, total)
-	}
-	return string(captured)
-}
-
-// isTextual reports whether a Content-Type is safe to dump as text. Empty type
-// is treated as textual since the proxy's JSON/SSE responses often omit it until
-// the first write.
-func isTextual(contentType string) bool {
-	ct := strings.ToLower(contentType)
-	switch {
-	case ct == "",
-		strings.HasPrefix(ct, "application/json"),
-		strings.HasPrefix(ct, "text/"),
-		strings.Contains(ct, "event-stream"):
-		return true
-	default:
-		return false
-	}
-}
+func (t *teeReadCloser) Close() error { return t.rc.Close() }
 
 type statusWriter struct {
 	http.ResponseWriter
-	status int
-	// capture, when non-nil (trace level or HAR), accumulates response bytes;
-	// bytesWritten tracks the full length for the truncation marker. When
-	// captureFull is set (HAR needs the whole body) capture grows unbounded;
-	// otherwise it stops at traceMaxBody.
-	capture      *bytes.Buffer
-	captureFull  bool
-	bytesWritten int
+	status       int
+	wroteHeader  bool
+	capture      *observability.Capture
+	bytesWritten int64
 }
 
 func (w *statusWriter) WriteHeader(code int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *statusWriter) Write(b []byte) (int, error) {
-	if w.capture != nil {
-		if w.captureFull {
-			w.capture.Write(b)
-		} else if room := traceMaxBody - w.capture.Len(); room > 0 {
-			if room >= len(b) {
-				w.capture.Write(b)
-			} else {
-				w.capture.Write(b[:room])
-			}
-		}
-		w.bytesWritten += len(b)
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
 	}
-	return w.ResponseWriter.Write(b)
+	n, err := w.ResponseWriter.Write(b)
+	// Count and capture only bytes actually accepted by the underlying writer.
+	if n > 0 {
+		w.bytesWritten += int64(n)
+		if w.capture != nil {
+			_, _ = w.capture.Write(b[:n])
+		}
+	}
+	return n, err
 }
 
 // Flush exposes the underlying flusher so SSE streaming keeps flushing through
-// this wrapper.
+// this wrapper. net/http commits an implicit 200 on Flush, so mirror that state
+// before delegating.
 func (w *statusWriter) Flush() {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}

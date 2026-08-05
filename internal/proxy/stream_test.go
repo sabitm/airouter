@@ -177,7 +177,7 @@ func setupStreamingWithStore(t *testing.T, backend domain.Protocol, anthropicBod
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token, st
@@ -286,7 +286,7 @@ func TestStreamToolResponsesToOpenAI(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
@@ -336,7 +336,7 @@ func TestStreamToolOpenAIToAnthropic(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
@@ -491,7 +491,7 @@ func TestStreamErrorBodyCapped(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
@@ -555,7 +555,7 @@ func TestStreamErrorEnvelopePerIngress(t *testing.T) {
 				t.Fatal(err)
 			}
 			mux := http.NewServeMux()
-			New(st, false, nil).Mount(mux)
+			New(st, nil, nil).Mount(mux)
 			ts := httptest.NewServer(mux)
 			t.Cleanup(ts.Close)
 

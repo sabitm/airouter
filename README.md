@@ -127,8 +127,8 @@ precedence.
 | `-listen` | `AIROUTER_LISTEN` | `:31415` | HTTP listen address |
 | `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
 | `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys and OAuth tokens at rest |
-| `-debug` | `AIROUTER_DEBUG` | `off` | Log verbosity. Bare `-debug` or `=1` logs request lines, client-facing failures, and upstream error exchanges. `=2` additionally traces request and response bodies (truncated on stderr) plus the resolved upstream URL for each proxied call (includes prompt content) |
-| `-har-file` | `AIROUTER_HAR_FILE` | (disabled) | Capture both legs of every proxied request (client↔airouter and airouter↔provider) verbatim — headers and bodies, including secrets and prompt content — into a HAR 1.2 document. Independent of `-debug`. Download live at `GET /debug/har`; flushed to this path on shutdown. Import into Chrome DevTools Network tab |
+| `-debug` | `AIROUTER_DEBUG` | `off` | Structured slog text verbosity. Bare `-debug` or `=1` logs access summaries, client-facing failures, upstream failure metadata, failover and OAuth diagnostics (no bodies). `=2` additionally traces truncated ingress and dashboard-probe request/response bodies (includes prompt content). Every response carries `X-Airouter-Request-ID` for correlation |
+| `-har-file` | `AIROUTER_HAR_FILE` | (disabled) | Capture both legs of every proxied request (client↔airouter and airouter↔provider) verbatim — headers and bodies up to the HAR per-body cap, including secrets and prompt content — into a HAR 1.2 document. Independent of `-debug`. Download live at `GET /debug/har`; flushed to this path on shutdown. Import into Chrome DevTools Network tab |
 
 If `AIROUTER_SECRET` is unset, an insecure built-in key is used and a warning is
 logged. Set a real secret in any deployment you care about; rotating it makes

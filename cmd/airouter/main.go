@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,6 +13,7 @@ import (
 
 	"airouter/internal/config"
 	"airouter/internal/crypto"
+	"airouter/internal/observability"
 	"airouter/internal/server"
 	"airouter/internal/store"
 )
@@ -28,31 +29,52 @@ func main() {
 		return
 	}
 
+	logger := observability.NewLogger(cfg.DebugLevel, os.Stderr)
+	slog.SetDefault(logger)
+	mainLog := logger.With("component", "main")
+
 	secret, isDev := cfg.EffectiveSecret()
 	if isDev {
-		log.Println("WARNING: AIROUTER_SECRET not set; using insecure dev key. Stored API keys are not protected.")
+		mainLog.Warn("insecure_dev_secret",
+			"event", "insecure_dev_secret",
+			"msg_detail", "AIROUTER_SECRET not set; using insecure dev key. Stored API keys are not protected.",
+		)
 	}
 	switch {
 	case cfg.DebugLevel >= 2:
-		log.Println("debug level 2 (trace) enabled; full request and response bodies will be logged (includes prompt content)")
+		mainLog.Info("debug_logging_enabled",
+			"event", "debug_logging_enabled",
+			"debug_level", cfg.DebugLevel,
+			"detail", "TRACE enabled; truncated ingress and probe bodies will be logged (includes prompt content)",
+		)
 	case cfg.DebugLevel == 1:
-		log.Println("debug mode enabled; failed upstream exchanges will be logged (may include prompt content)")
+		mainLog.Info("debug_logging_enabled",
+			"event", "debug_logging_enabled",
+			"debug_level", cfg.DebugLevel,
+			"detail", "DEBUG enabled; access lines and upstream failure metadata will be logged (no bodies)",
+		)
 	}
 	if cfg.HARFile != "" {
-		log.Println("HAR capture enabled; full request/response bodies and verbatim credentials will be recorded (GET /debug/har; flushed on shutdown)")
+		mainLog.Info("har_capture_enabled",
+			"event", "har_capture_enabled",
+			"path", cfg.HARFile,
+			"detail", "verbatim headers and request/response bodies up to the HAR per-body cap (GET /debug/har; flushed on shutdown)",
+		)
 	}
 	cipher, err := crypto.New(secret)
 	if err != nil {
-		log.Fatalf("init cipher: %v", err)
+		mainLog.Error("init_cipher_failed", "event", "init_cipher_failed", "error", err)
+		os.Exit(1)
 	}
 
 	st, err := store.Open(cfg.DBPath, cipher)
 	if err != nil {
-		log.Fatalf("open store: %v", err)
+		mainLog.Error("open_store_failed", "event", "open_store_failed", "error", err)
+		os.Exit(1)
 	}
 	defer st.Close()
 
-	app := server.New(st, cfg.DebugLevel, cfg.HARFile, version)
+	app := server.New(st, logger, cfg.HARFile, version)
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: app.Handler(),
@@ -64,28 +86,44 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("airouter %s listening on %s (dashboard at /dashboard)", version, cfg.ListenAddr)
+		mainLog.Info("server_listening",
+			"event", "server_listening",
+			"version", version,
+			"addr", cfg.ListenAddr,
+		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("serve: %v", err)
+			errCh <- err
+			return
 		}
+		errCh <- nil
 	}()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
 
-	log.Println("shutting down")
+	select {
+	case <-stop:
+	case err := <-errCh:
+		if err != nil {
+			mainLog.Error("server_failed", "event", "server_failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	mainLog.Info("shutdown_started", "event", "shutdown_started")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("shutdown: %v", err)
+		mainLog.Error("shutdown_failed", "event", "shutdown_failed", "error", err)
 	}
 	if rec := app.HAR(); rec != nil && cfg.HARFile != "" {
 		if err := rec.WriteFile(cfg.HARFile); err != nil {
-			log.Printf("write HAR file: %v", err)
+			mainLog.Error("har_write_failed", "event", "har_write_failed", "path", cfg.HARFile, "error", err)
 		} else {
-			log.Printf("wrote HAR capture to %s", cfg.HARFile)
+			mainLog.Info("har_written", "event", "har_written", "path", cfg.HARFile)
 		}
 	}
 }

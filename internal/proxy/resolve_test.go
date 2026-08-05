@@ -72,7 +72,7 @@ func setupCombo(t *testing.T, strategy domain.ComboStrategy, targets []*scripted
 	}
 
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token
@@ -128,7 +128,7 @@ func TestDisabledTargetSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	resp, out := post(t, ts.URL+"/v1/chat/completions", key.Token, oaiReq)
@@ -173,7 +173,7 @@ func TestArchivedProviderSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	resp, out := post(t, ts.URL+"/v1/chat/completions", key.Token, oaiReq)

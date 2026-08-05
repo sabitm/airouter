@@ -14,6 +14,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/harlog"
 	"airouter/internal/oauth"
+	"airouter/internal/observability"
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
@@ -384,7 +385,11 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 	if err := p.resolveToken(ctx, provider, false); err != nil {
 		// Proactive refresh failed; proceed with the existing token (it may still
 		// work, or the reactive path below will catch the 401).
-		p.debugf("oauth resolve %s: %v", provider.Name, err)
+		observability.Logger(ctx, p.logger).Debug("oauth_resolve_failed",
+			"event", "oauth_resolve_failed",
+			"provider", provider.Name,
+			"error", err,
+		)
 	}
 	status, respBody, err := send()
 	if err != nil {
@@ -394,7 +399,12 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if rerr := p.resolveToken(ctx, provider, true); rerr == nil {
 			return send()
 		} else {
-			p.debugf("oauth forced refresh %s after %d: %v", provider.Name, status, rerr)
+			observability.Logger(ctx, p.logger).Debug("oauth_forced_refresh_failed",
+				"event", "oauth_forced_refresh_failed",
+				"provider", provider.Name,
+				"status", status,
+				"error", rerr,
+			)
 		}
 	}
 	return status, respBody, nil
@@ -450,7 +460,11 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 	}
 
 	if err := p.resolveToken(ctx, provider, false); err != nil {
-		p.debugf("oauth resolve %s: %v", provider.Name, err)
+		observability.Logger(ctx, p.logger).Debug("oauth_resolve_failed",
+			"event", "oauth_resolve_failed",
+			"provider", provider.Name,
+			"error", err,
+		)
 	}
 	resp, err := send()
 	if err != nil {
@@ -461,7 +475,12 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 			resp.Body.Close()
 			return send()
 		} else {
-			p.debugf("oauth forced refresh %s after %d: %v", provider.Name, resp.StatusCode, rerr)
+			observability.Logger(ctx, p.logger).Debug("oauth_forced_refresh_failed",
+				"event", "oauth_forced_refresh_failed",
+				"provider", provider.Name,
+				"status", resp.StatusCode,
+				"error", rerr,
+			)
 		}
 	}
 	return resp, nil
@@ -511,8 +530,8 @@ func streamRespMIME(resp *http.Response, accept string) string {
 }
 
 // harCaptureBody tees a bounded copy of a streaming upstream body and records
-// the HAR entry on Close. Read bytes are relayed unchanged; the tee buffer is
-// capped at harlog.MaxBody so large streams cannot grow without bound.
+// the HAR entry on Close. Read bytes are relayed unchanged; the tee uses
+// observability.Capture capped at harlog.MaxBody.
 type harCaptureBody struct {
 	rc      io.ReadCloser
 	started time.Time
@@ -527,8 +546,7 @@ type harCaptureBody struct {
 	ctx     context.Context
 
 	mu     sync.Mutex
-	buf    bytes.Buffer
-	total  int
+	cap    *observability.Capture
 	closed bool
 }
 
@@ -536,14 +554,10 @@ func (c *harCaptureBody) Read(p []byte) (int, error) {
 	n, err := c.rc.Read(p)
 	if n > 0 {
 		c.mu.Lock()
-		c.total += n
-		if c.buf.Len() < harlog.MaxBody {
-			room := harlog.MaxBody - c.buf.Len()
-			if room > n {
-				room = n
-			}
-			c.buf.Write(p[:room])
+		if c.cap == nil {
+			c.cap = observability.NewCapture(harlog.MaxBody)
 		}
+		_, _ = c.cap.Write(p[:n])
 		c.mu.Unlock()
 	}
 	return n, err
@@ -556,8 +570,12 @@ func (c *harCaptureBody) Close() error {
 		return c.rc.Close()
 	}
 	c.closed = true
-	body := append([]byte(nil), c.buf.Bytes()...)
-	total := c.total
+	var body []byte
+	var total int
+	if c.cap != nil {
+		body = append([]byte(nil), c.cap.Bytes()...)
+		total = int(c.cap.Total())
+	}
 	c.mu.Unlock()
 
 	// If nothing was read (e.g. closed after a 401 before the body was drained),

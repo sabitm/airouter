@@ -5,8 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"airouter/internal/domain"
@@ -36,7 +35,7 @@ func kiroModels() []string {
 // the lightweight CodeWhisperer call that confirms a bearer token is accepted
 // without sending a chat request. Kiro API keys cannot use that admin API, so an
 // API-key provider reports stored-only and is validated on real traffic.
-func checkKiroUpstream(ctx context.Context, p *domain.Provider, trace bool) (bool, string) {
+func checkKiroUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	if p.Method() == domain.AuthAPIKey {
 		return true, "OK - API key stored; validated on real traffic (no lightweight check endpoint accepts API keys)"
 	}
@@ -54,27 +53,16 @@ func checkKiroUpstream(ctx context.Context, p *domain.Provider, trace bool) (boo
 	req.Header.Set("x-amz-target", "AmazonCodeWhispererService.ListAvailableProfiles")
 	req.Header.Set("Authorization", "Bearer "+p.APIKey)
 
-	if trace {
-		log.Printf("[trace] >>> POST %s (ListAvailableProfiles)", url)
-	}
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_kiro")
 	if err != nil {
-		if trace {
-			log.Printf("[trace] <<< POST %s: %v", url, err)
-		}
 		return false, "could not reach Kiro: " + err.Error()
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return false, fmt.Sprintf("credential rejected (HTTP %d)", resp.StatusCode)
-	case resp.StatusCode >= 400:
-		return false, fmt.Sprintf("upstream returned HTTP %d: %s", resp.StatusCode, upstreamErrorText(body))
+	case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("credential rejected (HTTP %d)", pr.StatusCode)
+	case pr.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d: %s", pr.StatusCode, upstreamErrorText(pr.Body))
 	}
 
 	var parsed struct {
@@ -83,7 +71,7 @@ func checkKiroUpstream(ctx context.Context, p *domain.Provider, trace bool) (boo
 			ProfileArn string `json:"profileArn"`
 		} `json:"profiles"`
 	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
+	if err := json.Unmarshal(pr.Body, &parsed); err != nil {
 		return true, "OK - credential accepted"
 	}
 	if arn := firstProfileArn(parsed.Profiles); arn != "" {

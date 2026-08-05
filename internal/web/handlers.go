@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -28,14 +29,17 @@ type Handler struct {
 	// sessions holds in-flight OAuth connect attempts between the begin request
 	// and the later status/exchange/save requests.
 	sessions *connectSessions
-	// trace, set at -debug=2, logs the dashboard's outbound provider subcalls
-	// (e.g. the /models probe behind the Check button) that the request-logging
-	// middleware cannot see. Bodies are truncated on stderr.
-	trace bool
+	// logger is the component=web logger. TRACE enables outbound probe body dumps.
+	logger *slog.Logger
 }
 
-func NewHandler(s *store.Store, trace bool) *Handler {
-	return &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), trace: trace}
+// NewHandler builds the dashboard handler. logger may be nil (falls back to
+// slog.Default). Prefer a component=web logger from the server constructor.
+func NewHandler(s *store.Store, logger *slog.Logger) *Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), logger: logger}
 }
 
 // Mount registers all dashboard routes on the given mux.

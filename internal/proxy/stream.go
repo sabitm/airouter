@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 
 	"airouter/internal/domain"
+	"airouter/internal/observability"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/sse"
 	"airouter/internal/proxy/thinking"
@@ -34,8 +34,7 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
-		p.debugf("stream passthrough %s %s: upstream %d\nresponse: %s", ingress.id, ingress.upstreamPath, resp.StatusCode, errBody)
-		return retryable(resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
+		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
 
 	sw, ok := sse.NewWriter(w)
@@ -53,7 +52,18 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 			return committed()
 		}
 		if err != nil {
-			log.Printf("stream passthrough read: %v", err)
+			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+				observability.Logger(ctx, p.logger).Debug("client_disconnected",
+					"event", "client_disconnected",
+					"ingress", ingress.id,
+				)
+			} else {
+				observability.Logger(ctx, p.logger).Error("stream_read_failed",
+					"event", "stream_read_failed",
+					"ingress", ingress.id,
+					"error", err,
+				)
+			}
 			return committed()
 		}
 		sniffStreamUsage(ev.Data, res)
@@ -146,9 +156,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
-		p.debugf("stream translate %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
-			ingress.id, backend.id, backend.upstreamPath, resp.StatusCode, upstreamBody, errBody)
-		return retryable(resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
+		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
 
 	sw, ok := sse.NewWriter(w)
@@ -180,16 +188,29 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		// A canceled context means the client disconnected after receiving the
 		// response; that is routine, not a server error, so do not log it as one.
 		if errors.Is(err, context.Canceled) {
-			p.debugf("stream translate %s -> %s: client disconnected", ingress.id, backend.id)
+			observability.Logger(ctx, p.logger).Debug("client_disconnected",
+				"event", "client_disconnected",
+				"ingress", ingress.id,
+				"backend", backend.id,
+			)
 			return committed()
 		}
 		// Already streaming; cannot switch to a unary error. Stop cleanly.
-		log.Printf("stream translate: %v", err)
-		p.debugf("stream translate %s -> %s: mid-stream error: %v", ingress.id, backend.id, err)
+		observability.Logger(ctx, p.logger).Error("stream_decode_failed",
+			"event", "stream_decode_failed",
+			"ingress", ingress.id,
+			"backend", backend.id,
+			"error", err,
+		)
 		return committed()
 	}
 	if err := enc.Close(sw); err != nil {
-		log.Printf("stream translate close: %v", err)
+		observability.Logger(ctx, p.logger).Error("stream_encode_close_failed",
+			"event", "stream_encode_close_failed",
+			"ingress", ingress.id,
+			"backend", backend.id,
+			"error", err,
+		)
 	}
 	return committed()
 }

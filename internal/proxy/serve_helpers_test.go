@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -102,44 +101,4 @@ func TestUpstreamErrorMessage(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestTruncateMsg(t *testing.T) {
-	t.Run("under limit unchanged", func(t *testing.T) {
-		s := "short message"
-		if got := truncateMsg(s, 100); got != s {
-			t.Errorf("got %q, want %q", got, s)
-		}
-	})
-	t.Run("exactly at limit unchanged", func(t *testing.T) {
-		s := strings.Repeat("a", 50)
-		if got := truncateMsg(s, 50); got != s {
-			t.Errorf("got %q, want %q", got, s)
-		}
-	})
-	t.Run("over limit truncates with marker", func(t *testing.T) {
-		s := strings.Repeat("a", 100)
-		got := truncateMsg(s, 10)
-		if !strings.HasPrefix(got, "aaaaaaaaaa") {
-			t.Errorf("expected first 10 bytes, got %q", got)
-		}
-		if !strings.Contains(got, "truncated") {
-			t.Errorf("expected marker, got %q", got)
-		}
-		if !strings.Contains(got, "100 bytes total") {
-			t.Errorf("expected total byte count, got %q", got)
-		}
-	})
-	t.Run("empty string under limit", func(t *testing.T) {
-		if got := truncateMsg("", 10); got != "" {
-			t.Errorf("got %q, want empty", got)
-		}
-	})
-	t.Run("limit zero truncates non-empty", func(t *testing.T) {
-		s := "abc"
-		got := truncateMsg(s, 0)
-		if !strings.Contains(got, "truncated") || !strings.Contains(got, "3 bytes total") {
-			t.Errorf("expected truncation marker for 3 bytes, got %q", got)
-		}
-	})
 }

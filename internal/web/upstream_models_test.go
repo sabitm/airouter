@@ -3,7 +3,6 @@ package web
 import (
 	"bytes"
 	"context"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -11,6 +10,7 @@ import (
 	"testing"
 
 	"airouter/internal/domain"
+	"airouter/internal/observability"
 )
 
 // TestProviderModelsOAuth: the combo form's model-list fetch resolves a saved
@@ -58,7 +58,7 @@ func TestProviderModelsOAuth(t *testing.T) {
 }
 
 func TestFetchCodexModelsFallsBackToStatic(t *testing.T) {
-	models, err := fetchUpstreamModels(context.Background(), &domain.Provider{
+	models, err := fetchUpstreamModels(context.Background(), nil, &domain.Provider{
 		Protocol: domain.ProtocolOpenAICodex,
 		BaseURL:  "http://127.0.0.1:1",
 	})
@@ -91,14 +91,14 @@ func TestCheckCodexUpstreamUsesModelsEndpoint(t *testing.T) {
 	}))
 	t.Cleanup(up.Close)
 
-	ok, msg := checkUpstream(context.Background(), &domain.Provider{
+	ok, msg := checkUpstream(context.Background(), nil, &domain.Provider{
 		BaseURL:  up.URL,
 		APIKey:   "tok",
 		Protocol: domain.ProtocolOpenAICodex,
 		OAuthCreds: &domain.OAuthCreds{
 			AccountID: "acct-1",
 		},
-	}, false)
+	})
 	if !ok {
 		t.Fatalf("check failed: %s", msg)
 	}
@@ -114,7 +114,7 @@ func TestCheckCodexUpstreamUsesModelsEndpoint(t *testing.T) {
 }
 
 func TestCheckCodexUpstreamTraceTruncatesStderr(t *testing.T) {
-	longID := strings.Repeat("x", traceMaxBody+64)
+	longID := strings.Repeat("x", probeTraceDisplay+64)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -123,15 +123,13 @@ func TestCheckCodexUpstreamTraceTruncatesStderr(t *testing.T) {
 	t.Cleanup(up.Close)
 
 	var buf bytes.Buffer
-	prev := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(prev) })
+	logger := observability.NewLogger(2, &buf)
 
-	ok, msg := checkUpstream(context.Background(), &domain.Provider{
+	ok, msg := checkUpstream(context.Background(), logger, &domain.Provider{
 		BaseURL:  up.URL,
 		APIKey:   "tok",
 		Protocol: domain.ProtocolOpenAICodex,
-	}, true)
+	})
 	if !ok {
 		t.Fatalf("check failed: %s", msg)
 	}

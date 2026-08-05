@@ -4,14 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/observability"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/store"
 )
@@ -19,9 +18,8 @@ import (
 const maxBodyBytes = 16 << 20 // 16 MiB ceiling on inbound request bodies
 
 // upstreamErrorMax caps how many bytes of an upstream error body are read for
-// surfacing in the ingress error envelope. Error bodies are only used to
-// extract a JSON error.message and for truncated debug logging, so a small cap
-// bounds memory under a failover storm.
+// extracting a client-facing message and persisted request-history detail. HAR
+// capture is independently bounded by harlog.MaxBody.
 const upstreamErrorMax = 1 << 20 // 1 MiB
 
 // reqResult accumulates the outcome of one request for logging. Each serve path
@@ -31,12 +29,14 @@ type reqResult struct {
 	inTok  int
 	outTok int
 	errMsg string
+	logErr string
 }
 
 // fail writes an error envelope and records the failure on the result.
 func (res *reqResult) fail(w http.ResponseWriter, ingress codec, status int, message, errType string) {
 	res.status = status
 	res.errMsg = message
+	res.logErr = message
 	writeErr(w, ingress, status, message, errType)
 }
 
@@ -54,17 +54,31 @@ type attemptResult struct {
 	retry   bool
 	status  int
 	errMsg  string
+	logErr  string
 	errType string
 }
 
 func committed() attemptResult { return attemptResult{written: true} }
 
 func retryable(status int, message, errType string) attemptResult {
-	return attemptResult{retry: true, status: status, errMsg: message, errType: errType}
+	return attemptResult{retry: true, status: status, errMsg: message, logErr: message, errType: errType}
+}
+
+// retryableUpstreamStatus preserves the upstream message for the client and
+// persisted request history while keeping raw non-JSON response bodies out of
+// DEBUG terminal logs.
+func retryableUpstreamStatus(status int, body []byte) attemptResult {
+	return attemptResult{
+		retry:   true,
+		status:  status,
+		errMsg:  upstreamErrorMessage(body),
+		logErr:  http.StatusText(status),
+		errType: "api_error",
+	}
 }
 
 func terminal(status int, message, errType string) attemptResult {
-	return attemptResult{status: status, errMsg: message, errType: errType}
+	return attemptResult{status: status, errMsg: message, logErr: message, errType: errType}
 }
 
 // serve runs the full ingress lifecycle for one request. ingress is the codec
@@ -79,14 +93,18 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		rec.OutputTokens = res.outTok
 		rec.ErrMsg = res.errMsg
 		rec.LatencyMS = time.Since(start).Milliseconds()
-		// Surface the client-facing failure reason in the terminal. Upstream
-		// exchanges log their own detail; this covers pre-upstream rejections
-		// (auth, unknown combo, bad body) that otherwise leave only an access-log
-		// status with no reason.
+		// The final client-facing outcome is distinct from any failed upstream
+		// attempt: it is emitted only when the request itself ultimately failed.
 		if res.errMsg != "" {
-			p.debugf("request failed: %s %s %d: %s", ingress.id, r.Method, res.status, res.errMsg)
+			observability.Logger(r.Context(), p.logger).Debug("request_failed",
+				"event", "request_failed",
+				"status", res.status,
+				"error", res.logErr,
+				"ingress", ingress.id,
+				"method", r.Method,
+			)
 		}
-		p.recordLog(rec)
+		p.recordLog(r.Context(), rec)
 	}()
 
 	keyName, ok := p.authenticate(r)
@@ -168,14 +186,14 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// subsequent requests defer it behind healthy targets. Applies to the last
 		// target too, so a whole-combo outage still grows the window.
 		p.penalizeProvider(provider.ID)
-		if i < len(candidates)-1 {
-			p.debugf("combo %s: target %d (%s) failed: %d %s; advancing",
-				combo.Name, i, provider.Name, last.status, last.errMsg)
+		willRetry := i < len(candidates)-1
+		p.logUpstreamAttemptFailed(r.Context(), combo.Name, provider, t.UpstreamModel, backend, i+1, last, willRetry)
+		if willRetry {
 			// Persist a row per failed-and-superseded target so the Logs tab shows
 			// which provider errored before failover advanced. The final outcome
 			// (a later success or the last target's failure) is still covered by the
 			// deferred rec log, so this only fires for intermediate failures.
-			p.recordLog(&domain.RequestLog{
+			p.recordLog(r.Context(), &domain.RequestLog{
 				AccessKeyName: rec.AccessKeyName,
 				Combo:         rec.Combo,
 				Provider:      provider.Name,
@@ -197,8 +215,27 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		if status == 0 {
 			status = http.StatusBadGateway
 		}
+		// request_failed in the defer covers the final client-facing outcome;
+		// upstream_attempt_failed covers each failed provider attempt.
 		res.fail(w, ingress, status, last.errMsg, last.errType)
+		res.logErr = last.logErr
 	}
+}
+
+// logUpstreamAttemptFailed emits one structured DEBUG event per failed target.
+func (p *Proxy) logUpstreamAttemptFailed(ctx context.Context, combo string, provider *domain.Provider, upstreamModel string, backend codec, attempt int, last attemptResult, retry bool) {
+	observability.Logger(ctx, p.logger).Debug("upstream_attempt_failed",
+		"event", "upstream_attempt_failed",
+		"combo", combo,
+		"provider", provider.Name,
+		"upstream_model", upstreamModel,
+		"protocol", string(provider.Protocol),
+		"format", backend.id,
+		"attempt", attempt,
+		"status", last.status,
+		"error", last.logErr,
+		"retry", retry,
+	)
 }
 
 // orderTargets returns the combo's targets in the order the resolution loop
@@ -266,8 +303,7 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	if status < 200 || status >= 300 {
-		p.debugf("passthrough %s %s: upstream %d\nresponse: %s", ingress.id, ingress.upstreamPath, status, respBody)
-		return retryable(status, upstreamErrorMessage(respBody), "api_error")
+		return retryableUpstreamStatus(status, respBody)
 	}
 	res.status = status
 	// Usage is not modeled in passthrough; recover it best-effort from the raw
@@ -306,16 +342,11 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	if status < 200 || status >= 300 {
-		// Surface the upstream error message in the ingress error envelope.
-		p.debugf("translate %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
-			ingress.id, backend.id, backend.upstreamPath, status, upstreamBody, respBody)
-		return retryable(status, upstreamErrorMessage(respBody), "api_error")
+		return retryableUpstreamStatus(status, respBody)
 	}
 
 	resp, err := backend.decodeResponse(respBody)
 	if err != nil {
-		p.debugf("translate %s -> %s: decode response failed: %v\nresponse: %s",
-			ingress.id, backend.id, err, respBody)
 		return retryable(http.StatusBadGateway, "failed to decode upstream response", "api_error")
 	}
 	res.inTok = resp.Usage.InputTokens
@@ -343,9 +374,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
-		p.debugf("stream-only unary %s -> %s %s: upstream %d\nrequest: %s\nresponse: %s",
-			ingress.id, backend.id, backend.upstreamPath, resp.StatusCode, upstreamBody, errBody)
-		return retryable(resp.StatusCode, upstreamErrorMessage(errBody), "api_error")
+		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
 	irResp, err := collectStreamResponse(resp.Body, backend, upstreamModel)
 	if err != nil {
@@ -474,38 +503,19 @@ func upstreamErrorMessage(body []byte) string {
 	return "upstream error"
 }
 
-// debugMaxBody caps the length of a debug line written to stderr, so a large
-// echoed error exchange cannot flood the terminal. Full request/response
-// forensics live in HAR capture (-har-file), not the text debug path.
-const debugMaxBody = 4 << 10
-
-// debugf logs an upstream error exchange when debug mode is on. No-op otherwise.
-// Bodies are truncated so a large exchange cannot flood the terminal.
-func (p *Proxy) debugf(format string, args ...any) {
-	if !p.debug {
-		return
-	}
-	log.Print(truncateMsg(fmt.Sprintf("[debug] "+format, args...), debugMaxBody))
-}
-
-// truncateMsg shortens s to limit bytes, appending a marker noting the full
-// length. The cut is at a byte boundary, acceptable for debug output.
-func truncateMsg(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
-	return fmt.Sprintf("%s... (truncated, %d bytes total)", s[:limit], len(s))
-}
-
 // recordLog persists a request log fire-and-forget so a slow DB write never
 // blocks the response. It runs on a fresh context since the request's may be
 // done by the time the write lands.
-func (p *Proxy) recordLog(l *domain.RequestLog) {
+func (p *Proxy) recordLog(ctx context.Context, l *domain.RequestLog) {
+	logger := observability.Logger(ctx, p.logger)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := p.store.CreateRequestLog(ctx, l); err != nil {
-			log.Printf("request log: %v", err)
+			logger.Error("request_log_write_failed",
+				"event", "request_log_write_failed",
+				"error", err,
+			)
 		}
 	}()
 }

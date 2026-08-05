@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,7 +50,7 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 		}
 		provider.APIKey = tok
 	}
-	models, err := fetchUpstreamModels(r.Context(), provider)
+	models, err := fetchUpstreamModels(r.Context(), h.logger, provider)
 	failed := err != nil
 	if failed {
 		models = nil
@@ -63,9 +62,9 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 // Anthropic return {"data":[{"id":...}]}; only the auth headers differ. The
 // credential header follows the effective auth scheme (oauth always bearer),
 // not the protocol, so an oauth provider speaking Anthropic still sends bearer.
-func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, error) {
+func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Provider) ([]string, error) {
 	if p.Protocol == domain.ProtocolOpenAICodex {
-		models, _, _, err := fetchCodexModels(ctx, p, false)
+		models, _, _, err := fetchCodexModels(ctx, logger, p)
 		if err != nil || len(models) == 0 {
 			return codexModels(), nil
 		}
@@ -120,18 +119,20 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 	}
 	applyClineProbeHeaders(req, p)
 
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "fetch_models")
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	if pr.StatusCode < 200 || pr.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d", pr.StatusCode)
+	}
 
 	var parsed struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	if err := json.Unmarshal(pr.Body, &parsed); err != nil {
 		return nil, err
 	}
 	out := make([]string, 0, len(parsed.Data))
@@ -143,7 +144,7 @@ func fetchUpstreamModels(ctx context.Context, p *domain.Provider) ([]string, err
 	return out, nil
 }
 
-func fetchCodexModels(ctx context.Context, p *domain.Provider, trace bool) ([]string, int, []byte, error) {
+func fetchCodexModels(ctx context.Context, logger *slog.Logger, p *domain.Provider) ([]string, int, []byte, error) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models?client_version=" + responses.CodexCLIVersion
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -157,26 +158,15 @@ func fetchCodexModels(ctx context.Context, p *domain.Provider, trace bool) ([]st
 	if p.OAuthCreds != nil && p.OAuthCreds.AccountID != "" {
 		req.Header.Set("chatgpt-account-id", p.OAuthCreds.AccountID)
 	}
-	if trace {
-		log.Printf("[trace] >>> GET %s", url)
-	}
-	resp, err := upstreamClient.Do(req)
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "fetch_codex_models")
 	if err != nil {
-		if trace {
-			log.Printf("[trace] <<< GET %s: %v", url, err)
-		}
 		return nil, 0, nil, err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if trace {
-		log.Printf("[trace] <<< %d\n%s", resp.StatusCode, traceBody(body, traceMaxBody))
+	if pr.StatusCode < 200 || pr.StatusCode >= 300 {
+		return nil, pr.StatusCode, pr.Body, fmt.Errorf("HTTP %d", pr.StatusCode)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, resp.StatusCode, body, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	models, err := parseModelIDs(body)
-	return models, resp.StatusCode, body, err
+	models, err := parseModelIDs(pr.Body)
+	return models, pr.StatusCode, pr.Body, err
 }
 
 func parseModelIDs(body []byte) ([]string, error) {

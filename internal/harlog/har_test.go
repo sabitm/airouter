@@ -222,6 +222,58 @@ func TestWriteFileRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReqBodySizeWhenAlreadyTruncated(t *testing.T) {
+	r := New("v")
+	pageID := "page_rb"
+	// Caller already truncated to 10 bytes but original wire was 5000.
+	prefix := []byte("0123456789")
+	oorig := 5000
+	r.EnsurePage(pageID, "t", time.Now())
+	r.Record(RecordInput{
+		PageID:      pageID,
+		StartedAt:   time.Now(),
+		Duration:    time.Millisecond,
+		Method:      "POST",
+		URL:         "http://example/x",
+		ReqHeaders:  http.Header{"Content-Type": []string{"text/plain"}},
+		ReqBody:     prefix,
+		ReqBodySize: oorig,
+		Status:      200,
+		RespHeaders: http.Header{"Content-Type": []string{"text/plain"}},
+		RespBody:    []byte("ok"),
+	})
+	data, err := r.MarshalHAR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Log struct {
+			Entries []struct {
+				Request struct {
+					BodySize int64 `json:"bodySize"`
+					PostData *struct {
+						Text    string `json:"text"`
+						Comment string `json:"comment"`
+					} `json:"postData"`
+				} `json:"request"`
+			} `json:"entries"`
+		} `json:"log"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	e := doc.Log.Entries[0]
+	if e.Request.BodySize != int64(oorig) {
+		t.Fatalf("bodySize = %d, want %d", e.Request.BodySize, oorig)
+	}
+	if e.Request.PostData == nil || !strings.Contains(e.Request.PostData.Comment, itoa(oorig)) {
+		t.Fatalf("postData comment = %+v", e.Request.PostData)
+	}
+	if e.Request.PostData.Text != string(prefix) {
+		t.Fatalf("text = %q", e.Request.PostData.Text)
+	}
+}
+
 func TestEnsurePageIdempotent(t *testing.T) {
 	r := New("v")
 	start := time.Now()

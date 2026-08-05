@@ -6,6 +6,7 @@ package proxy
 
 import (
 	"io"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -231,7 +232,7 @@ type Proxy struct {
 	// SSE streams are governed by the request context instead.
 	client       *http.Client
 	streamClient *http.Client
-	debug        bool
+	logger       *slog.Logger
 
 	// har, when non-nil, records both legs of every proxied exchange as HAR 1.2.
 	har *harlog.Recorder
@@ -270,13 +271,18 @@ const (
 	backoffShiftCap = 30
 )
 
-func New(s *store.Store, debug bool, har *harlog.Recorder) *Proxy {
+// New builds a Proxy. logger may be nil (falls back to slog.Default). Prefer a
+// component=proxy logger from the server constructor so attrs stay consistent.
+func New(s *store.Store, logger *slog.Logger, har *harlog.Recorder) *Proxy {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Proxy{
 		store:        s,
 		oauth:        oauth.New(s),
 		client:       &http.Client{Timeout: 5 * time.Minute},
 		streamClient: &http.Client{},
-		debug:        debug,
+		logger:       logger,
 		har:          har,
 		rr:           map[int64]uint64{},
 		bo:           map[int64]*backoffState{},

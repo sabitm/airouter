@@ -97,7 +97,7 @@ func setupKiro(t *testing.T, upstreamBody []byte, captured *kiroCapture) (string
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, false, nil).Mount(mux)
+	New(st, nil, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token, st

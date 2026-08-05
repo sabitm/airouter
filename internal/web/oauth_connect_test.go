@@ -29,7 +29,7 @@ func testHandler(t *testing.T) *Handler {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return NewHandler(st, false)
+	return NewHandler(st, nil)
 }
 
 // tokenServer is a mock OAuth token endpoint that issues a fixed token for the

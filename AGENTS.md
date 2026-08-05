@@ -59,15 +59,24 @@ Supporting packages:
   satisfies; `oauth.Service` is constructed internally by `proxy.New` and
   `web.NewHandler`, so neither constructor's signature changed.
 - `internal/config` - flags/env loading.
+- `internal/observability` - shared slog helpers (`NewLogger`, request-id
+  context, bounded `Capture`, `DescribeBody`) used by server/proxy/web. Levels:
+  Info (default), Debug (`-debug=1`), Trace (`-debug=2`, custom level below
+  Debug rendered as TRACE). Terminal output is slog text, not JSON.
 - `internal/server` - HTTP wiring: CORS (answers browser preflights, reflects
-  the request Origin) and the leveled request-logging middleware. At `-debug`
-  (level 1) it logs access lines; at `-debug=2` it also traces request and
-  response bodies (truncated on stderr) and the resolved upstream provider URL
-  per proxied call. Full request/response forensics use `-har-file` (HAR 1.2).
+  the request Origin, exposes `X-Airouter-Request-ID`) and request middleware.
+  Every request gets a correlation id on the context, `TraceInfo.RequestID`,
+  response header, and HAR page id. At `-debug` (level 1) it logs structured
+  `request_completed` access events; at `-debug=2` it also emits truncated
+  ingress body TRACE events (4 KiB). Full request/response forensics use
+  `-har-file` (HAR 1.2). Request bodies are tee-captured without eager drain so
+  proxy `MaxBytesReader` stays honest.
 - `internal/web` - templ + HTMX dashboard. `.templ` files generate `*_templ.go`.
-  Dashboard outbound provider probes (Check/model autocomplete) at `-debug=2`
-  log truncated request/response bodies to stderr.
-- `cmd/airouter` - main: wires config, crypto, store, server; graceful shutdown.
+  Dashboard outbound provider probes (Check/model autocomplete) share
+  `executeProbe`; at `-debug=2` they log truncated request/response bodies
+  (16 KiB display, 1 MiB capture) without auth headers.
+- `cmd/airouter` - main: wires config, crypto, store, slog default, server;
+  graceful shutdown.
 
 ## The passthrough vs translate rule
 

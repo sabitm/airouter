@@ -1,7 +1,6 @@
 package web
 
 import (
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,6 +8,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/observability"
 )
 
 // credsFromConnectForm builds an OAuthCreds config (no tokens yet) from the
@@ -212,8 +212,11 @@ func (h *Handler) beginOAuthConnect(w http.ResponseWriter, r *http.Request) {
 		render(w, r, OAuthConnectError(err.Error()))
 		return
 	}
-	if err := conn.Start(r.Context()); err != nil && h.trace {
-		log.Printf("[trace] oauth connect loopback bind failed: %v", err)
+	if err := conn.Start(r.Context()); err != nil {
+		observability.Logger(r.Context(), h.logger).Debug("oauth_loopback_bind_failed",
+			"event", "oauth_loopback_bind_failed",
+			"error", err,
+		)
 	}
 	authURL, err := conn.AuthorizeURL()
 	if err != nil {

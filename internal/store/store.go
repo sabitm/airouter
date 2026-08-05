@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -63,10 +63,18 @@ func Open(path string, cipher *crypto.Cipher) (*Store, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cutoff := time.Now().Add(-defaultLogRetention)
+	storeLog := slog.Default().With("component", "store")
 	if n, err := s.PruneRequestLogs(ctx, cutoff); err != nil {
-		log.Printf("prune request logs: %v", err)
+		storeLog.Error("request_logs_prune_failed",
+			"event", "request_logs_prune_failed",
+			"error", err,
+		)
 	} else if n > 0 {
-		log.Printf("pruned %d request log(s) older than %s", n, defaultLogRetention)
+		storeLog.Info("request_logs_pruned",
+			"event", "request_logs_pruned",
+			"count", n,
+			"retention", defaultLogRetention.String(),
+		)
 	}
 	return s, nil
 }
