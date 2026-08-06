@@ -105,7 +105,7 @@ func setupWithStore(t *testing.T, backend domain.Protocol, cap *capturedUpstream
 	}
 
 	mux := http.NewServeMux()
-	New(st, nil, nil).Mount(mux)
+	New(st, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, key.Token, st
@@ -302,7 +302,7 @@ func TestOpenModeNoKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	New(st, nil, nil).Mount(mux)
+	New(st, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 

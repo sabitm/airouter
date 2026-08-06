@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -467,7 +468,10 @@ func TestRequestBodyNotEagerlyDrained(t *testing.T) {
 }
 
 func TestHARBoundedBodySizes(t *testing.T) {
-	rec := harlog.New("test")
+	ctrl := harlog.NewController(false, "test", nil)
+	if err := ctrl.Start(); err != nil {
+		t.Fatal(err)
+	}
 	logger := observability.NewLogger(0, io.Discard)
 	payload := bytes.Repeat([]byte("p"), 100)
 	respBody := bytes.Repeat([]byte("r"), 80)
@@ -477,19 +481,25 @@ func TestHARBoundedBodySizes(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(respBody)
 	})
-	h := requestMiddleware(logger, rec, inner)
+	h := requestMiddleware(logger, ctrl, inner)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "text/plain")
 	req.Host = "localhost:31415"
 	h.ServeHTTP(rr, req)
 
-	data, err := rec.MarshalHAR()
+	if err := ctrl.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := ctrl.Download()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var doc struct {
 		Log struct {
+			Pages []struct {
+				Title string `json:"title"`
+			} `json:"pages"`
 			Entries []struct {
 				Request struct {
 					BodySize int64 `json:"bodySize"`
@@ -509,6 +519,9 @@ func TestHARBoundedBodySizes(t *testing.T) {
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		t.Fatal(err)
+	}
+	if len(doc.Log.Pages) != 1 || doc.Log.Pages[0].Title != "POST /v1/chat/completions" {
+		t.Fatalf("pages = %+v", doc.Log.Pages)
 	}
 	if len(doc.Log.Entries) != 1 {
 		t.Fatalf("entries = %d", len(doc.Log.Entries))
@@ -592,4 +605,176 @@ func (p *partialRW) Write(b []byte) (int, error) {
 		return p.n, nil
 	}
 	return len(b), nil
+}
+
+func TestRuntimeHARLifecycle(t *testing.T) {
+	ctrl := harlog.NewController(false, "test", nil)
+	logger := observability.NewLogger(0, io.Discard)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	h := requestMiddleware(logger, ctrl, inner)
+	do := func(path string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"m":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Host = "localhost"
+		h.ServeHTTP(rr, req)
+		return rr
+	}
+
+	// Idle: no capture.
+	rr := do("/v1/chat/completions")
+	if st := ctrl.Status(); st.Entries != 0 || st.State != harlog.StateIdle {
+		t.Fatalf("idle status = %+v", st)
+	}
+	if _, err := ctrl.Download(); !errors.Is(err, harlog.ErrNotAvailable) {
+		t.Fatalf("idle download err = %v", err)
+	}
+	rid := rr.Header().Get(requestIDHeader)
+	if rid == "" {
+		t.Fatal("missing request id")
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatal(err)
+	}
+	rr = do("/v1/chat/completions")
+	if st := ctrl.Status(); st.Entries != 1 || st.State != harlog.StateRecording || st.Pages != 1 {
+		t.Fatalf("recording status = %+v", st)
+	}
+	if _, err := ctrl.Download(); !errors.Is(err, harlog.ErrNotReady) {
+		t.Fatalf("recording download err = %v", err)
+	}
+	if page := "page_" + rr.Header().Get(requestIDHeader); ctrl.Status().Pages != 1 {
+		t.Fatalf("pages=%d page=%s", ctrl.Status().Pages, page)
+	}
+
+	// Block one request across Stop so Stopping waits for Release.
+	releaseGate := make(chan struct{})
+	entered := make(chan struct{})
+	blocking := requestMiddleware(logger, ctrl, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-releaseGate
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("done"))
+	}))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		brr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		blocking.ServeHTTP(brr, req)
+	}()
+	<-entered
+	if err := ctrl.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if st := ctrl.Status(); st.State != harlog.StateStopping || st.InFlight != 1 {
+		t.Fatalf("stopping status = %+v", st)
+	}
+	if _, err := ctrl.Download(); !errors.Is(err, harlog.ErrNotReady) {
+		t.Fatalf("stopping download err = %v", err)
+	}
+	// New requests after Stop are not captured.
+	before := ctrl.Status().Entries
+	do("/v1/chat/completions")
+	if st := ctrl.Status(); st.Entries != before {
+		t.Fatalf("post-stop capture entries %d -> %d", before, st.Entries)
+	}
+	close(releaseGate)
+	<-done
+	if st := ctrl.Status(); st.State != harlog.StateStopped {
+		t.Fatalf("want stopped, got %+v", st)
+	}
+	// Pre-Stop blocked request completed into stopped session (+ earlier recording entry).
+	if st := ctrl.Status(); st.Entries < 2 {
+		t.Fatalf("entries = %d, want >= 2", st.Entries)
+	}
+	data, err := ctrl.Download()
+	if err != nil {
+		t.Fatalf("stopped download: %v", err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("download not JSON")
+	}
+}
+
+func TestFileModeHARDownload(t *testing.T) {
+	ctrl := harlog.NewController(true, "file", nil)
+	logger := observability.NewLogger(0, io.Discard)
+	h := requestMiddleware(logger, ctrl, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/models", strings.NewReader(""))
+	h.ServeHTTP(rr, req)
+
+	srv := &Server{har: ctrl, logger: logger}
+	drr := httptest.NewRecorder()
+	srv.handleHAR(drr, httptest.NewRequest(http.MethodGet, "/debug/har", nil))
+	if drr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", drr.Code, drr.Body.String())
+	}
+	if ct := drr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if drr.Header().Get("Content-Disposition") != `attachment; filename="airouter.har"` {
+		t.Errorf("Content-Disposition = %q", drr.Header().Get("Content-Disposition"))
+	}
+	if drr.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("Cache-Control = %q", drr.Header().Get("Cache-Control"))
+	}
+	if drr.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q", drr.Header().Get("X-Content-Type-Options"))
+	}
+	if ctrl.FileRecorder() == nil {
+		t.Fatal("file recorder nil")
+	}
+	if err := ctrl.Start(); !errors.Is(err, harlog.ErrFileMode) {
+		t.Fatalf("Start err = %v", err)
+	}
+	if err := ctrl.Stop(); !errors.Is(err, harlog.ErrFileMode) {
+		t.Fatalf("Stop err = %v", err)
+	}
+}
+
+func TestDebugHARStateContract(t *testing.T) {
+	ctrl := harlog.NewController(false, "rt", nil)
+	srv := &Server{har: ctrl, logger: observability.NewLogger(0, io.Discard)}
+
+	// Idle -> 404
+	rr := httptest.NewRecorder()
+	srv.handleHAR(rr, httptest.NewRequest(http.MethodGet, "/debug/har", nil))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("idle status = %d", rr.Code)
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	srv.handleHAR(rr, httptest.NewRequest(http.MethodGet, "/debug/har", nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("recording status = %d", rr.Code)
+	}
+
+	if err := ctrl.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	srv.handleHAR(rr, httptest.NewRequest(http.MethodGet, "/debug/har", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("stopped status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Cache-Control") != "no-store" || rr.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("missing security headers: %v", rr.Header())
+	}
 }

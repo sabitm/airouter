@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"airouter/internal/domain"
-	"airouter/internal/harlog"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/antigravity"
@@ -234,9 +233,6 @@ type Proxy struct {
 	streamClient *http.Client
 	logger       *slog.Logger
 
-	// har, when non-nil, records both legs of every proxied exchange as HAR 1.2.
-	har *harlog.Recorder
-
 	// rr holds per-combo round-robin counters, keyed by combo id. In-memory only:
 	// the rotation resets on restart, which is acceptable for load spreading.
 	rrMu sync.Mutex
@@ -273,7 +269,8 @@ const (
 
 // New builds a Proxy. logger may be nil (falls back to slog.Default). Prefer a
 // component=proxy logger from the server constructor so attrs stay consistent.
-func New(s *store.Store, logger *slog.Logger, har *harlog.Recorder) *Proxy {
+// HAR capture is request-pinned via TraceInfo.HAR set by server middleware.
+func New(s *store.Store, logger *slog.Logger) *Proxy {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -283,13 +280,10 @@ func New(s *store.Store, logger *slog.Logger, har *harlog.Recorder) *Proxy {
 		client:       &http.Client{Timeout: 5 * time.Minute},
 		streamClient: &http.Client{},
 		logger:       logger,
-		har:          har,
 		rr:           map[int64]uint64{},
 		bo:           map[int64]*backoffState{},
 	}
 }
-
-func (p *Proxy) harEnabled() bool { return p.har != nil }
 
 // nextRoundRobin returns the starting target index for a round-robin combo with
 // n targets, advancing the per-combo counter so successive requests rotate.

@@ -18,7 +18,7 @@ var navItems = []NavItem{
 	{"/dashboard/combos", "Combos"},
 	{"/dashboard/keys", "Access Keys"},
 	{"/dashboard/logs", "Logs"},
-	{"/dashboard/settings", "Import / Export"},
+	{"/dashboard/settings", "Settings"},
 }
 
 func Layout(title, active string) templ.Component {

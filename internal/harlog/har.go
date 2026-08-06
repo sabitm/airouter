@@ -185,6 +185,16 @@ func (r *Recorder) Record(in RecordInput) {
 	}
 }
 
+// Stats returns the current page and entry counts under the recorder mutex.
+func (r *Recorder) Stats() (pages, entries int) {
+	if r == nil {
+		return 0, 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.pages), len(r.entries)
+}
+
 // MarshalHAR returns a pretty-printed HAR 1.2 document.
 func (r *Recorder) MarshalHAR() ([]byte, error) {
 	if r == nil {
@@ -196,18 +206,21 @@ func (r *Recorder) MarshalHAR() ([]byte, error) {
 		}}, "", "  ")
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	pages := r.pages
+	pages := append([]harPage(nil), r.pages...)
+	entries := append([]harEntry(nil), r.entries...)
+	version := r.version
+	r.mu.Unlock()
 	if pages == nil {
 		pages = []harPage{}
 	}
-	entries := r.entries
 	if entries == nil {
 		entries = []harEntry{}
 	}
+	// Records are immutable after append, so the shallow slice snapshots remain
+	// stable while JSON encoding proceeds without blocking capture writes.
 	doc := harDoc{Log: harLog{
 		Version: "1.2",
-		Creator: harCreator{Name: "airouter", Version: r.version},
+		Creator: harCreator{Name: "airouter", Version: version},
 		Pages:   pages,
 		Entries: entries,
 	}}

@@ -1,7 +1,10 @@
 package web
 
-templ SettingsPage() {
-	@Layout("Import / Export", "/dashboard/settings") {
+import "strconv"
+
+templ SettingsPage(har HARView) {
+	@Layout("Settings", "/dashboard/settings") {
+		@HARPanel(har)
 		<section class="panel">
 			<div class="panel-head">
 				<h1>Export</h1>
@@ -43,4 +46,89 @@ templ SettingsPage() {
 			</form>
 		</section>
 	}
+}
+
+// HARPanel is the settings HAR capture fragment (also used for HTMX poll/mutate swaps).
+templ HARPanel(v HARView) {
+	<section
+		id="har-panel"
+		class="panel"
+		if v.Poll {
+			hx-get="/dashboard/har/status"
+			hx-trigger="every 2s"
+			hx-swap="outerHTML"
+		}
+	>
+		<div class="panel-head">
+			<h1>HAR capture</h1>
+		</div>
+		<p class="hint har-warning">
+			Warning: HAR files include verbatim prompts, model responses, Authorization headers, API keys, and OAuth tokens.
+			Treat any downloaded HAR as a secret. Do not share it or commit it to source control.
+		</p>
+		<div id="har-flash" class="flash-sink" aria-live="polite">
+			if v.ErrorMessage != "" {
+				@flash("error", v.ErrorMessage)
+			}
+		</div>
+		<p class="har-status">
+			<span class="field-name">Status</span>
+			<span class="mono">{ v.StateLabel }</span>
+		</p>
+		if v.Detail != "" {
+			<p class="hint">{ v.Detail }</p>
+		}
+		<ul class="har-stats">
+			if v.StartedAt != "" {
+				<li><span class="field-name">Started</span> <span class="mono">{ v.StartedAt }</span></li>
+			}
+			if v.StoppedAt != "" {
+				<li><span class="field-name">Stopped</span> <span class="mono">{ v.StoppedAt }</span></li>
+			}
+			if v.State != "idle" || v.FileMode {
+				<li><span class="field-name">Pages</span> <span class="mono">{ fmtInt(v.Pages) }</span></li>
+				<li><span class="field-name">Entries</span> <span class="mono">{ fmtInt(v.Entries) }</span></li>
+			}
+			if !v.FileMode && (v.State == "recording" || v.State == "stopping") {
+				<li><span class="field-name">In flight</span> <span class="mono">{ fmtInt(v.InFlight) }</span></li>
+			}
+		</ul>
+		<div class="row-form har-actions">
+			if v.CanStart {
+				if v.State == "stopped" {
+					<button
+						type="button"
+						hx-post="/dashboard/har/start"
+						hx-target="#har-panel"
+						hx-swap="outerHTML"
+						hx-confirm="Start a new HAR recording? This replaces the retained recording. Capture includes secrets (prompts, responses, Authorization headers, API keys, OAuth tokens)."
+					>Start new recording</button>
+				} else {
+					<button
+						type="button"
+						hx-post="/dashboard/har/start"
+						hx-target="#har-panel"
+						hx-swap="outerHTML"
+						hx-confirm="Start HAR recording? Capture includes secrets (prompts, responses, Authorization headers, API keys, OAuth tokens)."
+					>Start recording</button>
+				}
+			}
+			if v.CanStop {
+				<button
+					type="button"
+					class="button-danger"
+					hx-post="/dashboard/har/stop"
+					hx-target="#har-panel"
+					hx-swap="outerHTML"
+				>Stop recording</button>
+			}
+			if v.CanDownload {
+				<a class="button" href="/debug/har" download="airouter.har">Download HAR</a>
+			}
+		</div>
+	</section>
+}
+
+func fmtInt(n int) string {
+	return strconv.Itoa(n)
 }

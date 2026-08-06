@@ -1,6 +1,10 @@
 package proxy
 
-import "context"
+import (
+	"context"
+
+	"airouter/internal/harlog"
+)
 
 // TraceInfo carries details discovered while serving a request back to the
 // request-logging middleware. The middleware attaches an empty TraceInfo to the
@@ -28,6 +32,10 @@ type TraceInfo struct {
 	// header, and HAR pages (page_<RequestID>). Always set by the server
 	// middleware before the handler runs.
 	RequestID string
+	// HAR is the request-pinned recorder selected at ingress. Nil when capture
+	// is off for this request. Upstream legs must use this pointer rather than
+	// re-resolving the process-wide active session (Stop must not split legs).
+	HAR *harlog.Recorder
 }
 
 type traceKeyT struct{}

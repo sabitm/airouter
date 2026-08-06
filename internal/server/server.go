@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,36 +25,44 @@ const requestIDHeader = "X-Airouter-Request-ID"
 type Server struct {
 	mux    *http.ServeMux
 	logger *slog.Logger
-	// har records both legs of proxied exchanges when non-nil (enabled by
-	// -har-file). Independent of logger level.
-	har *harlog.Recorder
+	// har owns process-wide capture: file mode (always on) or runtime Start/Stop.
+	har *harlog.Controller
 }
 
 // New builds the HTTP mux. logger may be nil (falls back to slog.Default).
-// harFile, when non-empty, enables the in-memory HAR recorder (creator version
-// is creatorVersion) and mounts GET /debug/har. The recorder is also passed to
-// the proxy for upstream-leg capture.
+// harFile, when non-empty, enables always-on file-mode HAR capture (creator
+// version is creatorVersion). Empty enables runtime dashboard-controlled capture.
+// GET /debug/har is always mounted.
 func New(s *store.Store, logger *slog.Logger, harFile, creatorVersion string) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	var har *harlog.Recorder
-	if harFile != "" {
-		har = harlog.New(creatorVersion)
-	}
+	har := harlog.NewController(harFile != "", creatorVersion, logger.With("component", "har"))
 	mux := http.NewServeMux()
 	httpLog := logger.With("component", "http")
-	web.NewHandler(s, logger.With("component", "web")).Mount(mux)
-	proxy.New(s, logger.With("component", "proxy"), har).Mount(mux)
+	web.NewHandler(s, logger.With("component", "web"), har).Mount(mux)
+	proxy.New(s, logger.With("component", "proxy")).Mount(mux)
 	srv := &Server{mux: mux, logger: httpLog, har: har}
-	if har != nil {
-		mux.HandleFunc("GET /debug/har", srv.handleHAR)
-	}
+	mux.HandleFunc("GET /debug/har", srv.handleHAR)
 	return srv
 }
 
-// HAR returns the live recorder, or nil when HAR capture is disabled.
-func (s *Server) HAR() *harlog.Recorder { return s.har }
+// HAR returns the file-mode recorder for shutdown flush, or nil in runtime mode
+// (runtime sessions are never written to disk on shutdown).
+func (s *Server) HAR() *harlog.Recorder {
+	if s == nil || s.har == nil {
+		return nil
+	}
+	return s.har.FileRecorder()
+}
+
+// HARController returns the process-wide capture controller.
+func (s *Server) HARController() *harlog.Controller {
+	if s == nil {
+		return nil
+	}
+	return s.har
+}
 
 func (s *Server) Handler() http.Handler {
 	h := cors(s.mux)
@@ -68,13 +77,22 @@ func (s *Server) handleHAR(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	data, err := s.har.MarshalHAR()
+	data, err := s.har.Download()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		switch {
+		case errors.Is(err, harlog.ErrNotAvailable):
+			http.NotFound(w, r)
+		case errors.Is(err, harlog.ErrNotReady):
+			http.Error(w, "HAR download unavailable while recording is active or stopping", http.StatusConflict)
+		default:
+			http.Error(w, "HAR download failed", http.StatusInternalServerError)
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", `attachment; filename="airouter.har"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = w.Write(data)
 }
 
@@ -138,7 +156,12 @@ func exposeRequestID(h http.Header) {
 // requestMiddleware attaches TraceInfo and a request id to every request,
 // optionally records the ingress HAR leg, and emits access/trace logs gated by
 // the logger level. HAR capture is independent of log level.
-func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Handler) http.Handler {
+//
+// For provider-facing paths the middleware acquires a recording lease once at
+// ingress and pins that recorder on TraceInfo so upstream legs use the same
+// session even if Stop runs mid-request. Release runs after the ingress entry
+// is written (or immediately when no capture).
+func requestMiddleware(logger *slog.Logger, har *harlog.Controller, next http.Handler) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -150,13 +173,26 @@ func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Hand
 		// and HTMX-fragment exchanges would only clutter the log / HAR.
 		proxyPath := isProxyPath(r.URL.Path)
 		traceOn := proxyPath && logger.Enabled(r.Context(), observability.LevelTrace)
-		harCap := proxyPath && har != nil
+
+		var lease *harlog.Lease
+		var pinned *harlog.Recorder
+		if proxyPath && har != nil {
+			lease = har.Acquire()
+			if lease != nil {
+				pinned = lease.Recorder()
+			}
+		}
+		// Release exactly once after ingress HAR recording (or immediately when
+		// the path never acquired).
+		if lease != nil {
+			defer func() { lease.Release() }()
+		}
 
 		// HAR retains bodies up to harlog.MaxBody. TRACE-only counts bytes the
 		// handler actually reads without retaining them (Capture(0)).
 		var reqCap *observability.Capture
 		switch {
-		case harCap:
+		case pinned != nil:
 			reqCap = observability.NewCapture(harlog.MaxBody)
 		case traceOn:
 			reqCap = observability.NewCapture(0)
@@ -167,17 +203,26 @@ func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Hand
 
 		// TraceInfo carries per-request cross-stage state. RequestID is always
 		// populated so terminal logs, HAR pages, and the response header share it.
-		tinfo := &proxy.TraceInfo{RequestID: reqID}
+		// HAR is the request-pinned recorder (nil when not capturing).
+		tinfo := &proxy.TraceInfo{RequestID: reqID, HAR: pinned}
 		ctx := proxy.WithTraceInfo(r.Context(), tinfo)
 		ctx = observability.WithRequestID(ctx, reqID)
 		r = r.WithContext(ctx)
+
+		if pinned != nil {
+			pageID := "page_" + reqID
+			title := r.Method + " " + r.URL.RequestURI()
+			// Register before forwarding so the page reflects ingress start/title;
+			// upstream recording may otherwise win EnsurePage's first-call rule.
+			pinned.EnsurePage(pageID, title, start)
+		}
 
 		// Set the correlation header before the handler runs so even early
 		// rejections carry it.
 		w.Header().Set(requestIDHeader, reqID)
 
 		var respCap *observability.Capture
-		if harCap {
+		if pinned != nil {
 			respCap = observability.NewCapture(harlog.MaxBody)
 		}
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK, capture: respCap}
@@ -197,10 +242,8 @@ func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Hand
 		if traceOn {
 			emitIngressExchange(r.Context(), log, r, tinfo, reqCap, sw, dur)
 		}
-		if harCap {
+		if pinned != nil {
 			pageID := "page_" + reqID
-			title := r.Method + " " + r.URL.RequestURI()
-			har.EnsurePage(pageID, title, start)
 			var reqBody []byte
 			var reqSize int
 			if reqCap != nil {
@@ -213,7 +256,7 @@ func requestMiddleware(logger *slog.Logger, har *harlog.Recorder, next http.Hand
 				respBody = respCap.Bytes()
 				respSize = int(respCap.Total())
 			}
-			har.Record(harlog.RecordInput{
+			pinned.Record(harlog.RecordInput{
 				PageID:       pageID,
 				StartedAt:    start,
 				Duration:     dur,

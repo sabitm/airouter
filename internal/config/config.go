@@ -17,12 +17,15 @@ type Config struct {
 	//   0 Info (lifecycle/warnings/operational errors);
 	//   1 Debug (+ access/upstream/failover/OAuth metadata; no bodies);
 	//   2 Trace (+ detailed ingress/probe exchange metadata; no bodies).
-	// Bodies require explicit -har-file (independent of debug level).
+	// Bodies require HAR capture (independent of debug level): runtime Start/Stop
+	// from the dashboard, or always-on -har-file mode.
 	DebugLevel int
-	// HARFile, when set, enables MitM-style HAR 1.2 capture of both legs of every
-	// proxied request (headers and bodies up to the HAR per-body cap). The live
-	// document is served at GET /debug/har and flushed to this path on shutdown.
-	// Empty disables. HAR contains sensitive prompt/credential material.
+	// HARFile, when set, enables always-on MitM-style HAR 1.2 capture of both legs
+	// of every proxied request (headers and bodies up to the HAR per-body cap).
+	// The live document is served at GET /debug/har and flushed to this path on
+	// shutdown. Empty enables runtime dashboard-controlled capture instead (in
+	// memory only; never written on shutdown). HAR contains sensitive
+	// prompt/credential material.
 	HARFile string
 	// Version, when true, prints the build version and exits.
 	Version bool
@@ -66,8 +69,8 @@ func Load() Config {
 	flag.StringVar(&c.DBPath, "db", env("AIROUTER_DB", "airouter.db"), "SQLite database path")
 	flag.StringVar(&c.Secret, "secret", env("AIROUTER_SECRET", ""), "secret seeding the at-rest encryption key")
 	level := debugLevel(envDebugLevel())
-	flag.Var(&level, "debug", "log verbosity: 1=access and upstream diagnostics, 2=detailed exchange metadata; bodies require -har-file")
-	flag.StringVar(&c.HARFile, "har-file", env("AIROUTER_HAR_FILE", ""), "capture proxied request/response pairs (both legs, headers and bodies up to the HAR per-body cap) to this HAR file on shutdown; also served at GET /debug/har. Contains prompt content and provider secrets")
+	flag.Var(&level, "debug", "log verbosity: 1=access and upstream diagnostics, 2=detailed exchange metadata; bodies require HAR capture (dashboard or -har-file)")
+	flag.StringVar(&c.HARFile, "har-file", env("AIROUTER_HAR_FILE", ""), "always-on HAR capture of proxied request/response pairs (both legs, headers and bodies up to the HAR per-body cap); live at GET /debug/har and flushed to this path on shutdown. Without this flag, use dashboard Settings to start/stop runtime capture. Contains prompt content and provider secrets")
 	flag.BoolVar(&c.Version, "version", false, "print version and exit")
 	flag.Parse()
 	c.DebugLevel = int(level)

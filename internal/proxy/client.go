@@ -364,7 +364,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
 		// Snapshot headers after auth/identity so HAR sees the wire credentials.
 		var harHdr http.Header
-		if p.harEnabled() {
+		if harRecorder(ctx) != nil {
 			harHdr = req.Header.Clone()
 		}
 		resp, err := p.client.Do(req)
@@ -376,7 +376,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if err != nil {
 			return resp.StatusCode, nil, err
 		}
-		if p.harEnabled() {
+		if harRecorder(ctx) != nil {
 			p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody))
 		}
 		return resp.StatusCode, respBody, nil
@@ -433,14 +433,14 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
 		req.Header.Set("Accept", accept)
 		var harHdr http.Header
-		if p.harEnabled() {
+		if harRecorder(ctx) != nil {
 			harHdr = req.Header.Clone()
 		}
 		resp, err := p.streamClient.Do(req)
 		if err != nil {
 			return nil, err
 		}
-		if p.harEnabled() {
+		if harRecorder(ctx) != nil {
 			// Wrap so Close finalizes the upstream HAR entry (including the
 			// 401 body that is closed before an OAuth retry).
 			resp.Body = &harCaptureBody{
@@ -488,12 +488,21 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 	return resp, nil
 }
 
-// recordUpstreamHAR writes one upstream leg into the HAR recorder. pageID comes
-// from TraceInfo.RequestID so it shares a page with the ingress entry.
-// respBodySize is the full wire length (may exceed len(respBody) when a stream
-// tee already truncated).
+// harRecorder returns the request-pinned HAR recorder, or nil when capture is off.
+func harRecorder(ctx context.Context) *harlog.Recorder {
+	if t := traceInfoFrom(ctx); t != nil {
+		return t.HAR
+	}
+	return nil
+}
+
+// recordUpstreamHAR writes one upstream leg into the request-pinned HAR
+// recorder. pageID comes from TraceInfo.RequestID so it shares a page with the
+// ingress entry. respBodySize is the full wire length (may exceed len(respBody)
+// when a stream tee already truncated).
 func (p *Proxy) recordUpstreamHAR(ctx context.Context, started time.Time, dur time.Duration, method, url string, reqHdr http.Header, reqBody []byte, status int, respHdr http.Header, respBody []byte, respMIME string, respBodySize int) {
-	if !p.harEnabled() {
+	rec := harRecorder(ctx)
+	if rec == nil {
 		return
 	}
 	pageID := ""
@@ -504,8 +513,8 @@ func (p *Proxy) recordUpstreamHAR(ctx context.Context, started time.Time, dur ti
 		return
 	}
 	title := method + " " + url
-	p.har.EnsurePage(pageID, title, started)
-	p.har.Record(harlog.RecordInput{
+	rec.EnsurePage(pageID, title, started)
+	rec.Record(harlog.RecordInput{
 		PageID:       pageID,
 		StartedAt:    started,
 		Duration:     dur,

@@ -70,7 +70,7 @@ func TestUpstreamAttemptFailedOneEventPerTarget(t *testing.T) {
 	var buf bytes.Buffer
 	logger := observability.NewLogger(1, &buf)
 	mux := http.NewServeMux()
-	New(st, logger, nil).Mount(mux)
+	New(st, logger).Mount(mux)
 
 	body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -115,7 +115,7 @@ func TestUpstreamErrorBodyDoesNotLeakAtDebug(t *testing.T) {
 	var buf bytes.Buffer
 	logger := observability.NewLogger(1, &buf)
 	mux := http.NewServeMux()
-	New(st, logger, nil).Mount(mux)
+	New(st, logger).Mount(mux)
 
 	body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -138,7 +138,7 @@ func TestRequestFailedPreUpstream(t *testing.T) {
 	var buf bytes.Buffer
 	logger := observability.NewLogger(1, &buf)
 	mux := http.NewServeMux()
-	New(st, logger, nil).Mount(mux)
+	New(st, logger).Mount(mux)
 
 	body := `{"model":"missing","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -191,7 +191,7 @@ func TestStreamDecodeFailedOnce(t *testing.T) {
 	var buf bytes.Buffer
 	logger := observability.NewLogger(1, &buf)
 	mux := http.NewServeMux()
-	New(st, logger, nil).Mount(mux)
+	New(st, logger).Mount(mux)
 
 	body := `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -235,7 +235,7 @@ func TestFailoverThenSuccessNoRequestFailed(t *testing.T) {
 	var buf bytes.Buffer
 	logger := observability.NewLogger(1, &buf)
 	mux := http.NewServeMux()
-	New(st, logger, nil).Mount(mux)
+	New(st, logger).Mount(mux)
 
 	body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))

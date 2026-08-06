@@ -117,6 +117,33 @@ button.link {
 
 button.link.danger { color: var(--danger); }
 
+button.button-danger {
+	background: var(--danger);
+	color: #fff;
+	border: none;
+	padding: 8px 14px;
+	border-radius: 6px;
+	cursor: pointer;
+	font-size: 14px;
+}
+button.button-danger:hover { filter: brightness(1.1); }
+
+.har-warning { color: #e3b341; }
+.har-status { margin: 0 0 8px; }
+.har-stats {
+	list-style: none;
+	padding: 0;
+	margin: 0 0 16px;
+	display: grid;
+	gap: 4px;
+}
+.har-stats .field-name {
+	display: inline-block;
+	min-width: 72px;
+	color: var(--muted);
+}
+.har-actions { gap: 10px; }
+
 button:focus-visible,
 .button:focus-visible,
 input:focus-visible,

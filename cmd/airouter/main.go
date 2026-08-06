@@ -58,7 +58,12 @@ func main() {
 		mainLog.Info("har_capture_enabled",
 			"event", "har_capture_enabled",
 			"path", cfg.HARFile,
-			"detail", "verbatim headers and request/response bodies up to the HAR per-body cap (GET /debug/har; flushed on shutdown)",
+			"detail", "file mode: always-on capture; download at GET /debug/har; flushed to path on shutdown",
+		)
+	} else {
+		mainLog.Info("har_runtime_available",
+			"event", "har_runtime_available",
+			"detail", "runtime HAR capture controlled from dashboard settings; download at GET /debug/har after Stop",
 		)
 	}
 	cipher, err := crypto.New(secret)

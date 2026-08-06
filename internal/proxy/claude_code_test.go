@@ -73,7 +73,7 @@ func TestClaudeCodeCloakAndHeaders(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	New(st, nil, nil).Mount(mux)
+	New(st, nil).Mount(mux)
 	// The server middleware attaches a TraceInfo so the prepare and header seams
 	// share the per-request session id; replicate that one line here (the proxy
 	// package's tests cannot import the server package without an import cycle).

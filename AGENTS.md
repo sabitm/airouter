@@ -64,20 +64,29 @@ Supporting packages:
   Debug (`-debug=1`), Trace (`-debug=2`, custom level below Debug rendered as
   TRACE). Terminal output is slog text, not JSON, and never includes HTTP body
   bytes at any level.
+- `internal/harlog` - HAR 1.2 recorder plus process-wide `Controller` owning
+  file mode (always-on, shutdown flush via `-har-file`) or runtime mode
+  (dashboard Start/Stop/Stopped download). Requests `Acquire` a lease at
+  ingress and pin that `*Recorder` for both legs; `Release` after the ingress
+  entry is written. Runtime Stop enters Stopping until in-flight leases drain.
 - `internal/server` - HTTP wiring: CORS (answers browser preflights, reflects
   the request Origin, exposes `X-Airouter-Request-ID`) and request middleware.
   Every request gets a correlation id on the context, `TraceInfo.RequestID`,
   response header, and HAR page id. At `-debug` (level 1) it logs structured
   `request_completed` access events; at `-debug=2` it also emits metadata-only
   `ingress_exchange` TRACE events (sizes, content types, status, duration,
-  upstream_url). Full request/response forensics use `-har-file` (HAR 1.2).
-  Request bodies are tee-observed without eager drain so proxy `MaxBytesReader`
-  stays honest; TRACE-only uses `Capture(0)` (count, no retain).
+  upstream_url). Full request/response forensics use HAR 1.2 capture: always-on
+  with `-har-file`, or runtime Start/Stop from the dashboard (in-memory only).
+  Middleware acquires a request-pinned recorder lease on provider paths and
+  stores it on `TraceInfo.HAR`. `GET /debug/har` is always mounted. Request
+  bodies are tee-observed without eager drain so proxy `MaxBytesReader` stays
+  honest; TRACE-only uses `Capture(0)` (count, no retain).
 - `internal/web` - templ + HTMX dashboard. `.templ` files generate `*_templ.go`.
   Dashboard outbound provider probes (Check/model autocomplete) share
   `executeProbe`; at `-debug=2` they log metadata-only `probe_request` /
   `probe_response` TRACE events (no bodies, no auth headers). Response bytes
-  are still retained up to 1 MiB for caller decoding.
+  are still retained up to 1 MiB for caller decoding. Settings hosts the HAR
+  capture panel (`/dashboard/har/status|start|stop`).
 - `cmd/airouter` - main: wires config, crypto, store, slog default, server;
   graceful shutdown.
 

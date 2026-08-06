@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/a-h/templ"
 
 	"airouter/internal/domain"
+	"airouter/internal/harlog"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
@@ -31,15 +33,18 @@ type Handler struct {
 	sessions *connectSessions
 	// logger is the component=web logger. TRACE enables outbound probe exchange metadata.
 	logger *slog.Logger
+	// har is the process-wide capture controller shared with server middleware.
+	har *harlog.Controller
 }
 
 // NewHandler builds the dashboard handler. logger may be nil (falls back to
 // slog.Default). Prefer a component=web logger from the server constructor.
-func NewHandler(s *store.Store, logger *slog.Logger) *Handler {
+// har may be nil (HAR panel renders as disabled/idle).
+func NewHandler(s *store.Store, logger *slog.Logger, har *harlog.Controller) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), logger: logger}
+	return &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), logger: logger, har: har}
 }
 
 // Mount registers all dashboard routes on the given mux.
@@ -106,6 +111,9 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /dashboard/settings", h.settingsPage)
 	mux.HandleFunc("GET /dashboard/export", h.exportConfig)
 	mux.HandleFunc("POST /dashboard/import", h.importConfig)
+	mux.HandleFunc("GET /dashboard/har/status", h.harStatus)
+	mux.HandleFunc("POST /dashboard/har/start", h.harStart)
+	mux.HandleFunc("POST /dashboard/har/stop", h.harStop)
 }
 
 func render(w http.ResponseWriter, r *http.Request, c templ.Component) {
@@ -1020,8 +1028,115 @@ func (h *Handler) clearLogs(w http.ResponseWriter, r *http.Request) {
 
 // --- Settings / import-export ---
 
+// HARView is a safe DTO for the settings HAR panel (no filesystem paths).
+type HARView struct {
+	Mode         string
+	State        string
+	StartedAt    string
+	StoppedAt    string
+	Pages        int
+	Entries      int
+	InFlight     int
+	CanStart     bool
+	CanStop      bool
+	CanDownload  bool
+	Poll         bool
+	FileMode     bool
+	StateLabel   string
+	Detail       string
+	ErrorMessage string
+}
+
+func (h *Handler) harView(errMsg string) HARView {
+	st := harlog.Status{Mode: harlog.ModeRuntime, State: harlog.StateIdle}
+	if h.har != nil {
+		st = h.har.Status()
+	}
+	v := HARView{
+		Mode:         st.Mode.String(),
+		State:        st.State.String(),
+		Pages:        st.Pages,
+		Entries:      st.Entries,
+		InFlight:     st.InFlight,
+		FileMode:     st.Mode == harlog.ModeFile,
+		ErrorMessage: errMsg,
+	}
+	if !st.StartedAt.IsZero() {
+		v.StartedAt = st.StartedAt.Local().Format(time.RFC3339)
+	}
+	if !st.StoppedAt.IsZero() {
+		v.StoppedAt = st.StoppedAt.Local().Format(time.RFC3339)
+	}
+	switch {
+	case v.FileMode:
+		v.StateLabel = "Always recording"
+		v.CanDownload = true
+		v.Detail = "Capture is always on because -har-file is set. Download is a live snapshot. The configured path is flushed on shutdown."
+	case st.State == harlog.StateIdle:
+		v.StateLabel = "Idle"
+		v.CanStart = true
+		v.Detail = "No active recording. Start to capture proxied requests until you stop."
+	case st.State == harlog.StateRecording:
+		v.StateLabel = "Recording"
+		v.CanStop = true
+		v.Poll = true
+		v.Detail = "New proxied requests are captured. Download is available only after Stop finishes."
+	case st.State == harlog.StateStopping:
+		v.StateLabel = "Stopping"
+		v.Poll = true
+		v.Detail = "New requests are excluded. Waiting for in-flight requests to finish before download is available."
+	case st.State == harlog.StateStopped:
+		v.StateLabel = "Stopped"
+		v.CanStart = true
+		v.CanDownload = true
+		v.Detail = "Recording retained in memory. Download the HAR, or start a new recording to replace it."
+	}
+	return v
+}
+
 func (h *Handler) settingsPage(w http.ResponseWriter, r *http.Request) {
-	render(w, r, SettingsPage())
+	render(w, r, SettingsPage(h.harView("")))
+}
+
+func (h *Handler) harStatus(w http.ResponseWriter, r *http.Request) {
+	render(w, r, HARPanel(h.harView("")))
+}
+
+func (h *Handler) harStart(w http.ResponseWriter, r *http.Request) {
+	if h.har == nil {
+		htmxBadRequest(w, r, "har-flash", "HAR capture is unavailable")
+		return
+	}
+	if err := h.har.Start(); err != nil {
+		msg := harControlError(err)
+		htmxBadRequest(w, r, "har-flash", msg)
+		return
+	}
+	render(w, r, HARPanel(h.harView("")))
+}
+
+func (h *Handler) harStop(w http.ResponseWriter, r *http.Request) {
+	if h.har == nil {
+		htmxBadRequest(w, r, "har-flash", "HAR capture is unavailable")
+		return
+	}
+	if err := h.har.Stop(); err != nil {
+		msg := harControlError(err)
+		htmxBadRequest(w, r, "har-flash", msg)
+		return
+	}
+	render(w, r, HARPanel(h.harView("")))
+}
+
+func harControlError(err error) string {
+	switch {
+	case errors.Is(err, harlog.ErrFileMode):
+		return "Start/Stop is disabled while -har-file is set"
+	case errors.Is(err, harlog.ErrInvalidTransition):
+		return "HAR control is not valid in the current state"
+	default:
+		return "HAR control failed"
+	}
 }
 
 func (h *Handler) exportConfig(w http.ResponseWriter, r *http.Request) {
