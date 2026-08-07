@@ -275,9 +275,48 @@ func TestApplyCursorHeaders(t *testing.T) {
 	}
 }
 
+func TestCodexFinalizeKeepsNativeHyphenAndSyncsInclude(t *testing.T) {
+	req := &ir.Request{Model: "gpt-5.3-codex-high"}
+	body, err := responses.EncodeCodexRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &domain.Provider{Protocol: domain.ProtocolOpenAICodex}
+	out, err := finalizeEncodedBody(body, req, codexCodec, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := got["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" {
+		t.Fatalf("reasoning = %v", reasoning)
+	}
+
+	req.Model = "gpt-5.6-luna"
+	req.Thinking = &ir.Thinking{Mode: ir.ThinkingNone}
+	body, err = responses.EncodeCodexRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = finalizeEncodedBody(body, req, codexCodec, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["include"]; ok {
+		t.Fatalf("none retained encrypted include: %s", out)
+	}
+}
+
 func TestCodexEncodeRequestIRThinkingOverridesHyphen(t *testing.T) {
 	body, err := responses.EncodeCodexRequest(&ir.Request{
-		Model: "gpt-5.3-codex-low",
+		Model:    "gpt-5.3-codex-low",
 		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
 		Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
 	})
@@ -300,7 +339,7 @@ func TestCodexEncodeRequestIRThinkingOverridesHyphen(t *testing.T) {
 func TestCodexEncodeRequestIRThinkingMaxMinimalPassThrough(t *testing.T) {
 	for _, lvl := range []string{"max", "minimal"} {
 		body, err := responses.EncodeCodexRequest(&ir.Request{
-			Model: "gpt-5.3-codex",
+			Model:    "gpt-5.3-codex",
 			Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
 			Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: lvl},
 		})

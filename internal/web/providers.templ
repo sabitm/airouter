@@ -81,6 +81,24 @@ func kiroAuthOrBuilderID(c *domain.OAuthCreds) string {
 	return c.KiroAuth
 }
 
+// reasoningDialectField renders a dialect selector for editable protocols or a
+// locked hidden input for fixed backends. current is the stored value (may be empty).
+templ reasoningDialectField(proto domain.Protocol, current domain.ReasoningDialect) {
+	if reasoningDialectEditable(proto) {
+		<label class="field">
+			<span class="field-name">Reasoning dialect</span>
+			<select name="reasoning_dialect" title="provider-native reasoning semantics" aria-label="reasoning dialect">
+				<option value="" selected?={ current == "" }>default ({ string(domain.DefaultReasoningDialect(proto)) })</option>
+				for _, d := range dialectOptionsFor(proto) {
+					<option value={ string(d) } selected?={ current == d }>{ string(d) }</option>
+				}
+			</select>
+		</label>
+	} else {
+		<input type="hidden" name="reasoning_dialect" value={ string(lockedReasoningDialect(proto)) }/>
+	}
+}
+
 // ConnectionPanel shows the router's own ingress URLs for agent clients. The two
 // differ by design: the Anthropic SDK appends /v1/messages to its base URL, so
 // it must omit /v1; OpenAI clients append /chat/completions to a base that
@@ -140,6 +158,7 @@ templ ProviderRecipeForm(r recipe) {
 					<span class="field-name">Base URL</span>
 					<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
 				</label>
+				@reasoningDialectField(r.Protocol, r.ReasoningDialect)
 				<label class="field">
 					<span class="field-name">Auth mode</span>
 					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
@@ -168,6 +187,7 @@ templ ProviderRecipeForm(r recipe) {
 		case kindKiro:
 			<form class="provider-form provider-form-grid" data-method="apikey" data-oauth-mode="web" data-protocol="kiro" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value="kiro"/>
+				<input type="hidden" name="reasoning_dialect" value="none"/>
 				<input type="hidden" name="preset" value="kiro"/>
 				<label class="field">
 					<span class="field-name">Name</span>
@@ -245,6 +265,7 @@ templ ProviderRecipeForm(r recipe) {
 		case kindQoder:
 			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="web" data-protocol="qoder" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value="qoder"/>
+				<input type="hidden" name="reasoning_dialect" value="none"/>
 				<input type="hidden" name="auth_method" value="oauth"/>
 				<input type="hidden" name="preset" value="qoder"/>
 				<label class="field">
@@ -297,6 +318,7 @@ templ ProviderRecipeForm(r recipe) {
 		case kindCursor:
 			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="manual" data-protocol="cursor" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value="cursor"/>
+				<input type="hidden" name="reasoning_dialect" value="none"/>
 				<input type="hidden" name="auth_method" value="oauth"/>
 				<input type="hidden" name="preset" value="cursor"/>
 				<label class="field">
@@ -348,6 +370,7 @@ templ ProviderRecipeForm(r recipe) {
 						<option value="x-api-key">x-api-key</option>
 					</select>
 				</label>
+				@reasoningDialectField(r.Protocol, "")
 				<div class="form-actions">
 					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
 					<span class="check-indicator htmx-indicator">checking...</span>
@@ -464,7 +487,7 @@ templ ProviderRow(p *domain.Provider) {
 		<td>{ p.Name }</td>
 		<td class="mono">{ p.BaseURL }</td>
 		<td>@providerCredCell(p)</td>
-		<td>{ string(p.Protocol) }</td>
+		<td>{ string(p.Protocol) } <span class="muted">({ string(p.Reasoning()) })</span></td>
 		<td>{ string(p.Auth()) }</td>
 		<td class="actions">
 			<button class="link" hx-get={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/edit" } hx-target={ "#provider-" + strconv.FormatInt(p.ID, 10) } hx-swap="outerHTML">Edit</button>
@@ -479,7 +502,7 @@ templ ArchivedProviderRow(p *domain.Provider) {
 		<td>{ p.Name }</td>
 		<td class="mono">{ p.BaseURL }</td>
 		<td>@providerCredCell(p)</td>
-		<td>{ string(p.Protocol) }</td>
+		<td>{ string(p.Protocol) } <span class="muted">({ string(p.Reasoning()) })</span></td>
 		<td>{ string(p.Auth()) }</td>
 		<td class="actions">
 			<button class="link" hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) + "/restore" } hx-target="#provider-list" hx-swap="outerHTML">Restore</button>
@@ -546,6 +569,7 @@ templ providerEditRowGenericAPIKey(p *domain.Provider) {
 				}
 			</select>
 		</label>
+		@reasoningDialectField(p.Protocol, p.ReasoningDialect)
 		<div class="form-actions">
 			@providerEditCheck()
 			@providerEditSaveCancel(p)
@@ -566,6 +590,7 @@ templ providerEditRowKiro(p *domain.Provider) {
 	>
 		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 		<input type="hidden" name="protocol" value="kiro"/>
+		<input type="hidden" name="reasoning_dialect" value="none"/>
 		<label class="field">
 			<span class="field-name">Name</span>
 			<input name="name" value={ p.Name } required/>
@@ -620,6 +645,7 @@ templ providerEditRowQoder(p *domain.Provider) {
 	>
 		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 		<input type="hidden" name="protocol" value="qoder"/>
+		<input type="hidden" name="reasoning_dialect" value="none"/>
 		<input type="hidden" name="auth_method" value="oauth"/>
 		<input type="hidden" name="preset" value="qoder"/>
 		<label class="field">
@@ -678,6 +704,7 @@ templ providerEditRowCursor(p *domain.Provider) {
 	>
 		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 		<input type="hidden" name="protocol" value="cursor"/>
+		<input type="hidden" name="reasoning_dialect" value="none"/>
 		<input type="hidden" name="auth_method" value="oauth"/>
 		<input type="hidden" name="preset" value="cursor"/>
 		<label class="field">
@@ -736,6 +763,7 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 			<span class="field-name">Base URL</span>
 			<input name="base_url" value={ p.BaseURL } required/>
 		</label>
+		@reasoningDialectField(p.Protocol, p.ReasoningDialect)
 		<span class="muted">Connected: { oauthLabel(p.OAuthCreds) }. Reconnect only if the refresh token is revoked.</span>
 		if c.ProjectID != "" {
 			<p class="field-hint">Cloud Code project: { c.ProjectID }</p>

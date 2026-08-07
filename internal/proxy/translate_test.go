@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"testing"
 
+	"airouter/internal/domain"
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/openai"
+	"airouter/internal/proxy/thinking"
 )
 
 // OpenAI chat request with a system prompt and tool definition should land in
@@ -344,7 +346,7 @@ func TestRewriteModelWithThinkingPassthrough(t *testing.T) {
 	}
 }
 
-func TestThinkingMaxPassesThroughOpenAI(t *testing.T) {
+func TestThinkingMaxClampsOnOpenAIDialect(t *testing.T) {
 	in := []byte(`{
 		"model":"default",
 		"messages":[{"role":"user","content":"hi"}]
@@ -353,8 +355,8 @@ func TestThinkingMaxPassesThroughOpenAI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	applyUpstreamModel(req, "deepseek-v4-flash-free(max)")
-	if req.Model != "deepseek-v4-flash-free" {
+	applyUpstreamModel(req, "gpt-5(max)")
+	if req.Model != "gpt-5" {
 		t.Fatalf("model = %q", req.Model)
 	}
 	if req.Thinking == nil || req.Thinking.Level != "max" {
@@ -370,14 +372,15 @@ func TestThinkingMaxPassesThroughOpenAI(t *testing.T) {
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.ReasoningEffort != "max" {
-		t.Fatalf("reasoning_effort = %q, want max", got.ReasoningEffort)
+	// OpenAI dialect clamps max -> xhigh unless model capability permits max.
+	if got.ReasoningEffort != "xhigh" {
+		t.Fatalf("reasoning_effort = %q, want xhigh", got.ReasoningEffort)
 	}
 }
 
-func TestThinkingMaxPassesThroughApplyWire(t *testing.T) {
+func TestThinkingMaxOnDeepSeekDialect(t *testing.T) {
 	body := []byte(`{"model":"combo","messages":[],"foo":1}`)
-	out, err := rewriteModelWithThinking(body, "deepseek-v4-flash-free(max)", "oai-chat")
+	out, err := thinking.FinalizeBody(body, "deepseek-v4-flash-free(max)", "oai-chat", domain.ProtocolOpenAI, domain.ReasoningDeepSeek)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,5 +393,91 @@ func TestThinkingMaxPassesThroughApplyWire(t *testing.T) {
 	}
 	if m["reasoning_effort"] != "max" {
 		t.Fatalf("reasoning_effort = %v, want max", m["reasoning_effort"])
+	}
+	th, _ := m["thinking"].(map[string]any)
+	if th == nil || th["type"] != "enabled" {
+		t.Fatalf("thinking = %v", th)
+	}
+}
+
+func TestThinkingClaudeAdaptivePreservesMax(t *testing.T) {
+	req := &ir.Request{
+		Model:    "claude-opus-4-7",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "max"},
+	}
+	out, err := anthropic.EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		OutputConfig *struct {
+			Effort string `json:"effort"`
+		} `json:"output_config"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.OutputConfig == nil || got.OutputConfig.Effort != "max" {
+		t.Fatalf("output_config = %+v, want max", got.OutputConfig)
+	}
+}
+
+func TestThinkingClaudeCodeHaikuBudget(t *testing.T) {
+	req := &ir.Request{
+		Model:    "claude-haiku-4.5",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+	}
+	out, err := anthropic.EncodeRequestClaudeCode(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Thinking *struct {
+			Type         string `json:"type"`
+			BudgetTokens int    `json:"budget_tokens"`
+		} `json:"thinking"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Thinking == nil || got.Thinking.Type != "enabled" || got.Thinking.BudgetTokens != 24576 {
+		t.Fatalf("haiku claude-code should be budget: %+v body=%s", got.Thinking, out)
+	}
+}
+
+func TestFinalizeBodyFailoverDialectIsolation(t *testing.T) {
+	// Body with qwen fields; when failing over to openai dialect only openai fields remain.
+	body := []byte(`{"model":"combo","messages":[],"enable_thinking":true,"thinking_budget":4096}`)
+	qwenOut, err := thinking.FinalizeBody(body, "qwen3(high)", "oai-chat", domain.ProtocolOpenAI, domain.ReasoningQwen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var qm map[string]any
+	if err := json.Unmarshal(qwenOut, &qm); err != nil {
+		t.Fatal(err)
+	}
+	if qm["enable_thinking"] != true {
+		t.Fatalf("qwen: %s", qwenOut)
+	}
+
+	// Same original body, OpenAI attempt — no leak of qwen fields.
+	oaiOut, err := thinking.FinalizeBody(body, "gpt-5(high)", "oai-chat", domain.ProtocolOpenAI, domain.ReasoningOpenAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var om map[string]any
+	if err := json.Unmarshal(oaiOut, &om); err != nil {
+		t.Fatal(err)
+	}
+	if om["reasoning_effort"] != "high" {
+		t.Fatalf("openai effort: %s", oaiOut)
+	}
+	if _, ok := om["enable_thinking"]; ok {
+		t.Fatalf("qwen field leaked to openai attempt: %s", oaiOut)
+	}
+	if _, ok := om["thinking_budget"]; ok {
+		t.Fatalf("qwen budget leaked: %s", oaiOut)
 	}
 }

@@ -26,9 +26,12 @@ type portableProvider struct {
 	// AuthMethod selects apikey vs oauth. Export always writes the resolved value;
 	// import also accepts "" or "default" as an alias for apikey (see
 	// Provider.Method).
-	AuthMethod string             `json:"auth_method"`
-	OAuth      *domain.OAuthCreds `json:"oauth,omitempty"`
-	Archived   bool               `json:"archived,omitempty"`
+	AuthMethod string `json:"auth_method"`
+	// ReasoningDialect is optional. Export writes the effective canonical dialect.
+	// Omitted/empty on import keeps the protocol default; aliases are accepted.
+	ReasoningDialect string             `json:"reasoning_dialect,omitempty"`
+	OAuth            *domain.OAuthCreds `json:"oauth,omitempty"`
+	Archived         bool               `json:"archived,omitempty"`
 }
 
 type portableTarget struct {
@@ -78,7 +81,8 @@ func (s *Store) Export(ctx context.Context, w io.Writer) error {
 	for _, p := range providers {
 		pp := portableProvider{
 			Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, Protocol: string(p.Protocol),
-			AuthScheme: string(p.Auth()), AuthMethod: string(p.Method()), Archived: p.Archived,
+			AuthScheme: string(p.Auth()), AuthMethod: string(p.Method()),
+			ReasoningDialect: string(p.Reasoning()), Archived: p.Archived,
 		}
 		if p.Method() == domain.AuthOAuth {
 			pp.OAuth = p.OAuthCreds
@@ -202,9 +206,14 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 	if method == domain.AuthOAuth && pp.OAuth == nil {
 		return fmt.Sprintf("provider %q: auth_method oauth requires oauth credentials", pp.Name)
 	}
+	dialect, ok := domain.ParseReasoningDialect(pp.ReasoningDialect)
+	if !ok {
+		return fmt.Sprintf("provider %q: invalid reasoning_dialect %q", pp.Name, pp.ReasoningDialect)
+	}
 	if cur, ok := byName[pp.Name]; ok {
 		cur.BaseURL, cur.APIKey, cur.Protocol = pp.BaseURL, pp.APIKey, proto
 		cur.AuthScheme, cur.AuthMethod, cur.OAuthCreds, cur.Archived = auth, method, pp.OAuth, pp.Archived
+		cur.ReasoningDialect = dialect
 		cur.AuthScheme = cur.Auth()   // expand the default alias to a concrete scheme
 		cur.AuthMethod = cur.Method() // expand the default alias to a concrete method
 		if err := s.updateProvider(ctx, ex, cur); err != nil {
@@ -216,6 +225,7 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 	np := &domain.Provider{
 		Name: pp.Name, BaseURL: pp.BaseURL, APIKey: pp.APIKey, Protocol: proto,
 		AuthScheme: auth, AuthMethod: method, OAuthCreds: pp.OAuth, Archived: pp.Archived,
+		ReasoningDialect: dialect,
 	}
 	np.AuthScheme = np.Auth()   // expand the default alias to a concrete scheme
 	np.AuthMethod = np.Method() // expand the default alias to a concrete method

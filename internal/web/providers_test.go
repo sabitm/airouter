@@ -76,3 +76,44 @@ func TestProviderEditRowGenericAPIKeyProtocolLockedForSpecific(t *testing.T) {
 		})
 	}
 }
+
+func TestProviderEditRowReasoningDialectSelector(t *testing.T) {
+	p := &domain.Provider{ID: 1, Name: "p", BaseURL: "https://x", Protocol: domain.ProtocolOpenAI}
+	html := renderComponent(t, providerEditRowGenericAPIKey(p))
+	if !strings.Contains(html, `name="reasoning_dialect"`) {
+		t.Fatalf("want dialect select; html=%s", html)
+	}
+	for _, opt := range []string{"none", "openai", "kimi", "qwen", "deepseek", "zai", "grok"} {
+		if !strings.Contains(html, `value="`+opt+`"`) {
+			t.Fatalf("missing dialect option %q; html=%s", opt, html)
+		}
+	}
+	// Anthropic: only none/claude
+	p.Protocol = domain.ProtocolAnthropic
+	html = renderComponent(t, providerEditRowGenericAPIKey(p))
+	if !strings.Contains(html, `value="claude"`) {
+		t.Fatalf("want claude option; html=%s", html)
+	}
+	if strings.Contains(html, `value="qwen"`) {
+		t.Fatalf("anthropic should not offer qwen; html=%s", html)
+	}
+}
+
+func TestGrokRecipeDefaultsToGrokDialect(t *testing.T) {
+	r, ok := recipeByID("xai")
+	if !ok {
+		t.Fatal("missing xai recipe")
+	}
+	html := renderComponent(t, ProviderRecipeForm(r))
+	if !strings.Contains(html, `name="reasoning_dialect"`) || !strings.Contains(html, `value="grok" selected`) {
+		t.Fatalf("grok recipe should preselect grok dialect; html=%s", html)
+	}
+}
+
+func TestProviderEditRowReasoningDialectLocked(t *testing.T) {
+	p := &domain.Provider{ID: 2, Name: "p", BaseURL: "https://x", Protocol: domain.ProtocolOpenAICodex, AuthMethod: domain.AuthOAuth}
+	html := renderComponent(t, providerEditRowInteractiveOAuth(p))
+	if !strings.Contains(html, `type="hidden" name="reasoning_dialect" value="codex"`) {
+		t.Fatalf("want locked codex dialect; html=%s", html)
+	}
+}

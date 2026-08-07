@@ -108,8 +108,8 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	return encodeRequest(req, domain.ProtocolAnthropic)
 }
 
-// EncodeRequestClaudeCode is EncodeRequest with Claude Code caps (always adaptive
-// thinking shape). Used by the claude-code backend codec.
+// EncodeRequestClaudeCode is EncodeRequest under ProtocolClaudeCode. Adaptive
+// vs budget follows the model name (Haiku=budget; Opus/Sonnet 4.6+=adaptive).
 func EncodeRequestClaudeCode(req *ir.Request) ([]byte, error) {
 	return encodeRequest(req, domain.ProtocolClaudeCode)
 }
@@ -155,7 +155,9 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 // thinking when the last message is not a user turn, so intent is dropped then.
 // Budget thinking can exceed a small max_tokens; bump max_tokens when needed.
 func applyThinking(out *messagesRequest, req *ir.Request, protocol domain.Protocol) {
-	caps := thinking.CapsFor(req.Model, protocol)
+	// Claude dialect is the transport default for Anthropic / Claude Code.
+	// Provider-level overrides are applied by the proxy finalizer after encode.
+	caps := thinking.CapsFor(req.Model, protocol, domain.ReasoningClaude)
 	cfg := thinking.Effective(thinking.FromIR(req.Thinking), caps)
 	if cfg == nil {
 		return
@@ -176,9 +178,8 @@ func applyThinking(out *messagesRequest, req *ir.Request, protocol domain.Protoc
 		case thinking.ModeAuto:
 			level = "auto"
 		}
-		if level == "xhigh" || level == "max" {
-			level = "high"
-		}
+		// Adaptive set: minimal->low, xhigh->high; max is preserved (not collapsed).
+		level = thinking.MapClaudeAdaptiveLevel(level)
 		if level == "" {
 			level = "medium"
 		}
@@ -193,10 +194,15 @@ func applyThinking(out *messagesRequest, req *ir.Request, protocol domain.Protoc
 	if budget <= 0 {
 		budget = 8192
 	}
+	if caps.MaxOutput > 0 && budget+1024 > caps.MaxOutput {
+		budget = max(1024, caps.MaxOutput-1024)
+	}
 	out.Thinking = &anthThinking{Type: "enabled", BudgetTokens: budget}
-	// Thinking tokens count against max_tokens; leave headroom for the answer.
 	if out.MaxTokens < budget+1024 {
 		out.MaxTokens = budget + 1024
+	}
+	if caps.MaxOutput > 0 && out.MaxTokens > caps.MaxOutput {
+		out.MaxTokens = caps.MaxOutput
 	}
 }
 

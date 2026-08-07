@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Protocol identifies the wire format a provider speaks natively.
 type Protocol string
@@ -72,6 +75,81 @@ const (
 
 func (m AuthMethod) Valid() bool {
 	return m == AuthAPIKey || m == AuthOAuth
+}
+
+// ReasoningDialect selects provider-native reasoning/thinking wire semantics.
+// It is independent of Protocol (transport) and AuthScheme/AuthMethod.
+// Empty on a provider means "use the protocol default"; explicit none disables
+// the generic reasoning writer (special protocols keep their own behavior).
+type ReasoningDialect string
+
+const (
+	ReasoningNone     ReasoningDialect = "none"
+	ReasoningOpenAI   ReasoningDialect = "openai"
+	ReasoningClaude   ReasoningDialect = "claude"
+	ReasoningCodex    ReasoningDialect = "codex"
+	ReasoningKimi     ReasoningDialect = "kimi"
+	ReasoningQwen     ReasoningDialect = "qwen"
+	ReasoningDeepSeek ReasoningDialect = "deepseek"
+	ReasoningZAI      ReasoningDialect = "zai"
+	ReasoningGrok     ReasoningDialect = "grok"
+)
+
+// ParseReasoningDialect canonicalizes a user/import value. Empty input yields
+// ("", true) so callers can store the protocol-default sentinel. Unknown values
+// return ("", false).
+func ParseReasoningDialect(s string) (ReasoningDialect, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return "", true
+	case "none", "off":
+		return ReasoningNone, true
+	case "openai", "gpt":
+		return ReasoningOpenAI, true
+	case "claude", "anthropic":
+		return ReasoningClaude, true
+	case "codex":
+		return ReasoningCodex, true
+	case "kimi":
+		return ReasoningKimi, true
+	case "qwen":
+		return ReasoningQwen, true
+	case "deepseek":
+		return ReasoningDeepSeek, true
+	case "zai", "zhipu", "glm":
+		return ReasoningZAI, true
+	case "grok", "xai":
+		return ReasoningGrok, true
+	default:
+		return "", false
+	}
+}
+
+func (d ReasoningDialect) Valid() bool {
+	switch d {
+	case "", ReasoningNone, ReasoningOpenAI, ReasoningClaude, ReasoningCodex,
+		ReasoningKimi, ReasoningQwen, ReasoningDeepSeek, ReasoningZAI, ReasoningGrok:
+		return true
+	default:
+		return false
+	}
+}
+
+// DefaultReasoningDialect is the legacy protocol default when the provider
+// stores an empty dialect. Kiro/Qoder/Antigravity/Cursor are protocol-managed
+// (no generic writer), so their default is none.
+func DefaultReasoningDialect(p Protocol) ReasoningDialect {
+	switch p {
+	case ProtocolOpenAI, ProtocolOpenAIResponses:
+		return ReasoningOpenAI
+	case ProtocolOpenAICodex:
+		return ReasoningCodex
+	case ProtocolAnthropic, ProtocolClaudeCode:
+		return ReasoningClaude
+	default:
+		// Kiro, Qoder, Antigravity, Cursor: protocol-managed, no generic writer.
+		return ReasoningNone
+	}
 }
 
 // OAuthMode distinguishes a built-in preset connect from a manually configured
@@ -206,6 +284,9 @@ type Provider struct {
 	OAuthCreds *OAuthCreds
 	// AuthScheme may be empty on legacy rows; use Auth for the effective value.
 	AuthScheme AuthScheme
+	// ReasoningDialect may be empty on legacy rows; use Reasoning for the
+	// effective dialect. Explicit none disables the generic reasoning writer.
+	ReasoningDialect ReasoningDialect
 	// Archived providers are soft-disabled: hidden from the combo builder and
 	// skipped during resolution, but kept so they can be restored or deleted.
 	Archived  bool
@@ -237,6 +318,19 @@ func (p *Provider) Auth() AuthScheme {
 		return AuthXAPIKey
 	}
 	return AuthBearer
+}
+
+// Reasoning resolves the effective reasoning dialect. Empty stored value falls
+// back to the protocol default; an explicit none is preserved so callers can
+// disable the generic writer.
+func (p *Provider) Reasoning() ReasoningDialect {
+	if p.ReasoningDialect == "" {
+		return DefaultReasoningDialect(p.Protocol)
+	}
+	if d, ok := ParseReasoningDialect(string(p.ReasoningDialect)); ok {
+		return d
+	}
+	return DefaultReasoningDialect(p.Protocol)
 }
 
 // ComboStrategy selects which target a combo resolves to per request.

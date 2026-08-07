@@ -54,7 +54,7 @@ func (s *Store) hydrateTargets(ctx context.Context, ex executor, byID map[int64]
 	}
 	const q = `
 SELECT t.combo_id, t.id, t.provider_id, t.upstream_model, t.position, t.enabled,
-       p.id, p.name, p.base_url, p.api_key, p.protocol, p.auth_scheme, p.auth_method, p.oauth_creds, p.created_at, p.updated_at, p.archived
+       p.id, p.name, p.base_url, p.api_key, p.protocol, p.auth_scheme, p.auth_method, p.oauth_creds, p.reasoning_dialect, p.created_at, p.updated_at, p.archived
 FROM combo_targets t JOIN providers p ON p.id = t.provider_id
 ORDER BY t.combo_id, t.position, t.id`
 	rows, err := ex.QueryContext(ctx, q)
@@ -66,13 +66,14 @@ ORDER BY t.combo_id, t.position, t.id`
 		var comboID int64
 		var t domain.ComboTarget
 		var p domain.Provider
-		var enc, oauthEnc string
+		var enc, oauthEnc, dialect string
 		if err := rows.Scan(
 			&comboID, &t.ID, &t.ProviderID, &t.UpstreamModel, &t.Position, &t.Enabled,
-			&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme, &p.AuthMethod, &oauthEnc, &p.CreatedAt, &p.UpdatedAt, &p.Archived,
+			&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme, &p.AuthMethod, &oauthEnc, &dialect, &p.CreatedAt, &p.UpdatedAt, &p.Archived,
 		); err != nil {
 			return err
 		}
+		p.ReasoningDialect = domain.ReasoningDialect(dialect)
 		c, ok := byID[comboID]
 		if !ok {
 			continue

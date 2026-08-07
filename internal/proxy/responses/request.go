@@ -200,13 +200,14 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	if req.ToolChoice != nil {
 		out["tool_choice"] = encodeToolChoice(req.ToolChoice)
 	}
-	if cfg := thinking.Effective(thinking.FromIR(req.Thinking), thinking.CapsFor(req.Model, domain.ProtocolOpenAIResponses)); cfg != nil {
+	caps := thinking.CapsFor(req.Model, domain.ProtocolOpenAIResponses, domain.ReasoningOpenAI)
+	if cfg := thinking.Effective(thinking.FromIR(req.Thinking), caps); cfg != nil {
 		switch cfg.Mode {
 		case thinking.ModeNone:
 			out["reasoning"] = map[string]any{"effort": "none"}
 		default:
 			if level := thinking.LevelFor(cfg); level != "" && level != "none" {
-				out["reasoning"] = map[string]any{"effort": level}
+				out["reasoning"] = map[string]any{"effort": thinking.NormalizeOpenAILevel(level, caps)}
 			}
 		}
 	}

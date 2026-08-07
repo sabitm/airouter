@@ -7,7 +7,8 @@ import (
 
 // ParseSuffix splits "model(high)" / "model(8192)" / "model(none)" / "model(auto)".
 // Only known levels, digits, none/off, or auto are consumed; any other parenthetical
-// is left on the model name so legitimate ids are not mangled.
+// (including dialect-qualified forms like "qwen:high") is left on the model name
+// so legitimate ids are not mangled.
 func ParseSuffix(model string) (base string, cfg *Config) {
 	base = model
 	if model == "" {
@@ -27,6 +28,10 @@ func ParseSuffix(model string) (base string, cfg *Config) {
 		return model, nil
 	}
 	raw := strings.ToLower(inner)
+	// Dialect-qualified suffixes are intentionally not recognized.
+	if strings.Contains(raw, ":") {
+		return model, nil
+	}
 	switch {
 	case raw == "none" || raw == "off":
 		return clean, &Config{Mode: ModeNone}

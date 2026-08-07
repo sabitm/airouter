@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS providers (
 	auth_scheme TEXT NOT NULL DEFAULT '',
 	auth_method TEXT NOT NULL DEFAULT '',
 	oauth_creds TEXT NOT NULL DEFAULT '',
+	reasoning_dialect TEXT NOT NULL DEFAULT '',
 	archived    INTEGER NOT NULL DEFAULT 0,
 	created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -160,10 +161,26 @@ func (s *Store) migrate() error {
 	if err := s.migrateProviderArchived(); err != nil {
 		return err
 	}
+	if err := s.migrateProviderReasoningDialect(); err != nil {
+		return err
+	}
 	if err := s.migrateComboTargetEnabled(); err != nil {
 		return err
 	}
 	return s.migrateCombosToTargets()
+}
+
+// migrateProviderReasoningDialect adds the reasoning_dialect column to a
+// providers table created before provider-level reasoning dialects. Idempotent;
+// existing rows default to ” (empty), which Provider.Reasoning resolves by
+// protocol. No destructive backfill.
+func (s *Store) migrateProviderReasoningDialect() error {
+	has, err := s.columnExists("providers", "reasoning_dialect")
+	if err != nil || has {
+		return err
+	}
+	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN reasoning_dialect TEXT NOT NULL DEFAULT ''")
+	return err
 }
 
 // migrateProviderAuthScheme adds the auth_scheme column to a providers table

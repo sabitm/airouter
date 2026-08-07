@@ -10,6 +10,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/observability"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/sse"
 	"airouter/internal/proxy/thinking"
 )
@@ -20,7 +21,7 @@ import (
 // attemptResult so the resolution loop can fail over to the next target on a
 // pre-commit failure; once the 200 header is written the response is committed.
 func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header) attemptResult {
-	rewritten, err := rewriteModelWithThinking(body, upstreamModel, ingress.id)
+	rewritten, err := finalizeRequestBody(body, upstreamModel, ingress, provider)
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 	}
@@ -135,12 +136,21 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
+	// Prefer Capture over typed decode so unfamiliar reasoning fields survive.
+	if captured := thinking.Capture(body); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
 	applyUpstreamModel(req, upstreamModel)
 	req.Stream = true
 
 	upstreamBody, err := backend.encodeRequest(req)
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
+	}
+	// Provider-aware reasoning finalization before protocol prepare/signing.
+	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, provider)
+	if err != nil {
+		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
 	}
 	upstreamBody, err = prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
 	if err != nil {
@@ -227,6 +237,7 @@ func rewriteModel(body []byte, model string) ([]byte, error) {
 
 // applyUpstreamModel sets the backend model from a combo target, applying a
 // model(level) thinking suffix override when present (suffix wins over body).
+// Intensity only; outgoing dialect is applied later by the provider-aware finalizer.
 func applyUpstreamModel(req *ir.Request, upstreamModel string) {
 	base, override := thinking.ParseSuffix(upstreamModel)
 	req.Model = base
@@ -235,13 +246,102 @@ func applyUpstreamModel(req *ir.Request, upstreamModel string) {
 	}
 }
 
-// rewriteModelWithThinking rewrites the model for passthrough. When the upstream
-// model carries a thinking suffix, known thinking fields are normalized to the
-// ingress wire shape; otherwise only the model field changes (passthrough invariant).
-func rewriteModelWithThinking(body []byte, upstreamModel, formatID string) ([]byte, error) {
-	base, override := thinking.ParseSuffix(upstreamModel)
-	if override == nil {
-		return rewriteModel(body, base)
+// finalizeRequestBody is the shared passthrough finalizer: suffix > body intent >
+// required default > model-only rewrite. Uses the target provider's dialect.
+func finalizeRequestBody(body []byte, upstreamModel string, ingress codec, provider *domain.Provider) ([]byte, error) {
+	dialect := domain.ReasoningNone
+	proto := domain.ProtocolOpenAI
+	if provider != nil {
+		dialect = provider.Reasoning()
+		proto = provider.Protocol
 	}
-	return thinking.ApplyWire(formatID, body, base, override)
+	// Passthrough shares ingress transport with the backend.
+	if proto == "" {
+		proto = protocolForCodec(ingress)
+	}
+	return thinking.FinalizeBody(body, upstreamModel, ingress.id, proto, dialect)
+}
+
+// finalizeEncodedBody normalizes reasoning on an already-encoded backend body
+// using the target provider dialect. Runs before prepareUpstreamRequest so
+// WAF/signing/cloak see the final bytes. Special protocol-managed dialects
+// (none/cursor/kiro/...) leave the body unchanged aside from model already set.
+func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *domain.Provider) ([]byte, error) {
+	if provider == nil {
+		return body, nil
+	}
+	dialect := provider.Reasoning()
+	// Protocol-managed: codecs own their shape; do not run the generic writer.
+	switch provider.Protocol {
+	case domain.ProtocolKiro, domain.ProtocolQoder, domain.ProtocolAntigravity, domain.ProtocolCursor:
+		return body, nil
+	}
+	// Explicit none: strip any transport-default reasoning the encoder may have
+	// written so the generic writer stays disabled.
+	if dialect == domain.ReasoningNone {
+		return thinking.ApplyWire(backend.id, body, req.Model, nil, provider.Protocol, dialect)
+	}
+	// Codex keeps the encoder's required default and native hyphen suffix when no
+	// unified body/suffix intent exists. Explicit intent is selectively patched.
+	cfg := thinking.FromIR(req.Thinking)
+	if provider.Protocol == domain.ProtocolOpenAICodex && cfg == nil {
+		return body, nil
+	}
+	caps := thinking.CapsFor(req.Model, provider.Protocol, dialect)
+	eff := thinking.ResolveIntent(cfg, nil, caps)
+	if eff == nil && caps.RequiredDefault == "" {
+		return body, nil
+	}
+	out, err := thinking.ApplyWire(backend.id, body, req.Model, eff, provider.Protocol, dialect)
+	if err != nil {
+		return nil, err
+	}
+	if provider.Protocol == domain.ProtocolOpenAICodex {
+		out = responses.SyncCodexReasoningInclude(out)
+	}
+	return out, nil
+}
+
+// protocolForCodec maps a codec id to a domain protocol for caps resolution.
+func protocolForCodec(c codec) domain.Protocol {
+	switch c.id {
+	case "oai-chat":
+		return domain.ProtocolOpenAI
+	case "anth-msg":
+		return domain.ProtocolAnthropic
+	case "oai-responses":
+		return domain.ProtocolOpenAIResponses
+	case "oai-codex":
+		return domain.ProtocolOpenAICodex
+	case "claude-code":
+		return domain.ProtocolClaudeCode
+	case "cursor":
+		return domain.ProtocolCursor
+	case "kiro":
+		return domain.ProtocolKiro
+	case "qoder":
+		return domain.ProtocolQoder
+	case "antigravity":
+		return domain.ProtocolAntigravity
+	default:
+		return domain.ProtocolOpenAI
+	}
+}
+
+// rewriteModelWithThinking is retained for tests; delegates to FinalizeBody with
+// OpenAI protocol defaults when no provider is in scope.
+func rewriteModelWithThinking(body []byte, upstreamModel, formatID string) ([]byte, error) {
+	proto := domain.ProtocolOpenAI
+	dialect := domain.ReasoningOpenAI
+	switch formatID {
+	case "anth-msg":
+		proto = domain.ProtocolAnthropic
+		dialect = domain.ReasoningClaude
+	case "oai-responses":
+		proto = domain.ProtocolOpenAIResponses
+	case "oai-codex":
+		proto = domain.ProtocolOpenAICodex
+		dialect = domain.ReasoningCodex
+	}
+	return thinking.FinalizeBody(body, upstreamModel, formatID, proto, dialect)
 }

@@ -239,12 +239,18 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "API key is required")
 		return
 	}
+	dialect, ok := parseReasoningDialectForm(r.FormValue("reasoning_dialect"), proto)
+	if !ok {
+		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
+		return
+	}
 	p := &domain.Provider{
-		Name:       r.FormValue("name"),
-		BaseURL:    kiroBaseURLOr(proto, r.FormValue("base_url")),
-		APIKey:     apiKey,
-		Protocol:   proto,
-		AuthScheme: auth,
+		Name:             r.FormValue("name"),
+		BaseURL:          kiroBaseURLOr(proto, r.FormValue("base_url")),
+		APIKey:           apiKey,
+		Protocol:         proto,
+		AuthScheme:       auth,
+		ReasoningDialect: dialect,
 	}
 	// "default" (empty auth) is an alias: expand it now to the protocol's scheme
 	// so the stored value is always concrete.
@@ -312,13 +318,19 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 			return
 		}
 	}
+	dialect, ok := parseReasoningDialectForm(r.FormValue("reasoning_dialect"), proto)
+	if !ok {
+		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
+		return
+	}
 	p := &domain.Provider{
-		Name:       r.FormValue("name"),
-		BaseURL:    kiroBaseURLOr(proto, r.FormValue("base_url")),
-		Protocol:   proto,
-		AuthMethod: domain.AuthOAuth,
-		AuthScheme: domain.AuthBearer,
-		OAuthCreds: creds,
+		Name:             r.FormValue("name"),
+		BaseURL:          kiroBaseURLOr(proto, r.FormValue("base_url")),
+		Protocol:         proto,
+		AuthMethod:       domain.AuthOAuth,
+		AuthScheme:       domain.AuthBearer,
+		OAuthCreds:       creds,
+		ReasoningDialect: dialect,
 	}
 	if err := h.store.CreateProvider(r.Context(), p); err != nil {
 		htmxBadRequest(w, r, "provider-flash", err.Error())
@@ -402,10 +414,16 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid auth scheme")
 		return
 	}
+	dialect, ok := parseReasoningDialectForm(r.FormValue("reasoning_dialect"), proto)
+	if !ok {
+		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
+		return
+	}
 	cur.Name = r.FormValue("name")
 	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))
 	cur.Protocol = proto
 	cur.AuthScheme = auth
+	cur.ReasoningDialect = dialect
 	// Switching an oauth provider back to apikey: drop the stored credentials so
 	// the row no longer resolves a bearer token.
 	cur.AuthMethod = domain.AuthAPIKey
@@ -470,12 +488,22 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 			return
 		}
 	}
+	dialect, ok := parseReasoningDialectForm(r.FormValue("reasoning_dialect"), proto)
+	if !ok {
+		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
+		return
+	}
 	cur.Name = r.FormValue("name")
 	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))
 	cur.Protocol = proto
 	cur.AuthMethod = domain.AuthOAuth
 	cur.AuthScheme = domain.AuthBearer
 	cur.APIKey = ""
+	// Preserve current dialect when the form omits the field (fixed backends
+	// still submit a locked hidden value).
+	if r.FormValue("reasoning_dialect") != "" || reasoningDialectEditable(proto) {
+		cur.ReasoningDialect = dialect
+	}
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return

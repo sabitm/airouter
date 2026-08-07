@@ -16,10 +16,12 @@ var ErrNotFound = errors.New("store: not found")
 func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provider, error) {
 	var p domain.Provider
 	var enc, oauthEnc string
+	var dialect string
 	if err := row.Scan(&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme,
-		&p.AuthMethod, &oauthEnc, &p.Archived, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		&p.AuthMethod, &oauthEnc, &dialect, &p.Archived, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
+	p.ReasoningDialect = domain.ReasoningDialect(dialect)
 	key, err := s.cipher.Decrypt(enc)
 	if err != nil {
 		return nil, err
@@ -39,7 +41,7 @@ func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provi
 	return &p, nil
 }
 
-const providerCols = "id, name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, archived, created_at, updated_at"
+const providerCols = "id, name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, reasoning_dialect, archived, created_at, updated_at"
 
 func (s *Store) ListProviders(ctx context.Context) ([]*domain.Provider, error) {
 	return s.listProviders(ctx, s.db)
@@ -100,8 +102,8 @@ func (s *Store) createProvider(ctx context.Context, ex executor, p *domain.Provi
 		return err
 	}
 	res, err := ex.ExecContext(ctx,
-		"INSERT INTO providers (name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.Archived)
+		"INSERT INTO providers (name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, reasoning_dialect, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.ReasoningDialect, p.Archived)
 	if err != nil {
 		return err
 	}
@@ -124,8 +126,8 @@ func (s *Store) updateProvider(ctx context.Context, ex executor, p *domain.Provi
 		return err
 	}
 	_, err = ex.ExecContext(ctx,
-		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, auth_scheme=?, auth_method=?, oauth_creds=?, archived=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.Archived, p.ID)
+		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, auth_scheme=?, auth_method=?, oauth_creds=?, reasoning_dialect=?, archived=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.ReasoningDialect, p.Archived, p.ID)
 	return err
 }
 

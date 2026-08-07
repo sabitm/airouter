@@ -206,9 +206,12 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	if req.ToolChoice != nil {
 		out.ToolChoice = encodeToolChoice(req.ToolChoice)
 	}
-	if cfg := thinking.Effective(thinking.FromIR(req.Thinking), thinking.CapsFor(req.Model, domain.ProtocolOpenAI)); cfg != nil {
+	// Transport-default OpenAI dialect. The proxy finalizer may rewrite this
+	// for provider dialects (qwen/kimi/...) after encode.
+	caps := thinking.CapsFor(req.Model, domain.ProtocolOpenAI, domain.ReasoningOpenAI)
+	if cfg := thinking.Effective(thinking.FromIR(req.Thinking), caps); cfg != nil {
 		if level := thinking.LevelFor(cfg); level != "" {
-			out.ReasoningEffort = level
+			out.ReasoningEffort = thinking.NormalizeOpenAILevel(level, caps)
 		}
 	}
 	return json.Marshal(out)

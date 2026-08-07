@@ -6,7 +6,7 @@ func TestProtocolValid(t *testing.T) {
 	valid := []Protocol{
 		ProtocolOpenAI, ProtocolAnthropic, ProtocolOpenAIResponses,
 		ProtocolOpenAICodex, ProtocolKiro, ProtocolQoder,
-		ProtocolAntigravity, ProtocolCursor,
+		ProtocolAntigravity, ProtocolCursor, ProtocolClaudeCode,
 	}
 	for _, p := range valid {
 		if !p.Valid() {
@@ -136,5 +136,116 @@ func TestProviderAuth(t *testing.T) {
 				t.Errorf("Auth() (no scheme set) = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestParseReasoningDialect(t *testing.T) {
+	cases := []struct {
+		in   string
+		want ReasoningDialect
+		ok   bool
+	}{
+		{"", "", true},
+		{"none", ReasoningNone, true},
+		{"off", ReasoningNone, true},
+		{"openai", ReasoningOpenAI, true},
+		{"gpt", ReasoningOpenAI, true},
+		{"GPT", ReasoningOpenAI, true},
+		{"claude", ReasoningClaude, true},
+		{"anthropic", ReasoningClaude, true},
+		{"codex", ReasoningCodex, true},
+		{"kimi", ReasoningKimi, true},
+		{"qwen", ReasoningQwen, true},
+		{"deepseek", ReasoningDeepSeek, true},
+		{"zai", ReasoningZAI, true},
+		{"zhipu", ReasoningZAI, true},
+		{"glm", ReasoningZAI, true},
+		{"grok", ReasoningGrok, true},
+		{"xai", ReasoningGrok, true},
+		{"  openai  ", ReasoningOpenAI, true},
+		{"bogus", "", false},
+		{"qwen:high", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := ParseReasoningDialect(tc.in)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("ParseReasoningDialect(%q) = %q,%v want %q,%v", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestReasoningDialectValid(t *testing.T) {
+	for _, d := range []ReasoningDialect{
+		"", ReasoningNone, ReasoningOpenAI, ReasoningClaude, ReasoningCodex,
+		ReasoningKimi, ReasoningQwen, ReasoningDeepSeek, ReasoningZAI, ReasoningGrok,
+	} {
+		if !d.Valid() {
+			t.Errorf("%q should be valid", d)
+		}
+	}
+	for _, d := range []ReasoningDialect{"gpt", "anthropic", "bogus", "OpenAI"} {
+		if d.Valid() {
+			t.Errorf("%q should be invalid (non-canonical)", d)
+		}
+	}
+}
+
+func TestDefaultReasoningDialect(t *testing.T) {
+	cases := []struct {
+		p    Protocol
+		want ReasoningDialect
+	}{
+		{ProtocolOpenAI, ReasoningOpenAI},
+		{ProtocolOpenAIResponses, ReasoningOpenAI},
+		{ProtocolOpenAICodex, ReasoningCodex},
+		{ProtocolAnthropic, ReasoningClaude},
+		{ProtocolClaudeCode, ReasoningClaude},
+		{ProtocolKiro, ReasoningNone},
+		{ProtocolQoder, ReasoningNone},
+		{ProtocolAntigravity, ReasoningNone},
+		{ProtocolCursor, ReasoningNone},
+	}
+	for _, tc := range cases {
+		if got := DefaultReasoningDialect(tc.p); got != tc.want {
+			t.Errorf("DefaultReasoningDialect(%q) = %q want %q", tc.p, got, tc.want)
+		}
+	}
+}
+
+func TestProviderReasoning(t *testing.T) {
+	// Empty -> protocol default.
+	p := Provider{Protocol: ProtocolOpenAI}
+	if got := p.Reasoning(); got != ReasoningOpenAI {
+		t.Errorf("empty openai: %q", got)
+	}
+	p = Provider{Protocol: ProtocolOpenAICodex}
+	if got := p.Reasoning(); got != ReasoningCodex {
+		t.Errorf("empty codex: %q", got)
+	}
+	p = Provider{Protocol: ProtocolAnthropic}
+	if got := p.Reasoning(); got != ReasoningClaude {
+		t.Errorf("empty anthropic: %q", got)
+	}
+	p = Provider{Protocol: ProtocolKiro}
+	if got := p.Reasoning(); got != ReasoningNone {
+		t.Errorf("empty kiro: %q", got)
+	}
+
+	// Explicit override.
+	p = Provider{Protocol: ProtocolOpenAI, ReasoningDialect: ReasoningQwen}
+	if got := p.Reasoning(); got != ReasoningQwen {
+		t.Errorf("override qwen: %q", got)
+	}
+
+	// Explicit none disables generic writer even on openai transport.
+	p = Provider{Protocol: ProtocolOpenAI, ReasoningDialect: ReasoningNone}
+	if got := p.Reasoning(); got != ReasoningNone {
+		t.Errorf("explicit none: %q", got)
+	}
+
+	// Alias stored form is canonicalized by Reasoning().
+	p = Provider{Protocol: ProtocolOpenAI, ReasoningDialect: "gpt"}
+	if got := p.Reasoning(); got != ReasoningOpenAI {
+		t.Errorf("alias gpt: %q", got)
 	}
 }

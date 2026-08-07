@@ -133,6 +133,40 @@ func resolveCodexEffort(t *ir.Thinking, hyphenEffort, base string) string {
 	return hyphenEffort
 }
 
+// SyncCodexReasoningInclude keeps encrypted reasoning continuity aligned with
+// the effective effort after provider-aware finalization. Explicit none removes
+// only the Codex-required include; other include entries are preserved.
+func SyncCodexReasoningInclude(body []byte) []byte {
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	effort := ""
+	if reasoning, ok := m["reasoning"].(map[string]any); ok {
+		effort, _ = reasoning["effort"].(string)
+	}
+	includes, _ := m["include"].([]any)
+	filtered := make([]any, 0, len(includes)+1)
+	for _, item := range includes {
+		if value, _ := item.(string); value != "reasoning.encrypted_content" {
+			filtered = append(filtered, item)
+		}
+	}
+	if effort != "" && effort != "none" {
+		filtered = append(filtered, "reasoning.encrypted_content")
+	}
+	if len(filtered) == 0 {
+		delete(m, "include")
+	} else {
+		m["include"] = filtered
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // InjectCodexRequestKey sets prompt_cache_key on an already-encoded Codex
 // request body. It is a no-op parse/patch so the encoder stays free of the
 // per-request id, which the proxy generates alongside the session_id header.

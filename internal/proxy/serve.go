@@ -12,6 +12,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/observability"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/thinking"
 	"airouter/internal/store"
 )
 
@@ -305,7 +306,7 @@ func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
 // preserving any provider-specific fields the IR does not model. The upstream
 // response is relayed as-is since its format already matches the ingress.
 func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header) attemptResult {
-	rewritten, err := rewriteModelWithThinking(body, upstreamModel, ingress.id)
+	rewritten, err := finalizeRequestBody(body, upstreamModel, ingress, provider)
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 	}
@@ -334,12 +335,19 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
+	if captured := thinking.Capture(body); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
 	applyUpstreamModel(req, upstreamModel)
 	req.Stream = false
 
 	upstreamBody, err := backend.encodeRequest(req)
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
+	}
+	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, provider)
+	if err != nil {
+		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
 	}
 	upstreamBody, err = prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
 	if err != nil {

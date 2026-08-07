@@ -266,3 +266,118 @@ func TestImportDecodeError(t *testing.T) {
 		t.Fatalf("providers = %d, want 0 after aborted decode", len(ps))
 	}
 }
+
+func TestExportImportReasoningDialect(t *testing.T) {
+	src := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "agg", BaseURL: "http://a", APIKey: "k",
+		Protocol: domain.ProtocolOpenAI, ReasoningDialect: domain.ReasoningDeepSeek,
+	}
+	if err := src.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.CreateCombo(ctx, &domain.Combo{
+		Name: "c", Strategy: domain.StrategyFailover,
+		Targets: []domain.ComboTarget{{ProviderID: p.ID, UpstreamModel: "ds(high)", Enabled: true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := src.Export(ctx, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `"reasoning_dialect": "deepseek"`) {
+		t.Fatalf("export missing dialect: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), `"upstream_model": "ds(high)"`) {
+		t.Fatalf("export should keep intensity in upstream_model: %s", buf.String())
+	}
+
+	dst := testStore(t)
+	if _, err := dst.Import(ctx, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.GetProvider(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReasoningDialect != domain.ReasoningDeepSeek {
+		t.Fatalf("imported dialect = %q", got.ReasoningDialect)
+	}
+	c, err := dst.GetComboByName(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Targets[0].UpstreamModel != "ds(high)" {
+		t.Fatalf("upstream_model = %q", c.Targets[0].UpstreamModel)
+	}
+	if c.Targets[0].Provider.Reasoning() != domain.ReasoningDeepSeek {
+		t.Fatalf("hydrated provider dialect = %q", c.Targets[0].Provider.Reasoning())
+	}
+}
+
+func TestImportReasoningDialectAliasesAndInvalid(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	// Alias gpt -> openai canonical; stored as empty default for openai protocol.
+	in := bytes.NewBufferString(`{
+		"version": 1,
+		"providers": [
+			{"name":"a","base_url":"http://a","api_key":"k","protocol":"openai","reasoning_dialect":"gpt"},
+			{"name":"b","base_url":"http://b","api_key":"k","protocol":"openai","reasoning_dialect":"zhipu"},
+			{"name":"bad","base_url":"http://c","api_key":"k","protocol":"openai","reasoning_dialect":"nope"}
+		],
+		"combos": []
+	}`)
+	sum, err := st.Import(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.ProvidersCreated != 2 {
+		t.Fatalf("created = %d want 2; failures=%v", sum.ProvidersCreated, sum.Failures)
+	}
+	if len(sum.Failures) != 1 || !strings.Contains(sum.Failures[0], "bad") {
+		t.Fatalf("failures = %v", sum.Failures)
+	}
+	a, err := st.ListProviders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]*domain.Provider{}
+	for _, p := range a {
+		by[p.Name] = p
+	}
+	// gpt alias -> openai canonical
+	if by["a"].Reasoning() != domain.ReasoningOpenAI {
+		t.Fatalf("a effective = %q", by["a"].Reasoning())
+	}
+	if by["a"].ReasoningDialect != domain.ReasoningOpenAI {
+		t.Fatalf("a stored = %q", by["a"].ReasoningDialect)
+	}
+	if by["b"].ReasoningDialect != domain.ReasoningZAI {
+		t.Fatalf("b stored = %q", by["b"].ReasoningDialect)
+	}
+}
+
+func TestImportOmitsReasoningDialect(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	in := bytes.NewBufferString(`{
+		"version": 1,
+		"providers": [
+			{"name":"legacy","base_url":"http://a","api_key":"k","protocol":"anthropic"}
+		],
+		"combos": []
+	}`)
+	if _, err := st.Import(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	p, err := st.ListProviders(ctx)
+	if err != nil || len(p) != 1 {
+		t.Fatal(err)
+	}
+	if p[0].ReasoningDialect != "" || p[0].Reasoning() != domain.ReasoningClaude {
+		t.Fatalf("legacy omit: stored=%q eff=%q", p[0].ReasoningDialect, p[0].Reasoning())
+	}
+}
