@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,9 +15,10 @@ import (
 // scriptedUpstream is a mock provider whose status and body are controlled per
 // test. It counts hits so distribution across targets can be asserted.
 type scriptedUpstream struct {
-	server *httptest.Server
-	hits   atomic.Int64
-	status atomic.Int64 // HTTP status to return; 200 by default
+	server   *httptest.Server
+	hits     atomic.Int64
+	status   atomic.Int64 // HTTP status to return; 200 by default
+	lastBody atomic.Value // []byte
 }
 
 func newScriptedUpstream(t *testing.T, protocol domain.Protocol) *scriptedUpstream {
@@ -29,7 +31,8 @@ func newScriptedUpstream(t *testing.T, protocol domain.Protocol) *scriptedUpstre
 	}
 	su.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		su.hits.Add(1)
-		_, _ = io.ReadAll(r.Body)
+		requestBody, _ := io.ReadAll(r.Body)
+		su.lastBody.Store(requestBody)
 		st := int(su.status.Load())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(st)
@@ -41,6 +44,19 @@ func newScriptedUpstream(t *testing.T, protocol domain.Protocol) *scriptedUpstre
 	}))
 	t.Cleanup(su.server.Close)
 	return su
+}
+
+func (su *scriptedUpstream) requestBody(t *testing.T) map[string]any {
+	t.Helper()
+	body, ok := su.lastBody.Load().([]byte)
+	if !ok {
+		t.Fatal("upstream did not receive a request body")
+	}
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("decode upstream request: %v; body=%s", err, body)
+	}
+	return out
 }
 
 // setupCombo wires a store + proxy with one combo whose targets reference the
@@ -98,6 +114,83 @@ func TestFailoverAdvancesOnFailure(t *testing.T) {
 	}
 	if got := extractText(t, "/v1/chat/completions", out); got != "hello from openai" {
 		t.Errorf("text = %q", got)
+	}
+}
+
+func TestFailoverDropsReasoningForNonReasoningTarget(t *testing.T) {
+	primary := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	fallback := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	primary.status.Store(http.StatusInternalServerError)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	primaryProvider := &domain.Provider{
+		Name:             "reasoning-primary",
+		BaseURL:          primary.server.URL,
+		APIKey:           "up-key",
+		Protocol:         domain.ProtocolOpenAI,
+		ReasoningDialect: domain.ReasoningOpenAI,
+	}
+	fallbackProvider := &domain.Provider{
+		Name:             "non-reasoning-fallback",
+		BaseURL:          fallback.server.URL,
+		APIKey:           "up-key",
+		Protocol:         domain.ProtocolOpenAI,
+		ReasoningDialect: domain.ReasoningOpenAI,
+	}
+	if err := st.CreateProvider(ctx, primaryProvider); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, fallbackProvider); err != nil {
+		t.Fatal(err)
+	}
+	combo := &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: primaryProvider.ID, UpstreamModel: "gpt-5(high)", Enabled: true},
+		{ProviderID: fallbackProvider.ID, UpstreamModel: "gpt-4o", Enabled: true},
+	}}
+	if err := st.CreateCombo(ctx, combo); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	body := `{"model":"default","reasoning_effort":"low","reasoning":{"summary":"detailed"},"messages":[{"role":"user","content":"hi"}]}`
+	resp, out := post(t, server.URL+"/v1/chat/completions", key.Token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	if primary.hits.Load() != 1 || fallback.hits.Load() != 1 {
+		t.Fatalf("hits primary=%d fallback=%d, want 1/1", primary.hits.Load(), fallback.hits.Load())
+	}
+	if got := extractText(t, "/v1/chat/completions", out); got != "hello from openai" {
+		t.Fatalf("fallback response text = %q", got)
+	}
+
+	primaryBody := primary.requestBody(t)
+	if primaryBody["model"] != "gpt-5" || primaryBody["reasoning_effort"] != "high" {
+		t.Fatalf("primary reasoning was not finalized from suffix: %v", primaryBody)
+	}
+	if reasoning, ok := primaryBody["reasoning"].(map[string]any); !ok || reasoning["summary"] != "detailed" {
+		t.Fatalf("primary reasoning summary was not preserved: %v", primaryBody)
+	}
+
+	fallbackBody := fallback.requestBody(t)
+	if fallbackBody["model"] != "gpt-4o" {
+		t.Fatalf("fallback model = %v, want gpt-4o", fallbackBody["model"])
+	}
+	for _, field := range []string{"reasoning_effort", "thinking", "enable_thinking", "thinking_budget"} {
+		if _, ok := fallbackBody[field]; ok {
+			t.Fatalf("fallback retained unsupported %s: %v", field, fallbackBody)
+		}
+	}
+	if reasoning, ok := fallbackBody["reasoning"].(map[string]any); !ok || reasoning["summary"] != "detailed" {
+		t.Fatalf("fallback reasoning summary was not preserved: %v", fallbackBody)
 	}
 }
 
