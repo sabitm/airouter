@@ -1,171 +1,144 @@
 # airouter
 
-A self-hosted, bidirectional AI inference router. Register OpenAI- or
-Anthropic-compatible upstreams, expose them under custom model names, and call
-them through whichever API format your client speaks. airouter translates
-between the OpenAI and Anthropic wire formats on the fly, in both directions,
-for unary and streaming requests.
+A self-hosted AI inference router with an embedded web dashboard. Point OpenAI,
+Anthropic, or compatible clients at one endpoint and route them to different
+providers under your own model names.
 
-A single Go binary serves both the proxy and a web dashboard. State lives in an
-embedded SQLite database; there are no external service dependencies.
+- OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages APIs
+- Bidirectional format translation for unary and streaming requests
+- Text, images, PDFs, reasoning, tool calls, and tool results
+- Ordered failover or round-robin routing across providers
+- API key and OAuth provider connections
+- Single Go binary with embedded SQLite; no external services
 
-## How it works
+## Quick start
 
-Three concepts:
-
-- **Provider** - an upstream connection: a base URL, the protocol it speaks
-  (`openai` for Chat Completions, `anthropic` for Messages,
-  `openai-responses` for the OpenAI Responses API - for upstreams that only
-  expose `/responses`, or `openai-codex` for ChatGPT Codex), an auth scheme -
-  how the credential is sent: `default` (sensible per protocol: `x-api-key` for
-  Anthropic, `bearer` for the OpenAI formats), `bearer`, or `x-api-key` - and
-  how it authenticates: an **API key** or **OAuth**. The auth scheme is
-  independent of the protocol, so an Anthropic-format upstream that
-  authenticates with a bearer token (an `ANTHROPIC_AUTH_TOKEN`-style gateway)
-  works by selecting protocol `anthropic` + auth `bearer`. The API key is
-  encrypted at rest.
-
-  An OAuth provider authenticates with an access token the router obtains and
-  refreshes for you, instead of a static key. Connect from the dashboard: pick a
-  built-in preset (e.g. **Grok (xAI)** or **OpenAI Codex (ChatGPT)**, which
-  prefill their endpoints, client ids, and scopes) or fill the config manually
-  for any provider (authorize URL, token URL, client id, optional secret, scopes,
-  redirect URI, PKCE), press Connect, approve in the browser, and the router
-  stores the tokens (encrypted at rest). It then refreshes proactively before
-  expiry and reactively on a 401/403, always sending a bearer token upstream. The
-  browser returns to a loopback callback automatically; on a remote host, paste
-  the resulting code or redirect URL instead.
-
-  A provider you no longer use can be **archived**: it is hidden from the combo
-  builder and skipped during resolution, but kept so you can restore or delete it
-  later. A "delete all archived" action removes them in bulk.
-- **Combo** - a custom model name (e.g. `default`) backed by one or more
-  targets, each a provider + real upstream model id (e.g. `gpt-4o`). Clients put
-  the combo name in the request `model` field; airouter resolves it to a target
-  and rewrites the model. With multiple targets, a strategy picks which to use:
-  `failover` tries them in order, `round-robin` spreads load and still fails over
-  past a dead target. The router advances to the next target on any upstream
-  failure that happens before the response starts streaming; a target that keeps
-  failing is temporarily deprioritized (deferred behind healthy targets for a
-  growing number of subsequent requests) rather than retried first every time.
-  Targets may mix protocols.
-- **Access key** - a bearer token clients use to authenticate against the
-  router. The full token is shown once at creation; only its hash is stored.
-
-A request arrives on one of the ingress endpoints (the *ingress format*) and is
-routed to a combo's provider (the *backend format*). When the two formats match,
-the request passes through with only the model rewritten, preserving any
-provider-specific fields. When they differ, the request and response are
-translated through a canonical intermediate representation. Streaming responses
-are translated event by event and flushed live.
-
-This means an OpenAI SDK can call an Anthropic model, an Anthropic SDK can call
-an OpenAI model, and the OpenAI Responses API can call either - all transparently.
-
-The `openai-codex` provider protocol targets the ChatGPT Codex backend through a
-ChatGPT OAuth connection. The dashboard's Check button and model autocomplete use
-Codex's account-aware model discovery endpoint; if discovery is unavailable, you
-can still enter the upstream model id manually.
-
-## Endpoints
-
-All proxy endpoints require an access key, sent as `Authorization: Bearer <key>`
-or `x-api-key: <key>`.
-
-| Endpoint | Ingress format | Notes |
-|----------|----------------|-------|
-| `POST /v1/chat/completions` | OpenAI Chat Completions | unary + streaming |
-| `POST /v1/messages` | Anthropic Messages | unary + streaming |
-| `POST /v1/responses` | OpenAI Responses | unary + streaming; passes through to a Responses provider, translates otherwise |
-| `GET /v1/models` | - | lists configured combos |
-
-Each endpoint is also served without the `/v1` prefix (e.g. `/messages`,
-`/models`), so a provider base URL configured with or without `/v1` resolves
-either way. This avoids a double prefix when a client hardcodes `/v1` onto the
-base it is given.
-
-Text, images, function/tool calling, and tool results are translated across all
-formats. Streaming reassembles tool-call argument fragments correctly.
-
-Browser clients on other origins are supported: the proxy answers the CORS
-preflight and reflects the request origin, so a local web app can call airouter
-directly.
-
-The dashboard is served at `/dashboard`.
-
-![Dashboard screenshot](dashboard.png)
-
-## Build and run
-
-Requires Go 1.26+. The dashboard uses [templ](https://templ.guide); if you edit
-any `.templ` file, regenerate the Go code first.
+Download a binary from [Releases](https://github.com/sabitm/airouter/releases), or
+build from source with Go 1.26.1+:
 
 ```sh
-# install the templ CLI (only needed when editing .templ files)
-go install github.com/a-h/templ/cmd/templ@latest
-
-# regenerate templates (after editing .templ files)
-templ generate
-
-# build
 go build -o airouter ./cmd/airouter
-
-# run
-AIROUTER_SECRET=$(openssl rand -hex 32) ./airouter
 ```
 
-Then open http://localhost:31415/dashboard, add a provider, create a combo, and
-generate an access key.
-
-## Configuration
-
-Each option is available as a flag or an environment variable. Flags take
-precedence.
-
-| Flag | Env | Default | Description |
-|------|-----|---------|-------------|
-| `-listen` | `AIROUTER_LISTEN` | `:31415` | HTTP listen address |
-| `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
-| `-secret` | `AIROUTER_SECRET` | (dev fallback) | Seeds the AES-256-GCM key encrypting provider API keys and OAuth tokens at rest |
-| `-debug` | `AIROUTER_DEBUG` | `off` | Structured slog text verbosity. Bare `-debug` or `=1` logs access summaries, client-facing failures, upstream failure metadata, failover and OAuth diagnostics (no bodies). `=2` additionally traces detailed ingress and dashboard-probe exchange metadata (sizes, content types, status, durations — still no bodies). Bodies require HAR capture (dashboard runtime Start/Stop, or `-har-file`). Every response carries `X-Airouter-Request-ID` for correlation |
-| `-har-file` | `AIROUTER_HAR_FILE` | (unset) | Always-on capture of both legs of every proxied request (client↔airouter and airouter↔provider) — headers and bodies up to the HAR per-body cap, including secrets and prompt content — into a HAR 1.2 document. Independent of `-debug`. Download live at `GET /debug/har`; flushed to this path on shutdown. When unset, the dashboard Settings page can start/stop an in-memory runtime recording and download it after Stop (never written on shutdown). Import into Chrome DevTools Network tab |
-
-If `AIROUTER_SECRET` is unset, an insecure built-in key is used and a warning is
-logged. Set a real secret in any deployment you care about; rotating it makes
-existing encrypted provider keys unreadable.
-
-## Usage example
-
-After creating a combo named `default` and an access key:
+Generate a secret, keep it stable across restarts, and run:
 
 ```sh
-# OpenAI-format client
+export AIROUTER_SECRET="$(openssl rand -hex 32)"
+./airouter
+```
+
+Open [http://localhost:31415/dashboard](http://localhost:31415/dashboard), then:
+
+1. Add and check a provider.
+2. Create a combo that maps a public model name to one or more provider models.
+3. Generate an access key.
+4. Use the airouter URL, access key, and combo name in your client.
+
+The dashboard also shows ready-to-copy base URLs for Claude Code and Codex.
+
+![Dashboard](dashboard.png)
+
+## Supported providers
+
+Generic connections support OpenAI Chat Completions, OpenAI Responses, and
+Anthropic-compatible APIs. The dashboard also includes guided connections for:
+
+| Connection | Authentication |
+|---|---|
+| Grok (xAI) | OAuth |
+| OpenAI Codex (ChatGPT) | OAuth |
+| Cline / ClinePass | OAuth |
+| Kiro (AWS CodeWhisperer) | API key or OAuth |
+| Qoder | OAuth device flow |
+| Antigravity (Google Cloud Code) | OAuth; unofficial |
+| Cursor IDE | Imported IDE token; unofficial |
+| Claude Code | OAuth; unofficial |
+
+Provider credentials and OAuth tokens are encrypted in SQLite using
+`AIROUTER_SECRET`. OAuth tokens are refreshed automatically when supported.
+
+## Client API
+
+| Endpoint | Format |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/responses` | OpenAI Responses |
+| `POST /v1/messages` | Anthropic Messages |
+| `GET /v1/models` | Configured combos |
+
+The same routes are available without `/v1`. Use a combo name as the request's
+`model`. When at least one access key exists, authenticate with either:
+
+```text
+Authorization: Bearer sk-air-...
+x-api-key: sk-air-...
+```
+
+Example:
+
+```sh
 curl http://localhost:31415/v1/chat/completions \
   -H "Authorization: Bearer sk-air-..." \
   -H "Content-Type: application/json" \
   -d '{"model":"default","messages":[{"role":"user","content":"hello"}]}'
-
-# Anthropic-format client hitting the same combo
-curl http://localhost:31415/v1/messages \
-  -H "x-api-key: sk-air-..." \
-  -H "Content-Type: application/json" \
-  -d '{"model":"default","max_tokens":256,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The combo's provider protocol determines whether translation happens; the client
-does not need to know or care which backend serves the request.
+When no access keys exist, proxy endpoints run in open mode.
 
-## Import / export
+## Routing
 
-The dashboard's Import / Export page round-trips all providers (including their
-auth scheme and, for OAuth providers, their stored tokens and config) and combos
-as JSON. Exports include provider API keys and OAuth tokens in plaintext
-so config is portable across instances with different secrets - treat exported
-files as secrets.
-Import upserts by name and never deletes. Access keys are not exported (only
-their hashes exist).
+- A **provider** is an upstream URL, protocol, and credential.
+- A **combo** is the model name clients use. Each target maps a provider to its
+  real upstream model ID.
+- An **access key** authenticates clients to airouter. Its full value is shown
+  once; only its hash is stored.
 
-## Storage
+`failover` tries targets in order. `roundrobin` rotates the first target and still
+fails over if it cannot start a response. Repeatedly failing providers are
+temporarily deprioritized.
 
-A single SQLite file (WAL mode, pure-Go driver, no CGO). Schema is created and
-migrated automatically on startup.
+Matching API formats pass through with only the model rewritten, preserving
+provider-specific fields. Different formats are translated automatically,
+including live streams.
+
+## Configuration
+
+Flags override environment variables.
+
+| Flag | Environment | Default | Purpose |
+|---|---|---|---|
+| `-listen` | `AIROUTER_LISTEN` | `:31415` | HTTP listen address |
+| `-db` | `AIROUTER_DB` | `airouter.db` | SQLite database path |
+| `-secret` | `AIROUTER_SECRET` | insecure development key | Credential encryption secret |
+| `-debug` | `AIROUTER_DEBUG` | `0` | `1` for request diagnostics; `2` for metadata traces |
+| `-har-file` | `AIROUTER_HAR_FILE` | unset | Always-on HAR capture and shutdown output path |
+| `-version` | — | `false` | Print the version and exit |
+
+Debug logs never include request or response bodies. Capture full exchanges from
+**Dashboard > Settings**, or use `-har-file`. HAR files include prompts,
+responses, authorization headers, and provider credentials.
+
+## Security and data
+
+- Always set and retain a strong `AIROUTER_SECRET`. Changing it makes existing
+  encrypted credentials unreadable.
+- The dashboard controls providers and exposes plaintext config exports. It has
+  no built-in login; keep it on a trusted network or protect it with an
+  authenticated reverse proxy.
+- Config exports include provider API keys and OAuth tokens in plaintext. Access
+  keys and request logs are not exported.
+- HAR captures contain sensitive headers and bodies. Store and share them as
+  secrets.
+
+State is stored in one automatically migrated SQLite database using WAL mode.
+Provider credentials are encrypted at rest; access keys are hashed.
+
+## Development
+
+```sh
+templ generate   # after editing internal/web/*.templ
+go test ./...
+go vet ./...
+```
+
+[MIT License](LICENSE)
