@@ -22,6 +22,7 @@ type BlockType string
 const (
 	BlockText       BlockType = "text"
 	BlockImage      BlockType = "image"
+	BlockFile       BlockType = "file"
 	BlockToolUse    BlockType = "tool_use"
 	BlockToolResult BlockType = "tool_result"
 )
@@ -34,6 +35,17 @@ type Image struct {
 	Data      string // base64, no data-URI prefix
 }
 
+// File holds a non-image attachment. Exactly one source is normally present:
+// Data (raw base64 payload, no data-URI prefix), URL, or a provider-owned ID.
+// Filename and MediaType are metadata and may accompany any source form.
+type File struct {
+	Filename  string
+	MediaType string
+	Data      string // base64, no data-URI prefix
+	URL       string
+	ID        string // provider-owned file id; not portable across protocols
+}
+
 // ContentBlock is a tagged union over the block kinds. Only the fields relevant
 // to Type are meaningful.
 type ContentBlock struct {
@@ -41,6 +53,7 @@ type ContentBlock struct {
 
 	Text  string // BlockText
 	Image *Image // BlockImage
+	File  *File  // BlockFile
 
 	// BlockToolUse: a model-issued call to a tool.
 	ToolID    string

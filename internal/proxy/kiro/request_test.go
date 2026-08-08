@@ -354,15 +354,17 @@ func TestBuildUser(t *testing.T) {
 		}
 	})
 
-	t.Run("remote url image degrades to text marker", func(t *testing.T) {
+	t.Run("remote url image left for materialization preflight", func(t *testing.T) {
 		content, images, _ := buildUser([]ir.ContentBlock{
 			{Type: ir.BlockImage, Image: &ir.Image{URL: "https://e.com/a.png"}},
 		})
-		if content != "[Image: https://e.com/a.png]" {
-			t.Errorf("content = %q, want image marker", content)
+		// URL-only images are not encoded as text markers; proxy materialization
+		// inlines them before encode, or preflight skips the target.
+		if content != "" {
+			t.Errorf("content = %q, want empty", content)
 		}
 		if len(images) != 0 {
-			t.Errorf("images len = %d, want 0 (url not inlined)", len(images))
+			t.Errorf("images len = %d, want 0 (url not inlined here)", len(images))
 		}
 	})
 

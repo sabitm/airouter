@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/media"
 )
 
 func contentToText(raw json.RawMessage) string {
@@ -75,17 +76,15 @@ func imageURLString(raw json.RawMessage) string {
 }
 
 func imageFromURL(url string) *ir.Image {
-	const prefix = "data:"
-	if strings.HasPrefix(url, prefix) {
-		if comma := strings.IndexByte(url, ','); comma > 0 {
-			meta := url[len(prefix):comma]
-			data := url[comma+1:]
-			mediaType := meta
-			if semi := strings.IndexByte(meta, ';'); semi >= 0 {
-				mediaType = meta[:semi]
-			}
-			return &ir.Image{MediaType: mediaType, Data: data}
+	if url == "" {
+		return &ir.Image{}
+	}
+	if media.IsDataURL(url) {
+		mt, data, _, err := media.ParseImageURL(url)
+		if err != nil {
+			return &ir.Image{URL: url}
 		}
+		return &ir.Image{MediaType: mt, Data: data}
 	}
 	return &ir.Image{URL: url}
 }
@@ -99,7 +98,77 @@ func imageToURL(img *ir.Image) string {
 		if mt == "" {
 			mt = "image/png"
 		}
-		return "data:" + mt + ";base64," + img.Data
+		return media.RenderDataURL(mt, img.Data)
 	}
 	return img.URL
+}
+
+func fileFromPart(p contentPart) *ir.File {
+	f := &ir.File{Filename: p.Filename, ID: p.FileID, URL: p.FileURL}
+	if p.FileData != "" {
+		mt, data, err := media.ParseFileData(p.FileData)
+		if err != nil {
+			if media.IsDataURL(p.FileData) {
+				f.URL = p.FileData
+			} else {
+				f.Data = p.FileData
+			}
+			return f
+		}
+		f.MediaType = mt
+		f.Data = data
+		if f.MediaType == "" && f.Filename != "" {
+			f.MediaType = mimeFromFilename(f.Filename)
+		}
+	}
+	return f
+}
+
+func inputFilePart(f *ir.File) map[string]any {
+	part := map[string]any{"type": "input_file"}
+	if f == nil {
+		return part
+	}
+	if f.Filename != "" {
+		part["filename"] = f.Filename
+	}
+	if f.ID != "" {
+		part["file_id"] = f.ID
+	}
+	if f.Data != "" {
+		mt := f.MediaType
+		if mt == "" {
+			mt = "application/octet-stream"
+		}
+		part["file_data"] = media.RenderDataURL(mt, f.Data)
+	} else if f.URL != "" {
+		if media.IsDataURL(f.URL) {
+			part["file_data"] = f.URL
+		} else {
+			part["file_url"] = f.URL
+		}
+	}
+	return part
+}
+
+func mimeFromFilename(name string) string {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(lower, ".pdf"):
+		return "application/pdf"
+	case strings.HasSuffix(lower, ".png"):
+		return "image/png"
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(lower, ".gif"):
+		return "image/gif"
+	case strings.HasSuffix(lower, ".webp"):
+		return "image/webp"
+	case strings.HasSuffix(lower, ".txt"):
+		return "text/plain"
+	case strings.HasSuffix(lower, ".json"):
+		return "application/json"
+	default:
+		return ""
+	}
 }

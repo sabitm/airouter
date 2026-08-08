@@ -63,6 +63,13 @@ func (su *scriptedUpstream) requestBody(t *testing.T) map[string]any {
 // given upstreams (in order). Returns the proxy base URL and access token.
 func setupCombo(t *testing.T, strategy domain.ComboStrategy, targets []*scriptedUpstream, protocols []domain.Protocol) (string, string) {
 	t.Helper()
+	base, token, _ := setupComboProxy(t, strategy, targets, protocols)
+	return base, token
+}
+
+// setupComboProxy is setupCombo but also returns the Proxy for backoff inspection.
+func setupComboProxy(t *testing.T, strategy domain.ComboStrategy, targets []*scriptedUpstream, protocols []domain.Protocol) (string, string, *Proxy) {
+	t.Helper()
 	st := newTestStore(t)
 	ctx := context.Background()
 
@@ -88,10 +95,11 @@ func setupCombo(t *testing.T, strategy domain.ComboStrategy, targets []*scripted
 	}
 
 	mux := http.NewServeMux()
-	New(st, nil).Mount(mux)
+	px := New(st, nil)
+	px.Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
-	return ts.URL, key.Token
+	return ts.URL, key.Token, px
 }
 
 const oaiReq = `{"model":"default","messages":[{"role":"user","content":"hi"}]}`

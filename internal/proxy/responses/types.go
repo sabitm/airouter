@@ -49,7 +49,12 @@ type inputItem struct {
 }
 
 type contentPart struct {
-	Type     string          `json:"type"` // input_text | output_text | text | input_image
+	Type     string          `json:"type"` // input_text | output_text | text | input_image | input_file
 	Text     string          `json:"text"`
 	ImageURL json.RawMessage `json:"image_url"` // string or {url}
+	// input_file fields (flat on the part in the public Responses shape)
+	FileData string `json:"file_data,omitempty"`
+	FileURL  string `json:"file_url,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
 }

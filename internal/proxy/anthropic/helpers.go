@@ -80,3 +80,53 @@ func sourceFromImage(img *ir.Image) *anthSource {
 	}
 	return &anthSource{Type: "url", URL: img.URL}
 }
+
+// fileFromDocument maps an Anthropic document block to IR. Only PDF sources are
+// accepted as documents; callers must not relabel arbitrary files as PDF.
+func fileFromDocument(b anthBlock) *ir.File {
+	f := &ir.File{Filename: b.Title}
+	if b.Source == nil {
+		return f
+	}
+	s := b.Source
+	switch s.Type {
+	case "url":
+		f.URL = s.URL
+		if s.MediaType != "" {
+			f.MediaType = s.MediaType
+		} else {
+			f.MediaType = "application/pdf"
+		}
+	default: // base64
+		f.MediaType = s.MediaType
+		if f.MediaType == "" {
+			f.MediaType = "application/pdf"
+		}
+		f.Data = s.Data
+	}
+	return f
+}
+
+func sourceFromFile(f *ir.File) *anthSource {
+	if f == nil {
+		return &anthSource{Type: "base64", MediaType: "application/pdf"}
+	}
+	if f.Data != "" {
+		mt := f.MediaType
+		if mt == "" {
+			mt = "application/pdf"
+		}
+		return &anthSource{Type: "base64", MediaType: mt, Data: f.Data}
+	}
+	return &anthSource{Type: "url", URL: f.URL}
+}
+
+// isPDFDocument reports whether f should encode as an Anthropic document block.
+// Only a canonical application/pdf media type qualifies; filename suffixes alone
+// must not relabel arbitrary files (e.g. text/plain named report.pdf).
+func isPDFDocument(f *ir.File) bool {
+	if f == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(f.MediaType), "application/pdf")
+}

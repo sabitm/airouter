@@ -20,7 +20,13 @@ import (
 // names) so each is flushed to the client immediately. It returns an
 // attemptResult so the resolution loop can fail over to the next target on a
 // pre-commit failure; once the 200 header is written the response is committed.
-func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header) attemptResult {
+func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header, prep *attachmentPrep) attemptResult {
+	if err := p.ensurePassthroughAttachments(ingress, body, prep); err != nil {
+		return mediaTerminal(err)
+	}
+	if reason := prep.checkCompatible(ingress, false); reason != "" {
+		return incompatibleSkip(reason)
+	}
 	rewritten, err := finalizeRequestBody(body, upstreamModel, ingress, provider)
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
@@ -131,10 +137,19 @@ func sniffStreamUsage(data []byte, res *reqResult) {
 // protocol, then pumps backend SSE events through the IR into ingress-format
 // SSE. Pre-commit failures are retryable so the resolution loop can fail over;
 // once the 200 header is written, errors mid-stream simply terminate.
-func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, body []byte) attemptResult {
+func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, body []byte, prep *attachmentPrep) attemptResult {
 	req, err := ingress.decodeRequest(body)
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
+	}
+	if err := prep.inspectDecoded(req); err != nil {
+		return mediaTerminal(err)
+	}
+	if reason := prep.checkCompatible(backend, true); reason != "" {
+		return incompatibleSkip(reason)
+	}
+	if err := prep.materialize(ctx, req, backend); err != nil {
+		return materializeSkip(err)
 	}
 	// Prefer Capture over typed decode so unfamiliar reasoning fields survive.
 	if captured := thinking.Capture(body); captured != nil {

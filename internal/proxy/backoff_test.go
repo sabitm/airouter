@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"testing"
 
 	"airouter/internal/domain"
@@ -91,7 +92,7 @@ func TestOrderTargetsDefersBackedOff(t *testing.T) {
 	// Penalize the first target; it must sink to the back.
 	p.penalizeProvider(10)
 
-	got := p.orderTargets(combo)
+	got, _ := p.orderTargets(context.Background(), combo, openaiCodec, nil)
 	order := [3]int64{got[0].ProviderID, got[1].ProviderID, got[2].ProviderID}
 	want := [3]int64{20, 30, 10}
 	if order != want {
@@ -115,7 +116,7 @@ func TestOrderTargetsAllBackedOffKeepsOrder(t *testing.T) {
 	p.penalizeProvider(10)
 	p.penalizeProvider(20)
 
-	got := p.orderTargets(combo)
+	got, _ := p.orderTargets(context.Background(), combo, openaiCodec, nil)
 	if len(got) != 2 || got[0].ProviderID != 10 || got[1].ProviderID != 20 {
 		t.Errorf("order = %+v, want all targets in base order", got)
 	}

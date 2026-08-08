@@ -34,7 +34,9 @@ func TestEncodeError(t *testing.T) {
 	t.Run("set errType", func(t *testing.T) {
 		raw := EncodeError("nope", "server_error")
 		var got struct {
-			Error struct{ Type string `json:"type"` } `json:"error"`
+			Error struct {
+				Type string `json:"type"`
+			} `json:"error"`
 		}
 		_ = json.Unmarshal(raw, &got)
 		if got.Error.Type != "server_error" {
@@ -119,7 +121,8 @@ func TestImageFromURL(t *testing.T) {
 		wantIsData bool
 	}{
 		{"data url with mediaType", "data:image/png;base64,abc", "image/png", "abc", "", true},
-		{"data without base64 flag", "data:image/gif,raw", "image/gif", "raw", "", true},
+		// Non-base64 data URLs are rejected at parse; left on URL for InspectRequest.
+		{"data without base64 flag", "data:image/gif,raw", "", "", "data:image/gif,raw", false},
 		{"plain url", "https://example.com/img.png", "", "", "https://example.com/img.png", false},
 		{"empty", "", "", "", "", false},
 		{"malformed no comma", "data:image/png;base64", "", "", "data:image/png;base64", false},
@@ -279,9 +282,9 @@ func TestResponsesStopReason(t *testing.T) {
 
 func TestCodexEffortForModel(t *testing.T) {
 	cases := []struct {
-		model     string
-		wantBase  string
-		wantEff   string
+		model    string
+		wantBase string
+		wantEff  string
 	}{
 		{"gpt-5.3-codex-high", "gpt-5.3-codex", "high"},
 		{"gpt-5.3-codex-medium", "gpt-5.3-codex", "medium"},

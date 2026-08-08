@@ -83,6 +83,8 @@ func decodeBlocks(raw json.RawMessage) []ir.ContentBlock {
 			out = append(out, ir.ContentBlock{Type: ir.BlockText, Text: b.Text})
 		case "image":
 			out = append(out, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromSource(b.Source)})
+		case "document":
+			out = append(out, ir.ContentBlock{Type: ir.BlockFile, File: fileFromDocument(b)})
 		case "tool_use":
 			out = append(out, ir.ContentBlock{
 				Type:      ir.BlockToolUse,
@@ -214,6 +216,13 @@ func encodeBlocks(blocks []ir.ContentBlock) []anthBlock {
 			out = append(out, anthBlock{Type: "text", Text: b.Text})
 		case ir.BlockImage:
 			out = append(out, anthBlock{Type: "image", Source: sourceFromImage(b.Image)})
+		case ir.BlockFile:
+			// Only PDF documents are representable on Anthropic. Non-PDF files are
+			// skipped here; preflight must reject incompatible targets before encode.
+			if isPDFDocument(b.File) {
+				blk := anthBlock{Type: "document", Source: sourceFromFile(b.File), Title: b.File.Filename}
+				out = append(out, blk)
+			}
 		case ir.BlockToolUse:
 			input := b.ToolInput
 			if len(input) == 0 {

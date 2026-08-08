@@ -165,8 +165,9 @@ func lastUserTurn(turns []turn) int {
 }
 
 // buildUser flattens a user message's blocks into content text, inline images,
-// and tool results. Remote image URLs cannot be sent inline, so they degrade to
-// a text marker rather than being dropped silently.
+// and tool results. Remote image URLs must be materialized before encode; the
+// proxy preflight skips Kiro when materialization cannot produce inline bytes.
+// File blocks are not representable and are ignored here (preflight rejects).
 func buildUser(blocks []ir.ContentBlock) (content string, images []cwImage, toolResults []cwToolResult) {
 	var text []string
 	for _, b := range blocks {
@@ -181,9 +182,8 @@ func buildUser(blocks []ir.ContentBlock) (content string, images []cwImage, tool
 			}
 			if b.Image.Data != "" {
 				images = append(images, cwImage{Format: imageFormat(b.Image.MediaType), Source: cwImageSource{Bytes: b.Image.Data}})
-			} else if b.Image.URL != "" {
-				text = append(text, "[Image: "+b.Image.URL+"]")
 			}
+			// URL-only images are left out; preflight + materialization handle them.
 		case ir.BlockToolResult:
 			toolResults = append(toolResults, cwToolResult{
 				ToolUseID: b.ToolUseID,

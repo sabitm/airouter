@@ -95,7 +95,8 @@ func TestImageFromURL(t *testing.T) {
 	}{
 		{"data url with mediaType", "data:image/png;base64,abc", "image/png", "abc", "", true},
 		{"data url with jpeg", "data:image/jpeg;base64,ZGVm", "image/jpeg", "ZGVm", "", true},
-		{"data without base64 flag", "data:image/gif,raw", "image/gif", "raw", "", true},
+		// Non-base64 data URLs are rejected at parse; left on URL for InspectRequest.
+		{"data without base64 flag", "data:image/gif,raw", "", "", "data:image/gif,raw", false},
 		{"plain http url", "https://example.com/img.png", "", "", "https://example.com/img.png", false},
 		{"empty", "", "", "", "", false},
 		{"malformed data no comma", "data:image/png;base64", "", "", "data:image/png;base64", false},

@@ -41,8 +41,10 @@ type anthBlock struct {
 
 	Text string `json:"text,omitempty"`
 
-	// image
+	// image | document
 	Source *anthSource `json:"source,omitempty"`
+	// document title (optional filename-like label)
+	Title string `json:"title,omitempty"`
 
 	// tool_use
 	ID    string          `json:"id,omitempty"`

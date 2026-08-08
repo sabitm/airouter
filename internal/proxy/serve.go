@@ -12,6 +12,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/observability"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/media"
 	"airouter/internal/proxy/thinking"
 	"airouter/internal/store"
 )
@@ -129,6 +130,11 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			res.fail(w, ingress, http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error")
+			return
+		}
 		res.fail(w, ingress, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
 		return
 	}
@@ -157,16 +163,44 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		res.fail(w, ingress, http.StatusInternalServerError, "combo lookup failed", "api_error")
 		return
 	}
-	candidates := p.orderTargets(combo)
+	// Inventory recognized attachments once before health ordering. Invalid
+	// media is a client error with zero upstream contact. Structural transport
+	// incompatibility filters targets before backoff skip credits are consumed.
+	var prep attachmentPrep
+	if ingress.decodeRequest != nil {
+		req, err := ingress.decodeRequest(body)
+		if err != nil {
+			res.fail(w, ingress, http.StatusBadRequest, err.Error(), "invalid_request_error")
+			return
+		}
+		if err := prep.inspectDecoded(req); err != nil {
+			res.fail(w, ingress, media.ClientErrorStatus(err), err.Error(), "invalid_request_error")
+			return
+		}
+	}
+
+	candidates, filterReason := p.orderTargets(r.Context(), combo, ingress, &prep)
 	if len(candidates) == 0 {
+		if prep.hasAttachments() {
+			msg := "attachment not supported by upstream: no compatible provider in combo"
+			if filterReason != "" {
+				msg = "attachment not supported by upstream: " + filterReason
+			}
+			res.fail(w, ingress, http.StatusBadRequest, msg, "invalid_request_error")
+			return
+		}
 		res.fail(w, ingress, http.StatusInternalServerError, "combo has no targets: "+meta.Model, "api_error")
 		return
 	}
 
-	// Walk the ordered targets. A target that fails before any byte reaches the
-	// client falls through to the next; the first that commits a response ends
-	// the walk. If all fail, the last failure's envelope is written below.
+	// Walk the ordered (attachment-compatible) targets. A target that fails before
+	// any byte reaches the client falls through to the next; the first that commits
+	// a response ends the walk. If all fail, the last failure's envelope is written
+	// below. Materialization skips do not penalize provider health. A real upstream
+	// failure on a compatible target is never hidden behind a later materialize skip.
 	var last attemptResult
+	var sawRealAttempt bool
+	var lastReal attemptResult
 	for i, t := range candidates {
 		provider := t.Provider
 		rec.Provider = provider.Name
@@ -176,14 +210,22 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		attemptStart := time.Now()
 		if ingress.id == backend.id {
 			if meta.Stream {
-				last = p.streamPassthrough(w, r.Context(), res, ingress, provider, t.UpstreamModel, body, r.Header)
+				last = p.streamPassthrough(w, r.Context(), res, ingress, provider, t.UpstreamModel, body, r.Header, &prep)
 			} else {
-				last = p.servePassthrough(w, r.Context(), res, ingress, provider, t.UpstreamModel, body, r.Header)
+				last = p.servePassthrough(w, r.Context(), res, ingress, provider, t.UpstreamModel, body, r.Header, &prep)
 			}
 		} else if meta.Stream {
-			last = p.streamTranslated(w, r.Context(), res, ingress, backend, provider, t.UpstreamModel, body)
+			last = p.streamTranslated(w, r.Context(), res, ingress, backend, provider, t.UpstreamModel, body, &prep)
 		} else {
-			last = p.serveTranslated(w, r.Context(), res, ingress, backend, provider, t.UpstreamModel, body)
+			last = p.serveTranslated(w, r.Context(), res, ingress, backend, provider, t.UpstreamModel, body, &prep)
+		}
+
+		attachmentSkip := last.retry && last.logErr == skipLogAttachment
+		if !attachmentSkip && (last.retry || last.written || last.status != 0) {
+			sawRealAttempt = true
+			if last.retry || (!last.retry && !last.written) {
+				lastReal = last
+			}
 		}
 
 		if !last.retry {
@@ -194,6 +236,19 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 				p.clearBackoff(provider.ID)
 			}
 			break
+		}
+		if attachmentSkip {
+			// Materialization / late structural skip: no health penalty.
+			observability.Logger(r.Context(), p.logger).Debug("attachment_target_skipped",
+				"event", "attachment_target_skipped",
+				"combo", combo.Name,
+				"provider", provider.Name,
+				"upstream_model", t.UpstreamModel,
+				"protocol", string(provider.Protocol),
+				"format", backend.id,
+				"reason", last.errMsg,
+			)
+			continue
 		}
 		// The attempt failed over before committing bytes: penalize the provider so
 		// subsequent requests defer it behind healthy targets. Applies to the last
@@ -224,14 +279,21 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 	// began). Otherwise either every target was exhausted (last.retry) or a
 	// terminal pre-commit error occurred; surface its envelope.
 	if !last.written {
-		status := last.status
+		// Prefer a real compatible-target failure over a trailing materialize skip.
+		outcome := last
+		if last.logErr == skipLogAttachment && sawRealAttempt && lastReal.status != 0 {
+			outcome = lastReal
+		} else if last.logErr == skipLogAttachment && !sawRealAttempt {
+			outcome = terminal(http.StatusBadRequest, last.errMsg, "invalid_request_error")
+		}
+		status := outcome.status
 		if status == 0 {
 			status = http.StatusBadGateway
 		}
 		// request_failed in the defer covers the final client-facing outcome;
 		// upstream_attempt_failed covers each failed provider attempt.
-		res.fail(w, ingress, status, last.errMsg, last.errType)
-		res.logErr = last.logErr
+		res.fail(w, ingress, status, outcome.errMsg, outcome.errType)
+		res.logErr = outcome.logErr
 	}
 }
 
@@ -252,16 +314,20 @@ func (p *Proxy) logUpstreamAttemptFailed(ctx context.Context, combo string, prov
 }
 
 // orderTargets returns the combo's targets in the order the resolution loop
-// should try them. Failover keeps position order; round-robin rotates the start
-// by a per-combo counter, then continues through the remainder so it still fails
-// over past a dead target. In both cases, disabled targets and archived providers
-// are dropped entirely (unlike backoff, which only defers). Providers penalized
-// for recent pre-commit failures are deferred behind healthy ones for a number of
-// subsequent requests (stably, preserving relative order) so a persistently
-// failing target is not retried first every request. Penalized targets are only
-// deferred, never dropped, so an all-backed-off combo still resolves and retries
-// its least-bad option.
-func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
+// should try them, plus the first structural attachment incompatibility reason
+// observed when every enabled target was filtered out (empty otherwise).
+// Failover keeps position order; round-robin rotates the start by a per-combo
+// counter, then continues through the remainder so it still fails over past a
+// dead target. In both cases, disabled targets and archived providers are
+// dropped entirely (unlike backoff, which only defers). Providers whose
+// transport cannot represent the request's attachments are dropped before any
+// backoff skip credit is consumed, and each such drop is logged. Providers
+// penalized for recent pre-commit failures are deferred behind healthy ones for
+// a number of subsequent requests (stably, preserving relative order) so a
+// persistently failing target is not retried first every request. Penalized
+// targets are only deferred, never dropped, so an all-backed-off combo still
+// resolves and retries its least-bad option among attachment-compatible targets.
+func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress codec, prep *attachmentPrep) ([]domain.ComboTarget, string) {
 	// Disabled targets and archived providers are explicit user choices: drop
 	// them from resolution entirely (unlike backoff, which only defers). The
 	// Provider nil-guard keeps unit tests that omit the hydrated provider working.
@@ -271,19 +337,60 @@ func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
 			enabled = append(enabled, t)
 		}
 	}
-	if len(enabled) <= 1 {
-		return enabled
+
+	// Structural attachment filter runs before health ordering so incompatible
+	// providers never consume skip credits.
+	compatible := enabled
+	var firstFilterReason string
+	if prep != nil && prep.hasAttachments() {
+		compatible = make([]domain.ComboTarget, 0, len(enabled))
+		for _, t := range enabled {
+			backend := openaiCodec
+			if t.Provider != nil {
+				backend = backendCodec(t.Provider.Protocol)
+			}
+			translated := ingress.id != backend.id
+			if reason := prep.checkCompatible(backend, translated); reason != "" {
+				if firstFilterReason == "" {
+					firstFilterReason = reason
+				}
+				name, proto := "", ""
+				if t.Provider != nil {
+					name = t.Provider.Name
+					proto = string(t.Provider.Protocol)
+				}
+				observability.Logger(ctx, p.logger).Debug("attachment_target_skipped",
+					"event", "attachment_target_skipped",
+					"combo", combo.Name,
+					"provider", name,
+					"upstream_model", t.UpstreamModel,
+					"protocol", proto,
+					"format", backend.id,
+					"reason", reason,
+				)
+				continue
+			}
+			compatible = append(compatible, t)
+		}
 	}
-	base := enabled
+
+	if len(compatible) == 0 {
+		return nil, firstFilterReason
+	}
+	if len(compatible) == 1 {
+		return compatible, ""
+	}
+	base := compatible
 	if combo.Strategy == domain.StrategyRoundRobin {
-		start := p.nextRoundRobin(combo.ID, len(enabled))
-		base = make([]domain.ComboTarget, 0, len(enabled))
-		for i := range enabled {
-			base = append(base, enabled[(start+i)%len(enabled)])
+		start := p.nextRoundRobin(combo.ID, len(compatible))
+		base = make([]domain.ComboTarget, 0, len(compatible))
+		for i := range compatible {
+			base = append(base, compatible[(start+i)%len(compatible)])
 		}
 	}
 	// Consume at most one skip credit per unique provider per request: a provider
 	// appearing in multiple targets of one combo must not be charged twice.
+	// Only attachment-compatible candidates participate.
 	seen := make(map[int64]bool, len(base))
 	healthy := make([]domain.ComboTarget, 0, len(base))
 	backedOff := make([]domain.ComboTarget, 0, len(base))
@@ -299,13 +406,19 @@ func (p *Proxy) orderTargets(combo *domain.Combo) []domain.ComboTarget {
 			healthy = append(healthy, t)
 		}
 	}
-	return append(healthy, backedOff...)
+	return append(healthy, backedOff...), ""
 }
 
 // servePassthrough forwards the body unchanged except for the model rewrite,
 // preserving any provider-specific fields the IR does not model. The upstream
 // response is relayed as-is since its format already matches the ingress.
-func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header) attemptResult {
+func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header, prep *attachmentPrep) attemptResult {
+	if err := p.ensurePassthroughAttachments(ingress, body, prep); err != nil {
+		return mediaTerminal(err)
+	}
+	if reason := prep.checkCompatible(ingress, false); reason != "" {
+		return incompatibleSkip(reason)
+	}
 	rewritten, err := finalizeRequestBody(body, upstreamModel, ingress, provider)
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
@@ -330,10 +443,19 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 
 // serveTranslated converts the request to the backend protocol, forwards it, and
 // converts the response back to the ingress protocol.
-func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, body []byte) attemptResult {
+func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, body []byte, prep *attachmentPrep) attemptResult {
 	req, err := ingress.decodeRequest(body)
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
+	}
+	if err := prep.inspectDecoded(req); err != nil {
+		return mediaTerminal(err)
+	}
+	if reason := prep.checkCompatible(backend, true); reason != "" {
+		return incompatibleSkip(reason)
+	}
+	if err := prep.materialize(ctx, req, backend); err != nil {
+		return materializeSkip(err)
 	}
 	if captured := thinking.Capture(body); captured != nil {
 		req.Thinking = thinking.ToIR(captured)

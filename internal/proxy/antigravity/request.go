@@ -124,6 +124,14 @@ func buildContents(msgs []ir.Message) []geminiContent {
 					}
 					parts = append(parts, geminiPart{InlineData: &inlineData{MimeType: mt, Data: b.Image.Data}})
 				}
+			case ir.BlockFile:
+				if b.File != nil && b.File.Data != "" {
+					mt := b.File.MediaType
+					if mt == "" {
+						mt = "application/octet-stream"
+					}
+					parts = append(parts, geminiPart{InlineData: &inlineData{MimeType: mt, Data: b.File.Data}})
+				}
 			case ir.BlockToolUse:
 				args := map[string]any{}
 				if len(b.ToolInput) > 0 {

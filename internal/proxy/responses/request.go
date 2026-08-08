@@ -123,9 +123,12 @@ func decodeParts(raw json.RawMessage) []ir.ContentBlock {
 		case "input_text", "output_text", "text":
 			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: p.Text})
 		case "input_image":
-			if url := imageURLString(p.ImageURL); url != "" {
-				blocks = append(blocks, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromURL(url)})
-			}
+			// Always emit a recognized image block so missing/empty sources fail
+			// closed at InspectRequest rather than vanishing on passthrough.
+			url := imageURLString(p.ImageURL)
+			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromURL(url)})
+		case "input_file":
+			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockFile, File: fileFromPart(p)})
 		}
 	}
 	return blocks
@@ -260,6 +263,8 @@ func encodeInput(req *ir.Request) []map[string]any {
 				parts = append(parts, map[string]any{"type": "input_text", "text": b.Text})
 			case ir.BlockImage:
 				parts = append(parts, map[string]any{"type": "input_image", "image_url": imageToURL(b.Image)})
+			case ir.BlockFile:
+				parts = append(parts, inputFilePart(b.File))
 			}
 		}
 		if len(parts) > 0 {

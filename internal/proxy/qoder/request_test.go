@@ -13,7 +13,7 @@ func TestEncodeRequestBasic(t *testing.T) {
 		Model:  "qoder/qmodel_latest",
 		System: "sys",
 		Messages: []ir.Message{{
-			Role: ir.RoleUser,
+			Role:    ir.RoleUser,
 			Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}},
 		}},
 		MaxTokens: 100,
@@ -46,7 +46,7 @@ func TestEncodeRequestBasic(t *testing.T) {
 
 func TestInjectModelConfig(t *testing.T) {
 	plain, err := EncodeRequest(&ir.Request{
-		Model: "auto",
+		Model:    "auto",
 		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "x"}}}},
 	})
 	if err != nil {
@@ -238,11 +238,11 @@ func TestCredsFromProvider(t *testing.T) {
 	t.Run("oauth only uses AccessToken and copies identity", func(t *testing.T) {
 		p := &domain.Provider{
 			OAuthCreds: &domain.OAuthCreds{
-				AccessToken:  "tok",
-				UserID:       "u1",
-				MachineID:    "mid",
-				DisplayName:  "Alice",
-				Email:        "a@e.com",
+				AccessToken: "tok",
+				UserID:      "u1",
+				MachineID:   "mid",
+				DisplayName: "Alice",
+				Email:       "a@e.com",
 			},
 		}
 		c := CredsFromProvider(p)
@@ -379,7 +379,8 @@ func TestEncodeMessages(t *testing.T) {
 		}
 	})
 
-	t.Run("user text plus image degrades to marker", func(t *testing.T) {
+	t.Run("user text plus image keeps text only", func(t *testing.T) {
+		// Images are not representable on Qoder; preflight skips before encode.
 		out, lastUser := encodeMessages([]ir.Message{
 			{Role: ir.RoleUser, Content: []ir.ContentBlock{
 				{Type: ir.BlockText, Text: "look"},
@@ -389,7 +390,7 @@ func TestEncodeMessages(t *testing.T) {
 		if len(out) != 1 {
 			t.Fatalf("len = %d, want 1", len(out))
 		}
-		want := "look\n[image omitted]"
+		want := "look"
 		if out[0]["content"] != want {
 			t.Errorf("content = %q, want %q", out[0]["content"], want)
 		}
@@ -438,10 +439,10 @@ func TestEncodeMessages(t *testing.T) {
 		if out[0]["role"] != "tool" || out[0]["tool_call_id"] != "tu1" {
 			t.Errorf("msg0 = %+v", out[0])
 		}
-		if out[1]["role"] != "user" || out[1]["content"] != "after\n[image omitted]" {
+		if out[1]["role"] != "user" || out[1]["content"] != "after" {
 			t.Errorf("msg1 = %+v", out[1])
 		}
-		if lastUser != "after\n[image omitted]" {
+		if lastUser != "after" {
 			t.Errorf("lastUser = %q", lastUser)
 		}
 	})

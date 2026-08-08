@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/media"
 )
 
 // parseStop normalizes the OpenAI `stop` field (string or []string) to a slice.
@@ -59,19 +60,20 @@ func toolResultText(b ir.ContentBlock) string {
 }
 
 // imageFromURL parses an OpenAI image_url, splitting an inline data URI into
-// media type + base64 data, or keeping a remote URL as-is.
+// media type + base64 data, or keeping a remote URL as-is. Malformed data URIs
+// still produce an Image so InspectRequest can reject them with a clear error;
+// the URL field is left as the original string only when it is not a data URI.
 func imageFromURL(url string) *ir.Image {
-	const prefix = "data:"
-	if strings.HasPrefix(url, prefix) {
-		if comma := strings.IndexByte(url, ','); comma > 0 {
-			meta := url[len(prefix):comma] // e.g. image/png;base64
-			data := url[comma+1:]
-			mediaType := meta
-			if semi := strings.IndexByte(meta, ';'); semi >= 0 {
-				mediaType = meta[:semi]
-			}
-			return &ir.Image{MediaType: mediaType, Data: data}
+	if url == "" {
+		return &ir.Image{}
+	}
+	if media.IsDataURL(url) {
+		mt, data, _, err := media.ParseImageURL(url)
+		if err != nil {
+			// Preserve the raw value under Data empty + URL so validation sees it.
+			return &ir.Image{URL: url}
 		}
+		return &ir.Image{MediaType: mt, Data: data}
 	}
 	return &ir.Image{URL: url}
 }
@@ -86,9 +88,76 @@ func imageToURL(img *ir.Image) string {
 		if mt == "" {
 			mt = "image/png"
 		}
-		return "data:" + mt + ";base64," + img.Data
+		return media.RenderDataURL(mt, img.Data)
 	}
 	return img.URL
+}
+
+func fileFromChat(f *chatFile) *ir.File {
+	if f == nil {
+		return &ir.File{}
+	}
+	out := &ir.File{Filename: f.Filename, ID: f.FileID}
+	if f.FileData == "" {
+		return out
+	}
+	mt, data, err := media.ParseFileData(f.FileData)
+	if err != nil {
+		// Leave Data as provided so InspectRequest can surface the error; if it
+		// looks like a data URL keep it in URL for the same reason.
+		if media.IsDataURL(f.FileData) {
+			out.URL = f.FileData
+		} else {
+			out.Data = f.FileData
+		}
+		return out
+	}
+	out.MediaType = mt
+	out.Data = data
+	if out.MediaType == "" && out.Filename != "" {
+		out.MediaType = mimeFromFilename(out.Filename)
+	}
+	return out
+}
+
+func chatFileFromIR(f *ir.File) *chatFile {
+	if f == nil {
+		return nil
+	}
+	out := &chatFile{Filename: f.Filename, FileID: f.ID}
+	if f.Data != "" {
+		mt := f.MediaType
+		if mt == "" {
+			mt = "application/octet-stream"
+		}
+		out.FileData = media.RenderDataURL(mt, f.Data)
+	} else if f.URL != "" && media.IsDataURL(f.URL) {
+		out.FileData = f.URL
+	}
+	// Remote file URLs are not a stable Chat Completions field; only inline/id.
+	return out
+}
+
+func mimeFromFilename(name string) string {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(lower, ".pdf"):
+		return "application/pdf"
+	case strings.HasSuffix(lower, ".png"):
+		return "image/png"
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(lower, ".gif"):
+		return "image/gif"
+	case strings.HasSuffix(lower, ".webp"):
+		return "image/webp"
+	case strings.HasSuffix(lower, ".txt"):
+		return "text/plain"
+	case strings.HasSuffix(lower, ".json"):
+		return "application/json"
+	default:
+		return ""
+	}
 }
 
 func mustText(s string) json.RawMessage {

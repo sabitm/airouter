@@ -34,13 +34,22 @@ type chatMessage struct {
 }
 
 type chatPart struct {
-	Type     string        `json:"type"` // text | image_url
+	Type     string        `json:"type"` // text | image_url | file
 	Text     string        `json:"text,omitempty"`
 	ImageURL *chatImageURL `json:"image_url,omitempty"`
+	File     *chatFile     `json:"file,omitempty"`
 }
 
 type chatImageURL struct {
 	URL string `json:"url"`
+}
+
+// chatFile is the OpenAI Chat Completions content part for type "file".
+// file_data may be a data URL or bare base64; file_id is provider-owned.
+type chatFile struct {
+	Filename string `json:"filename,omitempty"`
+	FileData string `json:"file_data,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
 }
 
 type chatToolCall struct {

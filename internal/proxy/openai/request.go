@@ -98,9 +98,15 @@ func decodeUserContent(raw json.RawMessage) []ir.ContentBlock {
 		case "text":
 			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: p.Text})
 		case "image_url":
+			// Always emit a recognized image block so missing/empty sources fail
+			// closed at InspectRequest rather than vanishing on passthrough.
 			if p.ImageURL != nil {
 				blocks = append(blocks, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromURL(p.ImageURL.URL)})
+			} else {
+				blocks = append(blocks, ir.ContentBlock{Type: ir.BlockImage, Image: &ir.Image{}})
 			}
+		case "file":
+			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockFile, File: fileFromChat(p.File)})
 		}
 	}
 	return blocks
@@ -260,6 +266,8 @@ func encodeMessage(m ir.Message) []chatMessage {
 			parts = append(parts, chatPart{Type: "text", Text: b.Text})
 		case ir.BlockImage:
 			parts = append(parts, chatPart{Type: "image_url", ImageURL: &chatImageURL{URL: imageToURL(b.Image)}})
+		case ir.BlockFile:
+			parts = append(parts, chatPart{Type: "file", File: chatFileFromIR(b.File)})
 		}
 	}
 	if len(parts) > 0 {

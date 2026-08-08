@@ -123,6 +123,8 @@ func encodeMessages(msgs []ir.Message) (out []map[string]any, lastUser string) {
 			}
 			out = append(out, msg)
 		default: // user (+ tool_result blocks)
+			// BlockImage/BlockFile are intentionally unhandled: attachment preflight
+			// skips this backend before encode so media never reaches here.
 			var textParts []string
 			for _, b := range m.Content {
 				switch b.Type {
@@ -135,9 +137,6 @@ func encodeMessages(msgs []ir.Message) (out []map[string]any, lastUser string) {
 					})
 				case ir.BlockText:
 					textParts = append(textParts, b.Text)
-				case ir.BlockImage:
-					// MVP: drop images; mark so the model sees something was present.
-					textParts = append(textParts, "[image omitted]")
 				}
 			}
 			if len(textParts) > 0 {
