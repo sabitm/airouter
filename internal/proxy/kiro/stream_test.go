@@ -88,6 +88,46 @@ func TestDecodeStreamText(t *testing.T) {
 	}
 }
 
+func TestDecodeStreamMetricsCacheAccounting(t *testing.T) {
+	cases := []struct {
+		name    string
+		metrics string
+		wantIn  int
+		wantOut int
+	}{
+		{"base only", `{"inputTokens":11,"outputTokens":5}`, 11, 5},
+		{"cache read camel", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4}`, 15, 5},
+		{"cache read snake", `{"inputTokens":11,"outputTokens":5,"cache_read_input_tokens":4}`, 15, 5},
+		{"cache creation camel", `{"inputTokens":11,"outputTokens":5,"cacheCreationInputTokens":7}`, 18, 5},
+		{"cache creation snake", `{"inputTokens":11,"outputTokens":5,"cache_creation_input_tokens":7}`, 18, 5},
+		{"both cache fields", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4,"cacheCreationInputTokens":7}`, 22, 5},
+		{"camel preferred over snake", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4,"cache_read_input_tokens":99,"cacheCreationInputTokens":7,"cache_creation_input_tokens":88}`, 22, 5},
+		{"missing fields", `{}`, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			buf.Write(buildFrame("metricsEvent", []byte(tc.metrics)))
+			buf.Write(buildFrame("messageStopEvent", []byte(`{}`)))
+			events := collect(t, buf.Bytes())
+			if len(events) != 2 || events[0].Kind != ir.EventMessageStart || events[1].Kind != ir.EventFinish {
+				t.Fatalf("events = %+v, want start and finish", events)
+			}
+			finish := events[1]
+			if finish.InputTokens != tc.wantIn || finish.OutputTokens != tc.wantOut {
+				t.Errorf("usage = %d/%d, want %d/%d", finish.InputTokens, finish.OutputTokens, tc.wantIn, tc.wantOut)
+			}
+		})
+	}
+}
+
+func TestDecodeStreamStopOnlyEmitsFinish(t *testing.T) {
+	events := collect(t, buildFrame("messageStopEvent", []byte(`{}`)))
+	if len(events) != 2 || events[0].Kind != ir.EventMessageStart || events[1].Kind != ir.EventFinish {
+		t.Fatalf("events = %+v, want start and finish", events)
+	}
+}
+
 func TestDecodeStreamStripsThinkingTags(t *testing.T) {
 	frame := buildFrame("assistantResponseEvent", []byte(`{"content":"<thinking>ignore</thinking>kept"}`))
 	events := collect(t, frame)

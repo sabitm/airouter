@@ -57,6 +57,13 @@ func kiroTextStream() []byte {
 	return buf.Bytes()
 }
 
+func kiroMetricsOnlyStream() []byte {
+	var buf bytes.Buffer
+	buf.Write(buildKiroFrame("metricsEvent", `{"inputTokens":7,"outputTokens":2,"cacheReadInputTokens":3,"cacheCreationInputTokens":4}`))
+	buf.Write(buildKiroFrame("messageStopEvent", `{}`))
+	return buf.Bytes()
+}
+
 // setupKiro wires a Kiro-backed provider whose upstream returns the given binary
 // EventStream, and records the last upstream request body and headers.
 func setupKiro(t *testing.T, upstreamBody []byte, captured *kiroCapture) (string, string, *store.Store) {
@@ -205,6 +212,49 @@ func TestKiroUnaryCollected(t *testing.T) {
 	if l.InputTokens != 7 || l.OutputTokens != 2 {
 		t.Errorf("tokens = %d/%d, want 7/2", l.InputTokens, l.OutputTokens)
 	}
+}
+
+func TestKiroMetricsOnlyUsagePropagates(t *testing.T) {
+	t.Run("stream", func(t *testing.T) {
+		base, token, st := setupKiro(t, kiroMetricsOnlyStream(), nil)
+		resp, body := postStream(t, base+"/v1/chat/completions", token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+		}
+		in, out, total := collectOpenAIUsage(t, body)
+		if in != 14 || out != 2 || total != 16 {
+			t.Errorf("client usage = %d/%d/%d, want 14/2/16", in, out, total)
+		}
+		l := waitForLogs(t, st, 1)[0]
+		if l.InputTokens != 14 || l.OutputTokens != 2 {
+			t.Errorf("logged tokens = %d/%d, want 14/2", l.InputTokens, l.OutputTokens)
+		}
+	})
+
+	t.Run("unary", func(t *testing.T) {
+		base, token, st := setupKiro(t, kiroMetricsOnlyStream(), nil)
+		resp, body := post(t, base+"/v1/chat/completions", token, `{"model":"default","messages":[{"role":"user","content":"hi"}]}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+		}
+		var got struct {
+			Usage struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Usage.PromptTokens != 14 || got.Usage.CompletionTokens != 2 || got.Usage.TotalTokens != 16 {
+			t.Errorf("client usage = %+v, want 14/2/16", got.Usage)
+		}
+		l := waitForLogs(t, st, 1)[0]
+		if l.InputTokens != 14 || l.OutputTokens != 2 {
+			t.Errorf("logged tokens = %d/%d, want 14/2", l.InputTokens, l.OutputTokens)
+		}
+	})
 }
 
 // TestKiroToolStream verifies a Kiro toolUseEvent stream reassembles into an

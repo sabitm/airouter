@@ -434,7 +434,7 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 	res.status = status
 	// Usage is not modeled in passthrough; recover it best-effort from the raw
 	// body, which already matches the ingress format.
-	res.inTok, res.outTok = parseUsage(respBody)
+	res.inTok, res.outTok = parseUsage(respBody, ingress.id)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(respBody)
@@ -604,28 +604,65 @@ func collectStreamResponse(r io.Reader, backend codec, fallbackModel string) (*i
 	return resp, nil
 }
 
-// parseUsage recovers token counts from a unary response body without knowing
-// its format: OpenAI uses prompt_tokens/completion_tokens, Anthropic uses
-// input_tokens/output_tokens. Returns 0,0 when no usage object is present.
-func parseUsage(body []byte) (in, out int) {
+// parseUsage recovers token counts from a unary response body's top-level usage
+// object. codecID selects one alias family so hybrid OpenAI/Anthropic field sets
+// are not summed twice. Returns 0,0 when no usage object is present.
+func parseUsage(body []byte, codecID string) (in, out int) {
 	var u struct {
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			InputTokens      int `json:"input_tokens"`
-			// Anthropic reports cached input separately; fold it in so the count
-			// reflects total input regardless of cache state.
-			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			OutputTokens             int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage json.RawMessage `json:"usage"`
 	}
-	if json.Unmarshal(body, &u) != nil {
+	if json.Unmarshal(body, &u) != nil || len(u.Usage) == 0 {
 		return 0, 0
 	}
-	in = u.Usage.PromptTokens + u.Usage.InputTokens + u.Usage.CacheCreationInputTokens + u.Usage.CacheReadInputTokens
-	out = u.Usage.CompletionTokens + u.Usage.OutputTokens
-	return in, out
+	return parseUsageObject(u.Usage, codecID)
+}
+
+// parseUsageObject interprets one usage JSON object under a single alias family.
+//
+// Families:
+//   - oai-chat: prompt_tokens / completion_tokens
+//   - oai-responses / oai-codex: input_tokens / output_tokens (no Anthropic caches)
+//   - anth-msg / claude-code: input_tokens + cache_* / output_tokens
+//
+// Without useful codec context, prefer a complete prompt/completion pair when
+// both sides are present; otherwise use input/output. Anthropic cache fields are
+// folded into input only for Anthropic codecs, or in the fallback when the
+// input/output family is selected and no prompt/completion pair won.
+func parseUsageObject(raw json.RawMessage, codecID string) (in, out int) {
+	if len(raw) == 0 || raw[0] != '{' {
+		return 0, 0
+	}
+	var f struct {
+		PromptTokens             int `json:"prompt_tokens"`
+		CompletionTokens         int `json:"completion_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	}
+	if json.Unmarshal(raw, &f) != nil {
+		return 0, 0
+	}
+	switch codecID {
+	case "oai-chat":
+		return f.PromptTokens, f.CompletionTokens
+	case "oai-responses", "oai-codex":
+		return f.InputTokens, f.OutputTokens
+	case "anth-msg", "claude-code":
+		return f.InputTokens + f.CacheCreationInputTokens + f.CacheReadInputTokens, f.OutputTokens
+	}
+	// Fallback without codec context: pick one family, never sum aliases.
+	hasPromptFamily := f.PromptTokens != 0 || f.CompletionTokens != 0
+	hasIOFamily := f.InputTokens != 0 || f.OutputTokens != 0 || f.CacheCreationInputTokens != 0 || f.CacheReadInputTokens != 0
+	if hasPromptFamily && (!hasIOFamily || (f.PromptTokens != 0 && f.CompletionTokens != 0)) {
+		return f.PromptTokens, f.CompletionTokens
+	}
+	if hasIOFamily {
+		// Treat as Anthropic-shaped when cache fields appear; otherwise plain I/O
+		// (Responses). Cache fields alone still count as input.
+		return f.InputTokens + f.CacheCreationInputTokens + f.CacheReadInputTokens, f.OutputTokens
+	}
+	return 0, 0
 }
 
 // upstreamErrorMessage extracts a human message from an upstream error body.

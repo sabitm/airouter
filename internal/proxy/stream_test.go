@@ -433,6 +433,61 @@ func TestStreamUsageRecorded(t *testing.T) {
 	}
 }
 
+// TestOpenAIStreamPassthroughForcesIncludeUsage verifies OpenAI->OpenAI streaming
+// passthrough injects stream_options.include_usage=true so upstream emits a
+// terminal usage chunk that reaches both the client SSE and the request log.
+func TestOpenAIStreamPassthroughForcesIncludeUsage(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	var gotBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "real-model", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	var fwd map[string]any
+	if err := json.Unmarshal(gotBody, &fwd); err != nil {
+		t.Fatalf("upstream body: %v\n%s", err, gotBody)
+	}
+	opts, ok := fwd["stream_options"].(map[string]any)
+	if !ok || opts["include_usage"] != true {
+		t.Fatalf("stream_options = %#v, want include_usage=true", fwd["stream_options"])
+	}
+	in, out, total := collectOpenAIUsage(t, body)
+	if in != 3 || out != 2 || total != 5 {
+		t.Errorf("client usage = %d/%d/%d, want 3/2/5", in, out, total)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.InputTokens != 3 || l.OutputTokens != 2 {
+		t.Errorf("logged tokens = %d/%d, want 3/2", l.InputTokens, l.OutputTokens)
+	}
+}
+
 func TestAnthropicStreamLateUsageRecordedAndForwarded(t *testing.T) {
 	base, token, st := setupStreamingWithStore(t, domain.ProtocolAnthropic, anthropicLateUsageSSE)
 	resp, body := postStream(t, base+"/v1/chat/completions", token,

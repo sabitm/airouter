@@ -32,8 +32,144 @@ func TestDecodeStreamTextAndFinish(t *testing.T) {
 	if text.String() != "hi!" {
 		t.Fatalf("text %q", text.String())
 	}
-	if finish == nil || finish.StopReason != ir.StopEndTurn || finish.OutputTokens != 2 {
+	if finish == nil || finish.StopReason != ir.StopEndTurn || finish.InputTokens != 3 || finish.OutputTokens != 2 {
 		t.Fatalf("finish %+v", finish)
+	}
+}
+
+func TestUsageMetadataAccounting(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+	cases := []struct {
+		name    string
+		meta    usageMetadata
+		wantIn  int
+		wantOut int
+	}{
+		{
+			name:    "prompt and candidates",
+			meta:    usageMetadata{PromptTokenCount: 10, CandidatesTokenCount: intPtr(4)},
+			wantIn:  10,
+			wantOut: 4,
+		},
+		{
+			name:    "candidates plus thoughts",
+			meta:    usageMetadata{PromptTokenCount: 10, CandidatesTokenCount: intPtr(4), ThoughtsTokenCount: 6},
+			wantIn:  10,
+			wantOut: 10,
+		},
+		{
+			name:    "absent candidates derives from total",
+			meta:    usageMetadata{PromptTokenCount: 10, ThoughtsTokenCount: 3, TotalTokenCount: intPtr(20)},
+			wantIn:  10,
+			wantOut: 10, // derived candidates 7 + thoughts 3
+		},
+		{
+			name:    "invalid low total clamps candidates nonnegative",
+			meta:    usageMetadata{PromptTokenCount: 10, ThoughtsTokenCount: 5, TotalTokenCount: intPtr(12)},
+			wantIn:  10,
+			wantOut: 5, // derived candidates max(12-10-5,0)=0 + thoughts 5
+		},
+		{
+			name:    "explicit zero candidates preferred over total derivation",
+			meta:    usageMetadata{PromptTokenCount: 10, CandidatesTokenCount: intPtr(0), ThoughtsTokenCount: 5, TotalTokenCount: intPtr(99)},
+			wantIn:  10,
+			wantOut: 5,
+		},
+		{
+			name:    "present zero total derives zero candidates",
+			meta:    usageMetadata{PromptTokenCount: 10, TotalTokenCount: intPtr(0)},
+			wantIn:  10,
+			wantOut: 0,
+		},
+		{
+			name:    "thoughts without candidates or total",
+			meta:    usageMetadata{PromptTokenCount: 10, ThoughtsTokenCount: 7},
+			wantIn:  10,
+			wantOut: 7,
+		},
+		{
+			name:    "cached content not double-counted",
+			meta:    usageMetadata{PromptTokenCount: 100, CachedContentTokenCount: 40, CandidatesTokenCount: intPtr(8)},
+			wantIn:  100,
+			wantOut: 8,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.meta.inputTokens(); got != tc.wantIn {
+				t.Errorf("input = %d, want %d", got, tc.wantIn)
+			}
+			if got := tc.meta.outputTokens(); got != tc.wantOut {
+				t.Errorf("output = %d, want %d", got, tc.wantOut)
+			}
+		})
+	}
+}
+
+func TestDecodeStreamLateUsageMetadata(t *testing.T) {
+	// Usage arrives only after finishReason content, including thoughts.
+	sse := "" +
+		"data: {\"response\":{\"responseId\":\"r1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}}\n\n" +
+		"data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":3,\"thoughtsTokenCount\":7,\"cachedContentTokenCount\":4}}}\n\n"
+	var finish *ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			cp := ev
+			finish = &cp
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finish == nil {
+		t.Fatal("missing finish")
+	}
+	if finish.InputTokens != 12 || finish.OutputTokens != 10 {
+		t.Fatalf("usage = %d/%d, want 12/10", finish.InputTokens, finish.OutputTokens)
+	}
+}
+
+func TestDecodeStreamThoughtOnlyUsageMetadata(t *testing.T) {
+	sse := "data: {\"response\":{\"responseId\":\"r-thought\",\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"thoughtsTokenCount\":7}}}\n\n"
+	var finish *ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			cp := ev
+			finish = &cp
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finish == nil || finish.InputTokens != 10 || finish.OutputTokens != 7 {
+		t.Fatalf("finish = %+v, want usage 10/7", finish)
+	}
+}
+
+func TestDecodeStreamLateTotalDerivedZeroOverwritesOutput(t *testing.T) {
+	// Earlier nonzero candidates must yield to a later authoritative metadata
+	// chunk that omits candidates and carries a total that derives output=0.
+	sse := "" +
+		"data: {\"response\":{\"responseId\":\"r2\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}}\n\n" +
+		"data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":10,\"totalTokenCount\":10}}}\n\n"
+	var finish *ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			cp := ev
+			finish = &cp
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finish == nil {
+		t.Fatal("missing finish")
+	}
+	if finish.InputTokens != 10 || finish.OutputTokens != 0 {
+		t.Fatalf("usage = %d/%d, want 10/0", finish.InputTokens, finish.OutputTokens)
 	}
 }
 

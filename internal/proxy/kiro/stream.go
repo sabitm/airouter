@@ -122,19 +122,39 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			}
 
 		case "metricsEvent":
+			// Base input excludes separately reported cache fields; fold cache-read
+			// and cache-creation into the input total. Accept camelCase and snake_case
+			// aliases; camel takes precedence when both are present. Missing fields stay 0.
 			var p struct {
-				InputTokens          int `json:"inputTokens"`
-				OutputTokens         int `json:"outputTokens"`
-				CacheReadInputTokens int `json:"cacheReadInputTokens"`
+				InputTokens                   int `json:"inputTokens"`
+				OutputTokens                  int `json:"outputTokens"`
+				CacheReadInputTokens          int `json:"cacheReadInputTokens"`
+				CacheReadInputTokensSnake     int `json:"cache_read_input_tokens"`
+				CacheCreationInputTokens      int `json:"cacheCreationInputTokens"`
+				CacheCreationInputTokensSnake int `json:"cache_creation_input_tokens"`
 			}
 			if json.Unmarshal(msg.payload, &p) == nil {
-				inputTokens = p.InputTokens + p.CacheReadInputTokens
+				if err := ensureStarted(); err != nil {
+					return err
+				}
+				cacheRead := p.CacheReadInputTokens
+				if cacheRead == 0 {
+					cacheRead = p.CacheReadInputTokensSnake
+				}
+				cacheCreation := p.CacheCreationInputTokens
+				if cacheCreation == 0 {
+					cacheCreation = p.CacheCreationInputTokensSnake
+				}
+				inputTokens = p.InputTokens + cacheRead + cacheCreation
 				outputTokens = p.OutputTokens
 			}
 
 		case "messageStopEvent":
-			// Terminal marker; the finish event is emitted once after the loop so
-			// late metrics/usage are included.
+			// A valid empty response may contain only a stop marker. Start a minimal
+			// response so callers still receive the terminal event.
+			if err := ensureStarted(); err != nil {
+				return err
+			}
 		}
 	}
 

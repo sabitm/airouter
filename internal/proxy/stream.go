@@ -31,6 +31,14 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
 	}
+	// OpenAI Chat streaming omits a terminal usage chunk unless asked; force it
+	// on same-id passthrough so logs and clients still see authoritative counts.
+	if ingress.id == "oai-chat" {
+		rewritten, err = forceOpenAIStreamIncludeUsage(rewritten)
+		if err != nil {
+			return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
+		}
+	}
 	resp, err := p.forwardStream(ctx, provider, ingress.upstreamPath, rewritten, clientHeaders, ingress.streamAccept)
 	if err != nil {
 		if resp != nil {
@@ -73,54 +81,44 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 			}
 			return committed()
 		}
-		sniffStreamUsage(ev.Data, res)
+		sniffStreamUsage(ev.Data, res, ingress.id)
 		if err := sw.WriteEvent(ev.Name, ev.Data); err != nil {
 			return committed() // client disconnected
 		}
 	}
 }
 
-// sniffStreamUsage extracts token counts from one raw SSE event's data,
-// accepting both OpenAI (prompt_tokens/completion_tokens, top-level usage) and
-// Anthropic (input_tokens/output_tokens, nested under message.usage at start or
-// usage at message_delta) shapes. Each field is only overwritten when present
-// and nonzero, so values reported on different events across the stream
-// accumulate rather than reset.
-func sniffStreamUsage(data []byte, res *reqResult) {
+// sniffStreamUsage extracts token counts from one raw SSE event's data without
+// mutating the relayed bytes. OpenAI nests usage top-level; Anthropic under
+// message.usage / message_delta usage; Responses under response.usage. Each
+// field is only overwritten when the chosen family yields a nonzero total, so
+// values reported on different events across the stream accumulate rather than
+// reset. codecID selects one alias family so hybrid objects are not double-counted.
+func sniffStreamUsage(data []byte, res *reqResult, codecID string) {
 	if len(data) == 0 || data[0] != '{' {
 		return
 	}
-	// Anthropic reports cached input under separate fields (cache_creation /
-	// cache_read); fold them into the input total so cache state does not skew it.
-	type usageFields struct {
-		PromptTokens             int `json:"prompt_tokens"`
-		CompletionTokens         int `json:"completion_tokens"`
-		InputTokens              int `json:"input_tokens"`
-		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-		OutputTokens             int `json:"output_tokens"`
-	}
 	var u struct {
-		Usage   *usageFields `json:"usage"`
+		Usage   json.RawMessage `json:"usage"`
 		Message *struct {
-			Usage *usageFields `json:"usage"`
+			Usage json.RawMessage `json:"usage"`
 		} `json:"message"`
-		// Responses nests usage under response.usage on the response.completed event.
 		Response *struct {
-			Usage *usageFields `json:"usage"`
+			Usage json.RawMessage `json:"usage"`
 		} `json:"response"`
 	}
 	if json.Unmarshal(data, &u) != nil {
 		return
 	}
-	apply := func(f *usageFields) {
-		if f == nil {
+	apply := func(raw json.RawMessage) {
+		if len(raw) == 0 {
 			return
 		}
-		if in := f.PromptTokens + f.InputTokens + f.CacheCreationInputTokens + f.CacheReadInputTokens; in != 0 {
+		in, out := parseUsageObject(raw, codecID)
+		if in != 0 {
 			res.inTok = in
 		}
-		if out := f.CompletionTokens + f.OutputTokens; out != 0 {
+		if out != 0 {
 			res.outTok = out
 		}
 	}
@@ -131,6 +129,31 @@ func sniffStreamUsage(data []byte, res *reqResult) {
 	if u.Response != nil {
 		apply(u.Response.Usage)
 	}
+}
+
+// forceOpenAIStreamIncludeUsage sets stream_options.include_usage=true on an
+// OpenAI Chat Completions body so upstream emits a terminal usage chunk. Other
+// stream_options keys are preserved; include_usage=false is overridden. No-op
+// when stream is not true.
+func forceOpenAIStreamIncludeUsage(body []byte) ([]byte, error) {
+	var generic map[string]json.RawMessage
+	if err := json.Unmarshal(body, &generic); err != nil {
+		return nil, err
+	}
+	var stream bool
+	if raw, ok := generic["stream"]; ok {
+		_ = json.Unmarshal(raw, &stream)
+	}
+	if !stream {
+		return body, nil
+	}
+	opts := map[string]json.RawMessage{}
+	if raw, ok := generic["stream_options"]; ok && len(raw) > 0 && raw[0] == '{' {
+		_ = json.Unmarshal(raw, &opts)
+	}
+	opts["include_usage"], _ = json.Marshal(true)
+	generic["stream_options"], _ = json.Marshal(opts)
+	return json.Marshal(generic)
 }
 
 // streamTranslated converts an ingress streaming request to the backend

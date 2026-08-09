@@ -3,21 +3,21 @@ package antigravity
 // Cloud Code envelope and Gemini-shaped wire types for Antigravity chat.
 
 type envelope struct {
-	Project     string         `json:"project"`
-	Model       string         `json:"model"`
-	UserAgent   string         `json:"userAgent"`
-	RequestType string         `json:"requestType"`
-	RequestID   string         `json:"requestId,omitempty"`
-	Request     geminiRequest  `json:"request"`
+	Project     string        `json:"project"`
+	Model       string        `json:"model"`
+	UserAgent   string        `json:"userAgent"`
+	RequestType string        `json:"requestType"`
+	RequestID   string        `json:"requestId,omitempty"`
+	Request     geminiRequest `json:"request"`
 }
 
 type geminiRequest struct {
-	SessionID         string             `json:"sessionId,omitempty"`
-	Contents          []geminiContent    `json:"contents,omitempty"`
-	SystemInstruction *geminiContent     `json:"systemInstruction,omitempty"`
-	GenerationConfig  *generationConfig  `json:"generationConfig,omitempty"`
-	Tools             []geminiToolGroup  `json:"tools,omitempty"`
-	ToolConfig        *toolConfig        `json:"toolConfig,omitempty"`
+	SessionID         string            `json:"sessionId,omitempty"`
+	Contents          []geminiContent   `json:"contents,omitempty"`
+	SystemInstruction *geminiContent    `json:"systemInstruction,omitempty"`
+	GenerationConfig  *generationConfig `json:"generationConfig,omitempty"`
+	Tools             []geminiToolGroup `json:"tools,omitempty"`
+	ToolConfig        *toolConfig       `json:"toolConfig,omitempty"`
 }
 
 type geminiContent struct {
@@ -101,7 +101,53 @@ type candidate struct {
 }
 
 type usageMetadata struct {
-	PromptTokenCount     int `json:"promptTokenCount"`
-	CandidatesTokenCount int `json:"candidatesTokenCount"`
-	TotalTokenCount      int `json:"totalTokenCount"`
+	PromptTokenCount int `json:"promptTokenCount"`
+	// CandidatesTokenCount is pointer-aware so an explicit zero is preferred
+	// over deriving candidates from totalTokenCount.
+	CandidatesTokenCount    *int `json:"candidatesTokenCount"`
+	ThoughtsTokenCount      int  `json:"thoughtsTokenCount"`
+	CachedContentTokenCount int  `json:"cachedContentTokenCount"`
+	// TotalTokenCount is pointer-aware so a present zero can still authorize
+	// total-based candidate derivation when candidates is absent.
+	TotalTokenCount *int `json:"totalTokenCount"`
+}
+
+// inputTokens is promptTokenCount only. cachedContentTokenCount is a subset of
+// prompt and must not be added again.
+func (u *usageMetadata) inputTokens() int {
+	if u == nil {
+		return 0
+	}
+	return u.PromptTokenCount
+}
+
+// hasAuthoritativeOutput reports whether this metadata carries known output:
+// explicit candidates (including zero), a total for derivation, or positive
+// thoughts when the other aggregate fields are omitted.
+func (u *usageMetadata) hasAuthoritativeOutput() bool {
+	if u == nil {
+		return false
+	}
+	return u.CandidatesTokenCount != nil || u.TotalTokenCount != nil || u.ThoughtsTokenCount > 0
+}
+
+// outputTokens is candidates + thoughts. When candidates is absent and total is
+// present, candidates are derived as max(total-prompt-thoughts, 0).
+func (u *usageMetadata) outputTokens() int {
+	if u == nil {
+		return 0
+	}
+	candidates := 0
+	if u.CandidatesTokenCount != nil {
+		candidates = *u.CandidatesTokenCount
+		if candidates < 0 {
+			candidates = 0
+		}
+	} else if u.TotalTokenCount != nil {
+		candidates = *u.TotalTokenCount - u.PromptTokenCount - u.ThoughtsTokenCount
+		if candidates < 0 {
+			candidates = 0
+		}
+	}
+	return candidates + u.ThoughtsTokenCount
 }

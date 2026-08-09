@@ -46,11 +46,16 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			model = resp.ModelVersion
 		}
 		if resp.UsageMetadata != nil {
-			if resp.UsageMetadata.PromptTokenCount > 0 {
-				inputTokens = resp.UsageMetadata.PromptTokenCount
+			// Latest authoritative usage wins, including late-only metadata chunks.
+			// Prompt stays positive-only: Gemini usage is cumulative and a bare
+			// zero is not a meaningful overwrite of earlier prompt counts.
+			if in := resp.UsageMetadata.inputTokens(); in > 0 {
+				inputTokens = in
 			}
-			if resp.UsageMetadata.CandidatesTokenCount > 0 {
-				outputTokens = resp.UsageMetadata.CandidatesTokenCount
+			// Output accepts explicit candidates (including zero), a present total
+			// used for derivation, or positive thoughts reported on their own.
+			if resp.UsageMetadata.hasAuthoritativeOutput() {
+				outputTokens = resp.UsageMetadata.outputTokens()
 			}
 		}
 		if !started {
