@@ -369,15 +369,21 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		}
 		resp, err := p.client.Do(req)
 		if err != nil {
+			if harRecorder(ctx) != nil {
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, 0, nil, nil, "", 0, err.Error())
+			}
 			return 0, nil, err
 		}
 		defer resp.Body.Close()
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
+			if harRecorder(ctx) != nil {
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody), err.Error())
+			}
 			return resp.StatusCode, nil, err
 		}
 		if harRecorder(ctx) != nil {
-			p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody))
+			p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody), "")
 		}
 		return resp.StatusCode, respBody, nil
 	}
@@ -438,6 +444,9 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		}
 		resp, err := p.streamClient.Do(req)
 		if err != nil {
+			if harRecorder(ctx) != nil {
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, 0, nil, nil, "", 0, err.Error())
+			}
 			return nil, err
 		}
 		if harRecorder(ctx) != nil {
@@ -500,7 +509,7 @@ func harRecorder(ctx context.Context) *harlog.Recorder {
 // recorder. pageID comes from TraceInfo.RequestID so it shares a page with the
 // ingress entry. respBodySize is the full wire length (may exceed len(respBody)
 // when a stream tee already truncated).
-func (p *Proxy) recordUpstreamHAR(ctx context.Context, started time.Time, dur time.Duration, method, url string, reqHdr http.Header, reqBody []byte, status int, respHdr http.Header, respBody []byte, respMIME string, respBodySize int) {
+func (p *Proxy) recordUpstreamHAR(ctx context.Context, started time.Time, dur time.Duration, method, url string, reqHdr http.Header, reqBody []byte, status int, respHdr http.Header, respBody []byte, respMIME string, respBodySize int, failure string) {
 	rec := harRecorder(ctx)
 	if rec == nil {
 		return
@@ -527,6 +536,7 @@ func (p *Proxy) recordUpstreamHAR(ctx context.Context, started time.Time, dur ti
 		RespBody:     respBody,
 		RespMIME:     respMIME,
 		RespBodySize: respBodySize,
+		Failure:      failure,
 	})
 }
 
@@ -553,24 +563,28 @@ type harCaptureBody struct {
 	status  int
 	respHdr http.Header
 	mime    string
-	record  func(ctx context.Context, started time.Time, dur time.Duration, method, url string, reqHdr http.Header, reqBody []byte, status int, respHdr http.Header, respBody []byte, respMIME string, respBodySize int)
+	record  func(ctx context.Context, started time.Time, dur time.Duration, method, url string, reqHdr http.Header, reqBody []byte, status int, respHdr http.Header, respBody []byte, respMIME string, respBodySize int, failure string)
 	ctx     context.Context
 
-	mu     sync.Mutex
-	cap    *observability.Capture
-	closed bool
+	mu      sync.Mutex
+	cap     *observability.Capture
+	readErr error
+	closed  bool
 }
 
 func (c *harCaptureBody) Read(p []byte) (int, error) {
 	n, err := c.rc.Read(p)
+	c.mu.Lock()
 	if n > 0 {
-		c.mu.Lock()
 		if c.cap == nil {
 			c.cap = observability.NewCapture(harlog.MaxBody)
 		}
 		_, _ = c.cap.Write(p[:n])
-		c.mu.Unlock()
 	}
+	if err != nil && err != io.EOF {
+		c.readErr = err
+	}
+	c.mu.Unlock()
 	return n, err
 }
 
@@ -587,13 +601,19 @@ func (c *harCaptureBody) Close() error {
 		body = append([]byte(nil), c.cap.Bytes()...)
 		total = int(c.cap.Total())
 	}
+	var failure string
+	if c.readErr != nil {
+		failure = c.readErr.Error()
+	} else if err := c.ctx.Err(); err != nil {
+		failure = err.Error()
+	}
 	c.mu.Unlock()
 
 	// If nothing was read (e.g. closed after a 401 before the body was drained),
 	// still record headers/status with an empty body. total may exceed len(body)
 	// when the tee hit MaxBody.
 	if c.record != nil {
-		c.record(c.ctx, c.started, time.Since(c.started), c.method, c.url, c.reqHdr, c.reqBody, c.status, c.respHdr, body, c.mime, total)
+		c.record(c.ctx, c.started, time.Since(c.started), c.method, c.url, c.reqHdr, c.reqBody, c.status, c.respHdr, body, c.mime, total, failure)
 	}
 	return c.rc.Close()
 }

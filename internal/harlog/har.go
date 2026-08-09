@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -90,6 +91,9 @@ type RecordInput struct {
 	// record the original wire length (used when a stream tee already truncated).
 	ReqBodySize  int
 	RespBodySize int
+	// Failure describes a transport or body-read failure. A request that failed
+	// before receiving response headers uses status 0, as expected by HAR tools.
+	Failure string
 }
 
 // Record appends one HAR entry. Bodies over MaxBody are truncated in place and
@@ -113,6 +117,16 @@ func (r *Recorder) Record(in RecordInput) {
 	}
 	reqBody, reqComment := clipBody(in.ReqBody, reqOrig)
 	respBody, respComment := clipBody(in.RespBody, respOrig)
+	failure := strings.TrimSpace(in.Failure)
+	responseComment := respComment
+	if failure != "" {
+		failure = "request failed: " + failure
+		if responseComment == "" {
+			responseComment = failure
+		} else {
+			responseComment += "; " + failure
+		}
+	}
 
 	reqMIME := headerMIME(in.ReqHeaders)
 	if reqMIME == "" {
@@ -156,9 +170,10 @@ func (r *Recorder) Record(in RecordInput) {
 			RedirectURL: "",
 			HeadersSize: -1,
 			BodySize:    int64(respOrig),
-			Comment:     respComment,
+			Comment:     responseComment,
 		},
-		Cache: harCache{},
+		Cache:   harCache{},
+		Comment: failure,
 		Timings: harTimings{
 			Blocked: -1,
 			DNS:     -1,
@@ -362,6 +377,7 @@ type harEntry struct {
 	Cache           harCache    `json:"cache"`
 	Timings         harTimings  `json:"timings"`
 	PageRef         string      `json:"pageref"`
+	Comment         string      `json:"comment,omitempty"`
 }
 
 type harRequest struct {

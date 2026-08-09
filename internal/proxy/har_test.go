@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,170 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/harlog"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type failingReadCloser struct {
+	body []byte
+	read bool
+}
+
+func (r *failingReadCloser) Read(p []byte) (int, error) {
+	if !r.read {
+		r.read = true
+		return copy(p, r.body), nil
+	}
+	return 0, errors.New("upstream body interrupted")
+}
+
+func (r *failingReadCloser) Close() error { return nil }
+
+func TestUpstreamHARRecordsCancellationBeforeHeaders(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "unary"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			rec := harlog.New("cancel")
+			ctx := WithTraceInfo(context.Background(), &TraceInfo{RequestID: name, HAR: rec})
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			entered := make(chan struct{})
+			transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				close(entered)
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			})
+			p := New(nil, nil)
+			p.client = &http.Client{Transport: transport}
+			p.streamClient = &http.Client{Transport: transport}
+			provider := &domain.Provider{BaseURL: "https://provider.example", APIKey: "up-secret", Protocol: domain.ProtocolOpenAI}
+			body := []byte(`{"model":"upstream-model","stream":true}`)
+
+			done := make(chan error, 1)
+			go func() {
+				if stream {
+					_, err := p.forwardStream(ctx, provider, "/chat/completions", body, nil, "")
+					done <- err
+					return
+				}
+				_, _, err := p.forward(ctx, provider, "/chat/completions", body, nil)
+				done <- err
+			}()
+			<-entered
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("forward error = %v, want context canceled", err)
+			}
+
+			data, err := rec.MarshalHAR()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc struct {
+				Log struct {
+					Entries []struct {
+						Comment string `json:"comment"`
+						Request struct {
+							URL      string                         `json:"url"`
+							Headers  []struct{ Name, Value string } `json:"headers"`
+							PostData *struct{ Text string }         `json:"postData"`
+						} `json:"request"`
+						Response struct {
+							Status  int    `json:"status"`
+							Comment string `json:"comment"`
+						} `json:"response"`
+					} `json:"entries"`
+				} `json:"log"`
+			}
+			if err := json.Unmarshal(data, &doc); err != nil {
+				t.Fatal(err)
+			}
+			if len(doc.Log.Entries) != 1 {
+				t.Fatalf("entries = %d, want 1", len(doc.Log.Entries))
+			}
+			e := doc.Log.Entries[0]
+			if e.Response.Status != 0 {
+				t.Fatalf("status = %d, want 0", e.Response.Status)
+			}
+			if !strings.Contains(e.Comment, "context canceled") || !strings.Contains(e.Response.Comment, "context canceled") {
+				t.Fatalf("failure comments = entry %q response %q", e.Comment, e.Response.Comment)
+			}
+			if e.Request.URL != "https://provider.example/chat/completions" {
+				t.Fatalf("url = %q", e.Request.URL)
+			}
+			if e.Request.PostData == nil || e.Request.PostData.Text != string(body) {
+				t.Fatalf("postData = %+v", e.Request.PostData)
+			}
+			foundAuth := false
+			for _, h := range e.Request.Headers {
+				if strings.EqualFold(h.Name, "Authorization") && h.Value == "Bearer up-secret" {
+					foundAuth = true
+				}
+			}
+			if !foundAuth {
+				t.Fatalf("missing upstream authorization header: %+v", e.Request.Headers)
+			}
+		})
+	}
+}
+
+func TestUnaryHARRecordsPartialResponseFailure(t *testing.T) {
+	rec := harlog.New("partial")
+	ctx := WithTraceInfo(context.Background(), &TraceInfo{RequestID: "partial", HAR: rec})
+	p := New(nil, nil)
+	p.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/plain"}},
+			Body:       &failingReadCloser{body: []byte("partial response")},
+			Request:    req,
+		}, nil
+	})}
+	provider := &domain.Provider{BaseURL: "https://provider.example", APIKey: "secret", Protocol: domain.ProtocolOpenAI}
+
+	status, _, err := p.forward(ctx, provider, "/chat/completions", []byte(`{"model":"up"}`), nil)
+	if status != http.StatusOK || err == nil || !strings.Contains(err.Error(), "body interrupted") {
+		t.Fatalf("forward status=%d err=%v", status, err)
+	}
+	data, err := rec.MarshalHAR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Log struct {
+			Entries []struct {
+				Comment  string `json:"comment"`
+				Response struct {
+					Status  int    `json:"status"`
+					Comment string `json:"comment"`
+					Content struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"response"`
+			} `json:"entries"`
+		} `json:"log"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Log.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(doc.Log.Entries))
+	}
+	e := doc.Log.Entries[0]
+	if e.Response.Status != http.StatusOK || e.Response.Content.Text != "partial response" {
+		t.Fatalf("response = %+v", e.Response)
+	}
+	if !strings.Contains(e.Comment, "body interrupted") || !strings.Contains(e.Response.Comment, "body interrupted") {
+		t.Fatalf("failure comments = entry %q response %q", e.Comment, e.Response.Comment)
+	}
+}
 
 func TestPinnedRecorderUnaryBothLegs(t *testing.T) {
 	var cap capturedUpstream
@@ -146,6 +311,70 @@ func TestNoPinnedRecorderNoCapture(t *testing.T) {
 	// harRecorder nil path: recordUpstreamHAR no-ops; nothing to assert beyond success.
 	if harRecorder(context.Background()) != nil {
 		t.Fatal("expected nil without TraceInfo")
+	}
+}
+
+func TestStreamingHARRecordsCancellationAfterHeaders(t *testing.T) {
+	rec := harlog.New("stream-cancel")
+	baseCtx := WithTraceInfo(context.Background(), &TraceInfo{RequestID: "stream-cancel", HAR: rec})
+	ctx, cancel := context.WithCancel(baseCtx)
+	pr, pw := io.Pipe()
+	body := &harCaptureBody{
+		rc:      pr,
+		started: time.Now(),
+		method:  "POST",
+		url:     "https://up.example/v1/chat/completions",
+		reqBody: []byte(`{"stream":true}`),
+		status:  http.StatusOK,
+		respHdr: http.Header{"Content-Type": []string{"text/event-stream"}},
+		mime:    "text/event-stream",
+		record:  (&Proxy{}).recordUpstreamHAR,
+		ctx:     ctx,
+	}
+	go func() {
+		_, _ = pw.Write([]byte("data: partial\n\n"))
+	}()
+	buf := make([]byte, 64)
+	n, err := body.Read(buf)
+	if err != nil || string(buf[:n]) != "data: partial\n\n" {
+		t.Fatalf("read n=%d err=%v body=%q", n, err, buf[:n])
+	}
+	cancel()
+	_ = pw.CloseWithError(context.Canceled)
+	if err := body.Close(); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+
+	data, err := rec.MarshalHAR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Log struct {
+			Entries []struct {
+				Comment  string `json:"comment"`
+				Response struct {
+					Status  int    `json:"status"`
+					Comment string `json:"comment"`
+					Content struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"response"`
+			} `json:"entries"`
+		} `json:"log"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Log.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(doc.Log.Entries))
+	}
+	e := doc.Log.Entries[0]
+	if e.Response.Status != http.StatusOK || e.Response.Content.Text != "data: partial\n\n" {
+		t.Fatalf("response = %+v", e.Response)
+	}
+	if !strings.Contains(e.Comment, "context canceled") || !strings.Contains(e.Response.Comment, "context canceled") {
+		t.Fatalf("failure comments = entry %q response %q", e.Comment, e.Response.Comment)
 	}
 }
 
