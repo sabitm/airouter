@@ -50,6 +50,7 @@ type streamMessageDelta struct {
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	var stopReason ir.StopReason = ir.StopEndTurn
+	inputTokens := 0
 	outputTokens := 0
 	finished := false
 
@@ -67,9 +68,10 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if json.Unmarshal(ev.Data, &m) != nil {
 				continue
 			}
+			inputTokens = m.Message.Usage.TotalInput()
 			if err := emit(ir.StreamEvent{
 				Kind: ir.EventMessageStart, ID: m.Message.ID, Model: m.Message.Model,
-				InputTokens: m.Message.Usage.TotalInput(),
+				InputTokens: inputTokens,
 			}); err != nil {
 				return err
 			}
@@ -107,16 +109,27 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				continue
 			}
 			stopReason = stopReason2(m.Delta.StopReason)
+			// Some Anthropic-compatible providers defer all usage until the final
+			// delta instead of reporting input at message_start.
+			if in := m.Usage.TotalInput(); in != 0 {
+				inputTokens = in
+			}
 			outputTokens = m.Usage.OutputTokens
 		case "message_stop":
-			if err := emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, OutputTokens: outputTokens}); err != nil {
+			if err := emit(ir.StreamEvent{
+				Kind: ir.EventFinish, StopReason: stopReason,
+				InputTokens: inputTokens, OutputTokens: outputTokens,
+			}); err != nil {
 				return err
 			}
 			finished = true
 		}
 	}
 	if !finished {
-		return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, OutputTokens: outputTokens})
+		return emit(ir.StreamEvent{
+			Kind: ir.EventFinish, StopReason: stopReason,
+			InputTokens: inputTokens, OutputTokens: outputTokens,
+		})
 	}
 	return nil
 }

@@ -51,6 +51,26 @@ data: {"type":"message_stop"}
 
 `
 
+const anthropicLateUsageSSE = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_late","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":735,"output_tokens":14,"cache_creation_input_tokens":0,"cache_read_input_tokens":1536}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
 // anthropicToolSSE streams a single tool_use block whose JSON input arrives in
 // two partial_json fragments.
 const anthropicToolSSE = `event: message_start
@@ -410,6 +430,24 @@ func TestStreamUsageRecorded(t *testing.T) {
 				t.Errorf("tokens = %d/%d, want %d/%d", l.InputTokens, l.OutputTokens, tc.wantIn, tc.wantOut)
 			}
 		})
+	}
+}
+
+func TestAnthropicStreamLateUsageRecordedAndForwarded(t *testing.T) {
+	base, token, st := setupStreamingWithStore(t, domain.ProtocolAnthropic, anthropicLateUsageSSE)
+	resp, body := postStream(t, base+"/v1/chat/completions", token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+
+	in, out, total := collectOpenAIUsage(t, body)
+	if in != 2271 || out != 14 || total != 2285 {
+		t.Errorf("client usage = %d/%d/%d, want 2271/14/2285", in, out, total)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.InputTokens != 2271 || l.OutputTokens != 14 {
+		t.Errorf("logged tokens = %d/%d, want 2271/14", l.InputTokens, l.OutputTokens)
 	}
 }
 
