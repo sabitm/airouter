@@ -150,12 +150,26 @@ func TestDecodeStreamResourceExhaustedAfterContentFinishes(t *testing.T) {
 		out = append(out, ev)
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("after content, error frame should finish cleanly, got %v", err)
+	if err == nil {
+		t.Fatal("after content, error frame must still return an error")
 	}
-	// Should end with a Finish event, not an error.
-	if len(out) == 0 || out[len(out)-1].Kind != ir.EventFinish {
-		t.Errorf("last event = %+v, want Finish", out[len(out)-1])
+	if !contains(err.Error(), "rate limited") {
+		t.Errorf("err = %q, want rate limited", err.Error())
+	}
+	for _, ev := range out {
+		if ev.Kind == ir.EventFinish {
+			t.Fatalf("must not emit Finish after error frame: %+v", out)
+		}
+	}
+	// Partial content should still have been emitted before the error.
+	sawText := false
+	for _, ev := range out {
+		if ev.Kind == ir.EventTextDelta && ev.Text == "partial" {
+			sawText = true
+		}
+	}
+	if !sawText {
+		t.Fatalf("want partial text before error, got %+v", out)
 	}
 }
 
@@ -210,12 +224,13 @@ func bytesContains(s, sub string) bool {
 
 func TestParseCursorError(t *testing.T) {
 	t.Run("non-json raw fallback", func(t *testing.T) {
+		// Raw bodies must not be embedded (terminal logs stay metadata-only).
 		err := parseCursorError([]byte("Internal Server Error"))
-		if !strings.Contains(err.Error(), "Internal Server Error") {
-			t.Errorf("got %q, want raw body", err.Error())
+		if err.Error() != "upstream stream failed" {
+			t.Errorf("got %q, want generic failure", err.Error())
 		}
-		if !strings.Contains(err.Error(), "cursor: upstream error") {
-			t.Errorf("got %q, want cursor prefix", err.Error())
+		if strings.Contains(err.Error(), "Internal Server Error") {
+			t.Errorf("raw body leaked into error: %q", err.Error())
 		}
 	})
 
@@ -262,11 +277,11 @@ func TestParseCursorError(t *testing.T) {
 		}
 	})
 
-	t.Run("empty message no details raw fallback", func(t *testing.T) {
+	t.Run("empty message no details generic fallback", func(t *testing.T) {
 		body := []byte(`{"error":{"code":"x","message":""}}`)
 		err := parseCursorError(body)
-		if !strings.Contains(err.Error(), "cursor: upstream error") {
-			t.Errorf("got %q, want upstream error fallback", err.Error())
+		if err.Error() != "upstream stream failed" {
+			t.Errorf("got %q, want generic failure", err.Error())
 		}
 	})
 }

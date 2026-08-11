@@ -43,7 +43,8 @@ type chunkFn struct {
 
 // DecodeStream reads an OpenAI Chat Completions SSE stream and emits IR stream
 // events. Used when OpenAI is the backend format. The Finish event is deferred
-// to end-of-stream so a trailing usage-only chunk is captured.
+// to end-of-stream so a trailing usage-only chunk is captured. A top-level
+// error object in a data frame returns *ir.StreamFailure without Finish.
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	started := false
@@ -62,8 +63,48 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		if string(ev.Data) == "[DONE]" {
 			break
 		}
+		if len(ev.Data) == 0 || ev.Data[0] != '{' {
+			continue
+		}
+		// Error frames are data-only JSON with a top-level "error" object and no
+		// choices. Detect before treating as a chat chunk so zero-valued error JSON
+		// does not fabricate EventMessageStart.
+		var errProbe struct {
+			Error *struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+				Code    string `json:"code"`
+			} `json:"error"`
+			Choices json.RawMessage `json:"choices"`
+		}
+		if json.Unmarshal(ev.Data, &errProbe) == nil && errProbe.Error != nil && len(errProbe.Choices) == 0 {
+			sf := &ir.StreamFailure{
+				Type:    errProbe.Error.Type,
+				Code:    errProbe.Error.Code,
+				Message: errProbe.Error.Message,
+			}
+			if sf.Message == "" {
+				sf.Message = "upstream stream failed"
+			}
+			return sf
+		}
 		var chunk chatChunk
 		if json.Unmarshal(ev.Data, &chunk) != nil {
+			continue
+		}
+		// Skip frames that carry neither identity, content, finish, nor usage so
+		// arbitrary empty JSON does not open a fabricated successful stream.
+		hasContent := chunk.ID != "" || chunk.Model != "" || chunk.Usage != nil
+		if !hasContent {
+			for _, c := range chunk.Choices {
+				if c.Delta.Role != "" || c.Delta.Content != "" || len(c.Delta.ToolCalls) > 0 ||
+					(c.FinishReason != nil && *c.FinishReason != "") {
+					hasContent = true
+					break
+				}
+			}
+		}
+		if !hasContent {
 			continue
 		}
 		if !started {
@@ -191,6 +232,16 @@ func (e *StreamEncoder) emitUsage(w *sse.Writer) error {
 		Usage:   &chatUsage{PromptTokens: e.usageIn, CompletionTokens: e.usageOut, TotalTokens: e.usageIn + e.usageOut},
 	}
 	raw, _ := marshalChunk(chunk, e.created)
+	return w.WriteEvent("", raw)
+}
+
+// EncodeError writes a terminal OpenAI-style data-only error frame. No finish,
+// usage, or [DONE] follows; official SDKs raise on this shape.
+func (e *StreamEncoder) EncodeError(w *sse.Writer, message, errType string) error {
+	if errType == "" {
+		errType = "api_error"
+	}
+	raw := EncodeError(message, errType)
 	return w.WriteEvent("", raw)
 }
 

@@ -14,12 +14,11 @@ import (
 // StreamUnifiedChatResponse (field 2). Tool-call argument fragments are
 // reassembled by tool id; composer models emit the post-</think> slice of the
 // thinking field as visible text. JSON error frames (resource_exhausted /
-// rate-limit) surface as errors but, if content already streamed, terminate
-// cleanly rather than overwrite a partial response.
+// rate-limit) always return a Go error, including after content has streamed,
+// so the proxy can emit an ingress error frame without fabricating Finish.
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	started := false
 	msgID := ""
-	sawTools := false
 
 	// tool-call reassembly by id: index, name, accumulated args, started flag.
 	type tcall struct {
@@ -85,13 +84,10 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		}
 		data := decompressPayload(payload, flags)
 
-		// JSON error frame: starts with '{'. Surface as error; if content
-		// already streamed, finish cleanly instead of overwriting it.
+		// JSON error frame: starts with '{'. Always surface as error; never emit
+		// Finish so partial content is not reported as a clean completion.
 		if len(data) > 0 && data[0] == 0x7b {
 			if isCursorError(data) {
-				if started || sawTools || len(toolOrder) > 0 {
-					return emitFinish()
-				}
 				return parseCursorError(data)
 			}
 		}
@@ -112,7 +108,6 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if !ok {
 					continue
 				}
-				sawTools = true
 				existing, seen := toolCalls[tc.id]
 				if !seen {
 					existing = &tcall{index: len(toolOrder), id: tc.id, name: tc.name}
@@ -280,7 +275,8 @@ func isCursorError(data []byte) bool {
 func parseCursorError(data []byte) error {
 	var env cursorErrorEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
-		return fmt.Errorf("cursor: upstream error: %s", strings.TrimSpace(string(data)))
+		// Do not embed the raw frame body; terminal logs must stay metadata-only.
+		return &ir.StreamFailure{Message: "upstream stream failed"}
 	}
 	msg := env.Error.Message
 	if msg == "" && len(env.Error.Details) > 0 {
@@ -290,14 +286,20 @@ func parseCursorError(data []byte) error {
 			msg = d.Detail
 		}
 	}
+	sf := &ir.StreamFailure{Code: env.Error.Code, Message: msg}
 	if env.Error.Code == "resource_exhausted" {
-		if msg == "" {
-			msg = "rate limit exceeded"
+		sf.Type = "resource_exhausted"
+		if sf.Message == "" {
+			sf.Message = "rate limit exceeded"
 		}
-		return fmt.Errorf("cursor: rate limited: %s", msg)
+		// Keep the historical "rate limited" phrase for tests/log message checks.
+		sf.Message = fmt.Sprintf("cursor: rate limited: %s", sf.Message)
+		return sf
 	}
-	if msg == "" {
-		return fmt.Errorf("cursor: upstream error: %s", strings.TrimSpace(string(data)))
+	if sf.Message == "" {
+		sf.Message = "upstream stream failed"
+	} else {
+		sf.Message = fmt.Sprintf("cursor: %s", sf.Message)
 	}
-	return fmt.Errorf("cursor: %s", msg)
+	return sf
 }

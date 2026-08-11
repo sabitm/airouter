@@ -63,6 +63,21 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			return err
 		}
 		switch ev.Name {
+		case "error":
+			var env struct {
+				Error *struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if json.Unmarshal(ev.Data, &env) != nil || env.Error == nil {
+				return &ir.StreamFailure{Message: "upstream stream failed"}
+			}
+			sf := &ir.StreamFailure{Type: env.Error.Type, Message: env.Error.Message}
+			if sf.Message == "" {
+				sf.Message = "upstream stream failed"
+			}
+			return sf
 		case "message_start":
 			var m streamMessageStart
 			if json.Unmarshal(ev.Data, &m) != nil {
@@ -275,6 +290,15 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		return e.event(w, "message_stop", map[string]any{})
 	}
 	return nil
+}
+
+// EncodeError writes a terminal Anthropic error event. No message_stop follows.
+func (e *StreamEncoder) EncodeError(w *sse.Writer, message, errType string) error {
+	if errType == "" {
+		errType = "api_error"
+	}
+	raw := EncodeError(message, errType)
+	return w.WriteEvent("error", raw)
 }
 
 func (e *StreamEncoder) Close(w *sse.Writer) error {

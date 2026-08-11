@@ -48,6 +48,12 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		if err != nil {
 			return err
 		}
+		// Smithy exception / error frames use :message-type rather than a content
+		// :event-type. Surface them as failures without fabricating Finish.
+		switch msg.headers[":message-type"] {
+		case "exception", "error":
+			return kiroStreamFailure(msg)
+		}
 		eventType := msg.headers[":event-type"]
 		switch eventType {
 		case "assistantResponseEvent", "codeEvent":
@@ -165,6 +171,31 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		stop = ir.StopToolUse
 	}
 	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stop, InputTokens: inputTokens, OutputTokens: outputTokens})
+}
+
+// kiroStreamFailure parses known safe fields from an EventStream exception frame.
+func kiroStreamFailure(msg *esMessage) *ir.StreamFailure {
+	sf := &ir.StreamFailure{
+		Type: msg.headers[":exception-type"],
+		Code: msg.headers[":error-code"],
+	}
+	if sf.Type == "" {
+		sf.Type = msg.headers[":event-type"]
+	}
+	var p struct {
+		Message string `json:"message"`
+		Msg     string `json:"Message"`
+	}
+	if json.Unmarshal(msg.payload, &p) == nil {
+		sf.Message = p.Message
+		if sf.Message == "" {
+			sf.Message = p.Msg
+		}
+	}
+	if sf.Message == "" {
+		sf.Message = "upstream stream failed"
+	}
+	return sf
 }
 
 // toolInputFragment renders a toolUseEvent input to a JSON argument fragment.

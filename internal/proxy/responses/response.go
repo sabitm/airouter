@@ -17,6 +17,14 @@ type respObject struct {
 	Output            []respOutputItem `json:"output"`
 	IncompleteDetails *respIncomplete  `json:"incomplete_details"`
 	Usage             *respUsage       `json:"usage"`
+	Error             *respErrorObject `json:"error"`
+}
+
+// respErrorObject is the nested error on a failed Responses object or SSE frame.
+type respErrorObject struct {
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 type respIncomplete struct {
@@ -47,6 +55,13 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 	var resp respObject
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("responses: decode response: %w", err)
+	}
+	if resp.Status == "failed" {
+		fail := streamFailureFrom(nil, &resp)
+		if fail == nil {
+			fail = &ir.StreamFailure{Message: "upstream response failed"}
+		}
+		return nil, fail
 	}
 	out := &ir.Response{ID: resp.ID, Model: resp.Model, StopReason: ir.StopEndTurn}
 	sawTool := false

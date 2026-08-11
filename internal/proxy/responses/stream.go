@@ -13,11 +13,12 @@ import (
 // reads. The event kind is taken from the JSON "type" field rather than the SSE
 // event name, so a producer that omits the name still decodes.
 type streamEnvelope struct {
-	Type        string      `json:"type"`
-	OutputIndex int         `json:"output_index"`
-	Delta       string      `json:"delta"`
-	Item        *streamItem `json:"item"`
-	Response    *respObject `json:"response"`
+	Type        string           `json:"type"`
+	OutputIndex int              `json:"output_index"`
+	Delta       string           `json:"delta"`
+	Item        *streamItem      `json:"item"`
+	Response    *respObject      `json:"response"`
+	Error       *respErrorObject `json:"error"`
 }
 
 type streamItem struct {
@@ -30,12 +31,14 @@ type streamItem struct {
 // Used when Responses is the backend format. Tool calls are keyed by the event
 // output_index so argument fragments attribute to the right call. The Finish
 // event is deferred to end-of-stream so the response.completed usage is captured.
+// Explicit error / response.failed frames return *ir.StreamFailure without Finish.
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	started := false
 	sawTool := false
 	stop := ir.StopEndTurn
 	inputTokens, outputTokens := 0, 0
+	var pendingFail *ir.StreamFailure
 
 	ensureStarted := func(id, model string) error {
 		if started {
@@ -61,6 +64,10 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			continue
 		}
 		switch env.Type {
+		case "error":
+			pendingFail = streamFailureFrom(env.Error, nil)
+			// Keep reading so a trailing response.failed can refine the failure;
+			// if the stream ends here, pendingFail is returned below.
 		case "response.created", "response.in_progress":
 			if env.Response != nil {
 				if err := ensureStarted(env.Response.ID, env.Response.Model); err != nil {
@@ -95,7 +102,29 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 					return err
 				}
 			}
-		case "response.completed", "response.incomplete", "response.failed":
+		case "response.failed":
+			fail := streamFailureFrom(nil, env.Response)
+			if pendingFail != nil {
+				if fail == nil {
+					fail = pendingFail
+				} else {
+					// Prefer response.failed fields; fill gaps from a prior error event.
+					if fail.Type == "" {
+						fail.Type = pendingFail.Type
+					}
+					if fail.Code == "" {
+						fail.Code = pendingFail.Code
+					}
+					if fail.Message == "" {
+						fail.Message = pendingFail.Message
+					}
+				}
+			}
+			if fail == nil {
+				fail = &ir.StreamFailure{Message: "upstream response failed"}
+			}
+			return fail
+		case "response.completed", "response.incomplete":
 			if env.Response != nil {
 				if env.Response.Usage != nil {
 					inputTokens = env.Response.Usage.InputTokens
@@ -109,10 +138,42 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			}
 		}
 	}
+	if pendingFail != nil {
+		return pendingFail
+	}
 	if !started {
 		return nil
 	}
 	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stop, InputTokens: inputTokens, OutputTokens: outputTokens})
+}
+
+// streamFailureFrom builds a StreamFailure from a top-level error object and/or
+// a response payload. Parsed fields only; never embeds raw JSON.
+func streamFailureFrom(errObj *respErrorObject, resp *respObject) *ir.StreamFailure {
+	sf := &ir.StreamFailure{}
+	if errObj != nil {
+		sf.Type = errObj.Type
+		sf.Code = errObj.Code
+		sf.Message = errObj.Message
+	}
+	if resp != nil && resp.Error != nil {
+		if sf.Type == "" {
+			sf.Type = resp.Error.Type
+		}
+		if sf.Code == "" {
+			sf.Code = resp.Error.Code
+		}
+		if sf.Message == "" {
+			sf.Message = resp.Error.Message
+		}
+	}
+	if sf.Type == "" && sf.Code == "" && sf.Message == "" {
+		return nil
+	}
+	if sf.Message == "" {
+		sf.Message = "upstream response failed"
+	}
+	return sf
 }
 
 const (
@@ -321,6 +382,21 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		return e.emit(w, "response.completed", map[string]any{"response": e.responseObj(status, e.items, true)})
 	}
 	return nil
+}
+
+// EncodeError writes a terminal Responses error event. No completed/finish follows.
+func (e *StreamEncoder) EncodeError(w *sse.Writer, message, errType string) error {
+	if errType == "" {
+		errType = "api_error"
+	}
+	return e.emit(w, "error", map[string]any{
+		"error": map[string]any{
+			"type":    errType,
+			"message": message,
+			"code":    nil,
+			"param":   nil,
+		},
+	})
 }
 
 func (e *StreamEncoder) openMessageItem(w *sse.Writer) error {

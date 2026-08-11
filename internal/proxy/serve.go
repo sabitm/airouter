@@ -45,7 +45,11 @@ func (res *reqResult) fail(w http.ResponseWriter, ingress codec, status int, mes
 // attemptResult reports the outcome of trying one combo target.
 //
 //   - written:  a response was committed to the client (success, or a stream
-//     that began). The resolution loop must not write anything further.
+//     that began). The resolution loop must not write anything further and must
+//     not attempt another target.
+//   - failed:   when written, marks a committed failure (partial stream then
+//     error). Stops failover like written, but must not clear provider backoff
+//     and must record errMsg on the request log.
 //   - retry:    the attempt failed before committing; the loop may try the next
 //     target. status/errMsg/errType describe the failure for a possible envelope.
 //
@@ -53,6 +57,7 @@ func (res *reqResult) fail(w http.ResponseWriter, ingress codec, status int, mes
 // written nor retry: the loop stops and surfaces the envelope once.
 type attemptResult struct {
 	written bool
+	failed  bool
 	retry   bool
 	status  int
 	errMsg  string
@@ -61,6 +66,16 @@ type attemptResult struct {
 }
 
 func committed() attemptResult { return attemptResult{written: true} }
+
+// committedFailure stops failover after bytes were written, keeps the provider
+// penalized, and surfaces errMsg in request history. status is the HTTP status
+// already committed (typically 200 for SSE).
+func committedFailure(status int, errMsg, logErr string) attemptResult {
+	if logErr == "" {
+		logErr = errMsg
+	}
+	return attemptResult{written: true, failed: true, status: status, errMsg: errMsg, logErr: logErr, errType: "api_error"}
+}
 
 func retryable(status int, message, errType string) attemptResult {
 	return attemptResult{retry: true, status: status, errMsg: message, logErr: message, errType: errType}
@@ -89,6 +104,45 @@ func retryableStreamDecode(err error) attemptResult {
 		logErr:  "upstream stream decode failed",
 		errType: "api_error",
 	}
+}
+
+// retryableStreamFailure maps a structured upstream stream failure to a
+// pre-commit failover result. Client/history get the upstream message; terminal
+// logs get a generic string only.
+func retryableStreamFailure(err error) attemptResult {
+	status := http.StatusBadGateway
+	errMsg := "upstream stream failed"
+	if sf, ok := ir.AsStreamFailure(err); ok {
+		if sf.Message != "" {
+			errMsg = sf.Message
+		}
+		if isServiceUnavailableFailure(sf) {
+			status = http.StatusServiceUnavailable
+		}
+	} else if err != nil && err.Error() != "" {
+		errMsg = err.Error()
+	}
+	return attemptResult{
+		retry:   true,
+		status:  status,
+		errMsg:  errMsg,
+		logErr:  "upstream stream failed",
+		errType: "api_error",
+	}
+}
+
+func isServiceUnavailableFailure(sf *ir.StreamFailure) bool {
+	if sf == nil {
+		return false
+	}
+	if sf.Type == "service_unavailable_error" {
+		return true
+	}
+	switch strings.ToLower(sf.Code) {
+	case "server_is_overloaded", "overloaded", "service_unavailable":
+		return true
+	}
+	return strings.Contains(strings.ToLower(sf.Message), "overloaded")
 }
 
 func terminal(status int, message, errType string) attemptResult {
@@ -230,10 +284,19 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 
 		if !last.retry {
 			// A committed success clears the provider's penalty so it is immediately
-			// eligible again. A terminal pre-commit error (not a failover) leaves the
-			// backoff untouched: it is not an upstream-health signal.
-			if last.written {
+			// eligible again. A committed failure keeps the penalty (bytes went out
+			// so failover is impossible, but the provider was unhealthy). A terminal
+			// pre-commit error leaves backoff untouched: not an upstream-health signal.
+			if last.written && !last.failed {
 				p.clearBackoff(provider.ID)
+			}
+			if last.written && last.failed {
+				res.status = last.status
+				if res.status == 0 {
+					res.status = http.StatusOK
+				}
+				res.errMsg = last.errMsg
+				res.logErr = last.logErr
 			}
 			break
 		}
@@ -489,6 +552,9 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 
 	resp, err := backend.decodeResponse(respBody)
 	if err != nil {
+		if _, ok := ir.AsStreamFailure(err); ok {
+			return retryableStreamFailure(err)
+		}
 		return retryable(http.StatusBadGateway, "failed to decode upstream response", "api_error")
 	}
 	res.inTok = resp.Usage.InputTokens
@@ -520,6 +586,9 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	}
 	irResp, err := collectStreamResponse(resp.Body, backend, upstreamModel)
 	if err != nil {
+		if _, ok := ir.AsStreamFailure(err); ok {
+			return retryableStreamFailure(err)
+		}
 		return retryableStreamDecode(err)
 	}
 	out, err := ingress.encodeResponse(irResp)
@@ -547,7 +616,9 @@ func collectStreamResponse(r io.Reader, backend codec, fallbackModel string) (*i
 	}
 	tools := map[int]*toolBuf{}
 	var order []int
+	sawEvent := false
 	err := backend.decodeStream(r, func(ev ir.StreamEvent) error {
+		sawEvent = true
 		switch ev.Kind {
 		case ir.EventMessageStart:
 			if ev.ID != "" {
@@ -587,6 +658,12 @@ func collectStreamResponse(r io.Reader, backend codec, fallbackModel string) (*i
 	})
 	if err != nil {
 		return nil, err
+	}
+	// A stream that decoded cleanly but produced nothing is an upstream failure,
+	// not an empty assistant turn: without this the caller renders a successful
+	// empty response instead of failing over.
+	if !sawEvent {
+		return nil, &ir.StreamFailure{Message: "upstream returned an empty stream"}
 	}
 	if text.Len() > 0 {
 		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText, Text: text.String()})

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"hash/crc32"
 	"io"
+	"strings"
 	"testing"
 
 	"airouter/internal/proxy/ir"
@@ -406,5 +407,64 @@ func TestToolInputFragment(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// buildExceptionFrame encodes an EventStream exception with :message-type and payload.
+func buildExceptionFrame(exceptionType, payload string) []byte {
+	headers := map[string]string{
+		":message-type":   "exception",
+		":exception-type": exceptionType,
+		":event-type":     exceptionType,
+	}
+	var hdr bytes.Buffer
+	// Deterministic order for test stability.
+	order := []string{":message-type", ":exception-type", ":event-type"}
+	for _, name := range order {
+		val := headers[name]
+		hdr.WriteByte(byte(len(name)))
+		hdr.WriteString(name)
+		hdr.WriteByte(esHeaderStringType)
+		var vl [2]byte
+		binary.BigEndian.PutUint16(vl[:], uint16(len(val)))
+		hdr.Write(vl[:])
+		hdr.WriteString(val)
+	}
+	hb := hdr.Bytes()
+	pl := []byte(payload)
+	totalLen := uint32(esPreludeLen + len(hb) + len(pl) + 4)
+	var prelude [esPreludeLen]byte
+	binary.BigEndian.PutUint32(prelude[0:4], totalLen)
+	binary.BigEndian.PutUint32(prelude[4:8], uint32(len(hb)))
+	binary.BigEndian.PutUint32(prelude[8:12], crc32.ChecksumIEEE(prelude[0:8]))
+	var msg bytes.Buffer
+	msg.Write(prelude[:])
+	msg.Write(hb)
+	msg.Write(pl)
+	var msgCRC [4]byte
+	binary.BigEndian.PutUint32(msgCRC[:], crc32.ChecksumIEEE(msg.Bytes()))
+	msg.Write(msgCRC[:])
+	return msg.Bytes()
+}
+
+func TestDecodeStreamExceptionFrame(t *testing.T) {
+	frame := buildExceptionFrame("ModelStreamErrorException", `{"message":"model overloaded"}`)
+	var events []ir.StreamEvent
+	err := DecodeStream(bytes.NewReader(frame), func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	sf, ok := ir.AsStreamFailure(err)
+	if !ok {
+		t.Fatalf("want StreamFailure, got %v", err)
+	}
+	if !strings.Contains(sf.Message, "overloaded") {
+		t.Errorf("message = %q", sf.Message)
+	}
+	if sf.Type != "ModelStreamErrorException" {
+		t.Errorf("type = %q", sf.Type)
+	}
+	if len(events) != 0 {
+		t.Fatalf("want no events, got %+v", events)
 	}
 }

@@ -52,26 +52,32 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
 
-	sw, ok := sse.NewWriter(w)
-	if !ok {
+	// Check flusher support without writing headers so a pre-event failure can
+	// still fail over. Headers are set only when the first event is relayed.
+	if _, ok := w.(http.Flusher); !ok {
 		return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
 	}
-	// Streaming passthrough relays raw events unchanged; usage is sniffed out of
-	// the relayed SSE without mutating it, so the log can record token counts.
-	res.status = http.StatusOK
-	w.WriteHeader(http.StatusOK)
+	var sw *sse.Writer
+	committedOut := false
 	reader := sse.NewReader(resp.Body)
 	for {
 		ev, err := reader.Next()
 		if err == io.EOF {
+			if !committedOut {
+				return retryable(http.StatusBadGateway, "upstream returned an empty stream", "api_error")
+			}
 			return committed()
 		}
 		if err != nil {
+			// Client disconnects are checked before the commit gate: retrying other
+			// targets for a gone client only wastes upstream calls.
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 				observability.Logger(ctx, p.logger).Debug("client_disconnected",
 					"event", "client_disconnected",
 					"ingress", ingress.id,
 				)
+			} else if !committedOut {
+				return retryable(http.StatusBadGateway, "upstream stream read failed", "api_error")
 			} else {
 				observability.Logger(ctx, p.logger).Error("stream_read_failed",
 					"event", "stream_read_failed",
@@ -80,6 +86,18 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 				)
 			}
 			return committed()
+		}
+		if !committedOut {
+			var ok bool
+			sw, ok = sse.NewWriter(w)
+			if !ok {
+				return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
+			}
+			// Streaming passthrough relays raw events unchanged; usage is sniffed out of
+			// the relayed SSE without mutating it, so the log can record token counts.
+			res.status = http.StatusOK
+			w.WriteHeader(http.StatusOK)
+			committedOut = true
 		}
 		sniffStreamUsage(ev.Data, res, ingress.id)
 		if err := sw.WriteEvent(ev.Name, ev.Data); err != nil {
@@ -207,14 +225,14 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
 
-	sw, ok := sse.NewWriter(w)
-	if !ok {
+	// Check flusher support without writing headers so pre-commit decode failures
+	// can still fail over to the next target.
+	if _, ok := w.(http.Flusher); !ok {
 		return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
 	}
-	res.status = http.StatusOK
-	w.WriteHeader(http.StatusOK)
 
 	enc := ingress.newStreamEncoder(upstreamModel)
+	sink := &translatedSink{w: w, res: res, enc: enc}
 	err = backend.decodeStream(resp.Body, func(ev ir.StreamEvent) error {
 		// Token counts arrive on distinct events depending on backend: Anthropic
 		// reports input at message start, OpenAI reports both at finish. Take
@@ -230,7 +248,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			}
 			res.outTok = ev.OutputTokens
 		}
-		return enc.Encode(ev, sw)
+		return sink.handle(ev)
 	})
 	if err != nil {
 		// A canceled context means the client disconnected after receiving the
@@ -243,16 +261,45 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			)
 			return committed()
 		}
-		// Already streaming; cannot switch to a unary error. Stop cleanly.
+		if !sink.committed {
+			if _, ok := ir.AsStreamFailure(err); ok {
+				return retryableStreamFailure(err)
+			}
+			return retryableStreamDecode(err)
+		}
+		// Post-commit: emit an ingress error frame and record the failure. Close is
+		// skipped so no finish_reason/usage/[DONE] follows; the error frame is terminal.
+		errMsg := "upstream stream decode failed"
+		errType := "api_error"
+		if sf, ok := ir.AsStreamFailure(err); ok {
+			if sf.Message != "" {
+				errMsg = sf.Message
+			}
+			if sf.Type != "" {
+				errType = sf.Type
+			}
+		} else if err.Error() != "" {
+			errMsg = err.Error()
+		}
 		observability.Logger(ctx, p.logger).Error("stream_decode_failed",
 			"event", "stream_decode_failed",
 			"ingress", ingress.id,
 			"backend", backend.id,
 			"error", "upstream stream decode failed",
 		)
-		return committed()
+		if sink.sw != nil {
+			_ = sink.enc.EncodeError(sink.sw, errMsg, errType)
+		}
+		res.errMsg = errMsg
+		res.logErr = "upstream stream decode failed"
+		return committedFailure(http.StatusOK, errMsg, "upstream stream decode failed")
 	}
-	if err := enc.Close(sw); err != nil {
+	if !sink.committed {
+		return retryable(http.StatusBadGateway, "upstream returned an empty stream", "api_error")
+	}
+	// Clean decode with a committed stream: Close emits format trailers ([DONE],
+	// etc.). Skipped on post-commit failure so the error frame stays terminal.
+	if err := enc.Close(sink.sw); err != nil {
 		observability.Logger(ctx, p.logger).Error("stream_encode_close_failed",
 			"event", "stream_encode_close_failed",
 			"ingress", ingress.id,
@@ -261,6 +308,58 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		)
 	}
 	return committed()
+}
+
+// translatedSink buffers lifecycle preamble until the first client-visible byte,
+// then commits SSE headers and replays. Commitment is deferred past
+// EventMessageStart so an upstream error before real output can still fail over.
+type translatedSink struct {
+	w         http.ResponseWriter
+	res       *reqResult
+	enc       streamEncoder
+	sw        *sse.Writer
+	pending   []ir.StreamEvent
+	committed bool
+}
+
+func (s *translatedSink) handle(ev ir.StreamEvent) error {
+	if !s.committed {
+		if ev.Kind == ir.EventMessageStart {
+			s.pending = append(s.pending, ev)
+			return nil
+		}
+		switch ev.Kind {
+		case ir.EventTextDelta, ir.EventToolCallStart, ir.EventToolCallDelta, ir.EventFinish:
+			if err := s.commit(); err != nil {
+				return err
+			}
+		default:
+			s.pending = append(s.pending, ev)
+			return nil
+		}
+	}
+	return s.enc.Encode(ev, s.sw)
+}
+
+func (s *translatedSink) commit() error {
+	if s.committed {
+		return nil
+	}
+	sw, ok := sse.NewWriter(s.w)
+	if !ok {
+		return errors.New("streaming unsupported by server")
+	}
+	s.sw = sw
+	s.res.status = http.StatusOK
+	s.w.WriteHeader(http.StatusOK)
+	s.committed = true
+	for _, ev := range s.pending {
+		if err := s.enc.Encode(ev, s.sw); err != nil {
+			return err
+		}
+	}
+	s.pending = nil
+	return nil
 }
 
 // rewriteModel replaces the top-level "model" field, preserving all other fields.

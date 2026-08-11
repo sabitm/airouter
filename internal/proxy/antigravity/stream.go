@@ -35,7 +35,11 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		if data == "" || data == "[DONE]" {
 			continue
 		}
-		resp, ok := unwrapChunk([]byte(data))
+		raw := []byte(data)
+		if sf, ok := antigravityStreamError(raw); ok {
+			return sf
+		}
+		resp, ok := unwrapChunk(raw)
 		if !ok {
 			continue
 		}
@@ -126,10 +130,8 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	}
 
 	if !started {
-		// Empty stream: still emit a minimal finish so unary collect does not hang empty.
-		if err := emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: ir.NewID("msg_"), Model: model}); err != nil {
-			return err
-		}
+		// Empty / error-only stream: do not fabricate a successful completion.
+		return nil
 	}
 	return emit(ir.StreamEvent{
 		Kind:         ir.EventFinish,
@@ -137,6 +139,35 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		OutputTokens: outputTokens,
 		InputTokens:  inputTokens,
 	})
+}
+
+// antigravityStreamError detects a top-level error envelope that unwrapChunk
+// would otherwise drop. Parsed fields only.
+func antigravityStreamError(data []byte) (*ir.StreamFailure, bool) {
+	if len(data) == 0 || data[0] != '{' {
+		return nil, false
+	}
+	var env struct {
+		Error *struct {
+			Message string `json:"message"`
+			Status  string `json:"status"`
+			Code    any    `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(data, &env) != nil || env.Error == nil {
+		return nil, false
+	}
+	sf := &ir.StreamFailure{Message: env.Error.Message, Type: env.Error.Status}
+	if sf.Message == "" {
+		sf.Message = "upstream stream failed"
+	}
+	switch c := env.Error.Code.(type) {
+	case string:
+		sf.Code = c
+	case float64:
+		sf.Code = fmt.Sprintf("%.0f", c)
+	}
+	return sf, true
 }
 
 func unwrapChunk(data []byte) (*geminiResponse, bool) {

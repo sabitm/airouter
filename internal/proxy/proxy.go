@@ -29,6 +29,9 @@ import (
 // streamEncoder renders IR stream events into an ingress-format SSE stream.
 type streamEncoder interface {
 	Encode(ev ir.StreamEvent, w *sse.Writer) error
+	// EncodeError writes a terminal in-stream error frame for the ingress format.
+	// Callers must not Encode or Close after it.
+	EncodeError(w *sse.Writer, message, errType string) error
 	Close(w *sse.Writer) error
 }
 

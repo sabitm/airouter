@@ -344,3 +344,22 @@ func TestMapFinish(t *testing.T) {
 		})
 	}
 }
+
+func TestDecodeStreamErrorEnvelope(t *testing.T) {
+	sse := "data: {\"error\":{\"code\":503,\"message\":\"backend unavailable\",\"status\":\"UNAVAILABLE\"}}\n\n"
+	var events []ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	sf, ok := ir.AsStreamFailure(err)
+	if !ok {
+		t.Fatalf("want StreamFailure, got %v", err)
+	}
+	if !strings.Contains(sf.Message, "unavailable") {
+		t.Errorf("message = %q", sf.Message)
+	}
+	if len(events) != 0 {
+		t.Fatalf("want no events, got %+v", events)
+	}
+}
