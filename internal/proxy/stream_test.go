@@ -2128,3 +2128,81 @@ func TestTranslatedStreamCommittedFailureKeepsAttemptUsage(t *testing.T) {
 		t.Errorf("request log missing failure: %+v", l)
 	}
 }
+
+func TestResponsesTranslatedNumericErrorFailover(t *testing.T) {
+	const numericFailedSSE = `event: response.created
+data: {"type":"response.created","response":{"id":"resp_bad","model":"up","status":"in_progress"}}
+
+event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_bad","status":"failed","error":{"code":429,"message":"numeric fail"},"output":[],"usage":null}}
+
+`
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, numericFailedSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "r-bad", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAIResponses}
+	p2 := &domain.Provider{Name: "oai-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "numeric fail") || strings.Contains(body, "resp_bad") {
+		t.Fatalf("first target bytes leaked: %s", body)
+	}
+	if strings.Contains(body, `"error"`) {
+		t.Fatalf("failed-target error leaked: %s", body)
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" {
+		t.Errorf("text = %q", text)
+	}
+	if !finished {
+		t.Error("stream not finished")
+	}
+	if got := backoffSkips(px, p1.ID); got == 0 {
+		t.Fatal("failed provider was not penalized")
+	}
+}

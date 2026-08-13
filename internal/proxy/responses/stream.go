@@ -63,11 +63,43 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		if json.Unmarshal(ev.Data, &env) != nil {
 			continue
 		}
-		switch env.Type {
-		case "error":
+		// Failure discriminators are authoritative even when nested metadata is
+		// unusable. Check them before the success switch so a failed status on a
+		// non-response.failed event cannot be ignored.
+		if env.Type == "error" {
 			pendingFail = streamFailureFrom(env.Error, nil)
+			if pendingFail == nil {
+				pendingFail = &ir.StreamFailure{Message: "upstream response failed"}
+			}
 			// Keep reading so a trailing response.failed can refine the failure;
 			// if the stream ends here, pendingFail is returned below.
+			continue
+		}
+		failedStatus := env.Response != nil && env.Response.Status == "failed"
+		if env.Type == "response.failed" || failedStatus {
+			fail := streamFailureFrom(nil, env.Response)
+			if pendingFail != nil {
+				if fail == nil {
+					fail = pendingFail
+				} else {
+					// Prefer response.failed fields; fill gaps from a prior error event.
+					if fail.Type == "" {
+						fail.Type = pendingFail.Type
+					}
+					if fail.Code == "" {
+						fail.Code = pendingFail.Code
+					}
+					if fail.Message == "" {
+						fail.Message = pendingFail.Message
+					}
+				}
+			}
+			if fail == nil {
+				fail = &ir.StreamFailure{Message: "upstream response failed"}
+			}
+			return fail
+		}
+		switch env.Type {
 		case "response.created", "response.in_progress":
 			if env.Response != nil {
 				if err := ensureStarted(env.Response.ID, env.Response.Model); err != nil {
@@ -102,28 +134,6 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 					return err
 				}
 			}
-		case "response.failed":
-			fail := streamFailureFrom(nil, env.Response)
-			if pendingFail != nil {
-				if fail == nil {
-					fail = pendingFail
-				} else {
-					// Prefer response.failed fields; fill gaps from a prior error event.
-					if fail.Type == "" {
-						fail.Type = pendingFail.Type
-					}
-					if fail.Code == "" {
-						fail.Code = pendingFail.Code
-					}
-					if fail.Message == "" {
-						fail.Message = pendingFail.Message
-					}
-				}
-			}
-			if fail == nil {
-				fail = &ir.StreamFailure{Message: "upstream response failed"}
-			}
-			return fail
 		case "response.completed", "response.incomplete":
 			if env.Response != nil {
 				if env.Response.Usage != nil {

@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"time"
@@ -41,6 +42,57 @@ type chunkFn struct {
 	Arguments string `json:"arguments,omitempty"`
 }
 
+// errorScalar decodes optional error metadata without failing the surrounding
+// object. Strings are preserved, numbers keep their original JSON text, and
+// null or unsupported values become empty.
+type errorScalar string
+
+func (s *errorScalar) UnmarshalJSON(data []byte) error {
+	*s = errorScalar(normalizeErrorScalar(data))
+	return nil
+}
+
+func normalizeErrorScalar(data []byte) string {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return ""
+	}
+	switch data[0] {
+	case '"':
+		var s string
+		if json.Unmarshal(data, &s) != nil {
+			return ""
+		}
+		return s
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return string(data)
+	default:
+		return ""
+	}
+}
+
+// chatStreamError is the top-level SSE error object. Field types are tolerated
+// so a numeric code cannot invalidate a recognized failure frame.
+type chatStreamError struct {
+	Message string
+	Type    string
+	Code    string
+}
+
+func (e *chatStreamError) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Message errorScalar `json:"message"`
+		Type    errorScalar `json:"type"`
+		Code    errorScalar `json:"code"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		*e = chatStreamError{}
+		return nil
+	}
+	*e = chatStreamError{Message: string(raw.Message), Type: string(raw.Type), Code: string(raw.Code)}
+	return nil
+}
+
 // DecodeStream reads an OpenAI Chat Completions SSE stream and emits IR stream
 // events. Used when OpenAI is the backend format. The Finish event is deferred
 // to end-of-stream so a trailing usage-only chunk is captured. A top-level
@@ -70,11 +122,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		// choices. Detect before treating as a chat chunk so zero-valued error JSON
 		// does not fabricate EventMessageStart.
 		var errProbe struct {
-			Error *struct {
-				Message string `json:"message"`
-				Type    string `json:"type"`
-				Code    string `json:"code"`
-			} `json:"error"`
+			Error   *chatStreamError  `json:"error"`
 			Choices []json.RawMessage `json:"choices"`
 		}
 		if json.Unmarshal(ev.Data, &errProbe) == nil && errProbe.Error != nil && len(errProbe.Choices) == 0 {

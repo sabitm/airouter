@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -21,10 +22,60 @@ type respObject struct {
 }
 
 // respErrorObject is the nested error on a failed Responses object or SSE frame.
+// Optional metadata is decoded tolerantly so a numeric code or unsupported
+// value cannot invalidate a recognized failure.
 type respErrorObject struct {
-	Type    string `json:"type"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Type    string
+	Code    string
+	Message string
+}
+
+// errorScalar decodes optional error metadata without failing the surrounding
+// object. Strings are preserved, numbers keep their original JSON text, and
+// null or unsupported values become empty.
+type errorScalar string
+
+func (s *errorScalar) UnmarshalJSON(data []byte) error {
+	*s = errorScalar(normalizeErrorScalar(data))
+	return nil
+}
+
+func normalizeErrorScalar(data []byte) string {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return ""
+	}
+	switch data[0] {
+	case '"':
+		var s string
+		if json.Unmarshal(data, &s) != nil {
+			return ""
+		}
+		return s
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return string(data)
+	default:
+		return ""
+	}
+}
+
+func (e *respErrorObject) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" || data[0] != '{' {
+		*e = respErrorObject{}
+		return nil
+	}
+	var raw struct {
+		Type    errorScalar `json:"type"`
+		Code    errorScalar `json:"code"`
+		Message errorScalar `json:"message"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		*e = respErrorObject{}
+		return nil
+	}
+	*e = respErrorObject{Type: string(raw.Type), Code: string(raw.Code), Message: string(raw.Message)}
+	return nil
 }
 
 type respIncomplete struct {
