@@ -1371,3 +1371,502 @@ func TestStreamEmptyBodyFailover(t *testing.T) {
 		t.Errorf("text = %q", text)
 	}
 }
+
+const responsesPreCommitErrSSE = `event: response.created
+data: {"type":"response.created","response":{"id":"resp_bad","model":"up","status":"in_progress"}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_bad","model":"up","status":"in_progress"}}
+
+event: error
+data: {"type":"error","error":{"type":"server_error","code":"boom","message":"precommit boom"}}
+
+event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_bad","status":"failed","error":{"code":"boom","message":"precommit boom"},"output":[],"usage":null}}
+
+`
+
+const openaiPreCommitErrSSE = `data: {"id":"chatcmpl-error","object":"chat.completion.chunk","model":"up","choices":[],"error":{"message":"servers overloaded","type":"server_error","code":"server_is_overloaded"}}
+
+`
+
+const anthropicPreCommitErrSSE = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_bad","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+
+`
+
+const openaiPostCommitErrSSE = `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+data: {"error":{"message":"mid-stream boom","type":"server_error","code":"boom"}}
+
+`
+
+func TestResponsesPassthroughPreCommitErrorFailover(t *testing.T) {
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, responsesPreCommitErrSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, responsesSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "r-bad", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAIResponses}
+	p2 := &domain.Provider{Name: "r-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAIResponses}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/responses", key.Token, `{"model":"default","input":"hi","stream":true}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "precommit boom") || strings.Contains(body, "resp_bad") {
+		t.Fatalf("first target bytes leaked: %s", body)
+	}
+	if !strings.Contains(body, `"delta":"world"`) || !strings.Contains(body, "response.completed") {
+		t.Errorf("fallback stream missing expected events: %s", body)
+	}
+	if got := backoffSkips(px, p1.ID); got == 0 {
+		t.Fatal("failed provider was not penalized")
+	}
+}
+
+func TestOpenAIPassthroughPreCommitErrorFailover(t *testing.T) {
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiPreCommitErrSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "oai-bad", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	p2 := &domain.Provider{Name: "oai-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "overloaded") || strings.Contains(body, "chatcmpl-error") {
+		t.Fatalf("first target bytes leaked: %s", body)
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" {
+		t.Errorf("text = %q", text)
+	}
+	if !finished {
+		t.Error("stream not finished")
+	}
+	if got := backoffSkips(px, p1.ID); got == 0 {
+		t.Fatal("failed provider was not penalized")
+	}
+}
+
+func TestAnthropicPassthroughPreCommitErrorFailover(t *testing.T) {
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, anthropicPreCommitErrSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, anthropicSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "anth-bad", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolAnthropic}
+	p2 := &domain.Provider{Name: "anth-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolAnthropic}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/messages", key.Token,
+		`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "Overloaded") || strings.Contains(body, "msg_bad") {
+		t.Fatalf("first target bytes leaked: %s", body)
+	}
+	text, finished := collectStreamText(t, "/v1/messages", body)
+	if text != "Hello world" {
+		t.Errorf("text = %q", text)
+	}
+	if !finished {
+		t.Error("stream not finished")
+	}
+	if got := backoffSkips(px, p1.ID); got == 0 {
+		t.Fatal("failed provider was not penalized")
+	}
+}
+
+func TestPassthroughSuccessfulLifecycleFlush(t *testing.T) {
+	base, token, st := setupStreamingWithStore(t, domain.ProtocolOpenAIResponses, anthropicSSE)
+	resp, body := postStream(t, base+"/v1/responses", token, `{"model":"default","input":"hi","stream":true}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "event: response.created") {
+		t.Errorf("missing buffered created event: %s", body)
+	}
+	if !strings.Contains(body, `"delta":"Hello "`) || !strings.Contains(body, `"delta":"world"`) {
+		t.Errorf("missing text deltas: %s", body)
+	}
+	if !strings.Contains(body, "response.completed") {
+		t.Errorf("missing completed trailer: %s", body)
+	}
+	createdAt := strings.Index(body, "event: response.created")
+	helloAt := strings.Index(body, `"delta":"Hello "`)
+	worldAt := strings.Index(body, `"delta":"world"`)
+	completedAt := strings.Index(body, "response.completed")
+	if createdAt < 0 || helloAt < createdAt || worldAt < helloAt || completedAt < worldAt {
+		t.Fatalf("event order wrong: created=%d hello=%d world=%d completed=%d", createdAt, helloAt, worldAt, completedAt)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.InputTokens != 3 || l.OutputTokens != 2 {
+		t.Errorf("tokens = %d/%d, want 3/2", l.InputTokens, l.OutputTokens)
+	}
+}
+
+func TestOpenAIPassthroughPostCommitNativeError(t *testing.T) {
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiPostCommitErrSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "oai-partial", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	p2 := &domain.Provider{Name: "oai-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 {
+		t.Fatalf("n1=%d", n1)
+	}
+	if n2 != 0 {
+		t.Fatalf("second target called n2=%d", n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "partial") {
+		t.Errorf("missing partial content: %s", body)
+	}
+	if strings.Count(body, "mid-stream boom") != 1 {
+		t.Fatalf("want exactly one native error, got: %s", body)
+	}
+	if strings.Contains(body, `"finish_reason":"stop"`) || strings.Contains(body, "[DONE]") ||
+		strings.Contains(body, "prompt_tokens") {
+		t.Fatalf("success trailer after error frame: %s", body)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.ErrMsg == "" || !strings.Contains(l.ErrMsg, "mid-stream boom") {
+		t.Fatalf("request log missing failure: %+v", l)
+	}
+	// Existing penalty must survive a later committed native-error stream.
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "partial", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	px.penalizeProvider(p1.ID)
+	before := backoffSkips(px, p1.ID)
+	resp2, body2 := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"partial","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("partial status=%d body=%s", resp2.StatusCode, body2)
+	}
+	after := backoffSkips(px, p1.ID)
+	if after < before {
+		t.Fatalf("committed failure cleared backoff (before=%d after=%d)", before, after)
+	}
+}
+
+func TestPassthroughPreCommitReadFailureFailover(t *testing.T) {
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Hijack and drop the connection after headers so the reader sees a transport error.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("hijack unsupported")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+		_ = conn.Close()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "drop", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	p2 := &domain.Provider{Name: "good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" {
+		t.Errorf("text = %q", text)
+	}
+	if !finished {
+		t.Error("stream not finished")
+	}
+}
+
+func TestPassthroughPostCommitReadFailureNoFailover(t *testing.T) {
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "drop-late", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	p2 := &domain.Provider{Name: "good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 {
+		t.Fatalf("n1=%d", n1)
+	}
+	if n2 != 0 {
+		t.Fatalf("second target called n2=%d", n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "partial") {
+		t.Errorf("missing partial content: %s", body)
+	}
+	if strings.Contains(body, "Hello world") || strings.Contains(body, "[DONE]") {
+		t.Fatalf("unexpected success continuation: %s", body)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.ErrMsg == "" {
+		t.Fatalf("request log missing failure: %+v", l)
+	}
+}

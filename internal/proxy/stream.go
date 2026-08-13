@@ -15,11 +15,11 @@ import (
 	"airouter/internal/proxy/thinking"
 )
 
-// streamPassthrough relays an upstream SSE response of the same protocol as the
-// ingress, rewriting only the request model. Events are re-emitted (preserving
-// names) so each is flushed to the client immediately. It returns an
-// attemptResult so the resolution loop can fail over to the next target on a
-// pre-commit failure; once the 200 header is written the response is committed.
+// streamPassthrough relays an upstream SSE response of the same codec as the
+// ingress, rewriting only the request model. Lifecycle-only events are buffered
+// until visible output or a successful terminal so an explicit protocol error
+// can still fail over. Once the 200 header is written, native events (including
+// a later error frame) are relayed unchanged and failover is forbidden.
 func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, upstreamModel string, body []byte, clientHeaders http.Header, prep *attachmentPrep) attemptResult {
 	if err := p.ensurePassthroughAttachments(ingress, body, prep); err != nil {
 		return mediaTerminal(err)
@@ -53,13 +53,39 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	}
 
 	// Check flusher support without writing headers so a pre-event failure can
-	// still fail over. Headers are set only when the first event is relayed.
+	// still fail over. Headers are set only when the first visible/terminal event is relayed.
 	if _, ok := w.(http.Flusher); !ok {
 		return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
 	}
 	var sw *sse.Writer
 	committedOut := false
+	var pending []sse.Event
 	reader := sse.NewReader(resp.Body)
+
+	commit := func() attemptResult {
+		if committedOut {
+			return attemptResult{}
+		}
+		var ok bool
+		sw, ok = sse.NewWriter(w)
+		if !ok {
+			return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
+		}
+		// Usage is sniffed only from events that are actually relayed so a failed
+		// target's counts cannot contaminate a later winning attempt.
+		res.status = http.StatusOK
+		w.WriteHeader(http.StatusOK)
+		committedOut = true
+		for _, ev := range pending {
+			sniffStreamUsage(ev.Data, res, ingress.id)
+			if err := sw.WriteEvent(ev.Name, ev.Data); err != nil {
+				return committed()
+			}
+		}
+		pending = nil
+		return attemptResult{}
+	}
+
 	for {
 		ev, err := reader.Next()
 		if err == io.EOF {
@@ -76,29 +102,50 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 					"event", "client_disconnected",
 					"ingress", ingress.id,
 				)
-			} else if !committedOut {
+				return committed()
+			}
+			if !committedOut {
 				return retryable(http.StatusBadGateway, "upstream stream read failed", "api_error")
-			} else {
-				observability.Logger(ctx, p.logger).Error("stream_read_failed",
-					"event", "stream_read_failed",
-					"ingress", ingress.id,
-					"error", err,
-				)
 			}
-			return committed()
+			observability.Logger(ctx, p.logger).Error("stream_read_failed",
+				"event", "stream_read_failed",
+				"ingress", ingress.id,
+				"error", err,
+			)
+			const readFail = "upstream stream read failed"
+			res.errMsg = readFail
+			res.logErr = readFail
+			return committedFailure(http.StatusOK, readFail, readFail)
 		}
+
+		class, fail := classifyPassthroughEvent(ingress.id, ev)
 		if !committedOut {
-			var ok bool
-			sw, ok = sse.NewWriter(w)
-			if !ok {
-				return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
+			switch class {
+			case passLifecycle:
+				pending = append(pending, ev)
+				continue
+			case passFailure:
+				return retryableStreamFailure(fail)
 			}
-			// Streaming passthrough relays raw events unchanged; usage is sniffed out of
-			// the relayed SSE without mutating it, so the log can record token counts.
-			res.status = http.StatusOK
-			w.WriteHeader(http.StatusOK)
-			committedOut = true
+			if ar := commit(); ar.written || ar.status != 0 {
+				return ar
+			}
 		}
+
+		if class == passFailure {
+			sniffStreamUsage(ev.Data, res, ingress.id)
+			if err := sw.WriteEvent(ev.Name, ev.Data); err != nil {
+				return committed()
+			}
+			errMsg := "upstream stream failed"
+			if fail != nil && fail.Message != "" {
+				errMsg = fail.Message
+			}
+			res.errMsg = errMsg
+			res.logErr = "upstream stream failed"
+			return committedFailure(http.StatusOK, errMsg, "upstream stream failed")
+		}
+
 		sniffStreamUsage(ev.Data, res, ingress.id)
 		if err := sw.WriteEvent(ev.Name, ev.Data); err != nil {
 			return committed() // client disconnected
