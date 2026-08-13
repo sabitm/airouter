@@ -1059,6 +1059,77 @@ func TestStreamPreCommitOverloadFailover(t *testing.T) {
 	}
 }
 
+func TestOpenAIEmptyChoicesErrorFailover(t *testing.T) {
+	const openaiErrorSSE = `data: {"id":"chatcmpl-error","object":"chat.completion.chunk","model":"up","choices":[],"error":{"message":"servers overloaded","type":"server_error","code":"server_is_overloaded"}}
+
+`
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiErrorSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "oai-bad", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	p2 := &domain.Provider{Name: "oai-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/messages", key.Token,
+		`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "overloaded") || strings.Contains(body, "chatcmpl-error") {
+		t.Fatalf("first target bytes leaked: %s", body)
+	}
+	text, finished := collectStreamText(t, "/v1/messages", body)
+	if text != "Hello world" {
+		t.Errorf("text = %q", text)
+	}
+	if !finished {
+		t.Error("stream not finished")
+	}
+	if got := backoffSkips(px, p1.ID); got == 0 {
+		t.Fatal("failed provider was not penalized")
+	}
+}
+
 func TestStreamPostCommitErrorNoFailover(t *testing.T) {
 	// First target streams real text then an error frame. Second must not be called.
 	const responsesPartialErr = `event: response.created

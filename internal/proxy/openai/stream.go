@@ -75,7 +75,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				Type    string `json:"type"`
 				Code    string `json:"code"`
 			} `json:"error"`
-			Choices json.RawMessage `json:"choices"`
+			Choices []json.RawMessage `json:"choices"`
 		}
 		if json.Unmarshal(ev.Data, &errProbe) == nil && errProbe.Error != nil && len(errProbe.Choices) == 0 {
 			sf := &ir.StreamFailure{
