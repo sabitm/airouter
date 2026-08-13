@@ -95,19 +95,26 @@ func BudgetFor(cfg *Config, min, max int) int {
 	return budget
 }
 
-// NormalizeOpenAILevel clamps max/ultra to xhigh unless AllowMax (or level is
-// listed in caps.Levels).
-func NormalizeOpenAILevel(level string, caps Caps) string {
-	if level != "max" && level != "ultra" {
+// NormalizeCodexLevel constrains max/ultra to the levels accepted by a Codex
+// model.
+func NormalizeCodexLevel(level string, caps Caps) string {
+	switch level {
+	case "max":
+		if caps.AllowMax || levelIn("max", caps.Levels) {
+			return "max"
+		}
+		return "xhigh"
+	case "ultra":
+		if levelIn("ultra", caps.Levels) {
+			return "ultra"
+		}
+		if caps.AllowMax || levelIn("max", caps.Levels) {
+			return "max"
+		}
+		return "xhigh"
+	default:
 		return level
 	}
-	if caps.AllowMax || levelIn(level, caps.Levels) {
-		return level
-	}
-	if level == "ultra" && (caps.AllowMax || levelIn("max", caps.Levels)) {
-		return "max"
-	}
-	return "xhigh"
 }
 
 // MapClaudeAdaptiveLevel maps unified levels onto the adaptive effort set

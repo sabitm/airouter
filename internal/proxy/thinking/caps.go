@@ -36,7 +36,7 @@ type Caps struct {
 	// Levels lists accepted discrete effort values for this model/dialect.
 	// Empty means use the format's default set.
 	Levels []string
-	// AllowMax permits the "max" effort on OpenAI-family writers (else clamp to xhigh).
+	// AllowMax permits "max" when normalizing Codex effort values.
 	AllowMax bool
 	// RequiredDefault, when non-empty, is injected when the caller expressed no
 	// intent (Codex default-low). Empty means no injection without intent.
@@ -109,11 +109,6 @@ func openaiCaps(m string, protocol domain.Protocol) Caps {
 	if isKnownNonReasoner(m) {
 		c.Reasoning = false
 		c.Format = FormatNone
-	}
-	// Models that accept "max" natively (rare; most clamp to xhigh).
-	if allowsOpenAIMax(m) {
-		c.AllowMax = true
-		c.Levels = append(c.Levels, "max")
 	}
 	return c
 }
@@ -293,12 +288,5 @@ func isKnownNonReasoner(m string) bool {
 			return true
 		}
 	}
-	return false
-}
-
-func allowsOpenAIMax(m string) bool {
-	// Most OpenAI models reject "max"; only explicit allow-list (Codex 5.6 handled
-	// in codexCaps). Keep false by default so max->xhigh.
-	_ = m
 	return false
 }

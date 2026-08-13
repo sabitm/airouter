@@ -337,9 +337,9 @@ func writeNative(m map[string]any, cfg *Config, caps Caps, formatID string, prot
 	}
 	switch caps.Format {
 	case FormatOpenAI, FormatGrok:
-		writeOpenAIChat(m, cfg, caps)
+		writeOpenAIChat(m, cfg, caps, protocol)
 	case FormatOpenAIResponses:
-		writeOpenAIResponses(m, cfg, caps)
+		writeOpenAIResponses(m, cfg, caps, protocol)
 	case FormatClaudeAdaptive:
 		writeClaudeAdaptive(m, cfg)
 	case FormatClaudeBudget:
@@ -358,9 +358,9 @@ func writeNative(m map[string]any, cfg *Config, caps Caps, formatID string, prot
 		// Fallback by transport id when format is unset but dialect resolved oddly.
 		switch formatID {
 		case "oai-chat":
-			writeOpenAIChat(m, cfg, caps)
+			writeOpenAIChat(m, cfg, caps, protocol)
 		case "oai-responses":
-			writeOpenAIResponses(m, cfg, caps)
+			writeOpenAIResponses(m, cfg, caps, protocol)
 		case "anth-msg":
 			if caps.Format == FormatClaudeAdaptive {
 				writeClaudeAdaptive(m, cfg)
@@ -372,7 +372,7 @@ func writeNative(m map[string]any, cfg *Config, caps Caps, formatID string, prot
 	_ = protocol
 }
 
-func writeOpenAIChat(m map[string]any, cfg *Config, caps Caps) {
+func writeOpenAIChat(m map[string]any, cfg *Config, caps Caps, protocol domain.Protocol) {
 	if cfg.Mode == ModeNone {
 		if caps.CanDisable {
 			m["reasoning_effort"] = "none"
@@ -383,10 +383,13 @@ func writeOpenAIChat(m map[string]any, cfg *Config, caps Caps) {
 	if level == "" || level == "none" {
 		return
 	}
-	m["reasoning_effort"] = NormalizeOpenAILevel(level, caps)
+	if protocol == domain.ProtocolOpenAICodex {
+		level = NormalizeCodexLevel(level, caps)
+	}
+	m["reasoning_effort"] = level
 }
 
-func writeOpenAIResponses(m map[string]any, cfg *Config, caps Caps) {
+func writeOpenAIResponses(m map[string]any, cfg *Config, caps Caps, protocol domain.Protocol) {
 	r, _ := m["reasoning"].(map[string]any)
 	if r == nil {
 		r = map[string]any{}
@@ -402,7 +405,10 @@ func writeOpenAIResponses(m map[string]any, cfg *Config, caps Caps) {
 	if level == "" || level == "none" {
 		return
 	}
-	r["effort"] = NormalizeOpenAILevel(level, caps)
+	if protocol == domain.ProtocolOpenAICodex {
+		level = NormalizeCodexLevel(level, caps)
+	}
+	r["effort"] = level
 	m["reasoning"] = r
 }
 

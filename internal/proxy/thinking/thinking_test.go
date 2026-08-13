@@ -194,14 +194,52 @@ func TestCapsForKnownNonReasoners(t *testing.T) {
 	}
 }
 
-func TestNormalizeOpenAIMaxClamp(t *testing.T) {
+func TestNormalizeCodexMax(t *testing.T) {
 	caps := CapsFor("gpt-5", domain.ProtocolOpenAI, domain.ReasoningOpenAI)
-	if got := NormalizeOpenAILevel("max", caps); got != "xhigh" {
+	if got := NormalizeCodexLevel("max", caps); got != "xhigh" {
 		t.Fatalf("max clamp = %q", got)
 	}
 	caps.AllowMax = true
-	if got := NormalizeOpenAILevel("max", caps); got != "max" {
+	if got := NormalizeCodexLevel("max", caps); got != "max" {
 		t.Fatalf("allow max = %q", got)
+	}
+}
+
+func TestApplyWireOpenAIMaxPolicy(t *testing.T) {
+	cases := []struct {
+		name     string
+		formatID string
+		protocol domain.Protocol
+		dialect  domain.ReasoningDialect
+		model    string
+		level    string
+		want     string
+	}{
+		{"chat compatible preserves max", "oai-chat", domain.ProtocolOpenAI, domain.ReasoningOpenAI, "cline-pass/deepseek-v4-pro", "max", "max"},
+		{"responses compatible preserves max", "oai-responses", domain.ProtocolOpenAIResponses, domain.ReasoningOpenAI, "hosted-reasoner", "max", "max"},
+		{"classic codex clamps max", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.3-codex", "max", "xhigh"},
+		{"expanded codex preserves max", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.6-luna", "max", "max"},
+		{"max-only codex maps ultra", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.6-luna", "ultra", "max"},
+		{"expanded codex preserves ultra", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.6-sol", "ultra", "ultra"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ApplyWire(tc.formatID, []byte(`{"model":"combo","messages":[]}`), tc.model, &Config{Mode: ModeLevel, Level: tc.level}, tc.protocol, tc.dialect)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			effort, _ := got["reasoning_effort"].(string)
+			if reasoning, ok := got["reasoning"].(map[string]any); ok {
+				effort, _ = reasoning["effort"].(string)
+			}
+			if effort != tc.want {
+				t.Fatalf("effort = %q, want %q; body=%s", effort, tc.want, out)
+			}
+		})
 	}
 }
 
@@ -431,11 +469,11 @@ func TestApplyWireDialectMatrix(t *testing.T) {
 			},
 		},
 		{
-			name: "openai-max-clamps", dialect: domain.ReasoningOpenAI, proto: domain.ProtocolOpenAI, formatID: "oai-chat",
+			name: "openai-max-preserved", dialect: domain.ReasoningOpenAI, proto: domain.ProtocolOpenAI, formatID: "oai-chat",
 			model: "gpt-5", cfg: &Config{Mode: ModeLevel, Level: "max"},
 			check: func(t *testing.T, m map[string]any) {
-				if m["reasoning_effort"] != "xhigh" {
-					t.Fatalf("effort=%v want xhigh", m["reasoning_effort"])
+				if m["reasoning_effort"] != "max" {
+					t.Fatalf("effort=%v want max", m["reasoning_effort"])
 				}
 			},
 		},
@@ -443,7 +481,7 @@ func TestApplyWireDialectMatrix(t *testing.T) {
 			name: "grok", dialect: domain.ReasoningGrok, proto: domain.ProtocolOpenAI, formatID: "oai-chat",
 			model: "grok-4", cfg: &Config{Mode: ModeLevel, Level: "max"},
 			check: func(t *testing.T, m map[string]any) {
-				if m["reasoning_effort"] != "xhigh" {
+				if m["reasoning_effort"] != "max" {
 					t.Fatalf("effort=%v", m["reasoning_effort"])
 				}
 			},

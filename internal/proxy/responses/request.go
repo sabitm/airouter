@@ -210,7 +210,7 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 			out["reasoning"] = map[string]any{"effort": "none"}
 		default:
 			if level := thinking.LevelFor(cfg); level != "" && level != "none" {
-				out["reasoning"] = map[string]any{"effort": thinking.NormalizeOpenAILevel(level, caps)}
+				out["reasoning"] = map[string]any{"effort": level}
 			}
 		}
 	}

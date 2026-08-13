@@ -336,6 +336,31 @@ func TestCodexEncodeRequestIRThinkingOverridesHyphen(t *testing.T) {
 	}
 }
 
+func TestCodexFinalizeNormalizesUnsupportedMax(t *testing.T) {
+	req := &ir.Request{
+		Model:    "gpt-5.3-codex",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "max"},
+	}
+	body, err := responses.EncodeCodexRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &domain.Provider{Protocol: domain.ProtocolOpenAICodex}
+	out, err := finalizeEncodedBody(body, req, codexCodec, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := got["reasoning"].(map[string]any)
+	if reasoning["effort"] != "xhigh" {
+		t.Fatalf("reasoning = %v, want xhigh; body=%s", reasoning, out)
+	}
+}
+
 func TestCodexEncodeRequestIRThinkingMaxMinimalPassThrough(t *testing.T) {
 	for _, lvl := range []string{"max", "minimal"} {
 		body, err := responses.EncodeCodexRequest(&ir.Request{

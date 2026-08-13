@@ -346,7 +346,7 @@ func TestRewriteModelWithThinkingPassthrough(t *testing.T) {
 	}
 }
 
-func TestThinkingMaxClampsOnOpenAIDialect(t *testing.T) {
+func TestThinkingMaxPreservedOnOpenAIDialect(t *testing.T) {
 	in := []byte(`{
 		"model":"default",
 		"messages":[{"role":"user","content":"hi"}]
@@ -372,9 +372,8 @@ func TestThinkingMaxClampsOnOpenAIDialect(t *testing.T) {
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatal(err)
 	}
-	// OpenAI dialect clamps max -> xhigh unless model capability permits max.
-	if got.ReasoningEffort != "xhigh" {
-		t.Fatalf("reasoning_effort = %q, want xhigh", got.ReasoningEffort)
+	if got.ReasoningEffort != "max" {
+		t.Fatalf("reasoning_effort = %q, want max", got.ReasoningEffort)
 	}
 }
 
