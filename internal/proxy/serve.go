@@ -63,6 +63,19 @@ type attemptResult struct {
 	errMsg  string
 	logErr  string
 	errType string
+	// inTok/outTok are this attempt's usage only. They must not be read from
+	// the shared reqResult: a pre-commit failure can decode usage and then
+	// fail over, and that count belongs on this row alone.
+	inTok  int
+	outTok int
+	hasTok bool
+}
+
+func (ar attemptResult) withTokens(in, out int) attemptResult {
+	ar.inTok = in
+	ar.outTok = out
+	ar.hasTok = true
+	return ar
 }
 
 func committed() attemptResult { return attemptResult{written: true} }
@@ -332,6 +345,8 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 				Format:        ingress.id,
 				Stream:        meta.Stream,
 				Status:        last.status,
+				InputTokens:   last.inTok,
+				OutputTokens:  last.outTok,
 				ErrMsg:        last.errMsg,
 				LatencyMS:     time.Since(attemptStart).Milliseconds(),
 			})
@@ -357,6 +372,13 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// upstream_attempt_failed covers each failed provider attempt.
 		res.fail(w, ingress, status, outcome.errMsg, outcome.errType)
 		res.logErr = outcome.logErr
+		// Attachment-only skips never produce usage. A selected real failure
+		// that recorded attempt-local tokens owns the final counts so an
+		// earlier target's pre-commit decode cannot remain on reqResult.
+		if outcome.hasTok {
+			res.inTok = outcome.inTok
+			res.outTok = outcome.outTok
+		}
 	}
 }
 

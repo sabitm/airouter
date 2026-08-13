@@ -280,22 +280,31 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 
 	enc := ingress.newStreamEncoder(upstreamModel)
 	sink := &translatedSink{w: w, res: res, enc: enc}
+	var inTok, outTok int
+	publishUsage := func() {
+		res.inTok = inTok
+		res.outTok = outTok
+	}
 	err = backend.decodeStream(resp.Body, func(ev ir.StreamEvent) error {
 		// Token counts arrive on distinct events depending on backend: Anthropic
-		// reports input at message start, OpenAI reports both at finish. Take
-		// input from whichever event carries a nonzero value.
+		// reports input at message start, OpenAI reports both at finish. Keep
+		// them attempt-local until the sink commits bytes downstream.
 		switch ev.Kind {
 		case ir.EventMessageStart:
 			if ev.InputTokens != 0 {
-				res.inTok = ev.InputTokens
+				inTok = ev.InputTokens
 			}
 		case ir.EventFinish:
 			if ev.InputTokens != 0 {
-				res.inTok = ev.InputTokens
+				inTok = ev.InputTokens
 			}
-			res.outTok = ev.OutputTokens
+			outTok = ev.OutputTokens
 		}
-		return sink.handle(ev)
+		err := sink.handle(ev)
+		if sink.committed {
+			publishUsage()
+		}
+		return err
 	})
 	if err != nil {
 		// A canceled context means the client disconnected after receiving the
@@ -306,13 +315,16 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 				"ingress", ingress.id,
 				"backend", backend.id,
 			)
-			return committed()
+			if sink.committed {
+				publishUsage()
+			}
+			return committed().withTokens(inTok, outTok)
 		}
 		if !sink.committed {
 			if _, ok := ir.AsStreamFailure(err); ok {
-				return retryableStreamFailure(err)
+				return retryableStreamFailure(err).withTokens(inTok, outTok)
 			}
-			return retryableStreamDecode(err)
+			return retryableStreamDecode(err).withTokens(inTok, outTok)
 		}
 		// Post-commit: emit an ingress error frame and record the failure. Close is
 		// skipped so no finish_reason/usage/[DONE] follows; the error frame is terminal.
@@ -339,10 +351,11 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		}
 		res.errMsg = errMsg
 		res.logErr = "upstream stream decode failed"
-		return committedFailure(http.StatusOK, errMsg, "upstream stream decode failed")
+		publishUsage()
+		return committedFailure(http.StatusOK, errMsg, "upstream stream decode failed").withTokens(inTok, outTok)
 	}
 	if !sink.committed {
-		return retryable(http.StatusBadGateway, "upstream returned an empty stream", "api_error")
+		return retryable(http.StatusBadGateway, "upstream returned an empty stream", "api_error").withTokens(inTok, outTok)
 	}
 	// Clean decode with a committed stream: Close emits format trailers ([DONE],
 	// etc.). Skipped on post-commit failure so the error frame stays terminal.
@@ -354,7 +367,8 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			"error", err,
 		)
 	}
-	return committed()
+	publishUsage()
+	return committed().withTokens(inTok, outTok)
 }
 
 // translatedSink buffers lifecycle preamble until the first client-visible byte,

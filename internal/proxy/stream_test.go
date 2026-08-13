@@ -1870,3 +1870,261 @@ func TestPassthroughPostCommitReadFailureNoFailover(t *testing.T) {
 		t.Fatalf("request log missing failure: %+v", l)
 	}
 }
+
+const anthropicPreCommitUsageSSE = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_usage","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":1234,"output_tokens":0}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+
+`
+
+const openaiNoUsageSSE = `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"content":"Hello world"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+
+const openaiWinnerUsageSSE = `data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"content":"Hello world"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}
+
+data: [DONE]
+
+`
+
+const anthropicFinalFailUsageSSE = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_final","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":77,"output_tokens":0}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"final fail"}}
+
+`
+
+const anthropicCommittedFailUsageSSE = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_commit","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":1234,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+event: error
+data: {"type":"error","error":{"type":"server_error","message":"mid-stream boom"}}
+
+`
+
+func findLogByProvider(t *testing.T, logs []*domain.RequestLog, name string) *domain.RequestLog {
+	t.Helper()
+	for _, l := range logs {
+		if l.Provider == name {
+			return l
+		}
+	}
+	t.Fatalf("no request log for provider %q", name)
+	return nil
+}
+
+func setupTranslatedFailover(t *testing.T, p1Name, p2Name, p1Body, p2Body string, p2Proto domain.Protocol) (string, string, *store.Store) {
+	t.Helper()
+	st := newTestStore(t)
+	ctx := context.Background()
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, p1Body)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, p2Body)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	p1 := &domain.Provider{Name: p1Name, BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolAnthropic}
+	p2 := &domain.Provider{Name: p2Name, BaseURL: up2.URL, APIKey: "k", Protocol: p2Proto}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL, key.Token, st
+}
+
+func TestTranslatedStreamFailedUsageDoesNotLeakToWinnerWithoutUsage(t *testing.T) {
+	base, token, st := setupTranslatedFailover(t, "anth-bad", "oai-good", anthropicPreCommitUsageSSE, openaiNoUsageSSE, domain.ProtocolOpenAI)
+	resp, body := postStream(t, base+"/v1/chat/completions", token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" {
+		t.Errorf("text = %q", text)
+	}
+	if !finished {
+		t.Error("stream not finished")
+	}
+	logs := waitForLogs(t, st, 2)
+	failed := findLogByProvider(t, logs, "anth-bad")
+	if failed.InputTokens != 1234 || failed.OutputTokens != 0 {
+		t.Errorf("failed row tokens = %d/%d, want 1234/0", failed.InputTokens, failed.OutputTokens)
+	}
+	if failed.ErrMsg == "" {
+		t.Errorf("failed row missing err: %+v", failed)
+	}
+	winner := findLogByProvider(t, logs, "oai-good")
+	if winner.InputTokens != 0 || winner.OutputTokens != 0 {
+		t.Errorf("winner tokens = %d/%d, want 0/0", winner.InputTokens, winner.OutputTokens)
+	}
+	if winner.ErrMsg != "" {
+		t.Errorf("winner err = %q, want empty", winner.ErrMsg)
+	}
+}
+
+func TestTranslatedStreamFailedUsageDoesNotLeakToWinnerWithUsage(t *testing.T) {
+	base, token, st := setupTranslatedFailover(t, "anth-bad", "oai-good", anthropicPreCommitUsageSSE, openaiWinnerUsageSSE, domain.ProtocolOpenAI)
+	resp, body := postStream(t, base+"/v1/chat/completions", token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	logs := waitForLogs(t, st, 2)
+	failed := findLogByProvider(t, logs, "anth-bad")
+	if failed.InputTokens != 1234 || failed.OutputTokens != 0 {
+		t.Errorf("failed row tokens = %d/%d, want 1234/0", failed.InputTokens, failed.OutputTokens)
+	}
+	winner := findLogByProvider(t, logs, "oai-good")
+	if winner.InputTokens != 3 || winner.OutputTokens != 2 {
+		t.Errorf("winner tokens = %d/%d, want 3/2", winner.InputTokens, winner.OutputTokens)
+	}
+}
+
+func TestTranslatedStreamAllTargetsFailUsesSelectedUsage(t *testing.T) {
+	base, token, st := setupTranslatedFailover(t, "anth-early", "anth-final", anthropicPreCommitUsageSSE, anthropicFinalFailUsageSSE, domain.ProtocolAnthropic)
+	resp, body := postStream(t, base+"/v1/chat/completions", token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("status = %d, want failure; body=%s", resp.StatusCode, body)
+	}
+	logs := waitForLogs(t, st, 2)
+	early := findLogByProvider(t, logs, "anth-early")
+	if early.InputTokens != 1234 || early.OutputTokens != 0 {
+		t.Errorf("early row tokens = %d/%d, want 1234/0", early.InputTokens, early.OutputTokens)
+	}
+	if early.ErrMsg == "" {
+		t.Errorf("early row missing err: %+v", early)
+	}
+	final := findLogByProvider(t, logs, "anth-final")
+	if final.InputTokens != 77 || final.OutputTokens != 0 {
+		t.Errorf("final row tokens = %d/%d, want 77/0", final.InputTokens, final.OutputTokens)
+	}
+	if final.ErrMsg == "" {
+		t.Errorf("final row missing err: %+v", final)
+	}
+}
+
+func TestTranslatedStreamCommittedFailureKeepsAttemptUsage(t *testing.T) {
+	var n2 int
+	st := newTestStore(t)
+	ctx := context.Background()
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, anthropicCommittedFailUsageSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiWinnerUsageSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	p1 := &domain.Provider{Name: "anth-partial", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolAnthropic}
+	p2 := &domain.Provider{Name: "oai-unused", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n2 != 0 {
+		t.Fatalf("second target called n2=%d", n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "partial") {
+		t.Errorf("missing partial content: %s", body)
+	}
+	if !strings.Contains(body, "mid-stream boom") {
+		t.Errorf("missing ingress error frame: %s", body)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.Provider != "anth-partial" {
+		t.Errorf("provider = %q, want anth-partial", l.Provider)
+	}
+	if l.InputTokens != 1234 || l.OutputTokens != 2 {
+		t.Errorf("tokens = %d/%d, want 1234/2", l.InputTokens, l.OutputTokens)
+	}
+	if l.ErrMsg == "" || !strings.Contains(l.ErrMsg, "mid-stream boom") {
+		t.Errorf("request log missing failure: %+v", l)
+	}
+}
