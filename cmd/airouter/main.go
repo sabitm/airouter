@@ -54,13 +54,25 @@ func main() {
 			"detail", "DEBUG enabled; access lines and upstream failure metadata will be logged (no bodies)",
 		)
 	}
-	if cfg.HARFile != "" {
+	if cfg.DisableDashboard {
+		mainLog.Info("dashboard_disabled",
+			"event", "dashboard_disabled",
+			"detail", "web dashboard and /static assets are not mounted; proxy routes and GET /debug/har remain available",
+		)
+	}
+	switch {
+	case cfg.HARFile != "":
 		mainLog.Info("har_capture_enabled",
 			"event", "har_capture_enabled",
 			"path", cfg.HARFile,
 			"detail", "file mode: always-on capture; download at GET /debug/har; flushed to path on shutdown",
 		)
-	} else {
+	case cfg.DisableDashboard:
+		mainLog.Info("har_runtime_unavailable",
+			"event", "har_runtime_unavailable",
+			"detail", "runtime dashboard-controlled HAR capture is unavailable; GET /debug/har remains mounted",
+		)
+	default:
 		mainLog.Info("har_runtime_available",
 			"event", "har_runtime_available",
 			"detail", "runtime HAR capture controlled from dashboard settings; download at GET /debug/har after Stop",
@@ -79,7 +91,7 @@ func main() {
 	}
 	defer st.Close()
 
-	app := server.New(st, logger, cfg.HARFile, version)
+	app := server.New(st, logger, cfg.HARFile, version, cfg.DisableDashboard)
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: app.Handler(),

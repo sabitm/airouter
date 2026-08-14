@@ -24,9 +24,12 @@ type Config struct {
 	// of every proxied request (headers and bodies up to the HAR per-body cap).
 	// The live document is served at GET /debug/har and flushed to this path on
 	// shutdown. Empty enables runtime dashboard-controlled capture instead (in
-	// memory only; never written on shutdown). HAR contains sensitive
-	// prompt/credential material.
+	// memory only; never written on shutdown) when the dashboard is mounted.
+	// HAR contains sensitive prompt/credential material.
 	HARFile string
+	// DisableDashboard, when true, skips mounting the web dashboard and /static
+	// assets. Proxy routes and GET /debug/har remain available.
+	DisableDashboard bool
 	// Version, when true, prints the build version and exits.
 	Version bool
 }
@@ -70,7 +73,8 @@ func Load() Config {
 	flag.StringVar(&c.Secret, "secret", env("AIROUTER_SECRET", ""), "secret seeding the at-rest encryption key")
 	level := debugLevel(envDebugLevel())
 	flag.Var(&level, "debug", "log verbosity: 1=access and upstream diagnostics, 2=detailed exchange metadata; bodies require HAR capture (dashboard or -har-file)")
-	flag.StringVar(&c.HARFile, "har-file", env("AIROUTER_HAR_FILE", ""), "always-on HAR capture of proxied request/response pairs (both legs, headers and bodies up to the HAR per-body cap); live at GET /debug/har and flushed to this path on shutdown. Without this flag, use dashboard Settings to start/stop runtime capture. Contains prompt content and provider secrets")
+	flag.StringVar(&c.HARFile, "har-file", env("AIROUTER_HAR_FILE", ""), "always-on HAR capture of proxied request/response pairs (both legs, headers and bodies up to the HAR per-body cap); live at GET /debug/har and flushed to this path on shutdown. Without this flag, use dashboard Settings to start/stop runtime capture (unavailable when the dashboard is disabled). Contains prompt content and provider secrets")
+	flag.BoolVar(&c.DisableDashboard, "disable-dashboard", envBool("AIROUTER_DISABLE_DASHBOARD", false), "disable the web dashboard and /static assets; proxy routes and GET /debug/har remain available")
 	flag.BoolVar(&c.Version, "version", false, "print version and exit")
 	flag.Parse()
 	c.DebugLevel = int(level)
@@ -91,6 +95,24 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool reads a boolean environment variable. Empty or unset yields def.
+// Accepted true spellings: 1, t, true, yes, on. Accepted false spellings:
+// 0, f, false, no, off. Unrecognized values yield def.
+func envBool(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "t", "true", "yes", "on":
+		return true
+	case "0", "f", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 // envDebugLevel reads AIROUTER_DEBUG, accepting both boolean spellings (mapped

@@ -31,16 +31,20 @@ type Server struct {
 
 // New builds the HTTP mux. logger may be nil (falls back to slog.Default).
 // harFile, when non-empty, enables always-on file-mode HAR capture (creator
-// version is creatorVersion). Empty enables runtime dashboard-controlled capture.
-// GET /debug/har is always mounted.
-func New(s *store.Store, logger *slog.Logger, harFile, creatorVersion string) *Server {
+// version is creatorVersion). Empty enables runtime dashboard-controlled capture
+// when the dashboard is mounted.
+// disableDashboard skips constructing and mounting the web handler; proxy
+// routes and GET /debug/har remain mounted either way.
+func New(s *store.Store, logger *slog.Logger, harFile, creatorVersion string, disableDashboard bool) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	har := harlog.NewController(harFile != "", creatorVersion, logger.With("component", "har"))
 	mux := http.NewServeMux()
 	httpLog := logger.With("component", "http")
-	web.NewHandler(s, logger.With("component", "web"), har).Mount(mux)
+	if !disableDashboard {
+		web.NewHandler(s, logger.With("component", "web"), har).Mount(mux)
+	}
 	proxy.New(s, logger.With("component", "proxy")).Mount(mux)
 	srv := &Server{mux: mux, logger: httpLog, har: har}
 	mux.HandleFunc("GET /debug/har", srv.handleHAR)

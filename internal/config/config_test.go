@@ -121,6 +121,48 @@ func TestEffectiveSecret(t *testing.T) {
 	})
 }
 
+func TestEnvBool(t *testing.T) {
+	cases := []struct {
+		name string
+		val  string
+		set  bool
+		def  bool
+		want bool
+	}{
+		{"unset default false", "", false, false, false},
+		{"unset default true", "", false, true, true},
+		{"empty default false", "", true, false, false},
+		{"empty default true", "", true, true, true},
+		{"true", "true", true, false, true},
+		{"TRUE", "TRUE", true, false, true},
+		{"1", "1", true, false, true},
+		{"t", "t", true, false, true},
+		{"yes", "yes", true, false, true},
+		{"on", "on", true, false, true},
+		{"false", "false", true, true, false},
+		{"FALSE", "FALSE", true, true, false},
+		{"0", "0", true, true, false},
+		{"f", "f", true, true, false},
+		{"no", "no", true, true, false},
+		{"off", "off", true, true, false},
+		{"garbage default false", "garbage", true, false, false},
+		{"garbage default true", "garbage", true, true, true},
+		{"whitespace true", "  yes  ", true, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("AIROUTER_DISABLE_DASHBOARD", tc.val)
+			} else {
+				clearEnvVar(t, "AIROUTER_DISABLE_DASHBOARD")
+			}
+			if got := envBool("AIROUTER_DISABLE_DASHBOARD", tc.def); got != tc.want {
+				t.Errorf("envBool() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEnv(t *testing.T) {
 	t.Run("present returns value", func(t *testing.T) {
 		t.Setenv("AIROUTER_TEST_VAR", "custom")

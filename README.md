@@ -112,6 +112,7 @@ Flags override environment variables.
 | `-secret` | `AIROUTER_SECRET` | insecure development key | Credential encryption secret |
 | `-debug` | `AIROUTER_DEBUG` | `0` | `1` for request diagnostics; `2` for metadata traces |
 | `-har-file` | `AIROUTER_HAR_FILE` | unset | Always-on HAR capture and shutdown output path |
+| `-disable-dashboard` | `AIROUTER_DISABLE_DASHBOARD` | `false` | Do not mount the web dashboard or `/static` assets |
 | `-version` | — | `false` | Print the version and exit |
 
 Debug logs never include request or response bodies. Capture full exchanges from
@@ -124,11 +125,14 @@ responses, authorization headers, and provider credentials.
   encrypted credentials unreadable.
 - The dashboard controls providers and exposes plaintext config exports. It has
   no built-in login; keep it on a trusted network or protect it with an
-  authenticated reverse proxy.
+  authenticated reverse proxy. In production, prefer `-disable-dashboard` so
+  the UI, `/static` assets, config import/export, and OAuth connect flows are
+  not mounted.
 - Config exports include provider API keys and OAuth tokens in plaintext. Access
   keys and request logs are not exported.
 - HAR captures contain sensitive headers and bodies. Store and share them as
-  secrets.
+  secrets. `-disable-dashboard` does not disable `GET /debug/har`; that
+  endpoint remains mounted and may serve captured prompts and credentials.
 
 State is stored in one automatically migrated SQLite database using WAL mode.
 Provider credentials are encrypted at rest; access keys are hashed.

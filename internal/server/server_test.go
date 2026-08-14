@@ -7,13 +7,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
+	"airouter/internal/crypto"
 	"airouter/internal/harlog"
 	"airouter/internal/observability"
 	"airouter/internal/proxy"
+	"airouter/internal/store"
 )
 
 // noopHandler returns 200 OK without touching CORS headers, so tests can
@@ -776,5 +779,114 @@ func TestDebugHARStateContract(t *testing.T) {
 	}
 	if rr.Header().Get("Cache-Control") != "no-store" || rr.Header().Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatalf("missing security headers: %v", rr.Header())
+	}
+}
+
+func newTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	c, err := crypto.New("test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+func servePath(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, nil)
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
+func TestDashboardDisabledUnregistersWebRoutes(t *testing.T) {
+	srv := New(newTestStore(t), observability.NewLogger(0, io.Discard), "", "test", true)
+	h := srv.Handler()
+
+	dashboardPaths := []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/"},
+		{http.MethodGet, "/dashboard"},
+		{http.MethodGet, "/dashboard/providers"},
+		{http.MethodGet, "/dashboard/settings"},
+		{http.MethodPost, "/dashboard/providers"},
+		{http.MethodPost, "/dashboard/import"},
+		{http.MethodPost, "/dashboard/har/start"},
+		{http.MethodGet, "/static/dashboard.js"},
+	}
+	for _, tc := range dashboardPaths {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rr := servePath(t, h, tc.method, tc.path)
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", rr.Code)
+			}
+		})
+	}
+}
+
+func TestDashboardDisabledKeepsProxyAndDebugHAR(t *testing.T) {
+	srv := New(newTestStore(t), observability.NewLogger(0, io.Discard), "", "test", true)
+	h := srv.Handler()
+
+	rr := servePath(t, h, http.MethodGet, "/v1/models")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /v1/models status = %d, want 200 (proxy still mounted)", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("GET /v1/models Content-Type = %q, want JSON", ct)
+	}
+
+	rr = servePath(t, h, http.MethodPost, "/v1/chat/completions")
+	if rr.Code == http.StatusNotFound {
+		t.Fatal("POST /v1/chat/completions returned 404; proxy route is unregistered")
+	}
+
+	// Idle runtime HAR also 404s; start a session so a registered /debug/har
+	// answers 409 instead of the mux 404 for an unregistered path.
+	if err := srv.HARController().Start(); err != nil {
+		t.Fatal(err)
+	}
+	rr = servePath(t, h, http.MethodGet, "/debug/har")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("GET /debug/har status = %d, want 409 (route remains mounted)", rr.Code)
+	}
+}
+
+func TestDashboardEnabledByDefault(t *testing.T) {
+	srv := New(newTestStore(t), observability.NewLogger(0, io.Discard), "", "test", false)
+	h := srv.Handler()
+
+	rr := servePath(t, h, http.MethodGet, "/")
+	if rr.Code != http.StatusFound {
+		t.Fatalf("GET / status = %d, want 302", rr.Code)
+	}
+	if loc := rr.Header().Get("Location"); loc != "/dashboard/providers" {
+		t.Fatalf("GET / Location = %q, want /dashboard/providers", loc)
+	}
+
+	rr = servePath(t, h, http.MethodGet, "/dashboard")
+	if rr.Code != http.StatusFound {
+		t.Fatalf("GET /dashboard status = %d, want 302", rr.Code)
+	}
+
+	rr = servePath(t, h, http.MethodGet, "/dashboard/providers")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /dashboard/providers status = %d, want 200", rr.Code)
+	}
+
+	rr = servePath(t, h, http.MethodGet, "/static/dashboard.js")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /static/dashboard.js status = %d, want 200", rr.Code)
+	}
+
+	rr = servePath(t, h, http.MethodGet, "/v1/models")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /v1/models status = %d, want 200", rr.Code)
 	}
 }
