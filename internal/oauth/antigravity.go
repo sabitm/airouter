@@ -11,11 +11,11 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/antigravity"
 )
 
-// Cloud Code Assist endpoints for Antigravity project bootstrap. Duplicated from
-// proxy/antigravity so oauth does not import the proxy package. Vars (not consts)
-// so tests can point them at an httptest server.
+// Cloud Code Assist endpoints for Antigravity project bootstrap. Vars (not
+// consts) so tests can point them at an httptest server.
 var (
 	agLoadCodeAssistURL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 	agOnboardUserURL    = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
@@ -23,8 +23,6 @@ var (
 )
 
 const (
-	agLoadCodeAssistUA = "google-api-nodejs-client/9.15.1"
-	agLoadCodeAssistAPI = "google-cloud-sdk vscode_cloudshelleditor/0.1"
 	agOnboardTimeout   = 60 * time.Second
 	agOnboardPollEvery = 5 * time.Second
 )
@@ -48,15 +46,17 @@ func finalizeAntigravity(ctx context.Context, c *domain.OAuthCreds) error {
 	if err != nil {
 		return fmt.Errorf("oauth: antigravity loadCodeAssist: %w", err)
 	}
-	if projectID == "" {
-		return fmt.Errorf("oauth: antigravity: no project id from loadCodeAssist; reconnect")
-	}
+	// Fresh Google accounts return 200 with allowedTiers but no project.
+	// onboardUser provisions cloudaicompanionProject; fail only after that.
 	finalID, err := completeOnboarding(ctx, c.AccessToken, projectID, tierID)
 	if err != nil {
 		return fmt.Errorf("oauth: antigravity onboard: %w", err)
 	}
 	if finalID != "" {
 		projectID = finalID
+	}
+	if projectID == "" {
+		return fmt.Errorf("oauth: antigravity: no project id after onboarding (tier %q); reconnect", tierID)
 	}
 	c.ProjectID = projectID
 	return nil
@@ -117,7 +117,9 @@ func loadCodeAssist(ctx context.Context, accessToken string) (projectID, tierID 
 	}
 	projectID = extractProjectID(data["cloudaicompanionProject"])
 	tierID = "legacy-tier"
-	if tiers, ok := data["allowedTiers"].([]any); ok {
+	if current, _ := data["currentTierId"].(string); strings.TrimSpace(current) != "" {
+		tierID = strings.TrimSpace(current)
+	} else if tiers, ok := data["allowedTiers"].([]any); ok {
 		for _, t := range tiers {
 			tm, ok := t.(map[string]any)
 			if !ok {
@@ -197,10 +199,10 @@ func setCodeAssistHeaders(req *http.Request, accessToken string) {
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", agLoadCodeAssistUA)
-	req.Header.Set("X-Goog-Api-Client", agLoadCodeAssistAPI)
-	meta, _ := json.Marshal(clientMetadata())
-	req.Header.Set("Client-Metadata", string(meta))
+	// Google fingerprints X-Goog-Api-Client/Client-Metadata on loadCodeAssist
+	// and onboardUser and silently omits cloudaicompanionProject. The real
+	// Antigravity IDE does not send those headers; metadata stays in the body.
+	req.Header.Set("User-Agent", antigravity.UserAgent)
 }
 
 func clientMetadata() map[string]int {

@@ -13,6 +13,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/qoder"
@@ -358,10 +359,9 @@ func checkAntigravityUpstream(ctx context.Context, logger *slog.Logger, p *domai
 	req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "google-api-nodejs-client/9.15.1")
-	req.Header.Set("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
-	mb, _ := json.Marshal(meta)
-	req.Header.Set("Client-Metadata", string(mb))
+	// Same fingerprinting constraint as oauth.setCodeAssistHeaders: do not send
+	// X-Goog-Api-Client or Client-Metadata; metadata stays in the JSON body.
+	req.Header.Set("User-Agent", antigravity.UserAgent)
 
 	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_antigravity")
 	if err != nil {

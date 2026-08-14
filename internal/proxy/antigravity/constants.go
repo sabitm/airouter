@@ -2,7 +2,7 @@ package antigravity
 
 // Cloud Code / Antigravity backend constants. Chat is SSE-only through
 // streamGenerateContent; OAuth project bootstrap uses loadCodeAssist/onboardUser
-// (those URL strings are duplicated in oauth to avoid an oauth->proxy import).
+// (those URL strings are duplicated as vars in oauth so tests can override them).
 
 const (
 	DefaultBaseURL = "https://cloudcode-pa.googleapis.com"
@@ -17,9 +17,9 @@ const (
 	MaxOutputTokens  = 64000
 	DefaultMaxTokens = 8192
 
-	ToolSuffix         = "_ide"
-	UserAgentEnvelope  = "antigravity"
-	RequestTypeAgent   = "agent"
+	ToolSuffix        = "_ide"
+	UserAgentEnvelope = "antigravity"
+	RequestTypeAgent  = "agent"
 )
 
 // DefaultThoughtSignature is backfilled on functionCall parts that lack one.
