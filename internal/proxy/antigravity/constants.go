@@ -5,7 +5,10 @@ package antigravity
 // (those URL strings are duplicated as vars in oauth so tests can override them).
 
 const (
-	DefaultBaseURL = "https://cloudcode-pa.googleapis.com"
+	// Chat/streamGenerateContent uses the IDE daily channel because prod
+	// cloudcode-pa 429s (RESOURCE_EXHAUSTED) non-IDE chat. Discovery
+	// (loadCodeAssist/onboardUser/fetchAvailableModels) stays on prod.
+	DefaultBaseURL = "https://daily-cloudcode-pa.googleapis.com"
 
 	IDEVersion = "2.1.1"
 	// UserAgent is the official Antigravity IDE Desktop fingerprint (macOS arm64).

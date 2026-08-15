@@ -167,7 +167,10 @@ func (s *Store) migrate() error {
 	if err := s.migrateComboTargetEnabled(); err != nil {
 		return err
 	}
-	return s.migrateCombosToTargets()
+	if err := s.migrateCombosToTargets(); err != nil {
+		return err
+	}
+	return s.migrateProviderAntigravityBaseURL()
 }
 
 // migrateProviderReasoningDialect adds the reasoning_dialect column to a
@@ -219,6 +222,16 @@ func (s *Store) migrateProviderArchived() error {
 		return err
 	}
 	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+	return err
+}
+
+// migrateProviderAntigravityBaseURL rewrites already-connected Antigravity
+// providers still on the old prod cloudcode-pa default to the daily chat
+// host. Prod 429s (RESOURCE_EXHAUSTED) non-IDE streamGenerateContent.
+// Custom base URLs and other protocols are left untouched. Idempotent:
+// after the first run no rows match.
+func (s *Store) migrateProviderAntigravityBaseURL() error {
+	_, err := s.db.Exec(`UPDATE providers SET base_url='https://daily-cloudcode-pa.googleapis.com' WHERE protocol='antigravity' AND base_url='https://cloudcode-pa.googleapis.com'`)
 	return err
 }
 

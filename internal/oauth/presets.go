@@ -146,7 +146,8 @@ var Presets = []Preset{
 		Protocol:    domain.ProtocolOpenAI,
 	},
 	// Antigravity is Google Cloud Code via the public IDE OAuth client. Chat is
-	// SSE-only at cloudcode-pa; connect finalizes a ProjectID via loadCodeAssist.
+	// SSE-only at daily-cloudcode-pa; discovery stays on prod cloudcode-pa.
+	// Connect finalizes a ProjectID via loadCodeAssist.
 	{
 		Name:         "antigravity",
 		Label:        "Antigravity (Google)",

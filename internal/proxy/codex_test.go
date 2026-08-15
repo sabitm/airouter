@@ -210,7 +210,7 @@ func TestApplyAntigravityHeadersAndProject(t *testing.T) {
 		t.Fatalf("project inject: %+v", env)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, antigravity.DefaultBaseURL+antigravity.UpstreamPathStream, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
