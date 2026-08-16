@@ -21,6 +21,7 @@ import (
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/store"
+	"airouter/internal/usage"
 )
 
 type Handler struct {
@@ -28,6 +29,8 @@ type Handler struct {
 	// oauth resolves an effective token for oauth providers before the dashboard
 	// probes an upstream (Check button, model autocomplete).
 	oauth *oauth.Service
+	// usage fetches live upstream account quota for the Usage page.
+	usage *usage.Service
 	// sessions holds in-flight OAuth connect attempts between the begin request
 	// and the later status/exchange/save requests.
 	sessions *connectSessions
@@ -44,7 +47,15 @@ func NewHandler(s *store.Store, logger *slog.Logger, har *harlog.Controller) *Ha
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{store: s, oauth: oauth.New(s), sessions: newConnectSessions(), logger: logger, har: har}
+	oauthSvc := oauth.New(s)
+	return &Handler{
+		store:    s,
+		oauth:    oauthSvc,
+		usage:    usage.NewService(oauthSvc, logger.With("component", "usage"), nil),
+		sessions: newConnectSessions(),
+		logger:   logger,
+		har:      har,
+	}
 }
 
 // Mount registers all dashboard routes on the given mux.
@@ -102,6 +113,10 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /dashboard/keys", h.keysPage)
 	mux.HandleFunc("POST /dashboard/keys", h.createKey)
 	mux.HandleFunc("POST /dashboard/keys/{id}/delete", h.deleteKey)
+
+	// Usage (upstream account quota)
+	mux.HandleFunc("GET /dashboard/usage", h.usagePage)
+	mux.HandleFunc("GET /dashboard/usage/card/{id}", h.usageCard)
 
 	// Logs
 	mux.HandleFunc("GET /dashboard/logs", h.logsPage)
@@ -1196,4 +1211,41 @@ func (h *Handler) importConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	render(w, r, flash("ok", msg))
+}
+
+// --- Usage ---
+
+func (h *Handler) usagePage(w http.ResponseWriter, r *http.Request) {
+	providers, err := h.store.ListProviders(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	supported := usageSupportedProviders(providers)
+	force := r.URL.Query().Get("refresh") == "1"
+	if r.Header.Get("HX-Request") != "" && force {
+		render(w, r, UsageGrid(supported, true))
+		return
+	}
+	render(w, r, UsagePage(supported, force))
+}
+
+func (h *Handler) usageCard(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	p, err := h.store.GetProvider(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if p.Archived || !usage.Supported(p) {
+		http.NotFound(w, r)
+		return
+	}
+	force := r.URL.Query().Get("force") == "1"
+	rep, ferr := h.usage.FetchWith(r.Context(), p, usage.FetchOpts{Force: force})
+	render(w, r, UsageCard(p, rep, usageErrMessage(p, ferr)))
 }

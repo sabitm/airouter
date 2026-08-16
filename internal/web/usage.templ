@@ -1,0 +1,111 @@
+package web
+
+import (
+	"strconv"
+
+	"airouter/internal/domain"
+	"airouter/internal/usage"
+)
+
+templ UsagePage(providers []*domain.Provider, force bool) {
+	@Layout("Usage", "/dashboard/usage") {
+		<section class="panel">
+			<div class="panel-head">
+				<h1>Usage</h1>
+				if len(providers) > 0 {
+					<button
+						type="button"
+						class="link"
+						hx-get="/dashboard/usage?refresh=1"
+						hx-target="#usage-grid"
+						hx-swap="outerHTML"
+					>Refresh all</button>
+				}
+			</div>
+			<p class="hint">Live account quota from the provider, not this router's request log.</p>
+			@UsageGrid(providers, force)
+		</section>
+	}
+}
+
+templ UsageGrid(providers []*domain.Provider, force bool) {
+	<div id="usage-grid" class="usage-grid">
+		if len(providers) == 0 {
+			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, or Antigravity.</p>
+		} else {
+			for _, p := range providers {
+				@UsageCardSkeleton(p, force)
+			}
+		}
+	</div>
+}
+
+templ UsageCardSkeleton(p *domain.Provider, force bool) {
+	<div
+		class="usage-card usage-card-loading"
+		id={ "usage-card-" + strconv.FormatInt(p.ID, 10) }
+		hx-get={ usageCardURL(p.ID, force) }
+		hx-trigger="load"
+		hx-swap="outerHTML"
+	>
+		<div class="usage-card-head">
+			<div>
+				<span class="usage-card-name">{ p.Name }</span>
+				<span class="tag">{ string(p.Protocol) }</span>
+			</div>
+		</div>
+		<p class="muted">loading...</p>
+	</div>
+}
+
+templ UsageCard(p *domain.Provider, report *usage.Report, errMsg string) {
+	<div class="usage-card" id={ "usage-card-" + strconv.FormatInt(p.ID, 10) }>
+		<div class="usage-card-head">
+			<div>
+				<span class="usage-card-name">{ p.Name }</span>
+				<span class="tag">{ string(p.Protocol) }</span>
+				if report != nil && report.Plan != "" {
+					<span class="usage-plan">{ report.Plan }</span>
+				}
+			</div>
+			<button
+				type="button"
+				class="link"
+				hx-get={ usageCardURL(p.ID, true) }
+				hx-target={ "#usage-card-" + strconv.FormatInt(p.ID, 10) }
+				hx-swap="outerHTML"
+			>Refresh</button>
+		</div>
+		if errMsg != "" {
+			<p class="usage-msg">{ errMsg }</p>
+		} else if report != nil && report.Message != "" && len(report.Quotas) == 0 {
+			<p class="usage-msg">{ report.Message }</p>
+		} else if report != nil {
+			if report.ResetCredits > 0 {
+				<p class="muted">reset credits: { strconv.Itoa(report.ResetCredits) }</p>
+			}
+			if report.Message != "" {
+				<p class="usage-msg">{ report.Message }</p>
+			}
+			for _, q := range report.Quotas {
+				@quotaRow(q)
+			}
+		}
+	</div>
+}
+
+templ quotaRow(q usage.Quota) {
+	<div class="quota-row">
+		<div class="quota-row-head">
+			<span class="quota-name">{ q.Name }</span>
+			<span class="quota-meta">{ quotaMeta(q) }</span>
+		</div>
+		<div class="quota-bar" aria-hidden="true">
+			<div class={ "quota-bar-fill", quotaBarClass(q) } style={ quotaBarStyle(q) }></div>
+		</div>
+		<div class="quota-row-foot">
+			<span class="quota-used">{ quotaUsedText(q) }</span>
+			<span class="quota-reset">{ formatResetCountdown(q.ResetAt) }</span>
+		</div>
+	</div>
+}
