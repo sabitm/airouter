@@ -25,7 +25,9 @@ func TestParseSuffix(t *testing.T) {
 		{"gpt-5(test)", "gpt-5(test)", "", "", 0, true}, // unknown token kept
 		{"gpt-5(minimal)", "gpt-5", ModeLevel, "minimal", 0, false},
 		{"x(max)", "x", ModeLevel, "max", 0, false},
+		{"gpt-5.6-sol(ultra)", "gpt-5.6-sol", ModeLevel, "ultra", 0, false},
 		{"gpt-5(qwen:high)", "gpt-5(qwen:high)", "", "", 0, true}, // dialect-qualified not parsed
+		{"gpt-5(spark)", "gpt-5(spark)", "", "", 0, true},
 		{"", "", "", "", 0, true},
 	}
 	for _, tc := range cases {
@@ -195,10 +197,32 @@ func TestCapsForKnownNonReasoners(t *testing.T) {
 }
 
 func TestNormalizeCodexMax(t *testing.T) {
-	caps := CapsFor("gpt-5", domain.ProtocolOpenAI, domain.ReasoningOpenAI)
-	if got := NormalizeCodexLevel("max", caps); got != "xhigh" {
-		t.Fatalf("max clamp = %q", got)
+	cases := []struct {
+		name  string
+		model string
+		level string
+		want  string
+	}{
+		{"openai max stays xhigh without allow", "gpt-5", "max", "xhigh"},
+		{"classic ultra", "gpt-5.3-codex", "ultra", "xhigh"},
+		{"classic auto", "gpt-5.3-codex", "auto", "medium"},
+		{"luna ultra", "gpt-5.6-luna", "ultra", "max"},
+		{"luna auto", "gpt-5.6-luna", "auto", "medium"},
+		{"sol ultra", "gpt-5.6-sol", "ultra", "ultra"},
+		{"terra ultra", "gpt-5.6-terra", "ultra", "ultra"},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			caps := CapsFor(tc.model, domain.ProtocolOpenAICodex, domain.ReasoningCodex)
+			if tc.model == "gpt-5" {
+				caps = CapsFor(tc.model, domain.ProtocolOpenAI, domain.ReasoningOpenAI)
+			}
+			if got := NormalizeCodexLevel(tc.level, caps); got != tc.want {
+				t.Fatalf("NormalizeCodexLevel(%q) = %q, want %q", tc.level, got, tc.want)
+			}
+		})
+	}
+	caps := CapsFor("gpt-5", domain.ProtocolOpenAI, domain.ReasoningOpenAI)
 	caps.AllowMax = true
 	if got := NormalizeCodexLevel("max", caps); got != "max" {
 		t.Fatalf("allow max = %q", got)
@@ -216,11 +240,14 @@ func TestApplyWireOpenAIMaxPolicy(t *testing.T) {
 		want     string
 	}{
 		{"chat compatible preserves max", "oai-chat", domain.ProtocolOpenAI, domain.ReasoningOpenAI, "cline-pass/deepseek-v4-pro", "max", "max"},
+		{"chat compatible preserves ultra", "oai-chat", domain.ProtocolOpenAI, domain.ReasoningOpenAI, "hosted-reasoner", "ultra", "ultra"},
 		{"responses compatible preserves max", "oai-responses", domain.ProtocolOpenAIResponses, domain.ReasoningOpenAI, "hosted-reasoner", "max", "max"},
 		{"classic codex clamps max", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.3-codex", "max", "xhigh"},
+		{"classic codex maps ultra", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.3-codex", "ultra", "xhigh"},
 		{"expanded codex preserves max", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.6-luna", "max", "max"},
 		{"max-only codex maps ultra", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.6-luna", "ultra", "max"},
 		{"expanded codex preserves ultra", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.6-sol", "ultra", "ultra"},
+		{"terra codex preserves ultra", "oai-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex, "gpt-5.6-terra", "ultra", "ultra"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -559,5 +586,125 @@ func TestResolveIntentNoInjectionFromDialectAlone(t *testing.T) {
 	cfg := ResolveIntent(nil, nil, caps)
 	if cfg == nil || cfg.Level != "low" {
 		t.Fatalf("codex required default: %+v", cfg)
+	}
+}
+
+func TestFinalizeBodyCodexAutoAndUltra(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		model      string
+		protocol   domain.Protocol
+		dialect    domain.ReasoningDialect
+		wantModel  string
+		wantEffort string
+	}{
+		{
+			name:       "codex explicit auto",
+			body:       `{"model":"combo","reasoning":{"effort":"auto"}}`,
+			model:      "gpt-5.3-codex",
+			protocol:   domain.ProtocolOpenAICodex,
+			dialect:    domain.ReasoningCodex,
+			wantModel:  "gpt-5.3-codex",
+			wantEffort: "medium",
+		},
+		{
+			name:       "codex no intent defaults low",
+			body:       `{"model":"combo"}`,
+			model:      "gpt-5.3-codex",
+			protocol:   domain.ProtocolOpenAICodex,
+			dialect:    domain.ReasoningCodex,
+			wantModel:  "gpt-5.3-codex",
+			wantEffort: "low",
+		},
+		{
+			name:       "sol ultra suffix",
+			body:       `{"model":"combo"}`,
+			model:      "gpt-5.6-sol(ultra)",
+			protocol:   domain.ProtocolOpenAICodex,
+			dialect:    domain.ReasoningCodex,
+			wantModel:  "gpt-5.6-sol",
+			wantEffort: "ultra",
+		},
+		{
+			name:       "luna ultra suffix",
+			body:       `{"model":"combo"}`,
+			model:      "gpt-5.6-luna(ultra)",
+			protocol:   domain.ProtocolOpenAICodex,
+			dialect:    domain.ReasoningCodex,
+			wantModel:  "gpt-5.6-luna",
+			wantEffort: "max",
+		},
+		{
+			name:       "classic ultra suffix",
+			body:       `{"model":"combo"}`,
+			model:      "gpt-5.3-codex(ultra)",
+			protocol:   domain.ProtocolOpenAICodex,
+			dialect:    domain.ReasoningCodex,
+			wantModel:  "gpt-5.3-codex",
+			wantEffort: "xhigh",
+		},
+		{
+			name:       "generic openai auto unchanged",
+			body:       `{"model":"combo","reasoning_effort":"auto"}`,
+			model:      "gpt-5",
+			protocol:   domain.ProtocolOpenAI,
+			dialect:    domain.ReasoningOpenAI,
+			wantModel:  "gpt-5",
+			wantEffort: "auto",
+		},
+		{
+			name:       "generic openai ultra unchanged",
+			body:       `{"model":"combo"}`,
+			model:      "gpt-5(ultra)",
+			protocol:   domain.ProtocolOpenAI,
+			dialect:    domain.ReasoningOpenAI,
+			wantModel:  "gpt-5",
+			wantEffort: "ultra",
+		},
+		{
+			name:       "generic openai max unchanged",
+			body:       `{"model":"combo","reasoning_effort":"max"}`,
+			model:      "gpt-5",
+			protocol:   domain.ProtocolOpenAI,
+			dialect:    domain.ReasoningOpenAI,
+			wantModel:  "gpt-5",
+			wantEffort: "max",
+		},
+		{
+			name:       "generic responses auto unchanged",
+			body:       `{"model":"combo","reasoning":{"effort":"auto"}}`,
+			model:      "gpt-5",
+			protocol:   domain.ProtocolOpenAIResponses,
+			dialect:    domain.ReasoningOpenAI,
+			wantModel:  "gpt-5",
+			wantEffort: "auto",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			formatID := "oai-chat"
+			if tc.protocol == domain.ProtocolOpenAICodex || tc.protocol == domain.ProtocolOpenAIResponses {
+				formatID = "oai-responses"
+			}
+			out, err := FinalizeBody([]byte(tc.body), tc.model, formatID, tc.protocol, tc.dialect)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["model"] != tc.wantModel {
+				t.Fatalf("model = %v, want %q; body=%s", got["model"], tc.wantModel, out)
+			}
+			effort, _ := got["reasoning_effort"].(string)
+			if reasoning, ok := got["reasoning"].(map[string]any); ok {
+				effort, _ = reasoning["effort"].(string)
+			}
+			if effort != tc.wantEffort {
+				t.Fatalf("effort = %q, want %q; body=%s", effort, tc.wantEffort, out)
+			}
+		})
 	}
 }

@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// ParseSuffix splits "model(high)" / "model(8192)" / "model(none)" / "model(auto)".
+// ParseSuffix splits "model(high)" / "model(8192)" / "model(none)" / "model(auto)" / "model(ultra)".
 // Only known levels, digits, none/off, or auto are consumed; any other parenthetical
 // (including dialect-qualified forms like "qwen:high") is left on the model name
 // so legitimate ids are not mangled.

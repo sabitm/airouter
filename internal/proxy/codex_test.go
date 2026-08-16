@@ -381,3 +381,86 @@ func TestCodexEncodeRequestIRThinkingMaxMinimalPassThrough(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexEncodeFinalizeAutoAndUltra(t *testing.T) {
+	provider := &domain.Provider{Protocol: domain.ProtocolOpenAICodex}
+	cases := []struct {
+		name       string
+		upstream   string
+		thinking   *ir.Thinking
+		wantModel  string
+		wantEffort string
+	}{
+		{
+			name:       "explicit auto becomes medium",
+			upstream:   "gpt-5.3-codex",
+			thinking:   &ir.Thinking{Mode: ir.ThinkingAuto},
+			wantModel:  "gpt-5.3-codex",
+			wantEffort: "medium",
+		},
+		{
+			name:       "sol ultra suffix",
+			upstream:   "gpt-5.6-sol(ultra)",
+			wantModel:  "gpt-5.6-sol",
+			wantEffort: "ultra",
+		},
+		{
+			name:       "terra ultra suffix",
+			upstream:   "gpt-5.6-terra(ultra)",
+			wantModel:  "gpt-5.6-terra",
+			wantEffort: "ultra",
+		},
+		{
+			name:       "luna ultra suffix",
+			upstream:   "gpt-5.6-luna(ultra)",
+			wantModel:  "gpt-5.6-luna",
+			wantEffort: "max",
+		},
+		{
+			name:       "classic ultra suffix",
+			upstream:   "gpt-5.3-codex(ultra)",
+			wantModel:  "gpt-5.3-codex",
+			wantEffort: "xhigh",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &ir.Request{
+				Model:    "combo",
+				Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+				Thinking: tc.thinking,
+			}
+			applyUpstreamModel(req, tc.upstream)
+			body, err := responses.EncodeCodexRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := finalizeEncodedBody(body, req, codexCodec, provider)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["model"] != tc.wantModel {
+				t.Fatalf("model = %v, want %q; body=%s", got["model"], tc.wantModel, out)
+			}
+			reasoning, _ := got["reasoning"].(map[string]any)
+			if reasoning["effort"] != tc.wantEffort {
+				t.Fatalf("reasoning = %v, want effort %q; body=%s", reasoning, tc.wantEffort, out)
+			}
+			include, _ := got["include"].([]any)
+			found := false
+			for _, item := range include {
+				if item == "reasoning.encrypted_content" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("missing reasoning.encrypted_content: %s", out)
+			}
+		})
+	}
+}

@@ -19,6 +19,7 @@ var knownLevels = map[string]bool{
 	"high":    true,
 	"xhigh":   true,
 	"max":     true,
+	"ultra":   true,
 }
 
 // BudgetToLevel returns the nearest discrete level for a numeric budget.
@@ -95,10 +96,12 @@ func BudgetFor(cfg *Config, min, max int) int {
 	return budget
 }
 
-// NormalizeCodexLevel constrains max/ultra to the levels accepted by a Codex
-// model.
+// NormalizeCodexLevel constrains Codex wire effort. Unified auto is always
+// medium; max/ultra collapse to the highest level the model accepts.
 func NormalizeCodexLevel(level string, caps Caps) string {
 	switch level {
+	case "auto":
+		return "medium"
 	case "max":
 		if caps.AllowMax || levelIn("max", caps.Levels) {
 			return "max"
