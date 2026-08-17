@@ -316,7 +316,7 @@ templ ProviderRecipeForm(r recipe) {
 				</div>
 			</form>
 		case kindCursor:
-			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="manual" data-protocol="cursor" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="web" data-protocol="cursor" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value="cursor"/>
 				<input type="hidden" name="reasoning_dialect" value="none"/>
 				<input type="hidden" name="auth_method" value="oauth"/>
@@ -330,14 +330,27 @@ templ ProviderRecipeForm(r recipe) {
 					<input name="base_url" placeholder="https://api2.cursor.sh" value={ r.BaseURL } required/>
 				</label>
 				<label class="field">
-					<span class="field-name">Access token</span>
-					<input name="access_token" type="password" class="mono" placeholder="cursorAuth/accessToken" required aria-label="access token"/>
+					<span class="field-name">Auth mode</span>
+					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
+						<option value="web" selected>Web auth</option>
+						<option value="manual">Manual</option>
+					</select>
 				</label>
-				<label class="field">
-					<span class="field-name">Machine id</span>
-					<input name="machine_id" class="mono" placeholder="storage.serviceMachineId" required aria-label="machine id"/>
-				</label>
-				<p class="field-hint">Export from a logged-in Cursor IDE: state.vscdb keys cursorAuth/accessToken and storage.serviceMachineId. Tokens last about 24 hours and cannot be refreshed - re-paste when Check fails. v1 uses Cursor's ChatService only; if upstream rejects plain text turns, chat may fail until a later update.</p>
+				<div class="oauth-web">
+					<button type="button" class="link" hx-post="/dashboard/providers/cursor/begin" hx-include="closest form" hx-target="#oauth-region-new-cursor" hx-swap="innerHTML">Connect</button>
+					<div id="oauth-region-new-cursor" class="oauth-region" aria-live="polite">
+						@OAuthConnectIdle()
+					</div>
+					<p class="field-hint">Save after Connect succeeds, or switch to Manual and paste tokens from the Cursor CLI or IDE.</p>
+				</div>
+				<div class="oauth-manual">
+					<span class="muted">Paste an access token and machine id. Include a refresh token to keep the session refreshable.</span>
+					<label class="field">
+						<span class="field-name">Machine id</span>
+						<input name="machine_id" class="oauth-cfg mono" placeholder="storage.serviceMachineId" aria-label="machine id"/>
+					</label>
+					@oauthTokenFields(&domain.OAuthCreds{}, "", "")
+				</div>
 				<div class="form-actions">
 					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
 					<span class="check-indicator htmx-indicator">checking...</span>
@@ -697,7 +710,7 @@ templ providerEditRowCursor(p *domain.Provider) {
 		class="provider-form provider-form-grid"
 		data-method="oauth"
 		data-protocol="cursor"
-		data-oauth-mode="manual"
+		data-oauth-mode="web"
 		hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) }
 		hx-target="#provider-list"
 		hx-swap="outerHTML"
@@ -715,15 +728,43 @@ templ providerEditRowCursor(p *domain.Provider) {
 			<span class="field-name">Base URL</span>
 			<input name="base_url" value={ p.BaseURL } required/>
 		</label>
+		<span class="muted">Connected: { oauthLabel(p.OAuthCreds) }.</span>
 		<label class="field">
-			<span class="field-name">Access token</span>
-			<input name="access_token" type="password" class="mono" placeholder="leave blank to keep current" aria-label="access token"/>
+			<span class="field-name">Auth mode</span>
+			<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
+				<option value="web" selected>Web auth</option>
+				<option value="manual">Manual</option>
+			</select>
 		</label>
-		<label class="field">
-			<span class="field-name">Machine id</span>
-			<input name="machine_id" class="mono" placeholder="storage.serviceMachineId" value={ c.MachineID } required aria-label="machine id"/>
-		</label>
-		<p class="field-hint">Tokens last about 24 hours and cannot be refreshed. Re-paste the access token when Check fails.</p>
+		<div class="oauth-web">
+			<button type="button" class="link" hx-post="/dashboard/providers/cursor/begin" hx-include="closest form" hx-target={ "#oauth-region-edit-cursor-" + strconv.FormatInt(p.ID, 10) } hx-swap="innerHTML">Reconnect</button>
+			<div id={ "oauth-region-edit-cursor-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
+				@OAuthConnectIdle()
+			</div>
+			if c.RefreshToken != "" {
+				<button
+					type="button"
+					class="link"
+					hx-post="/dashboard/providers/oauth/refresh"
+					hx-include="closest form"
+					hx-vals='{"refresh_view":"status"}'
+					hx-target={ "#oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) }
+					hx-swap="innerHTML"
+					hx-indicator="next .refresh-indicator"
+				>Refresh token</button>
+				<span class="refresh-indicator htmx-indicator">refreshing...</span>
+				<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result" aria-live="polite"></span>
+			} else {
+				<p class="field-hint">This import has no refresh token. Reconnect or paste a refresh token to enable rotation.</p>
+			}
+		</div>
+		<div class="oauth-manual">
+			<label class="field">
+				<span class="field-name">Machine id</span>
+				<input name="machine_id" class="oauth-cfg mono" placeholder="storage.serviceMachineId" value={ c.MachineID } aria-label="machine id"/>
+			</label>
+			@oauthTokenFields(&domain.OAuthCreds{}, "", "")
+		</div>
 		<div class="form-actions">
 			@providerEditCheck()
 			@providerEditSaveCancel(p)

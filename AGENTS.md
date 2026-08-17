@@ -110,9 +110,10 @@ Qoder, Antigravity, Cursor, and Claude Code are backend-only variants.
   Preserve project bootstrap, schema cleanup, thought-signature backfill, and
   tool cloak/decloak symmetry.
 - **Cursor:** Backend-only Connect-RPC protobuf and stream-only. Authentication is
-  an imported IDE token plus machine ID with no refresh. Preserve the current
-  checksum algorithm, full identity-header override, `mcp_custom_` name mapping,
-  and XML-flattened tool results.
+  a browser/CLI OAuth session or imported IDE token plus a stable machine ID.
+  Native login must persist that identity and never regenerate it during refresh.
+  Preserve the current checksum algorithm, full identity-header override,
+  `mcp_custom_` name mapping, and XML-flattened tool results.
 - **Claude Code:** Keep an ID distinct from Anthropic so requests always pass
   through preparation. Preserve per-request session ID pairing between body and
   headers, OAuth-token-gated cloaking, tool decloaking, and CLI identity headers.

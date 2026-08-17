@@ -99,6 +99,44 @@ func TestProviderEditRowReasoningDialectSelector(t *testing.T) {
 	}
 }
 
+func TestCursorRecipeDefaultsToWebAuth(t *testing.T) {
+	r, ok := recipeByID("cursor")
+	if !ok {
+		t.Fatal("missing cursor recipe")
+	}
+	if r.Tag != "OAuth" || r.Kind != kindCursor {
+		t.Fatalf("recipe = %+v", r)
+	}
+	html := renderComponent(t, ProviderRecipeForm(r))
+	if !strings.Contains(html, `data-oauth-mode="web"`) {
+		t.Fatalf("want web oauth mode; html=%s", html)
+	}
+	if !strings.Contains(html, `/dashboard/providers/cursor/begin`) {
+		t.Fatalf("want cursor begin route; html=%s", html)
+	}
+	if !strings.Contains(html, `name="refresh_token"`) {
+		t.Fatalf("want manual refresh token field; html=%s", html)
+	}
+}
+
+func TestCursorEditRowReconnectAndRefresh(t *testing.T) {
+	p := &domain.Provider{
+		ID: 9, Name: "c", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{CursorAuth: true, RefreshToken: "rt", MachineID: "mid"},
+	}
+	html := renderComponent(t, providerEditRowCursor(p))
+	if strings.Contains(html, "cannot be refreshed") {
+		t.Fatalf("connected text still claims no refresh: %s", html)
+	}
+	if !strings.Contains(html, `/dashboard/providers/cursor/begin`) {
+		t.Fatalf("want reconnect begin; html=%s", html)
+	}
+	if !strings.Contains(html, "Refresh token") {
+		t.Fatalf("want refresh action; html=%s", html)
+	}
+}
+
 func TestGrokRecipeDefaultsToGrokDialect(t *testing.T) {
 	r, ok := recipeByID("xai")
 	if !ok {

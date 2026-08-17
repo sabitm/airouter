@@ -396,8 +396,8 @@ func checkAntigravityUpstream(ctx context.Context, logger *slog.Logger, p *domai
 // checkCursorUpstream validates a Cursor IDE token against the AgentService
 // GetUsableModels endpoint. Cursor's ChatService is Connect-RPC protobuf and
 // has no /models REST endpoint; GetUsableModels is the lighter liveness probe
-// (an unframed application/proto unary call). Tokens are short-lived and not
-// refreshable, so a 401/403 means re-paste, not refresh.
+// (an unframed application/proto unary call). A 401/403 means the effective
+// credential was rejected; known expiries are refreshed before this probe.
 func checkCursorUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	token := strings.TrimSpace(p.APIKey)
 	if token == "" {
@@ -424,7 +424,7 @@ func checkCursorUpstream(ctx context.Context, logger *slog.Logger, p *domain.Pro
 	}
 	switch {
 	case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
-		return false, fmt.Sprintf("token rejected (HTTP %d) - re-paste required", pr.StatusCode)
+		return false, fmt.Sprintf("token rejected (HTTP %d) - reconnect required", pr.StatusCode)
 	case pr.StatusCode >= 400:
 		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
 	}

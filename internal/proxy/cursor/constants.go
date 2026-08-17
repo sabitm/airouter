@@ -1,8 +1,7 @@
 // Package cursor implements the Cursor IDE backend codec: Connect-RPC
 // protobuf chat (ChatService StreamUnifiedChatWithTools), stream-only. Auth is
-// a pasted IDE access token plus a machine id; tokens are short-lived and not
-// refreshable. Wire constants and field numbers are ported from 9router's
-// open-sse/utils/cursorProtobuf.js.
+// a Cursor OAuth access token plus a stable machine id. Wire constants and
+// field numbers are ported from 9router's open-sse/utils/cursorProtobuf.js.
 package cursor
 
 const (

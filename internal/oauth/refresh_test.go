@@ -301,8 +301,8 @@ func TestCanRefresh(t *testing.T) {
 		{"nil", nil, false},
 		{"qoder device", &domain.OAuthCreds{QoderAuth: true, RefreshToken: "rt"}, false},
 		{"qoder even when expired", &domain.OAuthCreds{QoderAuth: true, ExpiresAt: 1}, false},
-		{"cursor import", &domain.OAuthCreds{CursorAuth: true, RefreshToken: "rt"}, false},
-		{"cursor even when expired", &domain.OAuthCreds{CursorAuth: true, ExpiresAt: 1}, false},
+		{"cursor access-only import", &domain.OAuthCreds{CursorAuth: true, ExpiresAt: 1}, false},
+		{"cursor with refresh token", &domain.OAuthCreds{CursorAuth: true, RefreshToken: "rt"}, true},
 		{"plain oauth", &domain.OAuthCreds{RefreshToken: "rt"}, true},
 		{"kiro", &domain.OAuthCreds{KiroAuth: "builder-id", RefreshToken: "rt"}, true},
 		{"cline", &domain.OAuthCreds{ClineAuth: true, RefreshToken: "rt"}, true},
@@ -328,6 +328,8 @@ func TestShouldRefreshGate(t *testing.T) {
 		{"far future", &domain.OAuthCreds{ExpiresAt: now.Add(1 * time.Hour).Unix()}, false},
 		{"within lead", &domain.OAuthCreds{ExpiresAt: now.Add(2 * time.Minute).Unix()}, true},
 		{"already expired", &domain.OAuthCreds{ExpiresAt: now.Add(-1 * time.Minute).Unix()}, true},
+		{"cursor access-only expired", &domain.OAuthCreds{CursorAuth: true, ExpiresAt: now.Add(-1 * time.Minute).Unix()}, false},
+		{"cursor refreshable near expiry", &domain.OAuthCreds{CursorAuth: true, RefreshToken: "rt", ExpiresAt: now.Add(2 * time.Minute).Unix()}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -585,18 +587,18 @@ func TestRefreshNoRefreshToken(t *testing.T) {
 	}
 }
 
-// TestRefreshCursorSurfacesInvalidGrant confirms Cursor IDE tokens (imported,
-// short-lived, no refresh endpoint) classify as ErrInvalidGrant on a forced
-// refresh, so the reactive 401 path prompts re-paste rather than retrying.
-func TestRefreshCursorSurfacesInvalidGrant(t *testing.T) {
+// TestRefreshCursorAccessOnlySurfacesInvalidGrant confirms access-only Cursor
+// imports (no refresh token) classify as ErrInvalidGrant and never hit a
+// generic token URL, so the reactive 401 path prompts reconnect/re-paste.
+func TestRefreshCursorAccessOnlySurfacesInvalidGrant(t *testing.T) {
 	srv, _ := tokenTestServer(t, func(url.Values) (int, string) {
-		t.Error("cursor refresh must not hit the token endpoint")
+		t.Error("cursor access-only refresh must not hit the generic token endpoint")
 		return 500, ""
 	})
 	c := &domain.OAuthCreds{
 		Mode: domain.OAuthManual, CursorAuth: true,
-		AccessToken: "ide-tok", RefreshToken: "ignored",
-		TokenURL: srv.URL, ClientID: "cid",
+		AccessToken: "ide-tok",
+		TokenURL:    srv.URL, ClientID: "cid",
 	}
 	if err := refresh(context.Background(), c, time.Unix(1000, 0)); !IsInvalidGrant(err) {
 		t.Fatalf("err = %v, want ErrInvalidGrant", err)
@@ -606,20 +608,19 @@ func TestRefreshCursorSurfacesInvalidGrant(t *testing.T) {
 	}
 }
 
-// TestResolveForcedCursorSurfacesInvalidGrant mirrors the Qoder regression: a
-// forced Resolve on a Cursor imported token returns ErrInvalidGrant + the
-// fallback token, with zero token-endpoint hits, so the reactive 401 path can
-// surface reconnect without weakening the bulk-refresh skip.
-func TestResolveForcedCursorSurfacesInvalidGrant(t *testing.T) {
+// TestResolveForcedCursorAccessOnlySurfacesInvalidGrant mirrors the Qoder
+// regression for access-only Cursor imports: forced Resolve returns
+// ErrInvalidGrant + the fallback token, with zero generic token-endpoint hits.
+func TestResolveForcedCursorAccessOnlySurfacesInvalidGrant(t *testing.T) {
 	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
-		t.Error("cursor refresh must not hit the token endpoint")
+		t.Error("cursor access-only refresh must not hit the generic token endpoint")
 		return 500, ""
 	})
 	store := newFakeStore()
 	creds := &domain.OAuthCreds{
 		Mode: domain.OAuthManual, CursorAuth: true,
-		AccessToken: "ide-tok", RefreshToken: "ignored",
-		TokenURL: srv.URL, ClientID: "cid",
+		AccessToken: "ide-tok",
+		TokenURL:    srv.URL, ClientID: "cid",
 	}
 	store.creds[1] = creds
 	s := New(store)

@@ -51,7 +51,7 @@ Anthropic-compatible APIs. The dashboard also includes guided connections for:
 | Kiro (AWS CodeWhisperer) | API key or OAuth |
 | Qoder | OAuth device flow |
 | Antigravity (Google Cloud Code) | OAuth; unofficial |
-| Cursor IDE | Imported IDE token; unofficial |
+| Cursor IDE | OAuth or imported CLI/IDE token; unofficial |
 | Claude Code | OAuth; unofficial |
 
 Provider credentials and OAuth tokens are encrypted in SQLite using

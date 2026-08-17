@@ -53,7 +53,7 @@ type Preset struct {
 	QoderAuth bool
 	// AntigravityAuth marks a Google Antigravity connection (project bootstrap).
 	AntigravityAuth bool
-	// CursorAuth marks an imported Cursor IDE token connection (no refresh).
+	// CursorAuth marks a Cursor IDE connection (browser poll or imported tokens).
 	CursorAuth bool
 	// ClaudeCodeAuth marks a Claude Code (claude.ai) connection: JSON token
 	// exchange and the CLI identity/cloak profile. Refresh reuses the generic
@@ -172,9 +172,9 @@ var Presets = []Preset{
 		Protocol:        domain.ProtocolAntigravity,
 		AntigravityAuth: true,
 	},
-	// Cursor IDE: import a logged-in access token + machine id from the IDE's
-	// local state. No OAuth flow and no refresh (tokens are short-lived IDE
-	// sessions); this preset only prefills the base URL and the marker.
+	// Cursor IDE: browser-and-poll login (loginDeepControl + auth/poll) or a
+	// pasted CLI/IDE token + machine id. Refresh uses exchange_user_api_key when
+	// a refresh token is present. This preset only prefills the base URL and marker.
 	{
 		Name:       "cursor",
 		Label:      "Cursor IDE",

@@ -31,9 +31,10 @@ const (
 	// through the IR.
 	ProtocolAntigravity Protocol = "antigravity"
 	// ProtocolCursor is the Cursor IDE backend. Backend only: Connect-RPC protobuf
-	// chat (ChatService StreamUnifiedChatWithTools), stream-only. Auth is a pasted
-	// IDE access token plus a machine id (no OAuth refresh); every request
-	// translates through the IR. Tokens are short-lived and cannot be refreshed.
+	// chat (ChatService StreamUnifiedChatWithTools), stream-only. Auth is a Cursor
+	// browser/CLI OAuth session or a pasted IDE token plus a stable machine id;
+	// every request translates through the IR. Refresh uses exchange_user_api_key
+	// when a refresh token is present; access-only imports stay non-refreshable.
 	ProtocolCursor Protocol = "cursor"
 	// ProtocolClaudeCode is the Claude Code CLI-backed Anthropic Messages backend.
 	// Backend only: same Messages wire format as ProtocolAnthropic, but it
@@ -238,7 +239,8 @@ type OAuthCreds struct {
 	QoderAuth bool `json:"qoder_auth,omitempty"`
 	// UserID is the stable Qoder user id from the device token poll (COSY uid).
 	UserID string `json:"user_id,omitempty"`
-	// MachineID is a UUID generated at connect time and reused on every COSY request.
+	// MachineID is the stable provider identity generated at connect time. Qoder
+	// uses it for COSY signing; Cursor appends it to x-cursor-checksum.
 	MachineID string `json:"machine_id,omitempty"`
 	// OrganizationID is optional org scope from userinfo.
 	OrganizationID string `json:"organization_id,omitempty"`
@@ -253,11 +255,12 @@ type OAuthCreds struct {
 	// chat bodies. Empty means the connection is incomplete (fail closed).
 	ProjectID string `json:"project_id,omitempty"`
 
-	// CursorAuth marks an imported Cursor IDE token connection. When true,
-	// refresh is a no-op that surfaces reconnect (tokens are short-lived IDE
-	// sessions with no refresh endpoint). MachineID feeds the x-cursor-checksum
-	// header; AccessToken (with any "::" prefix stripped at header-build time) is
-	// sent as the bearer credential.
+	// CursorAuth marks a Cursor IDE OAuth connection. When true, refresh uses
+	// POST /auth/exchange_user_api_key with RefreshToken as the Bearer credential
+	// when one is present; access-only imports stay usable but cannot rotate.
+	// MachineID feeds the x-cursor-checksum header and must stay stable across
+	// refresh; AccessToken (with any "::" prefix stripped at header-build time)
+	// is sent as the bearer credential.
 	CursorAuth bool `json:"cursor_auth,omitempty"`
 
 	// ClaudeCodeAuth marks a Claude Code (claude.ai) OAuth connection. When true,

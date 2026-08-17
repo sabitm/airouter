@@ -21,7 +21,7 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 			return nil, fieldError("unknown preset")
 		}
 		// Interactive presets (with an authorize URL) are fully self-configured.
-		// Import/device presets (Kiro, Qoder) have no authorize endpoint on this form:
+		// Import/device presets (Kiro, Qoder, Cursor) have no authorize endpoint on this form:
 		// their client config comes from the form fields, tagged with the preset name.
 		if p.AuthURL != "" {
 			_, creds := oauth.Apply(p)
@@ -30,7 +30,7 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 		c := manualCredsFromForm(r)
 		c.Preset = name
 		// Device-flow / import markers must still land on the creds even without
-		// an authorize URL (Qoder device, Cursor token import).
+		// an authorize URL (Qoder device, Cursor browser/import).
 		if p.QoderAuth {
 			c.QoderAuth = true
 		}
@@ -111,6 +111,33 @@ func (h *Handler) qoderDeviceBegin(w http.ResponseWriter, r *http.Request) {
 	render(w, r, QoderDeviceView(conn.State(), conn.VerificationURI()))
 }
 
+func (h *Handler) cursorConnectBegin(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		render(w, r, OAuthConnectError("invalid form"))
+		return
+	}
+	machineID := strings.TrimSpace(r.FormValue("machine_id"))
+	if machineID == "" {
+		if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
+			if p, gErr := h.store.GetProvider(r.Context(), id); gErr == nil && p.OAuthCreds != nil {
+				machineID = strings.TrimSpace(p.OAuthCreds.MachineID)
+			}
+		}
+	}
+	conn, err := oauth.NewCursorConnect(machineID)
+	if err != nil {
+		render(w, r, OAuthConnectError(err.Error()))
+		return
+	}
+	if err := conn.Start(r.Context()); err != nil {
+		conn.Close()
+		render(w, r, OAuthConnectError(err.Error()))
+		return
+	}
+	h.sessions.put(conn.State(), &connectSession{conn: conn, created: time.Now()}, time.Now())
+	render(w, r, CursorConnectView(conn.State(), conn.LoginURL()))
+}
+
 // applyManualTokens overlays user-pasted tokens onto a config-only creds, for
 // importing an already-authenticated session (e.g. from a CLI) without running
 // the browser connect flow. It returns false when neither token is present, so
@@ -133,6 +160,9 @@ func applyManualTokens(c *domain.OAuthCreds, r *http.Request) bool {
 		c.AccountID = accountID
 	}
 	c.ExpiresAt = parseExpiresAt(r.FormValue("expires_at"))
+	if c.ExpiresAt == 0 && c.CursorAuth {
+		c.ExpiresAt = oauth.CursorTokenExpiry(access)
+	}
 	if v := strings.TrimSpace(r.FormValue("project_id")); v != "" {
 		c.ProjectID = v
 	}
@@ -148,9 +178,9 @@ func applyAntigravityConfig(c *domain.OAuthCreds, r *http.Request) {
 	}
 }
 
-// applyCursorConfig marks the connection as an imported Cursor IDE token and
-// overlays the machine id from the form. The access token comes in via
-// applyManualTokens; both are required at save time (validated by handlers).
+// applyCursorConfig marks the connection as Cursor OAuth and overlays a machine
+// id from the form when present. Browser-connect saves already carry MachineID
+// on the session creds; an empty form field must not erase it.
 func applyCursorConfig(c *domain.OAuthCreds, r *http.Request) {
 	c.CursorAuth = true
 	if v := strings.TrimSpace(r.FormValue("machine_id")); v != "" {
@@ -451,9 +481,11 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 	qoderFlow := creds.QoderAuth
 	cursorFlow := creds.CursorAuth
 	switch {
-	case qoderFlow, cursorFlow:
-		// Device / imported tokens cannot refresh; fall through to RefreshTokens
-		// which returns invalid_grant (reconnect / re-paste required).
+	case qoderFlow:
+		// Device tokens cannot refresh; fall through to RefreshTokens which
+		// returns invalid_grant (reconnect required).
+	case cursorFlow:
+		// Cursor exchange_user_api_key uses RefreshToken as Bearer; no token URL.
 	case kiroFlow:
 		// Kiro social/OIDC does not require client_id on this form path.
 	case clineFlow:

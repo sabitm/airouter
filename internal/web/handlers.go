@@ -97,6 +97,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/providers/oauth/refresh-all", h.refreshAllOAuth)
 	mux.HandleFunc("POST /dashboard/providers/kiro/device/begin", h.kiroDeviceBegin)
 	mux.HandleFunc("POST /dashboard/providers/qoder/device/begin", h.qoderDeviceBegin)
+	mux.HandleFunc("POST /dashboard/providers/cursor/begin", h.cursorConnectBegin)
 
 	// Combos
 	mux.HandleFunc("GET /dashboard/combos", h.combosPage)
@@ -466,9 +467,19 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 // tokens are kept. The paste fields are blank by default, so editing an oauth
 // provider without reconnecting or pasting never requires re-auth.
 func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cur *domain.Provider, proto domain.Protocol) {
+	var prevCursorMachineID string
+	if cur.OAuthCreds != nil {
+		prevCursorMachineID = cur.OAuthCreds.MachineID
+	}
 	if creds, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
 		cur.OAuthCreds = creds
 	} else if c, err := credsFromConnectForm(r); err == nil && applyManualTokens(c, r) {
+		if proto == domain.ProtocolCursor && c.AccessToken == "" && cur.OAuthCreds != nil {
+			c.AccessToken = cur.OAuthCreds.AccessToken
+			c.ExpiresAt = cur.OAuthCreds.ExpiresAt
+			c.Email = cur.OAuthCreds.Email
+			c.AccountID = cur.OAuthCreds.AccountID
+		}
 		cur.OAuthCreds = c
 	}
 	if cur.OAuthCreds == nil {
@@ -494,6 +505,9 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	}
 	if proto == domain.ProtocolCursor {
 		applyCursorConfig(cur.OAuthCreds, r)
+		if strings.TrimSpace(cur.OAuthCreds.MachineID) == "" {
+			cur.OAuthCreds.MachineID = prevCursorMachineID
+		}
 		if strings.TrimSpace(cur.OAuthCreds.AccessToken) == "" {
 			htmxBadRequest(w, r, "provider-flash", "cursor: paste an access token before saving")
 			return

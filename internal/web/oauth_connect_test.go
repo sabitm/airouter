@@ -2,7 +2,9 @@ package web
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +17,7 @@ import (
 
 	"airouter/internal/crypto"
 	"airouter/internal/domain"
+	"airouter/internal/oauth"
 	"airouter/internal/store"
 )
 
@@ -421,6 +424,318 @@ func TestCreateCursorProviderMissingMachineIDRejected(t *testing.T) {
 	}
 }
 
+func TestCreateCursorProviderWithRefreshToken(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "my-cursor")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("access_token", "cli-tok")
+	form.Set("refresh_token", "cli-rt")
+	form.Set("expires_at", "1782522851")
+	form.Set("machine_id", "m-uuid")
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, reqWithForm(form))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	providers, _ := h.store.ListProviders(context.Background())
+	if len(providers) != 1 {
+		t.Fatalf("providers = %d, want 1", len(providers))
+	}
+	c := providers[0].OAuthCreds
+	if c.RefreshToken != "cli-rt" || c.ExpiresAt != 1782522851 || c.MachineID != "m-uuid" {
+		t.Fatalf("creds = %+v", c)
+	}
+}
+
+func TestCreateCursorProviderDerivesJWTExpiry(t *testing.T) {
+	h := testHandler(t)
+	exp := int64(1_782_522_851)
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1782522851}`))
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "my-cursor")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("access_token", header+"."+payload+".")
+	form.Set("refresh_token", "cli-rt")
+	form.Set("machine_id", "m-uuid")
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, reqWithForm(form))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	providers, _ := h.store.ListProviders(context.Background())
+	if len(providers) != 1 || providers[0].OAuthCreds.ExpiresAt != exp {
+		t.Fatalf("providers = %+v", providers)
+	}
+}
+
+func TestCursorBeginStoresSessionAndRendersLogin(t *testing.T) {
+	restore := stubCursorPoll(t)
+	defer restore()
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("preset", "cursor")
+	rec := httptest.NewRecorder()
+	h.cursorConnectBegin(rec, reqWithForm(form))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("begin status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Open authorization page") {
+		t.Fatalf("missing login link: %s", body)
+	}
+	if !strings.Contains(body, "waiting for authorization") {
+		t.Fatalf("status poll should be enabled: %s", body)
+	}
+	state := parseState(t, body)
+	sess, ok := h.sessions.get(state)
+	if !ok {
+		t.Fatal("session not stored")
+	}
+	_ = sess.conn.Close()
+}
+
+func TestCreateCursorFromConnectSession(t *testing.T) {
+	h := testHandler(t)
+	conn := &stubCursorConn{
+		state: "cursor-state-1",
+		creds: &domain.OAuthCreds{
+			Mode: domain.OAuthAuto, Preset: "cursor", CursorAuth: true,
+			AccessToken: "sess-tok", RefreshToken: "sess-rt", MachineID: "gen-mid",
+		},
+	}
+	h.sessions.put(conn.state, &connectSession{conn: conn, created: time.Now()}, time.Now())
+
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "cursor-web")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("oauth_session", conn.state)
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, reqWithForm(form))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	providers, _ := h.store.ListProviders(context.Background())
+	if len(providers) != 1 {
+		t.Fatalf("providers = %d", len(providers))
+	}
+	c := providers[0].OAuthCreds
+	if c.AccessToken != "sess-tok" || c.MachineID != "gen-mid" || !c.CursorAuth {
+		t.Fatalf("creds = %+v", c)
+	}
+	if _, ok := h.sessions.get(conn.state); ok {
+		t.Error("session not dropped")
+	}
+}
+
+func TestUpdateCursorReconnectPreservesMachineID(t *testing.T) {
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "cursor", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			CursorAuth: true, AccessToken: "old-tok", MachineID: "keep-mid",
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	conn := &stubCursorConn{
+		state: "cursor-reconn",
+		creds: &domain.OAuthCreds{
+			Mode: domain.OAuthAuto, Preset: "cursor", CursorAuth: true,
+			AccessToken: "new-tok", RefreshToken: "new-rt", MachineID: "keep-mid",
+		},
+	}
+	h.sessions.put(conn.state, &connectSession{conn: conn, created: time.Now()}, time.Now())
+
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "cursor")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("oauth_session", conn.state)
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/"+strconv.FormatInt(p.ID, 10), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	got, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.AccessToken != "new-tok" || got.OAuthCreds.MachineID != "keep-mid" {
+		t.Fatalf("creds = %+v", got.OAuthCreds)
+	}
+}
+
+func TestUpdateCursorManualPasteKeepsMachineID(t *testing.T) {
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "cursor", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			CursorAuth: true, AccessToken: "old-tok", MachineID: "keep-mid",
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "cursor")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("access_token", "pasted-tok")
+	form.Set("refresh_token", "pasted-rt")
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/"+strconv.FormatInt(p.ID, 10), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	got, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.AccessToken != "pasted-tok" || got.OAuthCreds.RefreshToken != "pasted-rt" {
+		t.Fatalf("tokens = %+v", got.OAuthCreds)
+	}
+	if got.OAuthCreds.MachineID != "keep-mid" {
+		t.Fatalf("machine id = %q, want keep-mid", got.OAuthCreds.MachineID)
+	}
+}
+
+func TestUpdateCursorManualRefreshTokenKeepsAccessAndMachineID(t *testing.T) {
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "cursor", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			CursorAuth: true, AccessToken: "old-tok", MachineID: "keep-mid",
+			ExpiresAt: 12345, Email: "user@example.com", AccountID: "account-1",
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Set("auth_method", "oauth")
+	form.Set("name", "cursor")
+	form.Set("protocol", "cursor")
+	form.Set("preset", "cursor")
+	form.Set("refresh_token", "pasted-rt")
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/"+strconv.FormatInt(p.ID, 10), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	got, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.AccessToken != "old-tok" || got.OAuthCreds.RefreshToken != "pasted-rt" {
+		t.Fatalf("tokens = %+v", got.OAuthCreds)
+	}
+	if got.OAuthCreds.MachineID != "keep-mid" {
+		t.Fatalf("machine id = %q, want keep-mid", got.OAuthCreds.MachineID)
+	}
+	if got.OAuthCreds.ExpiresAt != 12345 || got.OAuthCreds.Email != "user@example.com" || got.OAuthCreds.AccountID != "account-1" {
+		t.Fatalf("metadata = %+v", got.OAuthCreds)
+	}
+}
+
+func TestCursorOAuthStatusPollsPendingSession(t *testing.T) {
+	restore := stubCursorPoll(t)
+	defer restore()
+	h := testHandler(t)
+	form := url.Values{}
+	form.Set("preset", "cursor")
+	begin := httptest.NewRecorder()
+	h.cursorConnectBegin(begin, reqWithForm(form))
+	state := parseState(t, begin.Body.String())
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/providers/oauth/status?state="+state, nil)
+	rec := httptest.NewRecorder()
+	h.oauthConnectStatus(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "waiting for authorization") {
+		t.Fatalf("pending status = %s", body)
+	}
+	if sess, ok := h.sessions.get(state); ok {
+		_ = sess.conn.Close()
+	}
+}
+
+func TestCursorBeginUsesExistingMachineID(t *testing.T) {
+	restore := stubCursorPoll(t)
+	defer restore()
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "cursor", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{CursorAuth: true, AccessToken: "tok", MachineID: "existing-mid"},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Set("preset", "cursor")
+	form.Set("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.cursorConnectBegin(rec, reqWithForm(form))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("begin status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	state := parseState(t, rec.Body.String())
+	sess, ok := h.sessions.get(state)
+	if !ok {
+		t.Fatal("session missing")
+	}
+	defer sess.conn.Close()
+	cc, ok := sess.conn.(*oauth.CursorConnect)
+	if !ok {
+		t.Fatalf("conn type %T", sess.conn)
+	}
+	if cc.MachineID() != "existing-mid" {
+		t.Fatalf("machine id = %q, want existing-mid", cc.MachineID())
+	}
+}
+
+func stubCursorPoll(t *testing.T) func() {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	return oauth.OverrideCursorURLs(srv.URL+"/loginDeepControl", srv.URL+"/auth/poll", "")
+}
+
+type stubCursorConn struct {
+	state string
+	creds *domain.OAuthCreds
+}
+
+func (s *stubCursorConn) State() string { return s.state }
+func (s *stubCursorConn) Result() (*domain.OAuthCreds, error, bool) {
+	return s.creds, nil, true
+}
+func (s *stubCursorConn) Close() error { return nil }
+
 func TestCreateCursorProviderMissingAccessTokenRejected(t *testing.T) {
 	h := testHandler(t)
 	form := url.Values{}
@@ -710,6 +1025,50 @@ func TestOAuthRefreshTokens(t *testing.T) {
 
 // TestOAuthRefreshNoRefreshToken: refreshing without a refresh token reports the
 // requirement and does not call any endpoint.
+func TestOAuthRefreshCursorUsesExchange(t *testing.T) {
+	h := testHandler(t)
+	var sawAuth, sawBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth = r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		sawBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"accessToken": "cursor-fresh",
+		})
+	}))
+	t.Cleanup(srv.Close)
+	restore := oauth.OverrideCursorURLs("", "", srv.URL)
+	defer restore()
+
+	p := &domain.Provider{
+		Name: "cursor", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			CursorAuth: true, AccessToken: "old", RefreshToken: "rt-cli", MachineID: "mid",
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Set("preset", "cursor")
+	form.Set("id", strconv.FormatInt(p.ID, 10))
+	form.Set("refresh_view", "status")
+	rec := httptest.NewRecorder()
+	h.oauthRefreshTokens(rec, reqWithForm(form))
+	if sawAuth != "Bearer rt-cli" || sawBody != "{}" {
+		t.Fatalf("exchange saw auth=%q body=%q", sawAuth, sawBody)
+	}
+	if !strings.Contains(rec.Body.String(), "refreshed") {
+		t.Fatalf("result = %s", rec.Body.String())
+	}
+	got, _ := h.store.GetProvider(context.Background(), p.ID)
+	if got.OAuthCreds.AccessToken != "cursor-fresh" || got.OAuthCreds.MachineID != "mid" {
+		t.Fatalf("persisted = %+v", got.OAuthCreds)
+	}
+}
+
 func TestOAuthRefreshNoRefreshToken(t *testing.T) {
 	h := testHandler(t)
 	form := url.Values{}
@@ -773,6 +1132,17 @@ func TestRefreshAllOAuth(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Access-only Cursor imports remain non-refreshable and must be skipped.
+	if err := h.store.CreateProvider(context.Background(), &domain.Provider{
+		Name: "cursor-import", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			Mode: domain.OAuthManual, CursorAuth: true,
+			AccessToken: "ide-tok", MachineID: "m1",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/oauth/refresh-all", nil)
 	rec := httptest.NewRecorder()
@@ -785,8 +1155,8 @@ func TestRefreshAllOAuth(t *testing.T) {
 	if !strings.Contains(body, "refreshed 2 oauth provider(s)") {
 		t.Fatalf("result = %s, want refreshed 2", body)
 	}
-	if !strings.Contains(body, "skipped 1 (non-refreshable)") {
-		t.Errorf("result = %s, want skipped 1", body)
+	if !strings.Contains(body, "skipped 2 (non-refreshable)") {
+		t.Errorf("result = %s, want skipped 2", body)
 	}
 	if strings.Contains(body, "qoder: reconnect required") || strings.Contains(body, "failed") {
 		t.Errorf("result = %s, qoder must not be failed", body)
@@ -799,6 +1169,12 @@ func TestRefreshAllOAuth(t *testing.T) {
 			if p.OAuthCreds.QoderAuth {
 				if p.OAuthCreds.AccessToken != "device-tok" {
 					t.Errorf("qoder access token = %q, want unchanged device-tok", p.OAuthCreds.AccessToken)
+				}
+				continue
+			}
+			if p.OAuthCreds.CursorAuth {
+				if p.OAuthCreds.AccessToken != "ide-tok" {
+					t.Errorf("cursor access token = %q, want unchanged ide-tok", p.OAuthCreds.AccessToken)
 				}
 				continue
 			}

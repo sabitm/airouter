@@ -60,6 +60,22 @@ templ QoderDeviceView(state, verificationURI string) {
 	</div>
 }
 
+templ CursorConnectView(state, loginURL string) {
+	<div class="oauth-connect">
+		<p class="muted">Open the Cursor authorization page and approve the request. This page detects completion automatically.</p>
+		<a class="button" href={ templ.SafeURL(loginURL) } target="_blank" rel="noopener">Open authorization page</a>
+		<button
+			type="button"
+			class="link danger"
+			hx-post="/dashboard/providers/oauth/cancel"
+			hx-vals={ `{"state":"` + state + `"}` }
+			hx-target="closest .oauth-region"
+			hx-swap="innerHTML"
+		>Cancel</button>
+		@OAuthStatusLine(state, true, "pending", "", "")
+	</div>
+}
+
 // OAuthConnectIdle is the empty connect region shown before Connect is pressed
 // and after a cancel.
 templ OAuthConnectIdle() {

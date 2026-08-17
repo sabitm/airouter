@@ -80,16 +80,22 @@ func isInvalidGrantCode(code string) bool {
 }
 
 // CanRefresh reports whether creds support token-endpoint rotation. False for
-// nil and device/token-import connections (QoderAuth, CursorAuth): their tokens
-// cannot be rotated, so the bulk-refresh control skips them rather than
-// reporting a false failure. Resolve(force=true) does NOT consult this — a dead
+// nil, Qoder device tokens, and Cursor access-only imports (no refresh token).
+// Cursor browser/CLI credentials that carry a RefreshToken can rotate via
+// exchange_user_api_key. Resolve(force=true) does NOT consult this — a dead
 // device/imported token must still surface ErrInvalidGrant so the reactive 401
 // path can prompt reconnect.
 func CanRefresh(c *domain.OAuthCreds) bool {
 	if c == nil {
 		return false
 	}
-	return !c.QoderAuth && !c.CursorAuth
+	if c.QoderAuth {
+		return false
+	}
+	if c.CursorAuth {
+		return c.RefreshToken != ""
+	}
+	return true
 }
 
 // shouldRefresh reports whether the access token should be refreshed before use.
@@ -107,16 +113,17 @@ func shouldRefresh(c *domain.OAuthCreds, now time.Time) bool {
 // (some providers always issue a new one; others reuse). Returns ErrInvalidGrant
 // when the authorization server rejects the refresh token.
 func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
-	if c.RefreshToken == "" {
-		return errors.New("oauth: no refresh token")
-	}
 	// Qoder device tokens cannot refresh (center.qoder.sh returns 403).
 	if c.QoderAuth {
 		return refreshQoder(ctx, c, now)
 	}
-	// Cursor IDE tokens are short-lived sessions with no refresh endpoint.
+	// Cursor browser/CLI tokens refresh via exchange_user_api_key when a
+	// refresh token is present; access-only imports surface ErrInvalidGrant.
 	if c.CursorAuth {
 		return refreshCursor(ctx, c, now)
+	}
+	if c.RefreshToken == "" {
+		return errors.New("oauth: no refresh token")
 	}
 	// Kiro social/OIDC refresh uses JSON bodies with camelCase responses the
 	// generic OAuth2 path cannot parse. external_idp is excluded: it refreshes
