@@ -118,7 +118,11 @@ Qoder, Antigravity, Cursor, and Claude Code are backend-only variants.
   regenerate it during refresh. Preserve the checksum algorithm, full
   identity-header override, and the transcript-folded history/tool results
   (the server ignores inline `conversation_history`, and
-  `custom_system_prompt` is rejected).
+  `custom_system_prompt` is rejected). MCP tool definitions must carry
+  `provider_identifier`/`tool_name` — two or more identity-less definitions
+  are rejected by the provider with a 400. Built-in interaction queries
+  (`interaction_query`: web search, web fetch, ...) are client-executed; the
+  proxy fails the turn with an actionable message instead of stalling.
 - **Claude Code:** Keep an ID distinct from Anthropic so requests always pass
   through preparation. Preserve per-request session ID pairing between body and
   headers, OAuth-token-gated cloaking, tool decloaking, and CLI identity headers.

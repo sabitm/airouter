@@ -69,6 +69,8 @@ const (
 	mcpDefDescription      = 2
 	mcpDefInputSchemaValue = 3
 	mcpDefInputSchemaJSON  = 6
+	mcpDefProviderID       = 4
+	mcpDefToolName         = 5
 )
 
 // RequestedModel.
@@ -82,6 +84,15 @@ const (
 	asmInteractionUpdate = 1
 	asmExecServerMessage = 2
 	asmKVServerMessage   = 4
+	// asmInteractionQuery (7): the server asks the CLIENT to run a built-in
+	// interaction (web search, web fetch, ask question, plan, VM setup). A
+	// proxy cannot execute these, and ignoring the query stalls the turn with
+	// heartbeats forever — DecodeAgentStream fails the turn instead.
+	asmInteractionQuery = 7
+
+	// InteractionQuery variants. Only the discriminator matters; every variant
+	// is client-executed.
+	iqWebSearch = 2
 )
 
 // KvServerMessage / KvClientMessage and blob args/results.
@@ -306,6 +317,8 @@ func encodeAgentMCPTools(tools []ir.Tool) []byte {
 		}
 		def := concatBytes(
 			encodeField(mcpDefName, wireLen, t.Name),
+			encodeField(mcpDefProviderID, wireLen, []byte("airouter")),
+			encodeField(mcpDefToolName, wireLen, t.Name),
 		)
 		if t.Description != "" {
 			def = append(def, encodeField(mcpDefDescription, wireLen, t.Description)...)

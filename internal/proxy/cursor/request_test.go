@@ -201,6 +201,16 @@ func TestEncodeAgentRequestMCPTools(t *testing.T) {
 	if got, _ := stringField(def, mcpDefName); got != "get_weather" {
 		t.Errorf("tool name = %q", got)
 	}
+	// provider_identifier and tool_name must be set on every definition:
+	// the deployed provider rejects requests with 2+ MCP tools when the
+	// definitions carry no provider identity (verified live; single tool
+	// slips through).
+	if got, _ := stringField(def, mcpDefProviderID); got == "" {
+		t.Error("provider_identifier empty; multi-tool requests fail provider-side")
+	}
+	if got, _ := stringField(def, mcpDefToolName); got != "get_weather" {
+		t.Errorf("tool_name = %q, want get_weather", got)
+	}
 	if got, _ := stringField(def, mcpDefDescription); got != "weather" {
 		t.Errorf("tool description = %q", got)
 	}

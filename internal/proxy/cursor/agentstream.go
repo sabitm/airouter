@@ -117,6 +117,21 @@ func DecodeAgentStream(r io.Reader, writeFrame func([]byte) error, emit func(ir.
 			continue
 		}
 
+		// interaction_query: the server delegates a built-in client-side
+		// interaction (web search, web fetch, ...) to the caller. Only a real
+		// Cursor client can service these (search execution, signed result
+		// blobs); staying silent makes the upstream stall with heartbeats
+		// forever, so fail the turn with an actionable message.
+		if iqs, ok := top[asmInteractionQuery]; ok && len(iqs) > 0 {
+			kind := "built-in tool"
+			if q := decodeOrEmpty(iqs[0].value); q[iqWebSearch] != nil {
+				kind = "built-in web search"
+			}
+			return &ir.StreamFailure{
+				Message: "cursor: model requested a " + kind + " that requires the Cursor client; provide a matching MCP tool in the request or rephrase",
+			}
+		}
+
 		// kv_server_message: reply with empty blob results. Cursor stores
 		// conversation state blobs here; without a reply the run stalls. The
 		// proxy is stateless across requests, so nothing is persisted.

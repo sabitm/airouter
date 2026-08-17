@@ -272,6 +272,43 @@ func TestDecodeAgentStreamEmptyStreamFinishes(t *testing.T) {
 	}
 }
 
+// TestDecodeAgentStreamInteractionQueryFailsTurn verifies the built-in
+// interaction guard: a web-search interaction_query (server asks the client
+// to execute the search) must fail the turn with an actionable message
+// instead of being ignored, which would stall the upstream forever.
+func TestDecodeAgentStreamInteractionQueryFailsTurn(t *testing.T) {
+	// InteractionQuery{2: WebSearchRequestQuery{1: WebSearchArgs{1: "q"}}}
+	// wrapped in AgentServerMessage field 7.
+	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
+		encodeField(iqWebSearch, wireLen,
+			encodeField(1, wireLen,
+				encodeField(1, wireLen, "SPUS")))))
+	err := DecodeAgentStream(bytes.NewReader(frame), nil, func(ir.StreamEvent) error { return nil })
+	if err == nil {
+		t.Fatal("expected StreamFailure for interaction_query")
+	}
+	if _, ok := ir.AsStreamFailure(err); !ok {
+		t.Fatalf("error = %v, want StreamFailure", err)
+	}
+	if !strings.Contains(err.Error(), "built-in web search") {
+		t.Errorf("error = %v, want built-in web search hint", err)
+	}
+}
+
+// TestDecodeAgentStreamInteractionQueryOtherVariantFailClosed checks the
+// generic branch for non-search interaction queries (ask question, plan, ...).
+func TestDecodeAgentStreamInteractionQueryOtherVariantFailClosed(t *testing.T) {
+	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
+		encodeField(3, wireLen, []byte{}))) // ask_question_interaction_query
+	err := DecodeAgentStream(bytes.NewReader(frame), nil, func(ir.StreamEvent) error { return nil })
+	if _, ok := ir.AsStreamFailure(err); !ok {
+		t.Fatalf("error = %v, want StreamFailure", err)
+	}
+	if !strings.Contains(err.Error(), "built-in tool") {
+		t.Errorf("error = %v, want generic built-in tool hint", err)
+	}
+}
+
 func TestParseCursorErrorPrefersDetailTitle(t *testing.T) {
 	raw := []byte(`{"error":{"code":"resource_exhausted","message":"Error","details":[{"debug":{"details":{"title":"Update Required","detail":"Your version of Cursor is no longer supported."}}}]}}`)
 	err := parseCursorError(raw)
