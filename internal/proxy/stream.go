@@ -259,7 +259,15 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
-	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
+	var writeFrame func([]byte) error
+	closeWrite := func() {}
+	var resp *http.Response
+	if backend.decodeStreamDuplex != nil {
+		resp, writeFrame, closeWrite, err = p.forwardStreamDuplex(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
+	} else {
+		resp, err = p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
+	}
+	defer closeWrite()
 	if err != nil {
 		if resp != nil {
 			resp.Body.Close()
@@ -285,7 +293,13 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		res.inTok = inTok
 		res.outTok = outTok
 	}
-	err = backend.decodeStream(resp.Body, func(ev ir.StreamEvent) error {
+	decode := backend.decodeStream
+	if backend.decodeStreamDuplex != nil {
+		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			return backend.decodeStreamDuplex(r, writeFrame, emit)
+		}
+	}
+	err = decode(resp.Body, func(ev ir.StreamEvent) error {
 		// Token counts arrive on distinct events depending on backend: Anthropic
 		// reports input at message start, OpenAI reports both at finish. Keep
 		// them attempt-local until the sink commits bytes downstream.

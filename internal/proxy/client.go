@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -421,8 +423,29 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 // The caller owns closing resp.Body. Used for SSE responses. Token resolution
 // and the reactive 401/403 retry mirror forward, but must complete before the
 // stream is handed back since the status is only inspected once.
+// upstreamURL resolves the request URL for a backend path. An absolute path
+// (http/https) is used verbatim — backends whose chat host differs from the
+// provider's base URL (Cursor AgentService) supply one — unless the provider
+// carries a non-Cursor base URL, which then overrides the absolute host
+// (self-hosted mirrors and tests).
+func upstreamURL(provider *domain.Provider, path string) string {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		if b := strings.TrimSpace(provider.BaseURL); b != "" && !strings.Contains(b, "cursor.sh") {
+			if u, err := url.Parse(path); err == nil {
+				if bu, err := url.Parse(strings.TrimRight(b, "/")); err == nil && bu.Host != "" {
+					u.Scheme = bu.Scheme
+					u.Host = bu.Host
+					return u.String()
+				}
+			}
+		}
+		return path
+	}
+	return strings.TrimRight(provider.BaseURL, "/") + path
+}
+
 func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header, streamAccept string) (*http.Response, error) {
-	url := strings.TrimRight(provider.BaseURL, "/") + path
+	url := upstreamURL(provider, path)
 	if t := traceInfoFrom(ctx); t != nil {
 		t.UpstreamURL = url
 	}
@@ -495,6 +518,124 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		}
 	}
 	return resp, nil
+}
+
+// forwardStreamDuplex opens a streaming request whose body stays writable
+// after the initial bytes are sent (bidi Connect over HTTP/2; the pipe forces
+// chunked/streamed body framing). It returns the live response plus a frame
+// writer bound to the winning attempt's request body and a closeWrite that
+// ends the body — the caller must invoke closeWrite once decoding finishes or
+// the attempt is abandoned. The reactive OAuth retry mirrors forwardStream,
+// with a fresh pipe per attempt (a consumed pipe cannot be replayed).
+func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header, streamAccept string) (*http.Response, func([]byte) error, func(), error) {
+	url := upstreamURL(provider, path)
+	if t := traceInfoFrom(ctx); t != nil {
+		t.UpstreamURL = url
+	}
+	accept := streamAccept
+	if accept == "" {
+		accept = "text/event-stream"
+	}
+
+	var pw *io.PipeWriter
+	var closeOnce sync.Once
+	closeWrite := func() {
+		closeOnce.Do(func() {
+			if pw != nil {
+				pw.Close()
+			}
+		})
+	}
+	writeFrame := func(frame []byte) error {
+		w := pw
+		if w == nil {
+			return fmt.Errorf("proxy: duplex request body already closed")
+		}
+		_, err := w.Write(frame)
+		return err
+	}
+
+	send := func() (*http.Response, error) {
+		closeOnce = sync.Once{} // re-arm for the new attempt's pipe
+		closeWrite()            // release the previous attempt's pipe, if any
+		var pr *io.PipeReader
+		pr, pw = io.Pipe()
+		go func() {
+			// Initial request bytes; the pipe stays open for mid-stream replies.
+			if _, err := pw.Write(body); err != nil {
+				pw.CloseWithError(err)
+			}
+		}()
+		started := time.Now()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, pr)
+		if err != nil {
+			closeWrite()
+			return nil, err
+		}
+		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
+		req.Header.Set("Accept", accept)
+		var harHdr http.Header
+		if harRecorder(ctx) != nil {
+			harHdr = req.Header.Clone()
+		}
+		resp, err := p.streamClient.Do(req)
+		if err != nil {
+			closeWrite()
+			if harRecorder(ctx) != nil {
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, 0, nil, nil, "", 0, err.Error())
+			}
+			return nil, err
+		}
+		if harRecorder(ctx) != nil {
+			// HAR captures the initial request bytes only; mid-stream duplex
+			// replies are not recorded.
+			resp.Body = &harCaptureBody{
+				rc:      resp.Body,
+				started: started,
+				method:  req.Method,
+				url:     url,
+				reqHdr:  harHdr,
+				reqBody: body,
+				status:  resp.StatusCode,
+				respHdr: resp.Header.Clone(),
+				mime:    streamRespMIME(resp, accept),
+				record:  p.recordUpstreamHAR,
+				ctx:     ctx,
+			}
+		}
+		return resp, nil
+	}
+
+	if err := p.resolveToken(ctx, provider, false); err != nil {
+		observability.Logger(ctx, p.logger).Debug("oauth_resolve_failed",
+			"event", "oauth_resolve_failed",
+			"provider", provider.Name,
+			"error", "OAuth token resolution failed",
+		)
+	}
+	resp, err := send()
+	if err != nil {
+		return nil, writeFrame, closeWrite, err
+	}
+	if isAuthFailure(resp.StatusCode) && provider.Method() == domain.AuthOAuth {
+		if rerr := p.resolveToken(ctx, provider, true); rerr == nil {
+			resp.Body.Close()
+			resp, err = send()
+			if err != nil {
+				return nil, writeFrame, closeWrite, err
+			}
+			return resp, writeFrame, closeWrite, nil
+		} else {
+			observability.Logger(ctx, p.logger).Debug("oauth_forced_refresh_failed",
+				"event", "oauth_forced_refresh_failed",
+				"provider", provider.Name,
+				"status", resp.StatusCode,
+				"reconnect_required", oauth.IsInvalidGrant(rerr),
+				"error", "OAuth forced refresh failed",
+			)
+		}
+	}
+	return resp, writeFrame, closeWrite, nil
 }
 
 // harRecorder returns the request-pinned HAR recorder, or nil when capture is off.

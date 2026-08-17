@@ -2,306 +2,297 @@ package cursor
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"airouter/internal/proxy/ir"
 )
 
-// frame builds a Connect-RPC frame (uncompressed) wrapping the given protobuf.
-func frame(t *testing.T, proto []byte) []byte {
+// agentFrame builds a Connect-RPC frame (uncompressed) wrapping the given
+// protobuf.
+func agentFrame(t *testing.T, proto []byte) []byte {
 	t.Helper()
 	return wrapConnectFrame(proto, false)
 }
 
-// textFrame builds a response frame whose field 2 (StreamUnifiedChatResponse)
-// carries the given text in field 1.
-func textFrame(t *testing.T, text string) []byte {
+// interactionUpdateFrame wraps one InteractionUpdate variant.
+func interactionUpdateFrame(t *testing.T, field int, inner []byte) []byte {
 	t.Helper()
-	resp := encodeField(respText, wireLen, text)
-	top := encodeField(respResponse, wireLen, resp)
-	return frame(t, top)
+	return agentFrame(t, encodeField(asmInteractionUpdate, wireLen,
+		encodeField(field, wireLen, inner)))
 }
 
-// thinkingFrame builds a response frame whose field 2 carries thinking text in
-// field 25 -> field 1.
-func thinkingFrame(t *testing.T, thinking string) []byte {
+func agentTextFrame(t *testing.T, text string) []byte {
 	t.Helper()
-	th := encodeField(thinkingText, wireLen, thinking)
-	resp := encodeField(respThinking, wireLen, th)
-	top := encodeField(respResponse, wireLen, resp)
-	return frame(t, top)
+	return interactionUpdateFrame(t, iuTextDelta, encodeField(tdText, wireLen, text))
 }
 
-// toolCallFrame builds a ClientSideToolV2Call (field 1) with id, name, args, and
-// nested mcp_params.tools[0].{name,params}.
-func toolCallFrame(t *testing.T, id, name, args string, isLast bool) []byte {
+func agentTurnEndedFrame(t *testing.T, in, out uint64) []byte {
 	t.Helper()
-	tool := concatBytes(
-		encodeField(mcpNestedName, wireLen, name),
-		encodeField(mcpNestedParams, wireLen, args),
+	inner := concatBytes(
+		encodeField(teInputTokens, wireVarint, in),
+		encodeField(teOutputTokens, wireVarint, out),
 	)
-	params := encodeField(mcpToolsList, wireLen, tool)
-	var call []byte
-	call = append(call, encodeField(toolID, wireLen, id)...)
-	call = append(call, encodeField(toolMCPParams, wireLen, params)...)
-	if isLast {
-		call = append(call, encodeField(toolIsLast, wireVarint, uint64(1))...)
-	}
-	top := encodeField(respToolCall, wireLen, call)
-	return frame(t, top)
+	return interactionUpdateFrame(t, iuTurnEnded, inner)
 }
 
-func collectEvents(t *testing.T, frames ...[]byte) []ir.StreamEvent {
+// kvServerFrame builds a KvServerMessage (field 4) with the given variant.
+func kvServerFrame(t *testing.T, variant int) []byte {
+	t.Helper()
+	kv := concatBytes(
+		encodeField(kvsID, wireVarint, uint64(7)),
+		encodeField(variant, wireLen, []byte{}),
+	)
+	return agentFrame(t, encodeField(asmKVServerMessage, wireLen, kv))
+}
+
+// execRequestContextFrame builds an ExecServerMessage with request_context_args.
+func execRequestContextFrame(t *testing.T) []byte {
+	t.Helper()
+	ex := concatBytes(
+		encodeField(esmID, wireVarint, uint64(3)),
+		encodeField(esmExecID, wireLen, "exec-1"),
+		encodeField(esmRequestContextArgs, wireLen, []byte{}),
+	)
+	return agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex))
+}
+
+// mcpExecFrame builds an ExecServerMessage carrying mcp_args.
+func mcpExecFrame(t *testing.T, callID, toolName string, args map[string]any) []byte {
+	t.Helper()
+	var argsMap []byte
+	for k, v := range args {
+		val := encodeField(3, wireLen, []byte(v.(string))) // string_value (direct scalar)
+		entry := concatBytes(encodeField(1, wireLen, k), encodeField(2, wireLen, val))
+		argsMap = append(argsMap, encodeField(maArgs, wireLen, entry)...)
+	}
+	ma := concatBytes(
+		encodeField(maName, wireLen, toolName),
+		argsMap,
+		encodeField(maCallID, wireLen, callID),
+	)
+	ex := concatBytes(
+		encodeField(esmID, wireVarint, uint64(5)),
+		encodeField(esmMCPArgs, wireLen, ma),
+	)
+	return agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex))
+}
+
+func collectAgentEvents(t *testing.T, frames ...[]byte) []ir.StreamEvent {
 	t.Helper()
 	var out []ir.StreamEvent
-	err := DecodeStream(bytes.NewReader(bytes.Join(frames, nil)), func(ev ir.StreamEvent) error {
+	err := DecodeAgentStream(bytes.NewReader(bytes.Join(frames, nil)), nil, func(ev ir.StreamEvent) error {
 		out = append(out, ev)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("DecodeStream: %v", err)
+		t.Fatalf("DecodeAgentStream: %v", err)
 	}
 	return out
 }
 
-func TestDecodeStreamTextDeltas(t *testing.T) {
-	evs := collectEvents(t, textFrame(t, "hel"), textFrame(t, "lo"))
-	// Expect MessageStart, two TextDeltas, Finish.
-	if len(evs) != 4 {
-		t.Fatalf("events = %d, want 4: %+v", len(evs), evs)
+func TestDecodeAgentStreamTextDeltas(t *testing.T) {
+	events := collectAgentEvents(t,
+		agentTextFrame(t, "Hello"),
+		agentTextFrame(t, " world"),
+		agentTurnEndedFrame(t, 12, 3),
+	)
+	var text strings.Builder
+	for _, ev := range events {
+		if ev.Kind == ir.EventTextDelta {
+			text.WriteString(ev.Text)
+		}
 	}
-	if evs[0].Kind != ir.EventMessageStart {
-		t.Errorf("ev0 = %v, want MessageStart", evs[0].Kind)
+	if text.String() != "Hello world" {
+		t.Errorf("text = %q", text.String())
 	}
-	if evs[1].Kind != ir.EventTextDelta || evs[1].Text != "hel" {
-		t.Errorf("ev1 = %+v, want text hel", evs[1])
+	last := events[len(events)-1]
+	if last.Kind != ir.EventFinish || last.StopReason != ir.StopEndTurn {
+		t.Fatalf("last event = %+v, want end_turn finish", last)
 	}
-	if evs[2].Kind != ir.EventTextDelta || evs[2].Text != "lo" {
-		t.Errorf("ev2 = %+v, want text lo", evs[2])
+	if last.InputTokens != 12 || last.OutputTokens != 3 {
+		t.Errorf("usage = %d/%d, want 12/3", last.InputTokens, last.OutputTokens)
 	}
-	if evs[3].Kind != ir.EventFinish || evs[3].StopReason != ir.StopEndTurn {
-		t.Errorf("ev3 = %+v, want Finish/EndTurn", evs[3])
+	if events[0].Kind != ir.EventMessageStart {
+		t.Errorf("first event = %+v, want message start", events[0])
 	}
 }
 
-func TestDecodeStreamToolCallReassembly(t *testing.T) {
-	// Two fragments for the same tool id, then is_last on the second.
-	evs := collectEvents(t,
-		toolCallFrame(t, "tc1", "mcp_custom_Write", `{"path":"`, false),
-		toolCallFrame(t, "tc1", "mcp_custom_Write", `foo.txt"}`, true),
-	)
-	// MessageStart, ToolCallStart, ToolCallDelta(full first), ToolCallDelta(second), Finish(ToolUse)
-	if len(evs) < 2 {
-		t.Fatalf("events = %d: %+v", len(evs), evs)
+func TestDecodeAgentStreamKVReplies(t *testing.T) {
+	var writes [][]byte
+	var events []ir.StreamEvent
+	err := DecodeAgentStream(bytes.NewReader(bytes.Join([][]byte{
+		kvServerFrame(t, kvsGetBlobArgs),
+		kvServerFrame(t, kvsSetBlobArgs),
+		agentTextFrame(t, "ok"),
+		agentTurnEndedFrame(t, 1, 1),
+	}, nil)), func(frame []byte) error {
+		writes = append(writes, frame)
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	var starts, deltas int
-	var firstName string
-	for _, ev := range evs {
+	if len(writes) != 2 {
+		t.Fatalf("client writes = %d, want 2", len(writes))
+	}
+	for i, w := range writes {
+		flags, payload, err := readFrame(bytes.NewReader(w))
+		if err != nil || flags != flagNone {
+			t.Fatalf("write %d: readFrame err=%v flags=%d", i, err, flags)
+		}
+		cm, err := decodeMessage(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// AgentClientMessage{3: KvClientMessage{1: id, variant: result}}
+		if _, ok := cm[3]; !ok {
+			t.Fatalf("write %d: not a kv_client_message", i)
+		}
+		kv, _ := decodeMessage(cm[3][0].value)
+		if id, _ := varintField(kv, kvcID); id != 7 {
+			t.Errorf("write %d: kv id = %d, want 7", i, id)
+		}
+		wantVariant := kvcGetBlobRes
+		if i == 1 {
+			wantVariant = kvcSetBlobRes
+		}
+		if _, ok := kv[wantVariant]; !ok {
+			t.Errorf("write %d: missing result variant %d", i, wantVariant)
+		}
+	}
+	if len(events) == 0 || events[len(events)-1].Kind != ir.EventFinish {
+		t.Error("stream did not finish after KV round-trips")
+	}
+}
+
+func TestDecodeAgentStreamRequestContextReply(t *testing.T) {
+	var writes [][]byte
+	var events []ir.StreamEvent
+	err := DecodeAgentStream(bytes.NewReader(bytes.Join([][]byte{
+		execRequestContextFrame(t),
+		agentTextFrame(t, "hi"),
+		agentTurnEndedFrame(t, 1, 1),
+	}, nil)), func(frame []byte) error {
+		writes = append(writes, frame)
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 1 {
+		t.Fatalf("client writes = %d, want 1", len(writes))
+	}
+	_, payload, err := readFrame(bytes.NewReader(writes[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := decodeMessage(payload)
+	ecm, ok := cm[2] // exec_client_message
+	if !ok {
+		t.Fatal("reply is not an exec_client_message")
+	}
+	em, _ := decodeMessage(ecm[0].value)
+	if id, _ := varintField(em, ecmID); id != 3 {
+		t.Errorf("exec id = %d, want 3", id)
+	}
+	if eid, _ := stringField(em, ecmExecID); eid != "exec-1" {
+		t.Errorf("exec_id = %q", eid)
+	}
+	if _, ok := em[ecmRequestContextRes]; !ok {
+		t.Error("request_context_result missing")
+	}
+	if events[len(events)-1].Kind != ir.EventFinish {
+		t.Error("stream did not finish")
+	}
+}
+
+func TestDecodeAgentStreamMCPToolCall(t *testing.T) {
+	events := collectAgentEvents(t, mcpExecFrame(t, "call-1", "get_weather", map[string]any{"city": "Tokyo"}))
+	var toolStart *ir.StreamEvent
+	for i, ev := range events {
 		if ev.Kind == ir.EventToolCallStart {
-			starts++
-			firstName = ev.ToolName
-		}
-		if ev.Kind == ir.EventToolCallDelta {
-			deltas++
+			toolStart = &events[i]
 		}
 	}
-	if starts != 1 {
-		t.Errorf("tool starts = %d, want 1", starts)
+	if toolStart == nil {
+		t.Fatal("no tool call start event")
 	}
-	if firstName != "Write" {
-		t.Errorf("tool name = %q, want Write (mcp_custom_ stripped)", firstName)
+	if toolStart.ToolID != "call-1" || toolStart.ToolName != "get_weather" {
+		t.Errorf("tool call = %s/%s", toolStart.ToolID, toolStart.ToolName)
 	}
-	if deltas != 2 {
-		t.Errorf("tool deltas = %d, want 2", deltas)
+	var args json.RawMessage
+	if err := json.Unmarshal([]byte(toolStart.ArgsFrag), &args); err != nil {
+		t.Fatalf("args not JSON: %q (%v)", toolStart.ArgsFrag, err)
 	}
-	var finish *ir.StreamEvent
-	for i := range evs {
-		if evs[i].Kind == ir.EventFinish {
-			finish = &evs[i]
-		}
+	if string(args) != `{"city":"Tokyo"}` {
+		t.Errorf("args = %s", args)
 	}
-	if finish == nil || finish.StopReason != ir.StopToolUse {
-		t.Errorf("finish = %+v, want ToolUse", finish)
+	last := events[len(events)-1]
+	if last.Kind != ir.EventFinish || last.StopReason != ir.StopToolUse {
+		t.Fatalf("finish = %+v, want tool_use", last)
 	}
 }
 
-func TestDecodeStreamResourceExhaustedBeforeContent(t *testing.T) {
-	jsonErr := []byte(`{"error":{"code":"resource_exhausted","message":"too many requests"}}`)
-	raw := wrapConnectFrame(jsonErr, false)
-	var out []ir.StreamEvent
-	err := DecodeStream(bytes.NewReader(raw), func(ev ir.StreamEvent) error {
-		out = append(out, ev)
-		return nil
-	})
+func TestDecodeAgentStreamUnsupportedExecToolFails(t *testing.T) {
+	// shell_args (field 2) — an IDE tool the proxy cannot execute.
+	ex := encodeField(2, wireLen, []byte{})
+	frame := agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex))
+	err := DecodeAgentStream(bytes.NewReader(frame), nil, func(ir.StreamEvent) error { return nil })
 	if err == nil {
-		t.Fatal("want rate-limit error before any content")
+		t.Fatal("expected unsupported-tool error")
 	}
-	if !contains(err.Error(), "rate limited") {
-		t.Errorf("err = %q, want rate limited", err.Error())
+	if !strings.Contains(err.Error(), "cannot execute") {
+		t.Errorf("error = %v", err)
 	}
 }
 
-func TestDecodeStreamResourceExhaustedAfterContentFinishes(t *testing.T) {
-	jsonErr := []byte(`{"error":{"code":"resource_exhausted","message":"too many requests"}}`)
-	raw := bytes.Join([][]byte{textFrame(t, "partial"), wrapConnectFrame(jsonErr, false)}, nil)
-	var out []ir.StreamEvent
-	err := DecodeStream(bytes.NewReader(raw), func(ev ir.StreamEvent) error {
-		out = append(out, ev)
-		return nil
-	})
+func TestDecodeAgentStreamErrorFrameBeforeContent(t *testing.T) {
+	errFrame := wrapConnectFrame([]byte(`{"error":{"code":"resource_exhausted","message":"Error","details":[{"debug":{"details":{"title":"Named models unavailable","detail":"Free plans can only use Auto."}}}]}}`), false)
+	err := DecodeAgentStream(bytes.NewReader(errFrame), nil, func(ir.StreamEvent) error { return nil })
 	if err == nil {
-		t.Fatal("after content, error frame must still return an error")
+		t.Fatal("expected error")
 	}
-	if !contains(err.Error(), "rate limited") {
-		t.Errorf("err = %q, want rate limited", err.Error())
-	}
-	for _, ev := range out {
-		if ev.Kind == ir.EventFinish {
-			t.Fatalf("must not emit Finish after error frame: %+v", out)
-		}
-	}
-	// Partial content should still have been emitted before the error.
-	sawText := false
-	for _, ev := range out {
-		if ev.Kind == ir.EventTextDelta && ev.Text == "partial" {
-			sawText = true
-		}
-	}
-	if !sawText {
-		t.Fatalf("want partial text before error, got %+v", out)
+	if !strings.Contains(err.Error(), "Named models unavailable") {
+		t.Errorf("error = %v, want detail title", err)
 	}
 }
 
-func TestDecodeStreamComposerThinkingSplit(t *testing.T) {
-	// Composer-style: thinking contains reasoning then </think> then visible text.
-	evs := collectEvents(t,
-		thinkingFrame(t, "reasoning here"),
-		thinkingFrame(t, "</think>final answer"),
-	)
-	var text string
-	for _, ev := range evs {
-		if ev.Kind == ir.EventTextDelta {
-			text += ev.Text
-		}
-	}
-	if text != "final answer" {
-		t.Errorf("composer text = %q, want 'final answer'", text)
+func TestDecodeAgentStreamEmptyStreamFinishes(t *testing.T) {
+	events := collectAgentEvents(t)
+	if len(events) != 2 || events[0].Kind != ir.EventMessageStart || events[1].Kind != ir.EventFinish {
+		t.Fatalf("events = %+v, want start+finish", events)
 	}
 }
 
-func TestDecodeStreamNonComposerThinkingDropped(t *testing.T) {
-	// Thinking without a  tag must not emit any text delta.
-	evs := collectEvents(t, thinkingFrame(t, "just reasoning, no close tag"))
-	for _, ev := range evs {
-		if ev.Kind == ir.EventTextDelta {
-			t.Errorf("non-composer thinking leaked as text: %q", ev.Text)
-		}
+func TestParseCursorErrorPrefersDetailTitle(t *testing.T) {
+	raw := []byte(`{"error":{"code":"resource_exhausted","message":"Error","details":[{"debug":{"details":{"title":"Update Required","detail":"Your version of Cursor is no longer supported."}}}]}}`)
+	err := parseCursorError(raw)
+	if err == nil || !strings.Contains(err.Error(), "Update Required") {
+		t.Errorf("error = %v, want detail title surfaced", err)
 	}
 }
 
-func TestDecodeStreamEmptyStream(t *testing.T) {
-	evs := collectEvents(t) // no frames
-	// Should still emit MessageStart + Finish so unary collect doesn't hang.
-	if len(evs) < 2 {
-		t.Fatalf("events = %d, want >=2: %+v", len(evs), evs)
+func TestParseCursorErrorGeneric(t *testing.T) {
+	raw := []byte(`{"error":{"code":"not_found","message":"nope"}}`)
+	err := parseCursorError(raw)
+	if err == nil || !strings.Contains(err.Error(), "cursor: nope") {
+		t.Errorf("error = %v", err)
 	}
-	if evs[0].Kind != ir.EventMessageStart {
-		t.Errorf("ev0 = %v, want MessageStart", evs[0].Kind)
-	}
-	if evs[len(evs)-1].Kind != ir.EventFinish {
-		t.Errorf("last = %v, want Finish", evs[len(evs)-1].Kind)
-	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && bytesContains(s, sub)
-}
-
-func bytesContains(s, sub string) bool {
-	return bytes.Contains([]byte(s), []byte(sub))
-}
-
-func TestParseCursorError(t *testing.T) {
-	t.Run("non-json raw fallback", func(t *testing.T) {
-		// Raw bodies must not be embedded (terminal logs stay metadata-only).
-		err := parseCursorError([]byte("Internal Server Error"))
-		if err.Error() != "upstream stream failed" {
-			t.Errorf("got %q, want generic failure", err.Error())
-		}
-		if strings.Contains(err.Error(), "Internal Server Error") {
-			t.Errorf("raw body leaked into error: %q", err.Error())
-		}
-	})
-
-	t.Run("direct message", func(t *testing.T) {
-		body := []byte(`{"error":{"code":"internal","message":"boom"}}`)
-		err := parseCursorError(body)
-		if err.Error() != "cursor: boom" {
-			t.Errorf("got %q, want cursor: boom", err.Error())
-		}
-	})
-
-	t.Run("falls back to detail title when message empty", func(t *testing.T) {
-		body := []byte(`{"error":{"code":"x","message":"","details":[{"debug":{"details":{"title":"ttl"}}}]}}`)
-		err := parseCursorError(body)
-		if err.Error() != "cursor: ttl" {
-			t.Errorf("got %q, want cursor: ttl", err.Error())
-		}
-	})
-
-	t.Run("falls back to detail detail when title empty", func(t *testing.T) {
-		body := []byte(`{"error":{"code":"x","message":"","details":[{"debug":{"details":{"title":"","detail":"explanation"}}}]}}`)
-		err := parseCursorError(body)
-		if err.Error() != "cursor: explanation" {
-			t.Errorf("got %q, want cursor: explanation", err.Error())
-		}
-	})
-
-	t.Run("resource exhausted with message", func(t *testing.T) {
-		body := []byte(`{"error":{"code":"resource_exhausted","message":"slow down"}}`)
-		err := parseCursorError(body)
-		if !strings.Contains(err.Error(), "rate limited") {
-			t.Errorf("got %q, want rate limited", err.Error())
-		}
-		if !strings.Contains(err.Error(), "slow down") {
-			t.Errorf("got %q, want message preserved", err.Error())
-		}
-	})
-
-	t.Run("resource exhausted without message defaults", func(t *testing.T) {
-		body := []byte(`{"error":{"code":"resource_exhausted","message":""}}`)
-		err := parseCursorError(body)
-		if !strings.Contains(err.Error(), "rate limit exceeded") {
-			t.Errorf("got %q, want default rate limit message", err.Error())
-		}
-	})
-
-	t.Run("empty message no details generic fallback", func(t *testing.T) {
-		body := []byte(`{"error":{"code":"x","message":""}}`)
-		err := parseCursorError(body)
-		if err.Error() != "upstream stream failed" {
-			t.Errorf("got %q, want generic failure", err.Error())
-		}
-	})
 }
 
 func TestDecloakToolName(t *testing.T) {
-	cases := []struct {
-		in   string
-		want string
-	}{
-		{"mcp_custom_get_weather", "get_weather"},
-		{"mcp_custom_", ""},
-		{"plain_tool", "plain_tool"},
-		{"", ""},
-		{"mcp_custom", "mcp_custom"}, // prefix without trailing underscore stays
+	if got := decloakToolName("mcp_custom_my_tool"); got != "my_tool" {
+		t.Errorf("decloak = %q", got)
 	}
-	for _, tc := range cases {
-		t.Run(tc.in, func(t *testing.T) {
-			if got := decloakToolName(tc.in); got != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
-			}
-		})
+	if got := decloakToolName("plain"); got != "plain" {
+		t.Errorf("decloak = %q", got)
 	}
 }

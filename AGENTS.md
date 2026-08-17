@@ -109,11 +109,16 @@ Qoder, Antigravity, Cursor, and Claude Code are backend-only variants.
 - **Antigravity:** Backend-only and stream-only. Fail closed without `ProjectID`.
   Preserve project bootstrap, schema cleanup, thought-signature backfill, and
   tool cloak/decloak symmetry.
-- **Cursor:** Backend-only Connect-RPC protobuf and stream-only. Authentication is
-  a browser/CLI OAuth session or imported IDE token plus a stable machine ID.
-  Native login must persist that identity and never regenerate it during refresh.
-  Preserve the current checksum algorithm, full identity-header override,
-  `mcp_custom_` name mapping, and XML-flattened tool results.
+- **Cursor:** Backend-only, stream-only, and bidi: chat runs on
+  `agent.v1.AgentService/Run` (absolute URL; ChatService is retired for non-Pro
+  accounts), and the upstream asks for context/KV replies mid-stream over the
+  still-open request body — the duplex write path is mandatory or runs stall.
+  Authentication is a browser/CLI OAuth session or imported IDE token plus a
+  stable machine ID. Native login must persist that identity and never
+  regenerate it during refresh. Preserve the checksum algorithm, full
+  identity-header override, and the transcript-folded history/tool results
+  (the server ignores inline `conversation_history`, and
+  `custom_system_prompt` is rejected).
 - **Claude Code:** Keep an ID distinct from Anthropic so requests always pass
   through preparation. Preserve per-request session ID pairing between body and
   headers, OAuth-token-gated cloaking, tool decloaking, and CLI identity headers.

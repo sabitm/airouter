@@ -53,7 +53,14 @@ type codec struct {
 	encodeError    func(message, errType string) []byte
 	upstreamPath   string // appended to the provider base URL when this is the backend
 
-	decodeStream     func(io.Reader, func(ir.StreamEvent) error) error
+	decodeStream func(io.Reader, func(ir.StreamEvent) error) error
+	// decodeStreamDuplex, when set, marks the backend's upstream stream as
+	// bidi (Connect over HTTP/2): the request body stays writable while the
+	// response is decoded, and writeFrame sends additional unframed client
+	// messages upstream (Cursor AgentService context/KV replies). Mutually
+	// exclusive with decodeStream; the transport sends from a pipe.
+	decodeStreamDuplex func(io.Reader, func([]byte) error, func(ir.StreamEvent) error) error
+
 	newStreamEncoder func(model string) streamEncoder
 
 	// streamOnly marks a backend whose upstream returns only a stream, even for a
@@ -167,18 +174,20 @@ var antigravityCodec = codec{
 	streamOnly:    true,
 }
 
-// cursorCodec is the Cursor IDE backend: Connect-RPC protobuf chat
-// (ChatService StreamUnifiedChatWithTools), stream-only. Backend-only; every
-// request translates through the IR. Auth is a pasted IDE token + machine id;
-// tokens are not refreshable.
+// cursorCodec is the Cursor backend: agent.v1.AgentService/Run Connect-RPC
+// protobuf chat (the endpoint Cursor's CLI and current IDE use; ChatService is
+// retired for non-Pro accounts), stream-only and bidi — the upstream asks for
+// context/KV replies mid-stream over the still-open request body. Backend-only;
+// every request translates through the IR. Auth is an OAuth token + stable
+// machine id.
 var cursorCodec = codec{
-	id:            "cursor",
-	protocol:      domain.ProtocolCursor,
-	encodeRequest: cursor.EncodeRequest,
-	upstreamPath:  cursor.UpstreamPath,
-	decodeStream:  cursor.DecodeStream,
-	streamOnly:    true,
-	streamAccept:  cursor.StreamAccept,
+	id:                 "cursor",
+	protocol:           domain.ProtocolCursor,
+	encodeRequest:      cursor.EncodeAgentRequest,
+	upstreamPath:       cursor.AgentRunURL,
+	decodeStreamDuplex: cursor.DecodeAgentStream,
+	streamOnly:         true,
+	streamAccept:       cursor.StreamAccept,
 }
 
 // claudeCodeCodec is the Claude Code CLI backend: Anthropic Messages wire

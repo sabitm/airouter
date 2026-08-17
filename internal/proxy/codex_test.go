@@ -231,8 +231,8 @@ func TestApplyAntigravityHeadersAndProject(t *testing.T) {
 }
 
 func TestApplyCursorHeaders(t *testing.T) {
-	body, err := cursor.EncodeRequest(&ir.Request{
-		Model:    "gpt-5.2",
+	body, err := cursor.EncodeAgentRequest(&ir.Request{
+		Model:    "default",
 		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
 	})
 	if err != nil {
@@ -246,7 +246,7 @@ func TestApplyCursorHeaders(t *testing.T) {
 			MachineID:  "m-1",
 		},
 	}
-	req, err := http.NewRequest(http.MethodPost, cursor.DefaultBaseURL+cursor.UpstreamPath, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, cursor.AgentRunURL, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

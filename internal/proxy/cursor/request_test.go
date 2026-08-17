@@ -3,22 +3,22 @@ package cursor
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"airouter/internal/proxy/ir"
 )
 
-func mustEncode(t *testing.T, req *ir.Request) []byte {
+func mustEncodeAgent(t *testing.T, req *ir.Request) []byte {
 	t.Helper()
-	body, err := EncodeRequest(req)
+	body, err := EncodeAgentRequest(req)
 	if err != nil {
-		t.Fatalf("EncodeRequest: %v", err)
+		t.Fatalf("EncodeAgentRequest: %v", err)
 	}
 	return body
 }
 
-func framePayload(t *testing.T, frame []byte) []byte {
+func agentFramePayload(t *testing.T, frame []byte) []byte {
 	t.Helper()
 	flags, payload, err := readFrame(bytes.NewReader(frame))
 	if err != nil {
@@ -30,242 +30,210 @@ func framePayload(t *testing.T, frame []byte) []byte {
 	return payload
 }
 
-func TestEncodeRequestEmptyModelErrors(t *testing.T) {
-	_, err := EncodeRequest(&ir.Request{
-		Model:    "",
-		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
-	})
-	if err == nil {
-		t.Fatal("empty model should error")
+// decodePath walks tagged length-delimited fields by number, returning the
+// nested bytes of the last field in the path.
+func decodePath(t *testing.T, b []byte, path ...int) []byte {
+	t.Helper()
+	cur := b
+	for _, want := range path {
+		m, err := decodeMessage(cur)
+		if err != nil {
+			t.Fatalf("decodeMessage: %v", err)
+		}
+		f, ok := m[want]
+		if !ok || len(f) == 0 {
+			t.Fatalf("field %d not found in % x", want, cur)
+		}
+		cur = f[0].value
+	}
+	return cur
+}
+
+func TestEncodeAgentRequestEmptyModelErrors(t *testing.T) {
+	if _, err := EncodeAgentRequest(&ir.Request{Messages: []ir.Message{{Role: ir.RoleUser}}}); err == nil {
+		t.Fatal("expected empty model error")
 	}
 }
 
-func TestEncodeRequestEmptyMessagesErrors(t *testing.T) {
-	_, err := EncodeRequest(&ir.Request{Model: "default", Messages: nil})
-	if err == nil {
-		t.Fatal("empty messages should error")
+func TestEncodeAgentRequestEmptyMessagesErrors(t *testing.T) {
+	if _, err := EncodeAgentRequest(&ir.Request{Model: "default"}); err == nil {
+		t.Fatal("expected empty messages error")
 	}
 }
 
-func TestEncodeRequestModelNameInBody(t *testing.T) {
-	body := mustEncode(t, &ir.Request{
-		Model:    "gpt-5.2",
-		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
-	})
-	payload := framePayload(t, body)
-	top, err := decodeMessage(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reqBytes, ok := stringField(top, topRequest)
-	if !ok {
-		t.Fatal("missing top.request field 1")
-	}
-	req, err := decodeMessage([]byte(reqBytes))
-	if err != nil {
-		t.Fatal(err)
-	}
-	modelBytes, ok := stringField(req, reqModel)
-	if !ok {
-		t.Fatal("missing model field 5")
-	}
-	modelMsg, err := decodeMessage([]byte(modelBytes))
-	if err != nil {
-		t.Fatal(err)
-	}
-	name, ok := stringField(modelMsg, modelName)
-	if !ok || name != "gpt-5.2" {
-		t.Errorf("model name = %q ok=%v", name, ok)
-	}
-}
-
-func TestEncodeRequestStripsCursorPrefix(t *testing.T) {
-	body := mustEncode(t, &ir.Request{
-		Model:    "cursor/gpt-5.2",
-		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
-	})
-	payload := framePayload(t, body)
-	top, _ := decodeMessage(payload)
-	reqBytes, _ := stringField(top, topRequest)
-	req, _ := decodeMessage([]byte(reqBytes))
-	modelBytes, _ := stringField(req, reqModel)
-	modelMsg, _ := decodeMessage([]byte(modelBytes))
-	if name, _ := stringField(modelMsg, modelName); name != "gpt-5.2" {
-		t.Errorf("model name = %q, want gpt-5.2 (prefix stripped)", name)
-	}
-}
-
-func TestEncodeRequestToolsUseMcpCustom(t *testing.T) {
-	body := mustEncode(t, &ir.Request{
-		Model:    "default",
-		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "do it"}}}},
-		Tools:    []ir.Tool{{Name: "Write", Description: "write a file", Parameters: json.RawMessage(`{"type":"object"}`)}},
-	})
-	payload := framePayload(t, body)
-	top, _ := decodeMessage(payload)
-	reqBytes, _ := stringField(top, topRequest)
-	req, _ := decodeMessage([]byte(reqBytes))
-	tools, ok := req[reqMCPTools]
-	if !ok || len(tools) != 1 {
-		t.Fatalf("mcp_tools = %d entries, want 1", len(tools))
-	}
-	toolMsg, _ := decodeMessage(tools[0].value)
-	name, ok := stringField(toolMsg, mcpToolName)
-	if !ok || name != "mcp_custom_Write" {
-		t.Errorf("tool name = %q, want mcp_custom_Write", name)
-	}
-	server, _ := stringField(toolMsg, mcpToolServer)
-	if server != "custom" {
-		t.Errorf("tool server = %q, want custom", server)
-	}
-	// is_agentic + unified_mode should reflect agent mode.
-	if v, _ := varintField(req, reqIsAgentic); v != 1 {
-		t.Errorf("is_agentic = %d, want 1", v)
-	}
-	if v, _ := varintField(req, reqUnifiedMode); v != unifiedModeAgent {
-		t.Errorf("unified_mode = %d, want %d", v, unifiedModeAgent)
-	}
-	if v, _ := varintField(req, reqShouldDisableTools); v != 0 {
-		t.Errorf("should_disable_tools = %d, want 0", v)
-	}
-}
-
-func TestEncodeRequestNoToolsIsChatMode(t *testing.T) {
-	body := mustEncode(t, &ir.Request{
-		Model:    "default",
-		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
-	})
-	payload := framePayload(t, body)
-	top, _ := decodeMessage(payload)
-	reqBytes, _ := stringField(top, topRequest)
-	req, _ := decodeMessage([]byte(reqBytes))
-	if v, _ := varintField(req, reqIsAgentic); v != 0 {
-		t.Errorf("is_agentic = %d, want 0", v)
-	}
-	if v, _ := varintField(req, reqUnifiedMode); v != unifiedModeChat {
-		t.Errorf("unified_mode = %d, want chat", v)
-	}
-	if v, _ := varintField(req, reqShouldDisableTools); v != 1 {
-		t.Errorf("should_disable_tools = %d, want 1", v)
-	}
-}
-
-func TestEncodeRequestSystemPromptPrefixedToFirstUser(t *testing.T) {
-	body := mustEncode(t, &ir.Request{
-		Model:    "default",
-		System:   "be concise",
-		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
-	})
-	payload := framePayload(t, body)
-	top, _ := decodeMessage(payload)
-	reqBytes, _ := stringField(top, topRequest)
-	req, _ := decodeMessage([]byte(reqBytes))
-	msgs, ok := req[reqMessages]
-	if !ok || len(msgs) != 1 {
-		t.Fatalf("messages = %d, want 1", len(msgs))
-	}
-	msg, _ := decodeMessage(msgs[0].value)
-	content, _ := stringField(msg, msgContent)
-	if !startsWith(content, "[System Instructions]\nbe concise") {
-		t.Errorf("content = %q, want system prefix", content)
-	}
-}
-
-func TestEncodeRequestToolResultAsXMLNotProtobuf(t *testing.T) {
-	body := mustEncode(t, &ir.Request{
+func TestEncodeAgentRequestEnvelope(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
 		Model: "default",
 		Messages: []ir.Message{
-			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockToolUse, ToolID: "tc1", ToolName: "Write"}}},
-			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockToolResult, ToolUseID: "tc1", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "ok"}}}}},
-			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "now what"}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
 		},
 	})
-	payload := framePayload(t, body)
-	top, _ := decodeMessage(payload)
-	reqBytes, _ := stringField(top, topRequest)
-	req, _ := decodeMessage([]byte(reqBytes))
-	msgs := req[reqMessages]
-	// The tool_result becomes XML text inside the second user message's content.
-	// It must contain <tool_result> and NOT a protobuf field-18 occurrence we can
-	// detect; we assert the XML marker is present in the content bytes.
-	found := false
-	for _, mf := range msgs {
-		msg, _ := decodeMessage(mf.value)
-		content, _ := stringField(msg, msgContent)
-		if bytes.Contains([]byte(content), []byte("<tool_result>")) {
-			found = true
-			if !bytes.Contains([]byte(content), []byte("<tool_name>Write</tool_name>")) {
-				t.Errorf("tool result XML missing tool name: %q", content)
-			}
+	payload := agentFramePayload(t, body)
+	// AgentClientMessage{1: AgentRunRequest{...}}
+	run := decodePath(t, payload, acmRunRequest)
+
+	// conversation_state (1) present and empty (fresh session per request).
+	m, err := decodeMessage(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cs, ok := m[runConversationState]; !ok || len(cs[0].value) != 0 {
+		t.Errorf("conversation_state = %+v, want present and empty", cs)
+	}
+
+	// action (2) -> user_message_action (1) -> user_message (1)
+	um := decodePath(t, run, runAction, convUserMessageAction, umaUserMessage)
+	umMsg, _ := decodeMessage(um)
+	text, _ := stringField(umMsg, umText)
+	if text != "hi" {
+		t.Errorf("user text = %q, want hi", text)
+	}
+	if id, _ := stringField(umMsg, umMessageID); id == "" {
+		t.Error("message id empty")
+	}
+
+	// requested_model (9): id + built_in_model=true.
+	rm := decodePath(t, run, runRequestedModel)
+	rmMsg, _ := decodeMessage(rm)
+	if got, _ := stringField(rmMsg, rmModelID); got != "default" {
+		t.Errorf("model = %q, want default", got)
+	}
+	if v, ok := varintField(rmMsg, rmBuiltInModel); !ok || v != 1 {
+		t.Errorf("built_in_model = %d ok=%v, want 1 true", v, ok)
+	}
+
+	// custom_system_prompt (8) must NOT appear: the server rejects it.
+	if _, ok := m[runCustomSystem]; ok {
+		t.Error("custom_system_prompt present; server rejects it")
+	}
+}
+
+func TestEncodeAgentRequestSystemPromptFoldedIntoUserText(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model:  "default",
+		System: "be brief",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+	})
+	um := decodePath(t, agentFramePayload(t, body), acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
+	umMsg, _ := decodeMessage(um)
+	text, _ := stringField(umMsg, umText)
+	if !strings.HasPrefix(text, "[System Instructions]\nbe brief") {
+		t.Errorf("user text = %q, want system-prompt prefix", text)
+	}
+	if !strings.HasSuffix(text, "hi") {
+		t.Errorf("user text = %q, want trailing user text", text)
+	}
+}
+
+func TestEncodeAgentRequestHistoryFoldedAsTranscript(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "first"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "second"}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "third"}}},
+		},
+	})
+	um := decodePath(t, agentFramePayload(t, body), acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
+	umMsg, _ := decodeMessage(um)
+	text, _ := stringField(umMsg, umText)
+	for _, want := range []string{"[Conversation History]", "User: first", "Assistant: second", "[Current Message]", "third"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("user text %q missing %q", text, want)
 		}
 	}
-	if !found {
-		t.Error("no <tool_result> XML found in any message content")
-	}
 }
 
-func TestFormatToolName(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"Write", "mcp_custom_Write"},
-		{"", "mcp_custom_tool"},
-		{"mcp__server__tool", "mcp_server_tool"},
-		{"mcp__s__t", "mcp_s_t"},
-		{"mcp__only", "mcp_custom_only"},
-		{"mcp_foo", "mcp_foo"},
-		{"mcp_custom_bar", "mcp_custom_bar"},
-	}
-	for _, c := range cases {
-		if got := formatToolName(c.in); got != c.want {
-			t.Errorf("formatToolName(%q) = %q, want %q", c.in, got, c.want)
+func TestEncodeAgentRequestToolResultInCurrentMessage(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "weather?"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{
+				Type: ir.BlockToolUse, ToolID: "c1", ToolName: "get_weather",
+				ToolInput: json.RawMessage(`{"city":"Tokyo"}`),
+			}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{
+				Type: ir.BlockToolResult, ToolUseID: "c1",
+				ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "18C cloudy"}},
+			}}},
+		},
+	})
+	um := decodePath(t, agentFramePayload(t, body), acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
+	umMsg, _ := decodeMessage(um)
+	text, _ := stringField(umMsg, umText)
+	for _, want := range []string{"Assistant (tool call): get_weather", "Tool result (get_weather): 18C cloudy"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("user text %q missing %q", text, want)
 		}
 	}
 }
 
-func startsWith(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+func TestEncodeAgentRequestMCPTools(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+		Tools: []ir.Tool{{
+			Name:        "get_weather",
+			Description: "weather",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`),
+		}},
+	})
+	run := decodePath(t, agentFramePayload(t, body), acmRunRequest)
+	m, err := decodeMessage(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolsRaw, ok := m[runMCPTools]
+	if !ok || len(toolsRaw) == 0 {
+		t.Fatal("mcp_tools missing")
+	}
+	tools, _ := decodeMessage(toolsRaw[0].value)
+	defs := tools[mcpDefsName]
+	if len(defs) != 1 {
+		t.Fatalf("tool defs = %d, want 1", len(defs))
+	}
+	def, _ := decodeMessage(defs[0].value)
+	if got, _ := stringField(def, mcpDefName); got != "get_weather" {
+		t.Errorf("tool name = %q", got)
+	}
+	if got, _ := stringField(def, mcpDefDescription); got != "weather" {
+		t.Errorf("tool description = %q", got)
+	}
+	schema, _ := stringField(def, mcpDefInputSchemaJSON)
+	if !strings.Contains(schema, `"city"`) {
+		t.Errorf("input schema json = %q, want city property", schema)
+	}
 }
 
-func TestSanitizeToolResultText(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"plain", "hello world", "hello world"},
-		{"preserves tab and newline", "a\tb\nc", "a\tb\nc"},
-		{"drops other control chars", "a\x01b\x02c", "abc"},
-		{"drops del", "a\x7fb", "ab"},
-		{"drops rune error", "a" + string(utf8.RuneError) + "b", "ab"},
-		{"mixed", "ok\t\x01\n\x7f", "ok\t\n"},
-		{"empty", "", ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := sanitizeToolResultText(tc.in); got != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
-			}
-		})
+func TestEncodeAgentRequestNoToolsOmitsMCPTools(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+	})
+	run := decodePath(t, agentFramePayload(t, body), acmRunRequest)
+	m, _ := decodeMessage(run)
+	if _, ok := m[runMCPTools]; ok {
+		t.Error("mcp_tools present without tools")
 	}
 }
 
-func TestEscapeXML(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"plain", "plain", "plain"},
-		{"ampersand", "a&b", "a&amp;b"},
-		{"less than", "a<b", "a&lt;b"},
-		{"greater than", "a>b", "a&gt;b"},
-		{"all three", "<&>", "&lt;&amp;&gt;"},
-		{"empty", "", ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := escapeXML(tc.in); got != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
-			}
-		})
+func TestEncodeAgentRequestStripsCursorPrefix(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "cursor/default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+	})
+	rm := decodePath(t, agentFramePayload(t, body), acmRunRequest, runRequestedModel)
+	rmMsg, _ := decodeMessage(rm)
+	if got, _ := stringField(rmMsg, rmModelID); got != "default" {
+		t.Errorf("model = %q, want cursor/ prefix stripped", got)
 	}
 }

@@ -597,7 +597,16 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 // Accept, decodes the upstream stream into an IR response, then renders the
 // ingress format's unary response envelope.
 func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, upstreamBody []byte) attemptResult {
-	resp, err := p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
+	var writeFrame func([]byte) error
+	closeWrite := func() {}
+	var resp *http.Response
+	var err error
+	if backend.decodeStreamDuplex != nil {
+		resp, writeFrame, closeWrite, err = p.forwardStreamDuplex(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
+	} else {
+		resp, err = p.forwardStream(ctx, provider, backend.upstreamPath, upstreamBody, nil, backend.streamAccept)
+	}
+	defer closeWrite()
 	if err != nil {
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
@@ -606,7 +615,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
 		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
-	irResp, err := collectStreamResponse(resp.Body, backend, upstreamModel)
+	irResp, err := collectStreamResponse(resp.Body, backend, writeFrame, upstreamModel)
 	if err != nil {
 		if _, ok := ir.AsStreamFailure(err); ok {
 			return retryableStreamFailure(err)
@@ -628,7 +637,9 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 
 // collectStreamResponse folds backend stream events into a unary IR response.
 // It is used only for backends that are SSE-only even for non-streaming clients.
-func collectStreamResponse(r io.Reader, backend codec, fallbackModel string) (*ir.Response, error) {
+// writeFrame is non-nil only for duplex backends (Cursor AgentService), whose
+// streams need mid-stream client replies to finish.
+func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) error, fallbackModel string) (*ir.Response, error) {
 	resp := &ir.Response{ID: ir.NewID("resp_"), Model: fallbackModel, StopReason: ir.StopEndTurn}
 	var text strings.Builder
 	type toolBuf struct {
@@ -639,7 +650,13 @@ func collectStreamResponse(r io.Reader, backend codec, fallbackModel string) (*i
 	tools := map[int]*toolBuf{}
 	var order []int
 	sawEvent := false
-	err := backend.decodeStream(r, func(ev ir.StreamEvent) error {
+	decode := backend.decodeStream
+	if backend.decodeStreamDuplex != nil {
+		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			return backend.decodeStreamDuplex(r, writeFrame, emit)
+		}
+	}
+	err := decode(r, func(ev ir.StreamEvent) error {
 		sawEvent = true
 		switch ev.Kind {
 		case ir.EventMessageStart:
