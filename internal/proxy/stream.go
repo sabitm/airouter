@@ -323,7 +323,10 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		// A canceled context means the client disconnected after receiving the
 		// response; that is routine, not a server error, so do not log it as one.
-		if errors.Is(err, context.Canceled) {
+		// Duplex streams surface cancel as a body-closed read error (the HTTP/2
+		// client cannot cancel a read while the request body is open), so key on
+		// ctx rather than the error value alone.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			observability.Logger(ctx, p.logger).Debug("client_disconnected",
 				"event", "client_disconnected",
 				"ingress", ingress.id,

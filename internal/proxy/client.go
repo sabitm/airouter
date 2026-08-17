@@ -537,33 +537,57 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 		accept = "text/event-stream"
 	}
 
+	// pw and liveResp are touched from the caller goroutine (send/retry), the
+	// decode loop's writeFrame, and the cancel watcher below; mu guards both.
+	// Pipe writes run outside the lock so a stalled upstream cannot hold it.
+	var mu sync.Mutex
 	var pw *io.PipeWriter
-	var closeOnce sync.Once
+	var liveResp io.ReadCloser
 	closeWrite := func() {
-		closeOnce.Do(func() {
-			if pw != nil {
-				pw.Close()
-			}
-		})
+		mu.Lock()
+		defer mu.Unlock()
+		if pw != nil {
+			pw.Close()
+			pw = nil
+		}
 	}
 	writeFrame := func(frame []byte) error {
+		mu.Lock()
 		w := pw
+		mu.Unlock()
 		if w == nil {
 			return fmt.Errorf("proxy: duplex request body already closed")
 		}
 		_, err := w.Write(frame)
 		return err
 	}
+	// The HTTP/2 client does not abort an in-flight response read on context
+	// cancellation while the request body is still open, and a bidi stream
+	// keeps its body open by design — so a client disconnect would leave the
+	// decode loop blocked in Read forever (and pin any HAR lease). Closing the
+	// response body is the only reliable unblock; callers classify the
+	// resulting read error as a client disconnect via ctx.Err().
+	go func() {
+		<-ctx.Done()
+		closeWrite()
+		mu.Lock()
+		defer mu.Unlock()
+		if liveResp != nil {
+			liveResp.Close()
+			liveResp = nil
+		}
+	}()
 
 	send := func() (*http.Response, error) {
-		closeOnce = sync.Once{} // re-arm for the new attempt's pipe
-		closeWrite()            // release the previous attempt's pipe, if any
-		var pr *io.PipeReader
-		pr, pw = io.Pipe()
+		closeWrite() // release the previous attempt's pipe, if any
+		pr, npw := io.Pipe()
+		mu.Lock()
+		pw = npw
+		mu.Unlock()
 		go func() {
 			// Initial request bytes; the pipe stays open for mid-stream replies.
-			if _, err := pw.Write(body); err != nil {
-				pw.CloseWithError(err)
+			if _, err := npw.Write(body); err != nil {
+				npw.CloseWithError(err)
 			}
 		}()
 		started := time.Now()
@@ -603,6 +627,9 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 				ctx:     ctx,
 			}
 		}
+		mu.Lock()
+		liveResp = resp.Body
+		mu.Unlock()
 		return resp, nil
 	}
 

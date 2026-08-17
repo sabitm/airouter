@@ -617,6 +617,12 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	}
 	irResp, err := collectStreamResponse(resp.Body, backend, writeFrame, upstreamModel)
 	if err != nil {
+		// Client disconnect: duplex streams surface it as a body-closed read
+		// error (see forwardStreamDuplex). Stop quietly instead of failing
+		// over against a dead context.
+		if ctx.Err() != nil {
+			return committed()
+		}
 		if _, ok := ir.AsStreamFailure(err); ok {
 			return retryableStreamFailure(err)
 		}
