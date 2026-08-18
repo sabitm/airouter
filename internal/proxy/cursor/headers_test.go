@@ -20,11 +20,11 @@ func TestBuildHeaders(t *testing.T) {
 	if got := h.Get("User-Agent"); got != UserAgent {
 		t.Errorf("user-agent = %q", got)
 	}
-	if got := h.Get("X-Cursor-Client-Version"); got != ClientVersion {
-		t.Errorf("client-version = %q", got)
+	if got := h.Get("X-Cursor-Client-Version"); got != ClientVersion || !strings.HasPrefix(got, "cli-") {
+		t.Errorf("client-version = %q, want %q with cli- prefix", got, ClientVersion)
 	}
-	if got := h.Get("X-Cursor-Client-Commit"); got != ClientCommit {
-		t.Errorf("client-commit = %q", got)
+	if got := h.Get("X-Cursor-Client-Type"); got != ClientType {
+		t.Errorf("client-type = %q", got)
 	}
 	if got := h.Get("X-Ghost-Mode"); got != "true" {
 		t.Errorf("ghost-mode = %q", got)
@@ -42,8 +42,23 @@ func TestBuildHeaders(t *testing.T) {
 	if got := h.Get("Connect-Protocol-Version"); got != "1" {
 		t.Errorf("connect-protocol-version = %q", got)
 	}
-	if got := h.Get("X-Cursor-Client-OS"); got == "" {
-		t.Error("os empty")
+}
+
+func TestBuildHeadersOmitsIDEOnlyHeaders(t *testing.T) {
+	// An IDE-shaped identity triggers a false "usage limit" on Run.
+	h := BuildHeaders("tok", "m1", true)
+	for _, name := range []string{
+		"X-Cursor-Client-Commit",
+		"X-Cursor-Client-OS",
+		"X-Cursor-Client-Arch",
+		"X-Cursor-Client-Device-Type",
+		"X-Cursor-Config-Version",
+		"X-Cursor-Timezone",
+		"X-Amzn-Trace-Id",
+	} {
+		if got := h.Get(name); got != "" {
+			t.Errorf("%s = %q, want empty", name, got)
+		}
 	}
 }
 

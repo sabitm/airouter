@@ -267,6 +267,9 @@ func TestApplyCursorHeaders(t *testing.T) {
 	if got := req.Header.Get("X-Cursor-Client-Version"); got != cursor.ClientVersion {
 		t.Errorf("client-version = %q", got)
 	}
+	if got := req.Header.Get("X-Cursor-Client-Type"); got != cursor.ClientType {
+		t.Errorf("client-type = %q", got)
+	}
 	if got := req.Header.Get("X-Session-Id"); got == "" {
 		t.Error("session-id empty")
 	}

@@ -114,9 +114,13 @@ Qoder, Antigravity, Cursor, and Claude Code are backend-only variants.
   accounts), and the upstream asks for context/KV replies mid-stream over the
   still-open request body — the duplex write path is mandatory or runs stall.
   Authentication is a browser/CLI OAuth session or imported IDE token plus a
-  stable machine ID. Native login must persist that identity and never
-  regenerate it during refresh. Preserve the checksum algorithm, full
-  identity-header override, and the transcript-folded history/tool results
+  stable machine ID. Upstream requests must carry the CLI identity
+  (`X-Cursor-Client-Type: cli`, `X-Cursor-Client-Version: cli-<version>`) and
+  must not send the IDE-only headers, because an IDE identity makes `Run`
+  return a false "usage limit" on non-Pro accounts. Native login must persist
+  that identity and never regenerate it during refresh. Preserve the checksum
+  algorithm, full identity-header override, and the transcript-folded
+  history/tool results
   (the server ignores inline `conversation_history`, and
   `custom_system_prompt` is rejected). MCP tool definitions must carry
   `provider_identifier`/`tool_name` — two or more identity-less definitions

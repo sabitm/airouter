@@ -16,8 +16,11 @@ const (
 	AgentRunURL = AgentBaseURL + AgentRunPath
 	ModelsPath  = "/agent.v1.AgentService/GetUsableModels"
 
-	ClientVersion = "3.12.17"
-	ClientCommit  = "0fb762053c34788bb7760d5673f8a6d4c8589d50"
+	// ClientType and ClientVersion must be CLI-shaped. An IDE version string
+	// makes AgentService/Run return a false "usage limit" on non-Pro accounts;
+	// omitting X-Cursor-Client-Version yields "Update Required".
+	ClientType    = "cli"
+	ClientVersion = "cli-2026.08.11-e8db854"
 	// ConnectContentType is the request Content-Type for framed Connect-RPC.
 	ConnectContentType = "application/connect+proto"
 	// StreamAccept is the Accept value for the streaming chat endpoint.
