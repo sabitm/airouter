@@ -302,6 +302,7 @@ func TestCanRefresh(t *testing.T) {
 		{"qoder device", &domain.OAuthCreds{QoderAuth: true, RefreshToken: "rt"}, false},
 		{"qoder even when expired", &domain.OAuthCreds{QoderAuth: true, ExpiresAt: 1}, false},
 		{"cursor access-only import", &domain.OAuthCreds{CursorAuth: true, ExpiresAt: 1}, false},
+		{"cursor session jwt", &domain.OAuthCreds{CursorAuth: true, RefreshToken: cursorSessionJWTForTest(t, time.Now().Add(time.Hour).Unix())}, false},
 		{"cursor with refresh token", &domain.OAuthCreds{CursorAuth: true, RefreshToken: "rt"}, true},
 		{"plain oauth", &domain.OAuthCreds{RefreshToken: "rt"}, true},
 		{"kiro", &domain.OAuthCreds{KiroAuth: "builder-id", RefreshToken: "rt"}, true},

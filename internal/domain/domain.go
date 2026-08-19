@@ -256,8 +256,9 @@ type OAuthCreds struct {
 	ProjectID string `json:"project_id,omitempty"`
 
 	// CursorAuth marks a Cursor IDE OAuth connection. When true, refresh uses
-	// POST /auth/exchange_user_api_key with RefreshToken as the Bearer credential
-	// when one is present; access-only imports stay usable but cannot rotate.
+	// POST /auth/exchange_user_api_key only when RefreshToken is a user API key.
+	// Browser poll tokens are session JWTs and cannot rotate; access-only
+	// imports stay usable until they expire.
 	// MachineID feeds the x-cursor-checksum header and must stay stable across
 	// refresh; AccessToken (with any "::" prefix stripped at header-build time)
 	// is sent as the bearer credential.

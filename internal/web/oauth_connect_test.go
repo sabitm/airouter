@@ -1069,6 +1069,45 @@ func TestOAuthRefreshCursorUsesExchange(t *testing.T) {
 	}
 }
 
+func TestOAuthRefreshCursorSessionJWTDoesNotExchange(t *testing.T) {
+	h := testHandler(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("session JWT must not hit exchange")
+		w.WriteHeader(500)
+	}))
+	t.Cleanup(srv.Close)
+	restore := oauth.OverrideCursorURLs("", "", srv.URL)
+	defer restore()
+
+	exp := time.Now().Add(time.Hour).Unix()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"https://authentication.cursor.sh","exp":` + strconv.FormatInt(exp, 10) + `}`))
+	sess := header + "." + payload + "."
+	p := &domain.Provider{
+		Name: "cursor", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			CursorAuth: true, AccessToken: sess, RefreshToken: sess, MachineID: "mid", ExpiresAt: exp,
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Set("preset", "cursor")
+	form.Set("id", strconv.FormatInt(p.ID, 10))
+	form.Set("refresh_view", "status")
+	rec := httptest.NewRecorder()
+	h.oauthRefreshTokens(rec, reqWithForm(form))
+	body := rec.Body.String()
+	if !strings.Contains(body, "cannot be rotated") {
+		t.Fatalf("result = %s", body)
+	}
+	if strings.Contains(body, "re-authorize") || strings.Contains(body, "reconnect") {
+		t.Fatalf("must not ask to reconnect: %s", body)
+	}
+}
+
 func TestOAuthRefreshNoRefreshToken(t *testing.T) {
 	h := testHandler(t)
 	form := url.Values{}
@@ -1132,6 +1171,21 @@ func TestRefreshAllOAuth(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Cursor browser session JWTs cannot rotate and must be skipped.
+	exp := time.Now().Add(time.Hour).Unix()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"https://authentication.cursor.sh","exp":` + strconv.FormatInt(exp, 10) + `}`))
+	sess := header + "." + payload + "."
+	if err := h.store.CreateProvider(context.Background(), &domain.Provider{
+		Name: "cursor-session", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			Mode: domain.OAuthAuto, CursorAuth: true,
+			AccessToken: sess, RefreshToken: sess, MachineID: "m2", ExpiresAt: exp,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	// Access-only Cursor imports remain non-refreshable and must be skipped.
 	if err := h.store.CreateProvider(context.Background(), &domain.Provider{
 		Name: "cursor-import", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
@@ -1155,8 +1209,8 @@ func TestRefreshAllOAuth(t *testing.T) {
 	if !strings.Contains(body, "refreshed 2 oauth provider(s)") {
 		t.Fatalf("result = %s, want refreshed 2", body)
 	}
-	if !strings.Contains(body, "skipped 2 (non-refreshable)") {
-		t.Errorf("result = %s, want skipped 2", body)
+	if !strings.Contains(body, "skipped 3 (non-refreshable)") {
+		t.Errorf("result = %s, want skipped 3", body)
 	}
 	if strings.Contains(body, "qoder: reconnect required") || strings.Contains(body, "failed") {
 		t.Errorf("result = %s, qoder must not be failed", body)
@@ -1173,8 +1227,11 @@ func TestRefreshAllOAuth(t *testing.T) {
 				continue
 			}
 			if p.OAuthCreds.CursorAuth {
-				if p.OAuthCreds.AccessToken != "ide-tok" {
+				if p.Name == "cursor-import" && p.OAuthCreds.AccessToken != "ide-tok" {
 					t.Errorf("cursor access token = %q, want unchanged ide-tok", p.OAuthCreds.AccessToken)
+				}
+				if p.Name == "cursor-session" && p.OAuthCreds.AccessToken != sess {
+					t.Errorf("cursor session access token mutated")
 				}
 				continue
 			}

@@ -75,6 +75,13 @@ func jwtWithExp(t *testing.T, exp int64) string {
 	return header + "." + payload + "."
 }
 
+func cursorSessionJWTForTest(t *testing.T, exp int64) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"https://authentication.cursor.sh","exp":` + strconv.FormatInt(exp, 10) + `}`))
+	return header + "." + payload + "."
+}
+
 func TestCursorConnectPendingThenSuccess(t *testing.T) {
 	restore := overrideCursorEndpoints(t)
 	defer restore()
@@ -377,6 +384,38 @@ func TestRefreshCursorKeepsRefreshTokenOnOmission(t *testing.T) {
 	}
 	if c.MachineID != "m" {
 		t.Fatalf("machine id = %q", c.MachineID)
+	}
+}
+
+func TestRefreshCursorSessionJWTSkipsExchange(t *testing.T) {
+	restore := overrideCursorEndpoints(t)
+	defer restore()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("session JWT must not hit exchange")
+		w.WriteHeader(500)
+	}))
+	t.Cleanup(srv.Close)
+	restoreURLs := OverrideCursorURLs("", "", srv.URL)
+	defer restoreURLs()
+
+	now := time.Now()
+	exp := now.Add(time.Hour).Unix()
+	sess := cursorSessionJWTForTest(t, exp)
+	c := &domain.OAuthCreds{
+		CursorAuth: true, AccessToken: jwtWithExp(t, exp), RefreshToken: sess,
+		ExpiresAt: exp, MachineID: "m",
+	}
+	if err := refresh(context.Background(), c, now); !IsCursorNotRotatable(err) {
+		t.Fatalf("err = %v, want ErrCursorNotRotatable", err)
+	}
+	if c.AccessToken == "" || c.RefreshToken != sess {
+		t.Fatalf("mutated: %+v", c)
+	}
+
+	c.ExpiresAt = now.Add(-time.Minute).Unix()
+	c.AccessToken = jwtWithExp(t, c.ExpiresAt)
+	if err := refresh(context.Background(), c, now); !IsInvalidGrant(err) {
+		t.Fatalf("expired session err = %v, want ErrInvalidGrant", err)
 	}
 }
 

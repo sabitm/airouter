@@ -303,11 +303,66 @@ type cursorTokenPayload struct {
 	RefreshToken string `json:"refreshToken"`
 }
 
-// refreshCursor exchanges the durable Cursor refresh token / user API key for a
-// new access token. Access-only imports have no refresh token and surface
-// ErrInvalidGrant so the reactive 401 path prompts reconnect.
-func refreshCursor(ctx context.Context, c *domain.OAuthCreds, _ time.Time) error {
-	if c == nil || c.RefreshToken == "" {
+// ErrCursorNotRotatable means Cursor rejected exchange (or the stored secret is
+// a browser session JWT) while the access token is still usable. Dashboard
+// refresh must not say reconnect; the next chat can keep using AccessToken.
+var ErrCursorNotRotatable = errors.New("oauth: cursor session cannot be rotated")
+
+const cursorSessionIssuer = "https://authentication.cursor.sh"
+
+// cursorSessionJWT reports whether token is a Cursor browser/CLI session JWT.
+// Those cannot be sent to exchange_user_api_key (401 Invalid User API Key).
+func cursorSessionJWT(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	payload, err := decodeJWTPayload(parts[1])
+	if err != nil {
+		return false
+	}
+	var claims struct {
+		Iss string `json:"iss"`
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return false
+	}
+	return claims.Iss == cursorSessionIssuer
+}
+
+// cursorUserAPIKey reports whether token looks like the durable secret
+// exchange_user_api_key accepts. Empty and Cursor session JWTs do not.
+func cursorUserAPIKey(token string) bool {
+	token = strings.TrimSpace(token)
+	return token != "" && !cursorSessionJWT(token)
+}
+
+func cursorAccessUsable(c *domain.OAuthCreds, now time.Time) bool {
+	if c == nil {
+		return false
+	}
+	exp := c.ExpiresAt
+	if exp == 0 {
+		exp = CursorTokenExpiry(c.AccessToken)
+	}
+	if exp == 0 {
+		return false
+	}
+	return now.Before(time.Unix(exp, 0))
+}
+
+// refreshCursor exchanges a Cursor user API key for a new access token.
+// Browser poll tokens are session JWTs and must not hit exchange. Access-only
+// imports and expired sessions surface ErrInvalidGrant so the 401 path
+// prompts reconnect.
+func refreshCursor(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
+	if c == nil || strings.TrimSpace(c.RefreshToken) == "" {
+		return ErrInvalidGrant
+	}
+	if !cursorUserAPIKey(c.RefreshToken) {
+		if cursorAccessUsable(c, now) {
+			return ErrCursorNotRotatable
+		}
 		return ErrInvalidGrant
 	}
 	_, _, exchangeURL := cursorURLs()
@@ -330,6 +385,9 @@ func refreshCursor(ctx context.Context, c *domain.OAuthCreds, _ time.Time) error
 		resp.StatusCode == http.StatusUnauthorized ||
 		resp.StatusCode == http.StatusForbidden
 	if badStatus {
+		if cursorAccessUsable(c, now) {
+			return ErrCursorNotRotatable
+		}
 		return ErrInvalidGrant
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {

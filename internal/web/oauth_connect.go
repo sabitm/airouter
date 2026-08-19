@@ -507,6 +507,10 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 		updated, err = h.oauth.RefreshTokens(r.Context(), creds)
 	}
 	if err != nil {
+		if oauth.IsCursorNotRotatable(err) {
+			renderErr(creds, "cursor session cannot be rotated; access token is still valid")
+			return
+		}
 		if oauth.IsInvalidGrant(err) {
 			renderErr(creds, "refresh token rejected - re-authorize")
 			return
@@ -571,8 +575,14 @@ func oauthLabel(c *domain.OAuthCreds) string {
 // no input.
 const defaultRedirectURI = "http://127.0.0.1:56121/callback"
 
+// oauthRefreshable reports whether the dashboard should offer a Refresh action.
+func oauthRefreshable(c *domain.OAuthCreds) bool {
+	return oauth.CanRefresh(c)
+}
+
 // orEmptyCreds returns a non-nil creds to read defaults from in the edit form,
 // so the template can prefill manual fields without nil checks.
+
 func orEmptyCreds(c *domain.OAuthCreds) *domain.OAuthCreds {
 	if c != nil {
 		return c

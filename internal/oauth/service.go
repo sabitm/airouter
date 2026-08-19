@@ -164,3 +164,7 @@ func (s *Service) RefreshAndPersist(ctx context.Context, id int64, creds *domain
 // IsInvalidGrant reports whether err is an ErrInvalidGrant, for callers that
 // want to surface a "reconnect required" state.
 func IsInvalidGrant(err error) bool { return errors.Is(err, ErrInvalidGrant) }
+
+// IsCursorNotRotatable reports a Cursor session that cannot exchange but still
+// has a usable access token. Callers must not treat this as reconnect.
+func IsCursorNotRotatable(err error) bool { return errors.Is(err, ErrCursorNotRotatable) }

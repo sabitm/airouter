@@ -137,6 +137,24 @@ func TestCursorEditRowReconnectAndRefresh(t *testing.T) {
 	}
 }
 
+func TestCursorEditRowSessionJWTHidesRefresh(t *testing.T) {
+	header := "eyJhbGciOiJub25lIn0"
+	payload := "eyJpc3MiOiJodHRwczovL2F1dGhlbnRpY2F0aW9uLmN1cnNvci5zaCJ9"
+	sess := header + "." + payload + "."
+	p := &domain.Provider{
+		ID: 9, Name: "c", BaseURL: "https://api2.cursor.sh", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{CursorAuth: true, RefreshToken: sess, MachineID: "mid"},
+	}
+	html := renderComponent(t, providerEditRowCursor(p))
+	if strings.Contains(html, "oauth-refresh-result-") {
+		t.Fatalf("session JWT should hide connected refresh: %s", html)
+	}
+	if !strings.Contains(html, "cannot be rotated") {
+		t.Fatalf("want session-cannot-rotate hint; html=%s", html)
+	}
+}
+
 func TestGrokRecipeDefaultsToGrokDialect(t *testing.T) {
 	r, ok := recipeByID("xai")
 	if !ok {

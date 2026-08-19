@@ -344,7 +344,7 @@ templ ProviderRecipeForm(r recipe) {
 					<p class="field-hint">Save after Connect succeeds, or switch to Manual and paste tokens from the Cursor CLI or IDE.</p>
 				</div>
 				<div class="oauth-manual">
-					<span class="muted">Paste an access token and machine id. Include a refresh token to keep the session refreshable.</span>
+					<span class="muted">Paste an access token and machine id. A Cursor user API key in the refresh field can rotate; a browser session JWT cannot.</span>
 					<label class="field">
 						<span class="field-name">Machine id</span>
 						<input name="machine_id" class="oauth-cfg mono" placeholder="storage.serviceMachineId" aria-label="machine id"/>
@@ -741,7 +741,7 @@ templ providerEditRowCursor(p *domain.Provider) {
 			<div id={ "oauth-region-edit-cursor-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
 				@OAuthConnectIdle()
 			</div>
-			if c.RefreshToken != "" {
+			if oauthRefreshable(c) {
 				<button
 					type="button"
 					class="link"
@@ -754,8 +754,10 @@ templ providerEditRowCursor(p *domain.Provider) {
 				>Refresh token</button>
 				<span class="refresh-indicator htmx-indicator">refreshing...</span>
 				<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result" aria-live="polite"></span>
+			} else if c.RefreshToken != "" {
+				<p class="field-hint">This Cursor browser session cannot be rotated. Use it until it expires, then Reconnect.</p>
 			} else {
-				<p class="field-hint">This import has no refresh token. Reconnect or paste a refresh token to enable rotation.</p>
+				<p class="field-hint">This import has no refresh token. Reconnect or paste a Cursor user API key to enable rotation.</p>
 			}
 		</div>
 		<div class="oauth-manual">

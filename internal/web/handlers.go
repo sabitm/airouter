@@ -614,6 +614,10 @@ func (h *Handler) refreshAllOAuth(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if _, err := h.oauth.Resolve(r.Context(), p, true); err != nil {
+			if oauth.IsCursorNotRotatable(err) {
+				skipped++
+				continue
+			}
 			failed++
 			if oauth.IsInvalidGrant(err) {
 				problems = append(problems, p.Name+": reconnect required")

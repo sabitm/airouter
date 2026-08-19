@@ -114,7 +114,9 @@ Qoder, Antigravity, Cursor, and Claude Code are backend-only variants.
   accounts), and the upstream asks for context/KV replies mid-stream over the
   still-open request body — the duplex write path is mandatory or runs stall.
   Authentication is a browser/CLI OAuth session or imported IDE token plus a
-  stable machine ID. Upstream requests must carry the CLI identity
+  stable machine ID. Browser poll tokens are session JWTs and cannot call
+  `exchange_user_api_key` (that endpoint accepts a user API key only). Do not
+  treat a still-valid access token as reconnect when exchange fails. Upstream requests must carry the CLI identity
   (`X-Cursor-Client-Type: cli`, `X-Cursor-Client-Version: cli-<version>`) and
   must not send the IDE-only headers, because an IDE identity makes `Run`
   return a false "usage limit" on non-Pro accounts. Native login must persist

@@ -94,14 +94,18 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 		}
 		tok, err := h.oauth.Resolve(r.Context(), probe, false)
 		if err != nil {
-			if oauth.IsInvalidGrant(err) {
+			if oauth.IsCursorNotRotatable(err) {
+				probe.APIKey = tok
+			} else if oauth.IsInvalidGrant(err) {
 				render(w, r, CheckResult(false, "token expired - reconnect required"))
 				return
+			} else {
+				render(w, r, CheckResult(false, "token refresh failed: "+err.Error()))
+				return
 			}
-			render(w, r, CheckResult(false, "token refresh failed: "+err.Error()))
-			return
+		} else {
+			probe.APIKey = tok
 		}
-		probe.APIKey = tok
 	} else {
 		probe.APIKey = creds.AccessToken
 	}

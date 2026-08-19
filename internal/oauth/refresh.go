@@ -80,8 +80,9 @@ func isInvalidGrantCode(code string) bool {
 }
 
 // CanRefresh reports whether creds support token-endpoint rotation. False for
-// nil, Qoder device tokens, and Cursor access-only imports (no refresh token).
-// Cursor browser/CLI credentials that carry a RefreshToken can rotate via
+// nil, Qoder device tokens, Cursor access-only imports, and Cursor browser/CLI
+// poll sessions (the stored refresh token is a session JWT, not a user API
+// key). A Cursor user API key pasted as RefreshToken can rotate via
 // exchange_user_api_key. Resolve(force=true) does NOT consult this — a dead
 // device/imported token must still surface ErrInvalidGrant so the reactive 401
 // path can prompt reconnect.
@@ -93,7 +94,7 @@ func CanRefresh(c *domain.OAuthCreds) bool {
 		return false
 	}
 	if c.CursorAuth {
-		return c.RefreshToken != ""
+		return cursorUserAPIKey(c.RefreshToken)
 	}
 	return true
 }
