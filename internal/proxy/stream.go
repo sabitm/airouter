@@ -9,6 +9,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/observability"
+	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/sse"
@@ -296,13 +297,13 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	decode := backend.decodeStream
 	if backend.decodeStreamDuplex != nil {
 		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			if backend.protocol == domain.ProtocolCursor {
+				return cursor.DecodeAgentStreamTools(req.Tools, r, writeFrame, emit)
+			}
 			return backend.decodeStreamDuplex(r, writeFrame, emit)
 		}
 	}
-	err = decode(resp.Body, func(ev ir.StreamEvent) error {
-		// Token counts arrive on distinct events depending on backend: Anthropic
-		// reports input at message start, OpenAI reports both at finish. Keep
-		// them attempt-local until the sink commits bytes downstream.
+	emit := func(ev ir.StreamEvent) error {
 		switch ev.Kind {
 		case ir.EventMessageStart:
 			if ev.InputTokens != 0 {
@@ -319,7 +320,40 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			publishUsage()
 		}
 		return err
-	})
+	}
+	err = decode(resp.Body, emit)
+	if ub, ok := cursor.AsUnmatchedBuiltin(err); ok && len(req.Tools) > 0 {
+		closeWrite()
+		_ = resp.Body.Close()
+		retryReq := cursor.WithBuiltinRejection(req, ub.Name)
+		retryBody, rerr := backend.encodeRequest(retryReq)
+		if rerr == nil {
+			retryBody, rerr = finalizeEncodedBody(retryBody, retryReq, backend, provider)
+		}
+		if rerr == nil {
+			retryBody, rerr = prepareUpstreamRequest(ctx, backend, provider, retryBody)
+		}
+		var retryResp *http.Response
+		var retryWrite func([]byte) error
+		var retryClose func()
+		if rerr == nil {
+			retryResp, retryWrite, retryClose, rerr = p.forwardStreamDuplex(ctx, provider, backend.upstreamPath, retryBody, nil, backend.streamAccept)
+		}
+		if rerr == nil {
+			defer retryClose()
+			defer retryResp.Body.Close()
+			if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+				err = cursor.DecodeAgentStreamTools(req.Tools, retryResp.Body, retryWrite, emit)
+				if _, again := cursor.AsUnmatchedBuiltin(err); again {
+					err = emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: ir.StopEndTurn})
+				}
+			} else {
+				err = emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: ir.StopEndTurn})
+			}
+		} else {
+			err = emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: ir.StopEndTurn})
+		}
+	}
 	if err != nil {
 		// A canceled context means the client disconnected after receiving the
 		// response; that is routine, not a server error, so do not log it as one.

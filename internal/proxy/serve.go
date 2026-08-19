@@ -11,6 +11,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/observability"
+	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/media"
 	"airouter/internal/proxy/thinking"
@@ -561,7 +562,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
 	if backend.streamOnly {
-		return p.serveStreamOnlyUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody)
+		return p.serveStreamOnlyUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody, req.Tools)
 	}
 
 	status, respBody, err := p.forward(ctx, provider, backend.upstreamPath, upstreamBody, nil)
@@ -596,7 +597,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 // non-streaming client request: it sends the request with the backend's stream
 // Accept, decodes the upstream stream into an IR response, then renders the
 // ingress format's unary response envelope.
-func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, upstreamBody []byte) attemptResult {
+func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, upstreamBody []byte, clientTools []ir.Tool) attemptResult {
 	var writeFrame func([]byte) error
 	closeWrite := func() {}
 	var resp *http.Response
@@ -615,7 +616,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
 		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
-	irResp, err := collectStreamResponse(resp.Body, backend, writeFrame, upstreamModel)
+	irResp, err := collectStreamResponse(resp.Body, backend, writeFrame, upstreamModel, clientTools)
 	if err != nil {
 		// Client disconnect: duplex streams surface it as a body-closed read
 		// error (see forwardStreamDuplex). Stop quietly instead of failing
@@ -645,7 +646,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 // It is used only for backends that are SSE-only even for non-streaming clients.
 // writeFrame is non-nil only for duplex backends (Cursor AgentService), whose
 // streams need mid-stream client replies to finish.
-func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) error, fallbackModel string) (*ir.Response, error) {
+func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) error, fallbackModel string, clientTools []ir.Tool) (*ir.Response, error) {
 	resp := &ir.Response{ID: ir.NewID("resp_"), Model: fallbackModel, StopReason: ir.StopEndTurn}
 	var text strings.Builder
 	type toolBuf struct {
@@ -659,6 +660,9 @@ func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) e
 	decode := backend.decodeStream
 	if backend.decodeStreamDuplex != nil {
 		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			if backend.protocol == domain.ProtocolCursor {
+				return cursor.DecodeAgentStreamTools(clientTools, r, writeFrame, emit)
+			}
 			return backend.decodeStreamDuplex(r, writeFrame, emit)
 		}
 	}
@@ -701,6 +705,15 @@ func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) e
 		}
 		return nil
 	})
+	if _, ok := cursor.AsUnmatchedBuiltin(err); ok {
+		// Unary collection cannot open a follow-up Run here; surface the
+		// text that already arrived and end the turn.
+		err = nil
+		if resp.StopReason == "" {
+			resp.StopReason = ir.StopEndTurn
+		}
+		sawEvent = true
+	}
 	if err != nil {
 		return nil, err
 	}

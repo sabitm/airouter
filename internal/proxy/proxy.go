@@ -181,13 +181,15 @@ var antigravityCodec = codec{
 // every request translates through the IR. Auth is an OAuth token + stable
 // machine id.
 var cursorCodec = codec{
-	id:                 "cursor",
-	protocol:           domain.ProtocolCursor,
-	encodeRequest:      cursor.EncodeAgentRequest,
-	upstreamPath:       cursor.AgentRunURL,
-	decodeStreamDuplex: cursor.DecodeAgentStream,
-	streamOnly:         true,
-	streamAccept:       cursor.StreamAccept,
+	id:            "cursor",
+	protocol:      domain.ProtocolCursor,
+	encodeRequest: cursor.EncodeAgentRequest,
+	upstreamPath:  cursor.AgentRunURL,
+	decodeStreamDuplex: func(r io.Reader, write func([]byte) error, emit func(ir.StreamEvent) error) error {
+		return cursor.DecodeAgentStreamTools(nil, r, write, emit)
+	},
+	streamOnly:   true,
+	streamAccept: cursor.StreamAccept,
 }
 
 // claudeCodeCodec is the Claude Code CLI backend: Anthropic Messages wire

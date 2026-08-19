@@ -127,6 +127,53 @@ func TestEncodeAgentRequestSystemPromptFoldedIntoUserText(t *testing.T) {
 	}
 }
 
+func TestEncodeAgentRequestFoldsMCPAvailabilityNote(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+		Tools: []ir.Tool{{Name: "bash"}, {Name: "websearch"}},
+	})
+	um := decodePath(t, agentFramePayload(t, body), acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
+	umMsg, _ := decodeMessage(um)
+	text, _ := stringField(umMsg, umText)
+	if !strings.Contains(text, "bash") || !strings.Contains(text, "websearch") {
+		t.Errorf("user text = %q, want declared tool names", text)
+	}
+	if !strings.Contains(text, "MCP tools") {
+		t.Errorf("user text = %q, want MCP availability note", text)
+	}
+}
+
+func TestMCPAvailabilityNoteUsesRequestTools(t *testing.T) {
+	note := MCPAvailabilityNote([]ir.Tool{{Name: "read"}, {Name: "bash"}}, "shell")
+	if !strings.Contains(note, "shell") || !strings.Contains(note, "read, bash") {
+		t.Errorf("note = %q", note)
+	}
+	if MCPAvailabilityNote(nil, "shell") != "" {
+		t.Error("empty tools should produce no note")
+	}
+}
+
+func TestWithBuiltinRejectionAppendsUserTurn(t *testing.T) {
+	req := &ir.Request{
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "run it"}}}},
+		Tools:    []ir.Tool{{Name: "bash"}},
+	}
+	out := WithBuiltinRejection(req, "shell")
+	if len(out.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(out.Messages))
+	}
+	if len(req.Messages) != 1 {
+		t.Fatal("original request mutated")
+	}
+	got := out.Messages[1].Content[0].Text
+	if !strings.Contains(got, "shell") || !strings.Contains(got, "bash") {
+		t.Errorf("retry text = %q", got)
+	}
+}
+
 func TestEncodeAgentRequestHistoryFoldedAsTranscript(t *testing.T) {
 	body := mustEncodeAgent(t, &ir.Request{
 		Model: "default",

@@ -85,14 +85,20 @@ const (
 	asmExecServerMessage = 2
 	asmKVServerMessage   = 4
 	// asmInteractionQuery (7): the server asks the CLIENT to run a built-in
-	// interaction (web search, web fetch, ask question, plan, VM setup). A
-	// proxy cannot execute these, and ignoring the query stalls the turn with
-	// heartbeats forever — DecodeAgentStream fails the turn instead.
+	// interaction. Every variant is named and resolved onto a declared MCP
+	// tool (or one retry). Ignoring the query stalls the turn with heartbeats.
 	asmInteractionQuery = 7
 
-	// InteractionQuery variants. Only the discriminator matters; every variant
-	// is client-executed.
+	iqID        = 1
 	iqWebSearch = 2
+	iqWebFetch  = 9
+
+	// WebSearchRequestQuery / WebFetchRequestQuery wrap typed args at field 1.
+	iqQueryArgs = 1
+	// WebSearchArgs / WebFetchArgs share field numbers: 1 = primary value
+	// (search_term or url), 2 = tool_call_id.
+	iqArgPrimary = 1
+	iqArgCallID  = 2
 )
 
 // KvServerMessage / KvClientMessage and blob args/results.
@@ -230,7 +236,15 @@ func EncodeAgentRequest(req *ir.Request) ([]byte, error) {
 	// custom_system_prompt (field 8) is rejected by the deployed server as an
 	// unknown CLI option, so the system prompt is folded into the current user
 	// message instead, matching the CLI's own prompt layout.
-	if sys := strings.TrimSpace(req.System); sys != "" {
+	sys := strings.TrimSpace(req.System)
+	if note := MCPAvailabilityNote(req.Tools, ""); note != "" {
+		if sys != "" {
+			sys = sys + "\n\n" + note
+		} else {
+			sys = note
+		}
+	}
+	if sys != "" {
 		userText = "[System Instructions]\n" + sys + "\n\n" + userText
 	}
 

@@ -29,7 +29,10 @@ type StreamEvent struct {
 	Index    int
 	ToolID   string
 	ToolName string
-	ArgsFrag string // partial JSON fragment for tool arguments
+	// ArgsFrag is consumed from EventToolCallDelta only. Start is identity
+	// (id/name/index); putting complete args on Start drops them at every
+	// ingress encoder and the unary collector.
+	ArgsFrag string
 
 	// EventFinish
 	StopReason   StopReason
