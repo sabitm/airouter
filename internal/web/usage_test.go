@@ -60,11 +60,20 @@ func TestUsagePageListsSupportedNonArchived(t *testing.T) {
 	if strings.Contains(body, "codex-archived") {
 		t.Fatalf("archived should be excluded: %s", body)
 	}
-	if !strings.Contains(body, "loading...") {
-		t.Fatalf("page should render skeletons, not wait on upstream: %s", body)
+	if !strings.Contains(body, "hx-get=\"/dashboard/usage?load=1\"") {
+		t.Fatalf("missing Load all control: %s", body)
 	}
-	if strings.Contains(body, "hx-get=\"/dashboard/usage/card/") == false {
-		t.Fatalf("missing lazy card loads: %s", body)
+	if strings.Count(body, ">Load</button>") != 2 {
+		t.Fatalf("each idle card should have a Load button: %s", body)
+	}
+	if !strings.Contains(body, "hx-get=\"/dashboard/usage/card/") {
+		t.Fatalf("missing per-provider Load controls: %s", body)
+	}
+	if strings.Contains(body, "hx-trigger=\"load\"") {
+		t.Fatalf("page must not autoload on navigation: %s", body)
+	}
+	if strings.Contains(body, "loading...") {
+		t.Fatalf("idle cards must not show loading skeletons: %s", body)
 	}
 }
 
@@ -147,7 +156,7 @@ func TestUsageCardUnsupported404(t *testing.T) {
 	}
 }
 
-func TestUsageRefreshAllPartial(t *testing.T) {
+func TestUsageLoadAllPartialAutoloads(t *testing.T) {
 	h := testHandler(t)
 	p := &domain.Provider{
 		Name: "codex-live", Protocol: domain.ProtocolOpenAICodex,
@@ -156,16 +165,43 @@ func TestUsageRefreshAllPartial(t *testing.T) {
 	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
 		t.Fatal(err)
 	}
+
+	// Full navigation carrying ?load=1 must still render the idle page, not an
+	// autoloading grid, so a stray query parameter cannot trigger upstream calls.
+	full := httptest.NewRecorder()
+	fullReq := httptest.NewRequest(http.MethodGet, "/dashboard/usage?load=1", nil)
+	h.usagePage(full, fullReq)
+	if !strings.Contains(full.Body.String(), "<html") {
+		t.Fatalf("full navigation with ?load=1 should render the page: %s", full.Body.String())
+	}
+	if strings.Contains(full.Body.String(), "hx-trigger=\"load\"") {
+		t.Fatalf("full navigation must not autoload: %s", full.Body.String())
+	}
+
+	// The explicit Load all HTMX request returns a grid partial whose skeletons
+	// autoload, using cached (non-forced) card requests.
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage?refresh=1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage?load=1", nil)
 	req.Header.Set("HX-Request", "true")
 	h.usagePage(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
 	body := rr.Body.String()
 	if strings.Contains(body, "<html") {
-		t.Fatalf("refresh-all should be a grid partial: %s", body)
+		t.Fatalf("load-all should be a grid partial: %s", body)
 	}
-	if !strings.Contains(body, "force=1") {
-		t.Fatalf("refresh-all cards should force: %s", body)
+	if !strings.Contains(body, "hx-trigger=\"load\"") {
+		t.Fatalf("load-all cards should autoload: %s", body)
+	}
+	if !strings.Contains(body, "loading...") {
+		t.Fatalf("load-all should render skeletons: %s", body)
+	}
+	if !strings.Contains(body, "hx-get=\"/dashboard/usage/card/") {
+		t.Fatalf("load-all skeletons should request card endpoints: %s", body)
+	}
+	if strings.Contains(body, "force=1") {
+		t.Fatalf("load-all should use cached data, not force refresh: %s", body)
 	}
 }
 

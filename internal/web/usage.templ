@@ -7,7 +7,7 @@ import (
 	"airouter/internal/usage"
 )
 
-templ UsagePage(providers []*domain.Provider, force bool) {
+templ UsagePage(providers []*domain.Provider) {
 	@Layout("Usage", "/dashboard/usage") {
 		<section class="panel">
 			<div class="panel-head">
@@ -16,35 +16,65 @@ templ UsagePage(providers []*domain.Provider, force bool) {
 					<button
 						type="button"
 						class="link"
-						hx-get="/dashboard/usage?refresh=1"
+						hx-get="/dashboard/usage?load=1"
 						hx-target="#usage-grid"
 						hx-swap="outerHTML"
-					>Refresh all</button>
+					>Load all</button>
 				}
 			</div>
 			<p class="hint">Live account quota from the provider, not this router's request log.</p>
-			@UsageGrid(providers, force)
+			@UsageGridIdle(providers)
 		</section>
 	}
 }
 
-templ UsageGrid(providers []*domain.Provider, force bool) {
+templ UsageGridIdle(providers []*domain.Provider) {
 	<div id="usage-grid" class="usage-grid">
 		if len(providers) == 0 {
 			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, or Antigravity.</p>
 		} else {
 			for _, p := range providers {
-				@UsageCardSkeleton(p, force)
+				@UsageCardIdle(p)
 			}
 		}
 	</div>
 }
 
-templ UsageCardSkeleton(p *domain.Provider, force bool) {
+templ UsageCardIdle(p *domain.Provider) {
+	<div class="usage-card" id={ "usage-card-" + strconv.FormatInt(p.ID, 10) }>
+		<div class="usage-card-head">
+			<div>
+				<span class="usage-card-name">{ p.Name }</span>
+				<span class="tag">{ string(p.Protocol) }</span>
+			</div>
+			<button
+				type="button"
+				class="link"
+				hx-get={ usageCardURL(p.ID, false) }
+				hx-target={ "#usage-card-" + strconv.FormatInt(p.ID, 10) }
+				hx-swap="outerHTML"
+			>Load</button>
+		</div>
+	</div>
+}
+
+templ UsageGridLoading(providers []*domain.Provider) {
+	<div id="usage-grid" class="usage-grid">
+		if len(providers) == 0 {
+			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, or Antigravity.</p>
+		} else {
+			for _, p := range providers {
+				@UsageCardSkeleton(p)
+			}
+		}
+	</div>
+}
+
+templ UsageCardSkeleton(p *domain.Provider) {
 	<div
 		class="usage-card usage-card-loading"
 		id={ "usage-card-" + strconv.FormatInt(p.ID, 10) }
-		hx-get={ usageCardURL(p.ID, force) }
+		hx-get={ usageCardURL(p.ID, false) }
 		hx-trigger="load"
 		hx-swap="outerHTML"
 	>

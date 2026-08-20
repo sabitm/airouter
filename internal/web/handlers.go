@@ -1240,12 +1240,14 @@ func (h *Handler) usagePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	supported := usageSupportedProviders(providers)
-	force := r.URL.Query().Get("refresh") == "1"
-	if r.Header.Get("HX-Request") != "" && force {
-		render(w, r, UsageGrid(supported, true))
+	// Load all is an explicit HTMX request for the grid in autoload mode. A
+	// full navigation with ?load=1 must still render the idle page, so require
+	// the HX-Request header rather than trusting the query parameter alone.
+	if r.Header.Get("HX-Request") != "" && r.URL.Query().Get("load") == "1" {
+		render(w, r, UsageGridLoading(supported))
 		return
 	}
-	render(w, r, UsagePage(supported, force))
+	render(w, r, UsagePage(supported))
 }
 
 func (h *Handler) usageCard(w http.ResponseWriter, r *http.Request) {
