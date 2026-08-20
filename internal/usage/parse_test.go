@@ -82,3 +82,39 @@ func TestSupported(t *testing.T) {
 		}
 	}
 }
+
+func TestSupportedGrokXaiOAuthOnly(t *testing.T) {
+	// xAI OAuth preset exposes Grok usage through ProtocolOpenAI.
+	grok := &domain.Provider{
+		Protocol:   domain.ProtocolOpenAI,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{Preset: "xai"},
+	}
+	if !Supported(grok) {
+		t.Fatal("xAI OAuth Grok must be supported")
+	}
+
+	// xAI over API key, unrelated OAuth OpenAI, and Cursor are all excluded.
+	for name, p := range map[string]*domain.Provider{
+		"xai apikey": {
+			Protocol:   domain.ProtocolOpenAI,
+			AuthMethod: domain.AuthAPIKey,
+			APIKey:     "k",
+			OAuthCreds: &domain.OAuthCreds{Preset: "xai"},
+		},
+		"unrelated oauth": {
+			Protocol:   domain.ProtocolOpenAI,
+			AuthMethod: domain.AuthOAuth,
+			OAuthCreds: &domain.OAuthCreds{Preset: "cline"},
+		},
+		"cursor": {
+			Protocol:   domain.ProtocolCursor,
+			AuthMethod: domain.AuthOAuth,
+			OAuthCreds: &domain.OAuthCreds{Preset: "xai", CursorAuth: true},
+		},
+	} {
+		if Supported(p) {
+			t.Fatalf("%s must not be supported", name)
+		}
+	}
+}

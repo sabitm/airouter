@@ -57,13 +57,25 @@ func (s *Service) resolveToken(ctx context.Context, p *domain.Provider, force bo
 
 func (s *Service) doJSON(ctx context.Context, method, rawURL, token string, headers map[string]string, body any) (httpResult, error) {
 	// Logs stay metadata-only: host, status, duration. Never tokens, auth headers, or bodies.
-	var rdr io.Reader
+	var raw []byte
 	if body != nil {
-		raw, err := json.Marshal(body)
+		var err error
+		raw, err = json.Marshal(body)
 		if err != nil {
 			return httpResult{}, err
 		}
-		rdr = bytes.NewReader(raw)
+	}
+	return s.doRequest(ctx, method, rawURL, token, headers, raw)
+}
+
+// doRequest sends an arbitrary raw-body request. It is the shared transport seam
+// under doJSON; gRPC-web and other non-JSON payloads use it directly so their
+// request bodies are never JSON-encoded and their content types are preserved.
+// Logging stays metadata-only (host, status, duration, size).
+func (s *Service) doRequest(ctx context.Context, method, rawURL, token string, headers map[string]string, body []byte) (httpResult, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, rawURL, rdr)
 	if err != nil {

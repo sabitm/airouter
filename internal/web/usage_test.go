@@ -34,6 +34,11 @@ func TestUsagePageListsSupportedNonArchived(t *testing.T) {
 		OAuthCreds: &domain.OAuthCreds{AccessToken: "t"},
 	})
 	mustCreate(&domain.Provider{
+		Name: "grok-live", Protocol: domain.ProtocolOpenAI,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{Preset: "xai", AccessToken: "t"},
+	})
+	mustCreate(&domain.Provider{
 		Name: "openai-plain", Protocol: domain.ProtocolOpenAI,
 		AuthMethod: domain.AuthAPIKey, APIKey: "k",
 	})
@@ -51,7 +56,7 @@ func TestUsagePageListsSupportedNonArchived(t *testing.T) {
 		t.Fatalf("status = %d", rr.Code)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "codex-live") || !strings.Contains(body, "claude-live") {
+	if !strings.Contains(body, "codex-live") || !strings.Contains(body, "claude-live") || !strings.Contains(body, "grok-live") {
 		t.Fatalf("missing supported cards: %s", body)
 	}
 	if strings.Contains(body, "openai-plain") {
@@ -63,7 +68,7 @@ func TestUsagePageListsSupportedNonArchived(t *testing.T) {
 	if !strings.Contains(body, "hx-get=\"/dashboard/usage?load=1\"") {
 		t.Fatalf("missing Load all control: %s", body)
 	}
-	if strings.Count(body, ">Load</button>") != 2 {
+	if strings.Count(body, ">Load</button>") != 3 {
 		t.Fatalf("each idle card should have a Load button: %s", body)
 	}
 	if !strings.Contains(body, "hx-get=\"/dashboard/usage/card/") {

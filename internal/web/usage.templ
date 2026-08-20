@@ -31,7 +31,7 @@ templ UsagePage(providers []*domain.Provider) {
 templ UsageGridIdle(providers []*domain.Provider) {
 	<div id="usage-grid" class="usage-grid">
 		if len(providers) == 0 {
-			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, or Antigravity.</p>
+			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, or Grok (xAI).</p>
 		} else {
 			for _, p := range providers {
 				@UsageCardIdle(p)
@@ -61,7 +61,7 @@ templ UsageCardIdle(p *domain.Provider) {
 templ UsageGridLoading(providers []*domain.Provider) {
 	<div id="usage-grid" class="usage-grid">
 		if len(providers) == 0 {
-			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, or Antigravity.</p>
+			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, or Grok (xAI).</p>
 		} else {
 			for _, p := range providers {
 				@UsageCardSkeleton(p)

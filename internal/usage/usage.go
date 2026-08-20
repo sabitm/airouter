@@ -48,6 +48,9 @@ var (
 	AntigravityLoadURL   = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 	KiroUsageBase        = "https://codewhisperer.us-east-1.amazonaws.com"
 	KiroQUsageBase       = "https://q.us-east-1.amazonaws.com"
+	GrokBillingURL       = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+	GrokUserURL          = "https://cli-chat-proxy.grok.com/v1/user?include=subscription"
+	GrokGrpcCreditsURL   = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
 )
 
 const (
@@ -128,12 +131,27 @@ func Supported(p *domain.Provider) bool {
 	if p == nil {
 		return false
 	}
+	if isGrok(p) {
+		return true
+	}
 	switch p.Protocol {
 	case domain.ProtocolOpenAICodex, domain.ProtocolClaudeCode, domain.ProtocolKiro, domain.ProtocolQoder, domain.ProtocolAntigravity:
 		return true
 	default:
 		return false
 	}
+}
+
+// isGrok reports whether a provider is the Grok CLI / Grok Build (xAI) OAuth
+// preset. Grok shares ProtocolOpenAI with generic OpenAI and Cline, so usage is
+// distinguished by the xai OAuth preset rather than the protocol alone.
+// Generic OpenAI, xAI API-key, unrelated OAuth OpenAI, Grok Web, and Cursor are
+// all excluded.
+func isGrok(p *domain.Provider) bool {
+	if p == nil || p.Protocol != domain.ProtocolOpenAI || p.Method() != domain.AuthOAuth || p.OAuthCreds == nil {
+		return false
+	}
+	return p.OAuthCreds.Preset == "xai"
 }
 
 // Fetch returns a cached or live quota report. Soft upstream failures are a
@@ -229,6 +247,11 @@ func (s *Service) fetchLive(ctx context.Context, p *domain.Provider) (*Report, e
 		return s.fetchQoder(ctx, p)
 	case domain.ProtocolAntigravity:
 		return s.fetchAntigravity(ctx, p)
+	case domain.ProtocolOpenAI:
+		if isGrok(p) {
+			return s.fetchGrok(ctx, p)
+		}
+		return nil, ErrUnsupported
 	default:
 		return nil, ErrUnsupported
 	}

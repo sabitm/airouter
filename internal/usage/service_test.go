@@ -265,6 +265,9 @@ func TestFetchKiroGETAndPOSTFallback(t *testing.T) {
 		}
 		if r.Method == http.MethodPost && r.Header.Get("x-amz-target") == "AmazonCodeWhispererService.GetUsageLimits" {
 			sawPOST.Store(true)
+			if got := r.Header.Get("Content-Type"); got != "application/x-amz-json-1.0" {
+				t.Errorf("content-type = %q", got)
+			}
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if _, ok := body["profileArn"]; ok {
