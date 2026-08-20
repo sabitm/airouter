@@ -397,7 +397,7 @@ func checkAntigravityUpstream(ctx context.Context, logger *slog.Logger, p *domai
 	return true, fmt.Sprintf("OK - reachable, project %s", project)
 }
 
-// checkCursorUpstream validates a Cursor IDE token against the AgentService
+// checkCursorUpstream validates a Cursor token against the AgentService
 // GetUsableModels endpoint. Cursor's ChatService is Connect-RPC protobuf and
 // has no /models REST endpoint; GetUsableModels is the lighter liveness probe
 // (an unframed application/proto unary call). A 401/403 means the effective

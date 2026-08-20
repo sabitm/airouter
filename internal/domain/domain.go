@@ -30,7 +30,7 @@ const (
 	// with loadCodeAssist/onboardUser project bootstrap. Every request translates
 	// through the IR.
 	ProtocolAntigravity Protocol = "antigravity"
-	// ProtocolCursor is the Cursor IDE backend. Backend only: Connect-RPC protobuf
+	// ProtocolCursor is the Cursor backend. Backend only: Connect-RPC protobuf
 	// chat (ChatService StreamUnifiedChatWithTools), stream-only. Auth is a Cursor
 	// browser/CLI OAuth session or a pasted IDE token plus a stable machine id;
 	// every request translates through the IR. Refresh uses exchange_user_api_key
@@ -255,7 +255,7 @@ type OAuthCreds struct {
 	// chat bodies. Empty means the connection is incomplete (fail closed).
 	ProjectID string `json:"project_id,omitempty"`
 
-	// CursorAuth marks a Cursor IDE OAuth connection. When true, refresh uses
+	// CursorAuth marks a Cursor OAuth connection. When true, refresh uses
 	// POST /auth/exchange_user_api_key only when RefreshToken is a user API key.
 	// Browser poll tokens are session JWTs and cannot rotate; access-only
 	// imports stay usable until they expire.
