@@ -185,7 +185,6 @@ templ ComboRow(c *domain.Combo) {
 							{ t.Provider.Name }
 							<span class="tag">{ string(t.Provider.Protocol) }</span>
 							<span class="mono">{ t.UpstreamModel }</span>
-							<span class="muted">disabled</span>
 							<button class="link" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/targets/" + strconv.FormatInt(t.ID, 10) + "/toggle" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML" title="re-enable this target">Enable</button>
 						</li>
 					}

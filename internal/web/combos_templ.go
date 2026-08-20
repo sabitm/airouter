@@ -825,14 +825,14 @@ func ComboRow(c *domain.Combo) templ.Component {
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 64, "</span> <span class=\"muted\">disabled</span> <button class=\"link\" hx-post=\"")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 64, "</span> <button class=\"link\" hx-post=\"")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 				var templ_7745c5c3_Var36 string
 				templ_7745c5c3_Var36, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/targets/" + strconv.FormatInt(t.ID, 10) + "/toggle")
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 189, Col: 144}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 188, Col: 144}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var36)
 				if templ_7745c5c3_Err != nil {
@@ -845,7 +845,7 @@ func ComboRow(c *domain.Combo) templ.Component {
 				var templ_7745c5c3_Var37 string
 				templ_7745c5c3_Var37, templ_7745c5c3_Err = templ.ResolveAttributeValue("#combo-" + strconv.FormatInt(c.ID, 10))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 189, Col: 198}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 188, Col: 198}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var37)
 				if templ_7745c5c3_Err != nil {
@@ -864,7 +864,7 @@ func ComboRow(c *domain.Combo) templ.Component {
 		var templ_7745c5c3_Var38 string
 		templ_7745c5c3_Var38, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/edit")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 196, Col: 93}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 195, Col: 93}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var38)
 		if templ_7745c5c3_Err != nil {
@@ -877,7 +877,7 @@ func ComboRow(c *domain.Combo) templ.Component {
 		var templ_7745c5c3_Var39 string
 		templ_7745c5c3_Var39, templ_7745c5c3_Err = templ.ResolveAttributeValue("#combo-" + strconv.FormatInt(c.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 196, Col: 147}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 195, Col: 147}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var39)
 		if templ_7745c5c3_Err != nil {
@@ -890,7 +890,7 @@ func ComboRow(c *domain.Combo) templ.Component {
 		var templ_7745c5c3_Var40 string
 		templ_7745c5c3_Var40, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/swap")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 197, Col: 93}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 196, Col: 93}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var40)
 		if templ_7745c5c3_Err != nil {
@@ -903,7 +903,7 @@ func ComboRow(c *domain.Combo) templ.Component {
 		var templ_7745c5c3_Var41 string
 		templ_7745c5c3_Var41, templ_7745c5c3_Err = templ.ResolveAttributeValue("#combo-" + strconv.FormatInt(c.ID, 10))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 197, Col: 147}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 196, Col: 147}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var41)
 		if templ_7745c5c3_Err != nil {
@@ -916,7 +916,7 @@ func ComboRow(c *domain.Combo) templ.Component {
 		var templ_7745c5c3_Var42 string
 		templ_7745c5c3_Var42, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/delete")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 198, Col: 103}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 197, Col: 103}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var42)
 		if templ_7745c5c3_Err != nil {
@@ -929,7 +929,7 @@ func ComboRow(c *domain.Combo) templ.Component {
 		var templ_7745c5c3_Var43 string
 		templ_7745c5c3_Var43, templ_7745c5c3_Err = templ.ResolveAttributeValue("Delete combo \"" + c.Name + "\"?")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 198, Col: 197}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 197, Col: 197}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var43)
 		if templ_7745c5c3_Err != nil {
@@ -979,7 +979,7 @@ func ComboEditRow(c *domain.Combo, providers []*domain.Provider) templ.Component
 		var templ_7745c5c3_Var45 string
 		templ_7745c5c3_Var45, templ_7745c5c3_Err = templ.ResolveAttributeValue("combo-" + id)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 212, Col: 23}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 211, Col: 23}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var45)
 		if templ_7745c5c3_Err != nil {
@@ -992,7 +992,7 @@ func ComboEditRow(c *domain.Combo, providers []*domain.Provider) templ.Component
 		var templ_7745c5c3_Var46 string
 		templ_7745c5c3_Var46, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/combos/" + id)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 214, Col: 63}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 213, Col: 63}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var46)
 		if templ_7745c5c3_Err != nil {
@@ -1005,7 +1005,7 @@ func ComboEditRow(c *domain.Combo, providers []*domain.Provider) templ.Component
 		var templ_7745c5c3_Var47 string
 		templ_7745c5c3_Var47, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 216, Col: 38}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 215, Col: 38}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var47)
 		if templ_7745c5c3_Err != nil {
@@ -1044,7 +1044,7 @@ func ComboEditRow(c *domain.Combo, providers []*domain.Provider) templ.Component
 		var templ_7745c5c3_Var48 string
 		templ_7745c5c3_Var48, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/combos/" + id + "/row")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 228, Col: 83}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 227, Col: 83}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var48)
 		if templ_7745c5c3_Err != nil {
@@ -1057,7 +1057,7 @@ func ComboEditRow(c *domain.Combo, providers []*domain.Provider) templ.Component
 		var templ_7745c5c3_Var49 string
 		templ_7745c5c3_Var49, templ_7745c5c3_Err = templ.ResolveAttributeValue("#combo-" + id)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 228, Col: 112}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 227, Col: 112}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var49)
 		if templ_7745c5c3_Err != nil {
@@ -1104,7 +1104,7 @@ func ComboSwapRow(c *domain.Combo, others []*domain.Combo) templ.Component {
 		var templ_7745c5c3_Var51 string
 		templ_7745c5c3_Var51, templ_7745c5c3_Err = templ.ResolveAttributeValue("combo-" + id)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 241, Col: 23}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 240, Col: 23}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var51)
 		if templ_7745c5c3_Err != nil {
@@ -1117,7 +1117,7 @@ func ComboSwapRow(c *domain.Combo, others []*domain.Combo) templ.Component {
 		var templ_7745c5c3_Var52 string
 		templ_7745c5c3_Var52, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/combos/" + id + "/swap")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 243, Col: 73}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 242, Col: 73}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var52)
 		if templ_7745c5c3_Err != nil {
@@ -1130,7 +1130,7 @@ func ComboSwapRow(c *domain.Combo, others []*domain.Combo) templ.Component {
 		var templ_7745c5c3_Var53 string
 		templ_7745c5c3_Var53, templ_7745c5c3_Err = templ.JoinStringErrs(c.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 245, Col: 48}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 244, Col: 48}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var53))
 		if templ_7745c5c3_Err != nil {
@@ -1158,7 +1158,7 @@ func ComboSwapRow(c *domain.Combo, others []*domain.Combo) templ.Component {
 				var templ_7745c5c3_Var54 string
 				templ_7745c5c3_Var54, templ_7745c5c3_Err = templ.ResolveAttributeValue(strconv.FormatInt(o.ID, 10))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 252, Col: 51}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 251, Col: 51}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var54)
 				if templ_7745c5c3_Err != nil {
@@ -1171,7 +1171,7 @@ func ComboSwapRow(c *domain.Combo, others []*domain.Combo) templ.Component {
 				var templ_7745c5c3_Var55 string
 				templ_7745c5c3_Var55, templ_7745c5c3_Err = templ.JoinStringErrs(o.Name)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 252, Col: 62}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 251, Col: 62}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var55))
 				if templ_7745c5c3_Err != nil {
@@ -1194,7 +1194,7 @@ func ComboSwapRow(c *domain.Combo, others []*domain.Combo) templ.Component {
 		var templ_7745c5c3_Var56 string
 		templ_7745c5c3_Var56, templ_7745c5c3_Err = templ.ResolveAttributeValue("/dashboard/combos/" + id + "/row")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 257, Col: 83}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 256, Col: 83}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var56)
 		if templ_7745c5c3_Err != nil {
@@ -1207,7 +1207,7 @@ func ComboSwapRow(c *domain.Combo, others []*domain.Combo) templ.Component {
 		var templ_7745c5c3_Var57 string
 		templ_7745c5c3_Var57, templ_7745c5c3_Err = templ.ResolveAttributeValue("#combo-" + id)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 257, Col: 112}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/combos.templ`, Line: 256, Col: 112}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var57)
 		if templ_7745c5c3_Err != nil {
