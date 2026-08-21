@@ -86,6 +86,7 @@ func TestGrokSupportedDetection(t *testing.T) {
 		domain.ProtocolKiro,
 		domain.ProtocolQoder,
 		domain.ProtocolAntigravity,
+		domain.ProtocolCursor,
 	} {
 		if !Supported(&domain.Provider{Protocol: proto}) {
 			t.Fatalf("%s should be supported", proto)

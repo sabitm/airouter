@@ -106,7 +106,7 @@ func UsageGridIdle(providers []*domain.Provider) templ.Component {
 			return templ_7745c5c3_Err
 		}
 		if len(providers) == 0 {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 6, "<p class=\"empty\">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, or Grok (xAI).</p>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 6, "<p class=\"empty\">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, or Grok (xAI).</p>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -246,7 +246,7 @@ func UsageGridLoading(providers []*domain.Provider) templ.Component {
 			return templ_7745c5c3_Err
 		}
 		if len(providers) == 0 {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 15, "<p class=\"empty\">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, or Grok (xAI).</p>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 15, "<p class=\"empty\">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, or Grok (xAI).</p>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}

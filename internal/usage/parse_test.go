@@ -71,9 +71,9 @@ func TestSupported(t *testing.T) {
 		domain.ProtocolKiro:        true,
 		domain.ProtocolQoder:       true,
 		domain.ProtocolAntigravity: true,
+		domain.ProtocolCursor:      true,
 		domain.ProtocolOpenAI:      false,
 		domain.ProtocolAnthropic:   false,
-		domain.ProtocolCursor:      false,
 	}
 	for proto, ok := range want {
 		p := &domain.Provider{Protocol: proto}
@@ -94,7 +94,8 @@ func TestSupportedGrokXaiOAuthOnly(t *testing.T) {
 		t.Fatal("xAI OAuth Grok must be supported")
 	}
 
-	// xAI over API key, unrelated OAuth OpenAI, and Cursor are all excluded.
+	// xAI over API key and unrelated OAuth OpenAI stay excluded from the Grok
+	// gate. Cursor is supported via ProtocolCursor, not the xAI preset.
 	for name, p := range map[string]*domain.Provider{
 		"xai apikey": {
 			Protocol:   domain.ProtocolOpenAI,
@@ -107,14 +108,20 @@ func TestSupportedGrokXaiOAuthOnly(t *testing.T) {
 			AuthMethod: domain.AuthOAuth,
 			OAuthCreds: &domain.OAuthCreds{Preset: "cline"},
 		},
-		"cursor": {
-			Protocol:   domain.ProtocolCursor,
-			AuthMethod: domain.AuthOAuth,
-			OAuthCreds: &domain.OAuthCreds{Preset: "xai", CursorAuth: true},
-		},
 	} {
 		if Supported(p) {
 			t.Fatalf("%s must not be supported", name)
 		}
+	}
+	cursor := &domain.Provider{
+		Protocol:   domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{Preset: "xai", CursorAuth: true},
+	}
+	if isGrok(cursor) {
+		t.Fatal("Cursor must not match the Grok gate")
+	}
+	if !Supported(cursor) {
+		t.Fatal("Cursor must be supported via ProtocolCursor")
 	}
 }

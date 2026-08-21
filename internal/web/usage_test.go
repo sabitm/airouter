@@ -39,6 +39,11 @@ func TestUsagePageListsSupportedNonArchived(t *testing.T) {
 		OAuthCreds: &domain.OAuthCreds{Preset: "xai", AccessToken: "t"},
 	})
 	mustCreate(&domain.Provider{
+		Name: "cursor-live", Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{CursorAuth: true, AccessToken: "t"},
+	})
+	mustCreate(&domain.Provider{
 		Name: "openai-plain", Protocol: domain.ProtocolOpenAI,
 		AuthMethod: domain.AuthAPIKey, APIKey: "k",
 	})
@@ -56,7 +61,7 @@ func TestUsagePageListsSupportedNonArchived(t *testing.T) {
 		t.Fatalf("status = %d", rr.Code)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "codex-live") || !strings.Contains(body, "claude-live") || !strings.Contains(body, "grok-live") {
+	if !strings.Contains(body, "codex-live") || !strings.Contains(body, "claude-live") || !strings.Contains(body, "grok-live") || !strings.Contains(body, "cursor-live") {
 		t.Fatalf("missing supported cards: %s", body)
 	}
 	if strings.Contains(body, "openai-plain") {
@@ -68,7 +73,7 @@ func TestUsagePageListsSupportedNonArchived(t *testing.T) {
 	if !strings.Contains(body, "hx-get=\"/dashboard/usage?load=1\"") {
 		t.Fatalf("missing Load all control: %s", body)
 	}
-	if strings.Count(body, ">Load</button>") != 3 {
+	if strings.Count(body, ">Load</button>") != 4 {
 		t.Fatalf("each idle card should have a Load button: %s", body)
 	}
 	if !strings.Contains(body, "hx-get=\"/dashboard/usage/card/") {
@@ -79,6 +84,20 @@ func TestUsagePageListsSupportedNonArchived(t *testing.T) {
 	}
 	if strings.Contains(body, "loading...") {
 		t.Fatalf("idle cards must not show loading skeletons: %s", body)
+	}
+}
+
+func TestUsagePageEmptyCopyMentionsCursor(t *testing.T) {
+	h := testHandler(t)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage", nil)
+	h.usagePage(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, or Grok (xAI).") {
+		t.Fatalf("empty copy missing Cursor: %s", body)
 	}
 }
 

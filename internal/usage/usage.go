@@ -51,6 +51,9 @@ var (
 	GrokBillingURL       = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 	GrokUserURL          = "https://cli-chat-proxy.grok.com/v1/user?include=subscription"
 	GrokGrpcCreditsURL   = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+	// CursorDashboardBaseURL is the Cursor DashboardService host. Usage RPCs
+	// must not be sent to agent.api5.cursor.sh.
+	CursorDashboardBaseURL = "https://api2.cursor.sh"
 )
 
 const (
@@ -135,7 +138,7 @@ func Supported(p *domain.Provider) bool {
 		return true
 	}
 	switch p.Protocol {
-	case domain.ProtocolOpenAICodex, domain.ProtocolClaudeCode, domain.ProtocolKiro, domain.ProtocolQoder, domain.ProtocolAntigravity:
+	case domain.ProtocolOpenAICodex, domain.ProtocolClaudeCode, domain.ProtocolKiro, domain.ProtocolQoder, domain.ProtocolAntigravity, domain.ProtocolCursor:
 		return true
 	default:
 		return false
@@ -145,8 +148,8 @@ func Supported(p *domain.Provider) bool {
 // isGrok reports whether a provider is the Grok CLI / Grok Build (xAI) OAuth
 // preset. Grok shares ProtocolOpenAI with generic OpenAI and Cline, so usage is
 // distinguished by the xai OAuth preset rather than the protocol alone.
-// Generic OpenAI, xAI API-key, unrelated OAuth OpenAI, Grok Web, and Cursor are
-// all excluded.
+// Generic OpenAI, xAI API-key, unrelated OAuth OpenAI, and Grok Web are
+// all excluded. Cursor usage is keyed by ProtocolCursor, not the xAI preset.
 func isGrok(p *domain.Provider) bool {
 	if p == nil || p.Protocol != domain.ProtocolOpenAI || p.Method() != domain.AuthOAuth || p.OAuthCreds == nil {
 		return false
@@ -247,6 +250,8 @@ func (s *Service) fetchLive(ctx context.Context, p *domain.Provider) (*Report, e
 		return s.fetchQoder(ctx, p)
 	case domain.ProtocolAntigravity:
 		return s.fetchAntigravity(ctx, p)
+	case domain.ProtocolCursor:
+		return s.fetchCursor(ctx, p)
 	case domain.ProtocolOpenAI:
 		if isGrok(p) {
 			return s.fetchGrok(ctx, p)

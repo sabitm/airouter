@@ -76,6 +76,39 @@ func TestBuildHeadersMachineIDFallback(t *testing.T) {
 	}
 }
 
+func TestBuildDashboardHeaders(t *testing.T) {
+	h := BuildDashboardHeaders("sess::tok", true)
+	if got := h.Get("Authorization"); got != "Bearer tok" {
+		t.Errorf("authorization = %q", got)
+	}
+	if got := h.Get("Content-Type"); got != ProtoContentType {
+		t.Errorf("content-type = %q", got)
+	}
+	if got := h.Get("Accept"); got != ProtoContentType {
+		t.Errorf("accept = %q", got)
+	}
+	if got := h.Get("Connect-Protocol-Version"); got != "1" {
+		t.Errorf("connect-protocol-version = %q", got)
+	}
+	if got := h.Get("X-Cursor-Client-Type"); got != ClientType {
+		t.Errorf("client-type = %q", got)
+	}
+	if got := h.Get("X-Cursor-Client-Version"); got != ClientVersion {
+		t.Errorf("client-version = %q", got)
+	}
+	if got := h.Get("X-Ghost-Mode"); got != "true" {
+		t.Errorf("ghost-mode = %q", got)
+	}
+	if got := h.Get("X-Request-Id"); got == "" {
+		t.Error("request-id empty")
+	}
+	for _, name := range []string{"X-Client-Key", "X-Cursor-Checksum", "X-Session-Id"} {
+		if got := h.Get(name); got != "" {
+			t.Errorf("%s = %q, want empty", name, got)
+		}
+	}
+}
+
 func TestBuildModelsHeadersDropsConnectFraming(t *testing.T) {
 	h := BuildModelsHeaders("tok", "m1", true)
 	if h.Get("Connect-Accept-Encoding") != "" {

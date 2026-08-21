@@ -46,6 +46,24 @@ func BuildModelsHeaders(token, machineID string, ghost bool) http.Header {
 	return h
 }
 
+// BuildDashboardHeaders constructs the CLI identity for unary DashboardService
+// calls such as /usage. Unlike AgentService, DashboardService does not receive
+// checksum, client-key, or session-id headers.
+func BuildDashboardHeaders(token string, ghost bool) http.Header {
+	clean := stripColonPrefix(token)
+	h := http.Header{}
+	h.Set("Authorization", "Bearer "+clean)
+	h.Set("Accept", ProtoContentType)
+	h.Set("Connect-Protocol-Version", "1")
+	h.Set("Content-Type", ProtoContentType)
+	h.Set("User-Agent", UserAgent)
+	h.Set("X-Cursor-Client-Type", ClientType)
+	h.Set("X-Cursor-Client-Version", ClientVersion)
+	h.Set("X-Ghost-Mode", ghostModeStr(ghost))
+	h.Set("X-Request-Id", uuid.NewString())
+	return h
+}
+
 func ghostModeStr(ghost bool) string {
 	if ghost {
 		return "true"
