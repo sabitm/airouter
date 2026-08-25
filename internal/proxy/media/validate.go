@@ -16,6 +16,9 @@ type Attachment struct {
 	HasID     bool
 	MediaType string
 	Filename  string
+	// Bytes is the decoded inline payload size. Remote URLs and provider-owned
+	// file IDs are 0; materialized remote bytes are accounted at fetch time.
+	Bytes int
 	// InToolResult is true when the block is nested inside a tool_result. Most
 	// backends flatten tool results to plain text and would silently drop nested
 	// media; only transports that recursively encode tool_result content can
@@ -32,6 +35,7 @@ func InspectRequest(req *ir.Request) ([]Attachment, error) {
 		return nil, nil
 	}
 	var out []Attachment
+	total := 0
 	var walk func(blocks []ir.ContentBlock, inToolResult bool) error
 	walk = func(blocks []ir.ContentBlock, inToolResult bool) error {
 		for i := range blocks {
@@ -45,6 +49,7 @@ func InspectRequest(req *ir.Request) ([]Attachment, error) {
 				if att != nil {
 					att.InToolResult = inToolResult
 					out = append(out, *att)
+					total += att.Bytes
 				}
 			case ir.BlockFile:
 				att, err := inspectFile(b)
@@ -54,14 +59,15 @@ func InspectRequest(req *ir.Request) ([]Attachment, error) {
 				if att != nil {
 					att.InToolResult = inToolResult
 					out = append(out, *att)
+					total += att.Bytes
 				}
 			case ir.BlockToolResult:
 				if err := walk(b.ToolResult, true); err != nil {
 					return err
 				}
 			}
-			if len(out) > MaxAttachments {
-				return fmt.Errorf("%w: maximum %d", ErrTooManyAttachments, MaxAttachments)
+			if total > MaxAttachmentTotalBytes {
+				return fmt.Errorf("%w: maximum %d bytes", ErrAttachmentBudgetExceeded, MaxAttachmentTotalBytes)
 			}
 		}
 		return nil
@@ -70,9 +76,6 @@ func InspectRequest(req *ir.Request) ([]Attachment, error) {
 		if err := walk(req.Messages[i].Content, false); err != nil {
 			return nil, err
 		}
-	}
-	if len(out) > MaxAttachments {
-		return nil, fmt.Errorf("%w: maximum %d", ErrTooManyAttachments, MaxAttachments)
 	}
 	return out, nil
 }
@@ -97,12 +100,13 @@ func inspectImage(b *ir.ContentBlock) (*Attachment, error) {
 	att := &Attachment{Kind: KindImage, IsImage: true, MediaType: CanonicalImageMIME(img.MediaType)}
 	if img.Data != "" {
 		att.HasData = true
-		mt, err := ValidateInlinePayload(img.Data, img.MediaType, KindImage)
+		mt, n, err := ValidateInlinePayload(img.Data, img.MediaType, KindImage)
 		if err != nil {
 			return nil, err
 		}
 		img.MediaType = mt
 		att.MediaType = mt
+		att.Bytes = n
 	} else if img.URL != "" {
 		att.HasURL = true
 		if IsDataURL(img.URL) {
@@ -205,21 +209,28 @@ func inspectFile(b *ir.ContentBlock) (*Attachment, error) {
 	if f.Data != "" {
 		switch kind {
 		case KindPDF:
-			if _, err := ValidateInlinePayload(f.Data, mt, KindPDF); err != nil {
+			_, n, err := ValidateInlinePayload(f.Data, mt, KindPDF)
+			if err != nil {
 				return nil, err
 			}
+			att.Bytes = n
 			att.MediaType = "application/pdf"
 			f.MediaType = "application/pdf"
 		default:
 			if IsSupportedImageMIME(mt) {
-				det, err := ValidateInlinePayload(f.Data, mt, KindImage)
+				det, n, err := ValidateInlinePayload(f.Data, mt, KindImage)
 				if err != nil {
 					return nil, err
 				}
 				att.MediaType = det
 				f.MediaType = det
-			} else if _, err := ValidateInlinePayload(f.Data, mt, KindGeneric); err != nil {
-				return nil, err
+				att.Bytes = n
+			} else {
+				_, n, err := ValidateInlinePayload(f.Data, mt, KindGeneric)
+				if err != nil {
+					return nil, err
+				}
+				att.Bytes = n
 			}
 		}
 	} else if f.URL != "" {
@@ -239,7 +250,7 @@ func ClientErrorStatus(err error) int {
 	if err == nil {
 		return 400
 	}
-	if errors.Is(err, ErrAttachmentTooLarge) {
+	if errors.Is(err, ErrAttachmentTooLarge) || errors.Is(err, ErrAttachmentBudgetExceeded) {
 		return 413
 	}
 	return 400

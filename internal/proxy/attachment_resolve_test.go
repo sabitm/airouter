@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -819,5 +820,156 @@ func TestAttachmentUnsafeRemoteURLClientError(t *testing.T) {
 	}
 	if up.hits.Load() != 1 {
 		t.Fatalf("valid https hits=%d want 1", up.hits.Load())
+	}
+}
+
+func TestAttachmentManySmallForwarded(t *testing.T) {
+	up := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	base, token := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{up}, []domain.Protocol{domain.ProtocolOpenAI})
+
+	content := make([]any, 9)
+	for i := range content {
+		content[i] = map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": "data:image/png;base64," + testPNGB64},
+		}
+	}
+	body := mustJSON(map[string]any{
+		"model": "default",
+		"messages": []any{
+			map[string]any{"role": "user", "content": content},
+		},
+	})
+	resp, out := post(t, base+"/v1/chat/completions", token, string(body))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+	}
+	if up.hits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", up.hits.Load())
+	}
+	raw, _ := json.Marshal(up.requestBody(t))
+	if n := strings.Count(string(raw), testPNGB64); n != 9 {
+		t.Fatalf("forwarded png count=%d want 9", n)
+	}
+}
+
+func TestAttachmentSingleTooLarge413(t *testing.T) {
+	up := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	base, token := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{up}, []domain.Protocol{domain.ProtocolOpenAI})
+
+	data := media.EncodeBase64(make([]byte, media.MaxAttachmentBytes+1))
+	body := mustJSON(map[string]any{
+		"model": "default",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "file", "file": map[string]any{
+						"filename":  "blob.bin",
+						"file_data": "data:application/octet-stream;base64," + data,
+					}},
+				},
+			},
+		},
+	})
+	resp, out := post(t, base+"/v1/chat/completions", token, string(body))
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s, want 413", resp.StatusCode, out)
+	}
+	if up.hits.Load() != 0 {
+		t.Fatal("upstream contacted on oversized attachment")
+	}
+}
+
+func TestAttachmentMaterializeTotalBudget(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		raw, _ := base64.StdEncoding.DecodeString(testPNGB64)
+		_, _ = w.Write(raw)
+	}))
+	t.Cleanup(srv.Close)
+
+	u := strings.Replace(srv.URL, "127.0.0.1", "example.com", 1)
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return net.Dial(network, strings.TrimPrefix(srv.URL, "http://"))
+		},
+	}
+	prep := &attachmentPrep{fetcher: &media.Fetcher{
+		Resolver: staticIPResolver{ip: net.ParseIP("8.8.8.8")},
+		Client:   &http.Client{Transport: tr, Timeout: 5 * time.Second},
+	}}
+	req := &ir.Request{Messages: []ir.Message{{
+		Role: ir.RoleUser,
+		Content: []ir.ContentBlock{
+			{Type: ir.BlockImage, Image: &ir.Image{URL: u + "/a.png"}},
+		},
+	}}}
+	if err := prep.inspectDecoded(req); err != nil {
+		t.Fatal(err)
+	}
+	// Inline payloads already consume the full request budget; one fetched image
+	// must still fail closed without leaking past the cap.
+	prep.inlineBytes = media.MaxAttachmentTotalBytes
+	err := prep.materialize(context.Background(), req, kiroCodec)
+	if err == nil || !errors.Is(err, media.ErrAttachmentBudgetExceeded) {
+		t.Fatalf("err=%v want ErrAttachmentBudgetExceeded", err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", hits.Load())
+	}
+}
+
+func TestAttachmentMaterializeReuseAcrossAttempts(t *testing.T) {
+	var hits atomic.Int64
+	raw, _ := base64.StdEncoding.DecodeString(testPNGB64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(raw)
+	}))
+	t.Cleanup(srv.Close)
+
+	u := strings.Replace(srv.URL, "127.0.0.1", "example.com", 1)
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return net.Dial(network, strings.TrimPrefix(srv.URL, "http://"))
+		},
+	}
+	prep := &attachmentPrep{fetcher: &media.Fetcher{
+		Resolver: staticIPResolver{ip: net.ParseIP("8.8.8.8")},
+		Client:   &http.Client{Transport: tr, Timeout: 5 * time.Second},
+	}}
+	makeReq := func() *ir.Request {
+		return &ir.Request{Messages: []ir.Message{{
+			Role: ir.RoleUser,
+			Content: []ir.ContentBlock{
+				{Type: ir.BlockImage, Image: &ir.Image{URL: u + "/a.png"}},
+			},
+		}}}
+	}
+	first := makeReq()
+	if err := prep.inspectDecoded(first); err != nil {
+		t.Fatal(err)
+	}
+	// Each attempt lands exactly on the request budget. If remote bytes leaked
+	// between attempts, the cached second materialization would be rejected.
+	prep.inlineBytes = media.MaxAttachmentTotalBytes - len(raw)
+	if err := prep.materialize(context.Background(), first, kiroCodec); err != nil {
+		t.Fatal(err)
+	}
+	second := makeReq()
+	if err := prep.materialize(context.Background(), second, kiroCodec); err != nil {
+		t.Fatal(err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("hits=%d want 1 (cached across attempts)", hits.Load())
+	}
+	if second.Messages[0].Content[0].Image.Data != testPNGB64 {
+		t.Fatal("second attempt missing inlined data")
 	}
 }

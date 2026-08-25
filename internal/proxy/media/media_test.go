@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -81,16 +82,79 @@ func TestValidatePDFBytes(t *testing.T) {
 	}
 }
 
-func TestInspectRequestLimits(t *testing.T) {
-	req := &ir.Request{Messages: []ir.Message{{Role: ir.RoleUser, Content: nil}}}
-	for i := 0; i < MaxAttachments+1; i++ {
+func TestInspectRequestAcceptsManySmall(t *testing.T) {
+	req := &ir.Request{Messages: []ir.Message{{Role: ir.RoleUser}}}
+	for i := 0; i < 9; i++ {
 		req.Messages[0].Content = append(req.Messages[0].Content, ir.ContentBlock{
 			Type:  ir.BlockImage,
 			Image: &ir.Image{MediaType: "image/png", Data: EncodeBase64(png1x1)},
 		})
 	}
-	if _, err := InspectRequest(req); err == nil {
-		t.Fatal("expected too many attachments")
+	atts, err := InspectRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atts) != 9 {
+		t.Fatalf("len=%d want 9", len(atts))
+	}
+}
+
+func TestInspectRequestSingleTooLarge(t *testing.T) {
+	req := &ir.Request{Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{
+		{Type: ir.BlockFile, File: &ir.File{Filename: "blob.bin", MediaType: "application/octet-stream", Data: EncodeBase64(make([]byte, MaxAttachmentBytes+1))}},
+	}}}}
+	_, err := InspectRequest(req)
+	if err == nil || !errors.Is(err, ErrAttachmentTooLarge) {
+		t.Fatalf("err=%v want ErrAttachmentTooLarge", err)
+	}
+}
+
+func TestInspectRequestTotalBudget(t *testing.T) {
+	per := MaxAttachmentBytes
+	under := MaxAttachmentTotalBytes / per
+	req := &ir.Request{Messages: []ir.Message{{Role: ir.RoleUser}}}
+	chunk := EncodeBase64(make([]byte, per))
+	file := func() ir.ContentBlock {
+		return ir.ContentBlock{
+			Type: ir.BlockFile,
+			File: &ir.File{Filename: "blob.bin", MediaType: "application/octet-stream", Data: chunk},
+		}
+	}
+	for i := 0; i < under; i++ {
+		req.Messages[0].Content = append(req.Messages[0].Content, file())
+	}
+	if _, err := InspectRequest(req); err != nil {
+		t.Fatalf("under budget: %v", err)
+	}
+	req.Messages[0].Content = append(req.Messages[0].Content, file())
+	_, err := InspectRequest(req)
+	if err == nil || !errors.Is(err, ErrAttachmentBudgetExceeded) {
+		t.Fatalf("err=%v want ErrAttachmentBudgetExceeded", err)
+	}
+	if ClientErrorStatus(err) != 413 {
+		t.Fatalf("status=%d want 413", ClientErrorStatus(err))
+	}
+}
+
+func TestInspectRequestFileIDZeroCost(t *testing.T) {
+	req := &ir.Request{Messages: []ir.Message{{Role: ir.RoleUser}}}
+	for i := 0; i < 9; i++ {
+		req.Messages[0].Content = append(req.Messages[0].Content, ir.ContentBlock{
+			Type: ir.BlockFile,
+			File: &ir.File{ID: "file-abc", MediaType: "application/pdf"},
+		})
+	}
+	atts, err := InspectRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atts) != 9 {
+		t.Fatalf("len=%d want 9", len(atts))
+	}
+	for i, a := range atts {
+		if a.Bytes != 0 || !a.HasID {
+			t.Fatalf("att[%d]=%+v want zero-byte file id", i, a)
+		}
 	}
 }
 

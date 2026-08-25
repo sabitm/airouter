@@ -13,9 +13,10 @@ import (
 const (
 	// MaxAttachmentBytes is the per-attachment decoded payload cap.
 	MaxAttachmentBytes = 10 << 20 // 10 MiB
-	// MaxAttachments is the maximum number of recognized image/file blocks
-	// allowed on one request.
-	MaxAttachments = 8
+	// MaxAttachmentTotalBytes is the per-request decoded attachment budget.
+	// Inline payloads and materialized remote bytes share this cap; provider
+	// file IDs contribute zero.
+	MaxAttachmentTotalBytes = 64 << 20 // 64 MiB
 	// FetchTimeout bounds a single remote image download.
 	FetchTimeoutSeconds = 10
 )
@@ -32,17 +33,17 @@ const (
 
 // Errors returned to ingress as client-facing attachment failures.
 var (
-	ErrTooManyAttachments = errors.New("too many attachments")
-	ErrAttachmentTooLarge = errors.New("attachment exceeds size limit")
-	ErrInvalidDataURL     = errors.New("invalid data URL")
-	ErrInvalidBase64      = errors.New("invalid base64 attachment payload")
-	ErrUnsupportedMedia   = errors.New("unsupported media type")
-	ErrSignatureMismatch  = errors.New("attachment content does not match declared type")
-	ErrEmptyAttachment    = errors.New("attachment has no usable source")
-	ErrMultipleSources    = errors.New("attachment specifies multiple source forms")
-	ErrUnsafeURL          = errors.New("attachment URL is not allowed")
-	ErrFetchFailed        = errors.New("failed to fetch remote attachment")
-	ErrRedirect           = errors.New("remote attachment redirects are not followed")
+	ErrAttachmentTooLarge       = errors.New("attachment exceeds size limit")
+	ErrAttachmentBudgetExceeded = errors.New("attachments exceed total size budget")
+	ErrInvalidDataURL           = errors.New("invalid data URL")
+	ErrInvalidBase64            = errors.New("invalid base64 attachment payload")
+	ErrUnsupportedMedia         = errors.New("unsupported media type")
+	ErrSignatureMismatch        = errors.New("attachment content does not match declared type")
+	ErrEmptyAttachment          = errors.New("attachment has no usable source")
+	ErrMultipleSources          = errors.New("attachment specifies multiple source forms")
+	ErrUnsafeURL                = errors.New("attachment URL is not allowed")
+	ErrFetchFailed              = errors.New("failed to fetch remote attachment")
+	ErrRedirect                 = errors.New("remote attachment redirects are not followed")
 )
 
 // NormalizeMIME lowercases and strips parameters (e.g. "; charset=utf-8").

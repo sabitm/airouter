@@ -18,7 +18,7 @@ import (
 	"airouter/internal/store"
 )
 
-const maxBodyBytes = 16 << 20 // 16 MiB ceiling on inbound request bodies
+const maxBodyBytes = 64 << 20 // 64 MiB ceiling on inbound request bodies
 
 // upstreamErrorMax caps how many bytes of an upstream error body are read for
 // extracting a client-facing message and persisted request-history detail. HAR

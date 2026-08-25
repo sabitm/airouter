@@ -14,6 +14,10 @@ import (
 type attachmentPrep struct {
 	atts      []media.Attachment
 	inspected bool
+	// inlineBytes is the decoded size of locally available payloads, recorded
+	// once per request so materialize can charge remote bytes against the same
+	// budget without re-summing IR clones.
+	inlineBytes int
 	// fetcher is optional; production leaves it nil so materialize constructs a
 	// default. Tests inject a Fetcher (e.g. with a custom Client/Resolver).
 	fetcher *media.Fetcher
@@ -29,6 +33,11 @@ func (a *attachmentPrep) inspectDecoded(req *ir.Request) error {
 	}
 	a.atts = atts
 	a.inspected = true
+	n := 0
+	for _, att := range atts {
+		n += att.Bytes
+	}
+	a.inlineBytes = n
 	return nil
 }
 
@@ -60,6 +69,10 @@ func (a *attachmentPrep) materialize(ctx context.Context, req *ir.Request, backe
 	if a.fetcher == nil {
 		a.fetcher = &media.Fetcher{}
 	}
+	// Sum this clone's fetched bytes against the request inline total. The
+	// shared Fetcher cache prevents repeat downloads across failover; this
+	// per-walk sum avoids accumulating the same remote bytes onto the budget.
+	total := a.inlineBytes
 	var walk func(blocks []ir.ContentBlock) error
 	walk = func(blocks []ir.ContentBlock) error {
 		for i := range blocks {
@@ -73,6 +86,10 @@ func (a *attachmentPrep) materialize(ctx context.Context, req *ir.Request, backe
 				if err != nil {
 					return fmt.Errorf("materialize image: %w", err)
 				}
+				if res.Bytes > media.MaxAttachmentTotalBytes-total {
+					return fmt.Errorf("%w: maximum %d bytes", media.ErrAttachmentBudgetExceeded, media.MaxAttachmentTotalBytes)
+				}
+				total += res.Bytes
 				b.Image.Data = res.Data
 				b.Image.MediaType = res.MediaType
 				b.Image.URL = ""

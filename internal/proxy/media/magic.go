@@ -76,29 +76,30 @@ func ValidatePDFBytes(raw []byte) error {
 // ValidateInlinePayload validates locally available base64 for the given kind.
 // kind should be KindImage, KindPDF, or KindGeneric. For images and PDFs the
 // magic bytes are checked; generic files only get size/base64 validation.
-func ValidateInlinePayload(base64Data, mediaType string, kind Kind) (canonMIME string, err error) {
+func ValidateInlinePayload(base64Data, mediaType string, kind Kind) (canonMIME string, n int, err error) {
 	raw, err := DecodeBase64(base64Data, MaxAttachmentBytes)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
+	n = len(raw)
 	switch kind {
 	case KindImage:
 		det, err := ValidateImageBytes(raw, mediaType)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
-		return det, nil
+		return det, n, nil
 	case KindPDF:
 		if err := ValidatePDFBytes(raw); err != nil {
-			return "", err
+			return "", 0, err
 		}
-		return "application/pdf", nil
+		return "application/pdf", n, nil
 	default:
 		// Generic: size already checked. Prefer declared MIME when present.
 		mt := NormalizeMIME(mediaType)
 		if mt == "" {
 			mt = "application/octet-stream"
 		}
-		return mt, nil
+		return mt, n, nil
 	}
 }

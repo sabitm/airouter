@@ -13,7 +13,6 @@ import (
 
 	"airouter/internal/crypto"
 	"airouter/internal/domain"
-	"airouter/internal/proxy/media"
 	"airouter/internal/store"
 )
 
@@ -445,26 +444,11 @@ func TestRequestLogUnknownCombo(t *testing.T) {
 func TestRequestLogPreRoutingValidationCapturesUniqueTarget(t *testing.T) {
 	var cap capturedUpstream
 	base, token, st := setupWithStore(t, domain.ProtocolOpenAI, &cap)
-	content := make([]any, media.MaxAttachments+1)
-	for i := range content {
-		content[i] = map[string]any{
-			"type": "image_url",
-			"image_url": map[string]any{
-				"url": "data:image/png;base64," + testPNGB64,
-			},
-		}
-	}
-	body, err := json.Marshal(map[string]any{
-		"model": "default",
-		"messages": []any{
-			map[string]any{"role": "user", "content": content},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Nine small attachments are now valid; use a local media validation failure
+	// that still rejects before target ordering / upstream contact.
+	body := `{"model":"default","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,!!!"}}]}]}`
 
-	resp, out := post(t, base+"/v1/chat/completions", token, string(body))
+	resp, out := post(t, base+"/v1/chat/completions", token, body)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
 	}
@@ -475,8 +459,8 @@ func TestRequestLogPreRoutingValidationCapturesUniqueTarget(t *testing.T) {
 	if l.Provider != "p" || l.UpstreamModel != "real-model" {
 		t.Fatalf("pre-routing log route = %q / %q, want p / real-model", l.Provider, l.UpstreamModel)
 	}
-	if !strings.Contains(l.ErrMsg, "too many attachments") {
-		t.Fatalf("error = %q, want attachment limit detail", l.ErrMsg)
+	if !strings.Contains(l.ErrMsg, "invalid base64") {
+		t.Fatalf("error = %q, want local attachment validation detail", l.ErrMsg)
 	}
 }
 
