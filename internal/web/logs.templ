@@ -3,6 +3,7 @@ package web
 import (
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"airouter/internal/domain"
@@ -112,19 +113,25 @@ templ LogsTable(logs []*domain.RequestLog, q store.RequestLogQuery, meta LogsPag
 			<p class="empty">No requests recorded yet.</p>
 		}
 	} else {
-		<table>
+		<table class="logs-table">
+			<colgroup>
+				<col class="log-col-time"/>
+				<col class="log-col-key"/>
+				<col class="log-col-route"/>
+				<col class="log-col-format"/>
+				<col class="log-col-usage"/>
+				<col class="log-col-latency"/>
+				<col class="log-col-outcome"/>
+			</colgroup>
 			<thead>
 				<tr>
 					<th>Time</th>
 					<th>Key</th>
-					<th>Combo</th>
-					<th>Provider / model</th>
+					<th>Route</th>
 					<th>Format</th>
-					<th>Status</th>
-					<th>In</th>
-					<th>Out</th>
-					<th>Latency</th>
-					<th>Error</th>
+					<th class="log-number">Usage</th>
+					<th class="log-number">Latency</th>
+					<th>Outcome</th>
 				</tr>
 			</thead>
 			<tbody id="logs-tbody">
@@ -142,7 +149,7 @@ templ LogRows(logs []*domain.RequestLog) {
 }
 
 templ LogRow(l *domain.RequestLog) {
-	<tr data-id={ strconv.FormatInt(l.ID, 10) }>
+	<tr class="log-row" data-id={ strconv.FormatInt(l.ID, 10) }>
 		<td class="log-time-cell">
 			<time
 				class="log-time"
@@ -154,28 +161,55 @@ templ LogRow(l *domain.RequestLog) {
 				<span class="log-time-clock">{ l.CreatedAt.UTC().Format("15:04:05") } UTC</span>
 			</time>
 		</td>
-		<td>{ l.AccessKeyName }</td>
-		<td>
-			{ l.Combo }
-			if l.Stream {
-				<span class="tag">stream</span>
-			}
+		<td class="log-key-cell">{ l.AccessKeyName }</td>
+		<td class="log-route-cell">
+			<div class="log-route-primary">
+				<span>{ l.Combo }</span>
+				if l.Stream {
+					<span class="tag">stream</span>
+				}
+			</div>
+			<div class="log-route-target">
+				<span>{ l.Provider }</span>
+				<span aria-hidden="true"> / </span>
+				<span>{ l.UpstreamModel }</span>
+			</div>
 		</td>
-		<td>{ l.Provider } / { l.UpstreamModel }</td>
-		<td class="mono">{ l.Format }</td>
-		<td>@statusBadge(l.Status)</td>
-		<td>{ strconv.Itoa(l.InputTokens) }</td>
-		<td>{ strconv.Itoa(l.OutputTokens) }</td>
-		<td>{ strconv.FormatInt(l.LatencyMS, 10) }ms</td>
-		<td class="err">
+		<td class="mono log-format-cell">{ l.Format }</td>
+		<td
+			class="log-number log-usage-cell"
+			title={ "Input: " + formatLogNumber(int64(l.InputTokens)) + " tokens; Output: " + formatLogNumber(int64(l.OutputTokens)) + " tokens" }
+		>
+			<span><strong>{ formatLogNumber(int64(l.InputTokens)) }</strong> in</span>
+			<span><strong>{ formatLogNumber(int64(l.OutputTokens)) }</strong> out</span>
+		</td>
+		<td class="log-number log-latency-cell" title={ formatLogNumber(l.LatencyMS) + " ms" }>
+			{ formatLogLatency(l.LatencyMS) }
+		</td>
+		<td class="log-outcome-cell">
+			@statusBadge(l.Status)
 			if l.ErrMsg != "" {
-				<details class="log-err">
-					<summary>{ truncateErr(l.ErrMsg, 80) }</summary>
-					<pre class="log-err-full">{ l.ErrMsg }</pre>
-				</details>
+				<button
+					type="button"
+					class="log-error-toggle"
+					data-log-error-toggle
+					aria-expanded="false"
+					aria-controls={ logErrorID(l.ID) }
+					aria-label={ "Show error details: " + truncateErr(l.ErrMsg, 120) }
+				>{ truncateErr(l.ErrMsg, 48) }</button>
 			}
 		</td>
 	</tr>
+	if l.ErrMsg != "" {
+		<tr id={ logErrorID(l.ID) } class="log-error-row" hidden>
+			<td colspan="7">
+				<div class="log-error-detail">
+					<span class="log-error-detail-label">Error detail</span>
+					<pre class="log-error-full">{ l.ErrMsg }</pre>
+				</div>
+			</td>
+		</tr>
+	}
 }
 
 templ LogsPager(q store.RequestLogQuery, meta LogsPageMeta) {
@@ -248,11 +282,58 @@ func statusClass(code int) string {
 	}
 }
 
-func truncateErr(s string, n int) string {
-	if n <= 0 || len(s) <= n {
+func logErrorID(id int64) string {
+	return "log-error-" + strconv.FormatInt(id, 10)
+}
+
+func formatLogNumber(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	start := 0
+	if len(s) > 0 && s[0] == '-' {
+		start = 1
+	}
+	digits := len(s) - start
+	if digits <= 3 {
 		return s
 	}
-	return s[:n] + "..."
+
+	first := digits % 3
+	if first == 0 {
+		first = 3
+	}
+	var b strings.Builder
+	b.Grow(len(s) + digits/3)
+	b.WriteString(s[:start+first])
+	for i := start + first; i < len(s); i += 3 {
+		b.WriteByte(',')
+		b.WriteString(s[i : i+3])
+	}
+	return b.String()
+}
+
+func formatLogLatency(ms int64) string {
+	if ms < 0 {
+		return strconv.FormatInt(ms, 10) + " ms"
+	}
+	switch {
+	case ms < 1000:
+		return strconv.FormatInt(ms, 10) + " ms"
+	case ms < 10_000:
+		return strconv.FormatFloat(float64(ms)/1000, 'f', 2, 64) + " s"
+	case ms < 60_000:
+		return strconv.FormatFloat(float64(ms)/1000, 'f', 1, 64) + " s"
+	default:
+		totalSeconds := (ms + 500) / 1000
+		return strconv.FormatInt(totalSeconds/60, 10) + "m " + strconv.FormatInt(totalSeconds%60, 10) + "s"
+	}
+}
+
+func truncateErr(s string, n int) string {
+	runes := []rune(s)
+	if n <= 0 || len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "..."
 }
 
 func logsPageMeta(page, pageSize int, total int64) LogsPageMeta {

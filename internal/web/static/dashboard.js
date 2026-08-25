@@ -100,6 +100,24 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
 
 airouterFormatLocalTimes(document);
 
+document.addEventListener("click", function (event) {
+  const toggle = event.target && event.target.closest
+    ? event.target.closest("[data-log-error-toggle]")
+    : null;
+  if (!toggle) return;
+
+  const detail = document.getElementById(toggle.getAttribute("aria-controls"));
+  if (!detail) return;
+  const expanded = toggle.getAttribute("aria-expanded") === "true";
+  toggle.setAttribute("aria-expanded", String(!expanded));
+  const label = toggle.getAttribute("aria-label") || "";
+  toggle.setAttribute(
+    "aria-label",
+    label.replace(expanded ? /^Hide / : /^Show /, expanded ? "Show " : "Hide ")
+  );
+  detail.hidden = expanded;
+});
+
 // Escape cancels open create/edit forms without submitting.
 document.addEventListener("keydown", function (event) {
   if (event.key !== "Escape") return;
