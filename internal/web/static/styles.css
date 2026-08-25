@@ -292,6 +292,11 @@ td.mono { overflow-wrap: anywhere; }
 /* Auto table-layout ignores max-width on a cell, so bound the Error column with a
    real width and let long messages wrap instead of widening the whole table. */
 td.err { color: var(--danger); width: 260px; white-space: normal; overflow-wrap: anywhere; }
+.log-time-cell { white-space: nowrap; }
+.log-time { display: inline-flex; flex-direction: column; }
+.log-time-date,
+.log-time-clock { display: block; }
+.log-time-clock { color: var(--muted); font-size: 12px; }
 
 .status {
 	display: inline-block;

@@ -3,6 +3,7 @@ package web
 import (
 	"net/url"
 	"strconv"
+	"time"
 
 	"airouter/internal/domain"
 	"airouter/internal/store"
@@ -142,7 +143,17 @@ templ LogRows(logs []*domain.RequestLog) {
 
 templ LogRow(l *domain.RequestLog) {
 	<tr data-id={ strconv.FormatInt(l.ID, 10) }>
-		<td>{ l.CreatedAt.Format("2006-01-02 15:04:05") }</td>
+		<td class="log-time-cell">
+			<time
+				class="log-time"
+				datetime={ l.CreatedAt.UTC().Format(time.RFC3339) }
+				data-local-time
+				title={ "UTC: " + l.CreatedAt.UTC().Format("2006-01-02 15:04:05") }
+			>
+				<span class="log-time-date">{ l.CreatedAt.UTC().Format("2006-01-02") }</span>
+				<span class="log-time-clock">{ l.CreatedAt.UTC().Format("15:04:05") } UTC</span>
+			</time>
+		</td>
 		<td>{ l.AccessKeyName }</td>
 		<td>
 			{ l.Combo }

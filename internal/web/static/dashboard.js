@@ -1,4 +1,39 @@
-// Shared dashboard helpers: clipboard, HTMX 400 flash swaps, Escape cancel, focus.
+// Shared dashboard helpers: clipboard, local timestamps, HTMX 400 flash swaps, Escape cancel, focus.
+
+function airouterFormatLocalTimes(root) {
+  const scope = root && root.querySelectorAll ? root : document;
+  const times = scope.querySelectorAll("time[data-local-time]");
+  const dateFormatter = new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+  const timeFormatter = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  });
+  const fullFormatter = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "full",
+    timeStyle: "long",
+  });
+
+  times.forEach(function (el) {
+    if (el.dataset.localTime === "formatted") return;
+    const instant = new Date(el.dateTime);
+    if (Number.isNaN(instant.getTime())) return;
+
+    const date = el.querySelector(".log-time-date");
+    const clock = el.querySelector(".log-time-clock");
+    if (date) date.textContent = dateFormatter.format(instant);
+    if (clock) clock.textContent = timeFormatter.format(instant);
+
+    const utcTitle = el.getAttribute("title");
+    el.title = fullFormatter.format(instant) + (utcTitle ? "\n" + utcTitle : "");
+    el.dataset.localTime = "formatted";
+  });
+}
 
 function airouterMarkCopied(btn) {
   if (!btn) return;
@@ -53,6 +88,7 @@ function airouterIsEditRowTarget(t) {
 document.body.addEventListener("htmx:afterSwap", function (event) {
   const t = event.detail.target;
   if (!t) return;
+  airouterFormatLocalTimes(document);
   if (t.id === "provider-form-slot") {
     airouterFocusFirstField(t);
     return;
@@ -61,6 +97,8 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
     airouterFocusFirstField(t);
   }
 });
+
+airouterFormatLocalTimes(document);
 
 // Escape cancels open create/edit forms without submitting.
 document.addEventListener("keydown", function (event) {
