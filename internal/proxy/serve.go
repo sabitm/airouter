@@ -231,6 +231,12 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		res.fail(w, ingress, http.StatusInternalServerError, "combo lookup failed", "api_error")
 		return
 	}
+	// A unique active target is unambiguous route metadata even when local
+	// validation rejects the request before target ordering or upstream contact.
+	if targets := activeComboTargets(combo); len(targets) == 1 && targets[0].Provider != nil {
+		rec.Provider = targets[0].Provider.Name
+		rec.UpstreamModel = targets[0].UpstreamModel
+	}
 	// Inventory recognized attachments once before health ordering. Invalid
 	// media is a client error with zero upstream contact. Structural transport
 	// incompatibility filters targets before backoff skip credits are consumed.
@@ -399,6 +405,19 @@ func (p *Proxy) logUpstreamAttemptFailed(ctx context.Context, combo string, prov
 	)
 }
 
+func activeComboTargets(combo *domain.Combo) []domain.ComboTarget {
+	if combo == nil {
+		return nil
+	}
+	targets := make([]domain.ComboTarget, 0, len(combo.Targets))
+	for _, t := range combo.Targets {
+		if t.Enabled && (t.Provider == nil || !t.Provider.Archived) {
+			targets = append(targets, t)
+		}
+	}
+	return targets
+}
+
 // orderTargets returns the combo's targets in the order the resolution loop
 // should try them, plus the first structural attachment incompatibility reason
 // observed when every enabled target was filtered out (empty otherwise).
@@ -417,12 +436,7 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 	// Disabled targets and archived providers are explicit user choices: drop
 	// them from resolution entirely (unlike backoff, which only defers). The
 	// Provider nil-guard keeps unit tests that omit the hydrated provider working.
-	enabled := make([]domain.ComboTarget, 0, len(combo.Targets))
-	for _, t := range combo.Targets {
-		if t.Enabled && (t.Provider == nil || !t.Provider.Archived) {
-			enabled = append(enabled, t)
-		}
-	}
+	enabled := activeComboTargets(combo)
 
 	// Structural attachment filter runs before health ordering so incompatible
 	// providers never consume skip credits.
