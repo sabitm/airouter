@@ -85,10 +85,28 @@ function airouterIsEditRowTarget(t) {
   return !!t && (/^provider-\d+$/.test(t.id) || /^combo-\d+$/.test(t.id));
 }
 
+let airouterLogsScrollY = null;
+
+document.body.addEventListener("htmx:beforeSwap", function (event) {
+  const target = event.detail.target;
+  if (target && target.id === "logs-body") {
+    airouterLogsScrollY = window.scrollY;
+  }
+});
+
 document.body.addEventListener("htmx:afterSwap", function (event) {
   const t = event.detail.target;
   if (!t) return;
   airouterFormatLocalTimes(document);
+  if (t.id === "logs-body" && airouterLogsScrollY !== null) {
+    const documentHeight = Math.max(
+      document.documentElement.scrollHeight,
+      document.body.scrollHeight
+    );
+    const maxScrollY = Math.max(0, documentHeight - window.innerHeight);
+    window.scrollTo({ top: airouterLogsScrollY <= maxScrollY ? airouterLogsScrollY : 0 });
+    airouterLogsScrollY = null;
+  }
   if (t.id === "provider-form-slot") {
     airouterFocusFirstField(t);
     return;
