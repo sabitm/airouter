@@ -529,6 +529,12 @@ tr.archived { opacity: 0.6; }
 }
 
 
+#logs-body {
+	display: flex;
+	flex-direction: column;
+	gap: 20px;
+}
+
 .logs-filters { margin-bottom: 16px; }
 .logs-filters .button.link {
 	background: none;
