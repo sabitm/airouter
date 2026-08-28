@@ -137,6 +137,118 @@ func TestCORS_BareOptionsWithoutACRMFallsThrough(t *testing.T) {
 	}
 }
 
+// The dashboard and /debug/har are unauthenticated, so cors must emit no CORS
+// header for them even when an Origin is present; reflecting there would let any
+// webpage the operator visits read the plaintext config export and HAR data.
+func TestCORS_ScopedToProxyPaths(t *testing.T) {
+	const evil = "https://evil.example"
+
+	t.Run("dashboard export gets no CORS headers", func(t *testing.T) {
+		h := cors(noopHandler(http.StatusOK))
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/dashboard/export", nil)
+		req.Header.Set("Origin", evil)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (delegated)", rec.Code)
+		}
+		assertNoCORS(t, rec)
+	})
+
+	t.Run("debug har gets no CORS headers", func(t *testing.T) {
+		h := cors(noopHandler(http.StatusOK))
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/debug/har", nil)
+		req.Header.Set("Origin", evil)
+		h.ServeHTTP(rec, req)
+		assertNoCORS(t, rec)
+	})
+
+	t.Run("proxy chat completions still reflects origin", func(t *testing.T) {
+		h := cors(noopHandler(http.StatusOK))
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Header.Set("Origin", evil)
+		h.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != evil {
+			t.Errorf("ACAO = %q, want reflected %q", got, evil)
+		}
+		if !containsHeader(rec.Header().Values("Vary"), "Origin") {
+			t.Errorf("Vary = %v, want to contain Origin", rec.Header().Values("Vary"))
+		}
+	})
+
+	t.Run("preflight on proxy path still 204 with headers", func(t *testing.T) {
+		h := cors(noopHandler(http.StatusOK))
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodOptions, "/v1/messages", nil)
+		req.Header.Set("Origin", evil)
+		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204 (preflight short-circuit)", rec.Code)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != evil {
+			t.Errorf("ACAO = %q, want %q", got, evil)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Methods"); got == "" {
+			t.Error("missing ACA-Methods on proxy preflight")
+		}
+	})
+
+	t.Run("preflight on dashboard path delegates without CORS headers", func(t *testing.T) {
+		h := cors(noopHandler(http.StatusOK))
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodOptions, "/dashboard/providers", nil)
+		req.Header.Set("Origin", evil)
+		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		h.ServeHTTP(rec, req)
+		// 200 (delegated), not 204: the middleware must not answer it as a preflight.
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (delegated, not answered as preflight)", rec.Code)
+		}
+		assertNoCORS(t, rec)
+	})
+}
+
+// End-to-end through the full handler: the unauthenticated dashboard/debug
+// surfaces must not emit CORS headers even with a cross-origin Origin.
+func TestCORS_NotEmittedOnDashboardEndToEnd(t *testing.T) {
+	srv := New(newTestStore(t), observability.NewLogger(0, io.Discard), "", "test", false)
+	h := srv.Handler()
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/dashboard/export"},
+		{http.MethodGet, "/dashboard/providers"},
+		{http.MethodGet, "/debug/har"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Origin", "https://evil.example")
+			h.ServeHTTP(rr, req)
+			assertNoCORS(t, rr)
+		})
+	}
+}
+
+// assertNoCORS fails if any CORS header (or an Origin Vary entry) is present.
+func assertNoCORS(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	for _, k := range []string{
+		"Access-Control-Allow-Origin",
+		"Access-Control-Allow-Methods",
+		"Access-Control-Allow-Headers",
+		"Access-Control-Expose-Headers",
+	} {
+		if got := rec.Header().Get(k); got != "" {
+			t.Errorf("%s = %q, want none", k, got)
+		}
+	}
+	if containsHeader(rec.Header().Values("Vary"), "Origin") {
+		t.Errorf("Vary = %v, want no Origin", rec.Header().Values("Vary"))
+	}
+}
+
 func containsHeader(vals []string, want string) bool {
 	for _, v := range vals {
 		if v == want {

@@ -107,11 +107,21 @@ func (s *Server) handleHAR(w http.ResponseWriter, r *http.Request) {
 // response headers the browser requires.
 //
 // It only engages when an Origin header is present, leaving server-to-server
-// traffic untouched. The Origin is reflected rather than set to "*" so the
-// headers stay valid if a caller ever uses credentialed requests. Authorization
-// is still required, so reflecting any origin does not weaken access control.
+// traffic untouched, and only for proxy ingress paths (isProxyPath). The Origin
+// is reflected rather than set to "*" so the headers stay valid if a caller ever
+// uses credentialed requests. Reflection is safe on the proxy surface because it
+// requires an access key. The dashboard and /debug/har are unauthenticated, so
+// they must not receive any CORS header: reflecting an arbitrary origin there
+// would disable the browser's same-origin read protection and let any webpage
+// the operator visits read the plaintext config export and captured HAR data.
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Non-proxy surfaces are same-origin HTMX apps with no auth; skip CORS so
+		// the browser blocks cross-origin reads instead of being handed them.
+		if !isProxyPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		origin := r.Header.Get("Origin")
 		if origin == "" {
 			next.ServeHTTP(w, r)
