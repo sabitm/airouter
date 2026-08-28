@@ -35,8 +35,14 @@ func wrapConnectFrame(payload []byte, compress bool) []byte {
 func readFrame(r io.Reader) (byte, []byte, error) {
 	var header [5]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
-		if err == io.ErrUnexpectedEOF || err == io.EOF {
+		// Only a clean EOF at a frame boundary ends the stream. A partial header
+		// means the stream was truncated mid-frame; masking it as io.EOF would
+		// fabricate a clean finish over partial content.
+		if err == io.EOF {
 			return 0, nil, io.EOF
+		}
+		if err == io.ErrUnexpectedEOF {
+			return 0, nil, fmt.Errorf("cursor: truncated frame header: %w", err)
 		}
 		return 0, nil, err
 	}

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
+	"errors"
+	"io"
 	"testing"
 )
 
@@ -83,10 +85,11 @@ func TestReadFrameEOF(t *testing.T) {
 }
 
 func TestReadFramePartial(t *testing.T) {
-	// Only 3 header bytes -> io.ErrUnexpectedEOF maps to EOF via readFrame.
+	// 3 bytes < 5-byte header -> io.ErrUnexpectedEOF surfaced as an error, not
+	// mapped to io.EOF (which would mask a truncated stream as a clean end).
 	_, _, err := readFrame(bytes.NewReader([]byte{1, 2, 3}))
-	if err == nil {
-		t.Error("partial header should error")
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("got %v, want wrapped io.ErrUnexpectedEOF for partial header", err)
 	}
 }
 

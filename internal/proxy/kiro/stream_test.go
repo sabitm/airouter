@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"hash/crc32"
 	"io"
 	"strings"
@@ -55,6 +56,34 @@ func collect(t *testing.T, frames []byte) []ir.StreamEvent {
 		t.Fatalf("DecodeStream: %v", err)
 	}
 	return events
+}
+
+// TestDecodeStreamTruncatedPrelude verifies that a stream cut mid-prelude is
+// reported as an error instead of ending cleanly. Masking it as io.EOF would
+// fabricate a successful finish over partial content.
+func TestDecodeStreamTruncatedPrelude(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"Hello "}`)))
+	buf.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"world"}`)))
+	// 7 bytes of the next 12-byte prelude: the upstream died mid-frame.
+	buf.Write([]byte{0, 0, 0, 0, 0, 0, 0})
+
+	var sawFinish bool
+	err := DecodeStream(bytes.NewReader(buf.Bytes()), func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			sawFinish = true
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("DecodeStream: expected truncation error, got nil (clean finish)")
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("error %v does not wrap io.ErrUnexpectedEOF", err)
+	}
+	if sawFinish {
+		t.Error("DecodeStream fabricated a Finish event on a truncated stream")
+	}
 }
 
 func TestDecodeStreamText(t *testing.T) {
@@ -208,11 +237,11 @@ func TestReadEventStreamMessage(t *testing.T) {
 		}
 	})
 
-	t.Run("partial prelude returns EOF", func(t *testing.T) {
-		// 5 bytes < 12-byte prelude -> io.ErrUnexpectedEOF, mapped to io.EOF.
+	t.Run("partial prelude is a truncation error", func(t *testing.T) {
+		// 5 bytes < 12-byte prelude -> io.ErrUnexpectedEOF, surfaced as an error.
 		_, err := readEventStreamMessage(bytes.NewReader([]byte{1, 2, 3, 4, 5}))
-		if err != io.EOF {
-			t.Errorf("got %v, want io.EOF for partial prelude", err)
+		if err == nil || err == io.EOF || !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("got %v, want wrapped io.ErrUnexpectedEOF for partial prelude", err)
 		}
 	})
 

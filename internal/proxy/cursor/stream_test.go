@@ -3,6 +3,8 @@ package cursor
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -427,6 +429,30 @@ func TestDecodeAgentStreamErrorFrameBeforeContent(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Named models unavailable") {
 		t.Errorf("error = %v, want detail title", err)
+	}
+}
+
+// TestDecodeAgentStreamTruncatedHeader verifies that a stream cut mid-frame
+// header is reported as an error instead of ending cleanly; masking it as
+// io.EOF would fabricate a successful finish over partial content.
+func TestDecodeAgentStreamTruncatedHeader(t *testing.T) {
+	// One valid text-bearing frame, then 3 bytes of a next 5-byte header.
+	good := wrapConnectFrame(encodeField(asmInteractionUpdate, wireLen,
+		encodeField(iuTextDelta, wireLen,
+			encodeField(tdText, wireLen, []byte("Hello world")))), false)
+
+	var sawFinish bool
+	err := DecodeAgentStreamTools(nil, bytes.NewReader(append(append([]byte{}, good...), 1, 2, 3)), nil, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			sawFinish = true
+		}
+		return nil
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("DecodeAgentStreamTools: got %v, want wrapped io.ErrUnexpectedEOF for truncated header", err)
+	}
+	if sawFinish {
+		t.Error("DecodeAgentStreamTools fabricated a Finish event on a truncated stream")
 	}
 }
 

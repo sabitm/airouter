@@ -33,12 +33,13 @@ func readEventStreamMessage(r io.Reader) (*esMessage, error) {
 	prelude := make([]byte, esPreludeLen)
 	if _, err := io.ReadFull(r, prelude); err != nil {
 		// EOF at a boundary is the clean end of stream; propagate it verbatim so
-		// the caller can stop. A partial prelude is a truncation error.
+		// the caller can stop. A partial prelude means the stream was truncated
+		// mid-frame; masking it as io.EOF would fabricate a clean Finish.
 		if err == io.EOF {
 			return nil, io.EOF
 		}
 		if err == io.ErrUnexpectedEOF {
-			return nil, io.EOF
+			return nil, fmt.Errorf("kiro: eventstream truncated prelude: %w", err)
 		}
 		return nil, err
 	}

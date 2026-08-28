@@ -182,6 +182,81 @@ func TestKiroStreamTranslate(t *testing.T) {
 	}
 }
 
+// TestKiroTruncatedStreamFailover verifies that a Kiro upstream whose
+// EventStream dies mid-prelude does not fabricate a clean finish: the proxy must
+// treat it as a pre-commit decode failure and fail over to the next target.
+func TestKiroTruncatedStreamFailover(t *testing.T) {
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+		w.WriteHeader(http.StatusOK)
+		w.Write(buildKiroFrame("metricsEvent", `{"inputTokens":7,"outputTokens":2}`))
+		// Die 7 bytes into the next frame's 12-byte prelude. metricsEvent is
+		// non-committing (only a buffered MessageStart), so the proxy must treat
+		// this as a pre-commit decode failure and fail over.
+		w.Write([]byte{0, 0, 0, 0, 0, 0, 0})
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+		w.WriteHeader(http.StatusOK)
+		w.Write(kiroTextStream())
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "kiro-bad", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthAPIKey,
+		OAuthCreds: &domain.OAuthCreds{ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/BAD"}}
+	p2 := &domain.Provider{Name: "kiro-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthAPIKey,
+		OAuthCreds: &domain.OAuthCreds{ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/GOOD"}}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d, want failover to second target", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "partial") {
+		t.Errorf("truncated first-target bytes leaked: %s", body)
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" {
+		t.Errorf("text = %q", text)
+	}
+	if !finished {
+		t.Error("stream did not finish cleanly on second target")
+	}
+}
+
 // TestKiroUnaryCollected verifies a non-streaming client request to the
 // stream-only Kiro backend is collected from the EventStream into a unary
 // response and usage is recorded.

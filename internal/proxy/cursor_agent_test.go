@@ -252,6 +252,101 @@ func TestCursorUnaryCollected(t *testing.T) {
 	}
 }
 
+// TestCursorTruncatedStreamFailover verifies that a Cursor AgentService stream
+// cut mid-frame header is not fabricated into a clean finish: the proxy must
+// treat it as a pre-commit decode failure and fail over to the next target.
+func TestCursorTruncatedStreamFailover(t *testing.T) {
+	goodCap := &cursorAgentCapture{}
+	// Gate the good target's turn on the proxy's KV reply, like the other
+	// AgentService tests: without the wait, handler return RSTs the duplex
+	// request stream and races the proxy's mid-stream reply write.
+	var goodKV sync.WaitGroup
+	goodKV.Add(1)
+	badHits := 0
+	serveBad := func(w http.ResponseWriter, r *http.Request) {
+		badHits++
+		// Drain the duplex request body so handler return does not RST the h2
+		// stream before the truncated DATA frames are delivered.
+		go io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", cursor.ConnectContentType)
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		// Heartbeat-only interaction_update: non-committing for the client (only
+		// a buffered MessageStart), so the cut below is a pre-commit failure.
+		hb := teField(13, teBytes, nil)
+		_, _ = w.Write(wrapFrameForTest(teField(1, teBytes, teField(1, teBytes, hb))))
+		fl.Flush()
+		// Die 3 bytes into the next frame's 5-byte header.
+		_, _ = w.Write([]byte{0, 0, 0})
+		fl.Flush()
+	}
+	up1 := httptest.NewUnstartedServer(http.HandlerFunc(serveBad))
+	up1.EnableHTTP2 = true
+	up1.StartTLS()
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewUnstartedServer(serveAgentRun(goodCap, &goodKV))
+	up2.EnableHTTP2 = true
+	up2.StartTLS()
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "cursor-bad", BaseURL: up1.URL, Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthAPIKey, APIKey: "agent-tok",
+		OAuthCreds: &domain.OAuthCreds{CursorAuth: true, MachineID: "m-1"}}
+	p2 := &domain.Provider{Name: "cursor-good", BaseURL: up2.URL, Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthAPIKey, APIKey: "agent-tok",
+		OAuthCreds: &domain.OAuthCreds{CursorAuth: true, MachineID: "m-1"}}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "default", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "default", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	p := New(st, nil)
+	p.streamClient = &http.Client{Transport: &http.Transport{
+		ForceAttemptHTTP2:   true,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // self-signed httptest cert
+		TLSHandshakeTimeout: 10 * time.Second,
+	}}
+	p.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+	if badHits != 1 {
+		t.Fatalf("bad target hits = %d", badHits)
+	}
+	goodCap.mu.Lock()
+	hit2 := goodCap.runPayload != nil
+	goodCap.mu.Unlock()
+	if !hit2 {
+		t.Fatal("failover never reached the second target")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" {
+		t.Errorf("text = %q", text)
+	}
+	if !finished {
+		t.Error("stream did not finish cleanly on second target")
+	}
+}
+
 // readConnectFrameForTest reads one 5-byte-prefixed Connect frame.
 func readConnectFrameForTest(r io.Reader) (byte, []byte, error) {
 	var hdr [5]byte
