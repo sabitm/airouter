@@ -9,17 +9,32 @@ import "encoding/json"
 // metadata without exporting internal wire types. Every field EncodeRequest
 // emits is modeled so remarshal drops nothing.
 type messagesBody struct {
-	Model         string          `json:"model"`
-	System        json.RawMessage `json:"system,omitempty"` // string or []block
-	Messages      []wireMessage   `json:"messages"`
-	MaxTokens     int             `json:"max_tokens"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	StopSequences []string        `json:"stop_sequences,omitempty"`
-	Stream        bool            `json:"stream,omitempty"`
-	Tools         []wireTool      `json:"tools,omitempty"`
-	ToolChoice    *wireToolChoice `json:"tool_choice,omitempty"`
-	Metadata      *wireMetadata   `json:"metadata,omitempty"`
+	Model         string            `json:"model"`
+	System        json.RawMessage   `json:"system,omitempty"` // string or []block
+	Messages      []wireMessage     `json:"messages"`
+	MaxTokens     int               `json:"max_tokens"`
+	Temperature   *float64          `json:"temperature,omitempty"`
+	TopP          *float64          `json:"top_p,omitempty"`
+	StopSequences []string          `json:"stop_sequences,omitempty"`
+	Stream        bool              `json:"stream,omitempty"`
+	Tools         []wireTool        `json:"tools,omitempty"`
+	ToolChoice    *wireToolChoice   `json:"tool_choice,omitempty"`
+	Thinking      *wireThinking     `json:"thinking,omitempty"`
+	OutputConfig  *wireOutputConfig `json:"output_config,omitempty"`
+	Metadata      *wireMetadata     `json:"metadata,omitempty"`
+}
+
+// wireThinking mirrors anthropic.anthThinking. Budget thinking must survive
+// the cloak remarshal or OAuth Claude Code silently loses extended reasoning
+// while keeping applyThinking's inflated max_tokens.
+type wireThinking struct {
+	Type         string `json:"type"` // disabled | adaptive | enabled
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
+// wireOutputConfig mirrors anthropic.anthOutputConfig (adaptive-model effort).
+type wireOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type wireMessage struct {
@@ -33,6 +48,7 @@ type wireBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
 	Source    *wireSource     `json:"source,omitempty"`
+	Title     string          `json:"title,omitempty"` // document blocks (optional filename-like label)
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
