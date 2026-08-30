@@ -397,6 +397,10 @@ type AccessKey struct {
 	Token string
 }
 
+// MaxErrorMessageBytes is the shared ceiling for client-facing proxy error
+// messages and persisted request-log detail.
+const MaxErrorMessageBytes = 1 << 20
+
 // RequestLog is one proxied inference request, recorded after it completes.
 // Provider, combo, and access-key names are denormalized so a log survives
 // deletion of the entities it references. Token counts are 0 when the path did

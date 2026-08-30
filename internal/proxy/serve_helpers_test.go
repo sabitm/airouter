@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"airouter/internal/proxy/ir"
 )
@@ -288,46 +291,102 @@ func TestCollectStreamResponseLimits(t *testing.T) {
 	})
 }
 
+func TestClampErrorMessage(t *testing.T) {
+	message := strings.Repeat("x", upstreamErrorMax-1) + "€tail"
+	got := clampErrorMessage(message)
+	if len(got) > upstreamErrorMax {
+		t.Fatalf("length = %d, want <= %d", len(got), upstreamErrorMax)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("clamped message is not valid UTF-8")
+	}
+	if !strings.HasSuffix(got, "x") {
+		t.Fatalf("message ended inside multibyte rune: %q", got[len(got)-4:])
+	}
+}
+
+func TestWriteErrClampsMessage(t *testing.T) {
+	message := strings.Repeat("x", upstreamErrorMax+1)
+	rec := httptest.NewRecorder()
+	writeErr(rec, openaiCodec, http.StatusBadGateway, message, "api_error")
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope.Error.Message) != upstreamErrorMax {
+		t.Fatalf("client error length = %d, want %d", len(envelope.Error.Message), upstreamErrorMax)
+	}
+}
+
 func TestUpstreamErrorMessage(t *testing.T) {
 	cases := []struct {
-		name string
-		body string
-		want string
+		name   string
+		status int
+		body   string
+		want   string
 	}{
 		{
-			name: "openai nested error message",
-			body: `{"error":{"message":"rate limit exceeded","type":"rate_limit"}}`,
-			want: "rate limit exceeded",
+			name:   "openai nested error message",
+			status: http.StatusTooManyRequests,
+			body:   `{"error":{"message":"rate limit exceeded","type":"rate_limit"}}`,
+			want:   "rate limit exceeded",
 		},
 		{
-			name: "anthropic nested error message",
-			body: `{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}`,
-			want: "overloaded",
+			name:   "anthropic nested error message",
+			status: http.StatusServiceUnavailable,
+			body:   `{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}`,
+			want:   "overloaded",
 		},
 		{
-			name: "non-json body returns raw body",
-			body: `Internal Server Error`,
-			want: "Internal Server Error",
+			name:   "top-level message",
+			status: http.StatusBadRequest,
+			body:   `{"message":"invalid request"}`,
+			want:   "invalid request",
 		},
 		{
-			name: "nested but empty message falls back to raw body",
-			body: `{"error":{"message":""}}`,
-			want: `{"error":{"message":""}}`,
+			name:   "top-level detail",
+			status: http.StatusBadRequest,
+			body:   `{"detail":"invalid parameter"}`,
+			want:   "invalid parameter",
 		},
 		{
-			name: "empty body returns default",
-			body: ``,
-			want: "upstream error",
+			name:   "string error field",
+			status: http.StatusBadRequest,
+			body:   `{"error":"bad input"}`,
+			want:   "bad input",
 		},
 		{
-			name: "json without error object falls back to raw body",
-			body: `{"type":"ok"}`,
-			want: `{"type":"ok"}`,
+			name:   "non-json body uses status fallback",
+			status: http.StatusBadGateway,
+			body:   `Internal Server Error`,
+			want:   "upstream returned 502 Bad Gateway",
+		},
+		{
+			name:   "empty structured message uses status fallback",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"message":""}}`,
+			want:   "upstream returned 401 Unauthorized",
+		},
+		{
+			name:   "empty body uses status fallback",
+			status: 599,
+			body:   ``,
+			want:   "upstream returned HTTP status 599",
+		},
+		{
+			name:   "unrecognized json uses status fallback",
+			status: http.StatusInternalServerError,
+			body:   `{"type":"ok"}`,
+			want:   "upstream returned 500 Internal Server Error",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := upstreamErrorMessage([]byte(tc.body)); got != tc.want {
+			if got := upstreamErrorMessage(tc.status, []byte(tc.body)); got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})

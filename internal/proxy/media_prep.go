@@ -137,7 +137,7 @@ func incompatibleSkip(reason string) attemptResult {
 	return attemptResult{
 		retry:   true,
 		status:  400,
-		errMsg:  "attachment not supported by upstream: " + reason,
+		errMsg:  clampErrorMessage("attachment not supported by upstream: " + reason),
 		logErr:  "attachment_incompatible",
 		errType: "invalid_request_error",
 	}
@@ -149,7 +149,7 @@ func materializeSkip(err error) attemptResult {
 	return attemptResult{
 		retry:   true,
 		status:  media.ClientErrorStatus(err),
-		errMsg:  err.Error(),
+		errMsg:  clampErrorMessage(err.Error()),
 		logErr:  skipLogAttachment,
 		errType: "invalid_request_error",
 	}

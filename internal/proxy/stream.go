@@ -158,6 +158,7 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 			if fail != nil && fail.Message != "" {
 				errMsg = fail.Message
 			}
+			errMsg = clampErrorMessage(errMsg)
 			res.errMsg = errMsg
 			res.logErr = "upstream stream failed"
 			return committedFailure(http.StatusOK, errMsg, "upstream stream failed")
@@ -407,6 +408,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		} else if err.Error() != "" {
 			errMsg = err.Error()
 		}
+		errMsg = clampErrorMessage(errMsg)
 		observability.Logger(ctx, p.logger).Error("stream_decode_failed",
 			"event", "stream_decode_failed",
 			"ingress", ingress.id,

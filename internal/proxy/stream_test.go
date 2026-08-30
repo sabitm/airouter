@@ -554,15 +554,10 @@ func TestStreamUsageChunk(t *testing.T) {
 	}
 }
 
-// TestStreamErrorBodyCapped asserts an upstream error body is not buffered in
-// full: only upstreamErrorMax bytes are read before being surfaced in the
-// ingress error envelope. The passthrough path returns the upstream status and a
-// best-effort message, so we assert the client sees the upstream status and no
-// more than upstreamErrorMax bytes of body are held.
+// TestStreamErrorBodyCapped asserts a large unstructured upstream error is read
+// through the fixed error-body cap and represented by a safe status fallback.
 func TestStreamErrorBodyCapped(t *testing.T) {
-	// Upstream returns a huge error body on a streaming request.
 	bigErr := strings.Repeat("x", upstreamErrorMax+1<<20) // 1 MiB over the cap
-	bigErrLen := len(bigErr)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusBadGateway)
@@ -594,18 +589,16 @@ func TestStreamErrorBodyCapped(t *testing.T) {
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
-	// The non-JSON error body is surfaced verbatim as the error.message, so the
-	// cap directly bounds the client-facing envelope: it must be no larger than
-	// upstreamErrorMax plus the small JSON envelope overhead, and strictly less
-	// than the full upstream body.
-	if len(body) > upstreamErrorMax+512 {
-		t.Fatalf("client body %d bytes exceeds cap+envelope; want <= %d", len(body), upstreamErrorMax+512)
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	if len(body) >= bigErrLen {
-		t.Fatalf("client body %d not capped (full upstream was %d)", len(body), bigErrLen)
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("decode error envelope: %v", err)
 	}
-	if !strings.Contains(body, "error") {
-		t.Fatalf("want error envelope, got: %s", body)
+	if envelope.Error.Message != "upstream returned 502 Bad Gateway" {
+		t.Fatalf("message = %q", envelope.Error.Message)
 	}
 }
 

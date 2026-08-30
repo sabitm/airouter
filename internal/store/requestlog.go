@@ -5,17 +5,35 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"airouter/internal/domain"
 )
 
+const maxRequestLogErrorBytes = domain.MaxErrorMessageBytes
+
+func clampRequestLogError(message string) string {
+	if !utf8.ValidString(message) {
+		message = strings.ToValidUTF8(message, "\uFFFD")
+	}
+	if len(message) <= maxRequestLogErrorBytes {
+		return message
+	}
+	end := maxRequestLogErrorBytes
+	for end > 0 && !utf8.RuneStart(message[end]) {
+		end--
+	}
+	return message[:end]
+}
+
 func (s *Store) CreateRequestLog(ctx context.Context, l *domain.RequestLog) error {
+	errMsg := clampRequestLogError(l.ErrMsg)
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO request_logs
 			(access_key_name, combo, provider, upstream_model, format, stream, status, input_tokens, output_tokens, latency_ms, err_msg)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		l.AccessKeyName, l.Combo, l.Provider, l.UpstreamModel, l.Format, l.Stream,
-		l.Status, l.InputTokens, l.OutputTokens, l.LatencyMS, l.ErrMsg)
+		l.Status, l.InputTokens, l.OutputTokens, l.LatencyMS, errMsg)
 	if err != nil {
 		return err
 	}

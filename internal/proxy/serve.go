@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"airouter/internal/domain"
 	"airouter/internal/observability"
@@ -33,7 +35,7 @@ var (
 // upstreamErrorMax caps how many bytes of an upstream error body are read for
 // extracting a client-facing message and persisted request-history detail. HAR
 // capture is independently bounded by harlog.MaxBody.
-const upstreamErrorMax = 1 << 20 // 1 MiB
+const upstreamErrorMax = domain.MaxErrorMessageBytes
 
 // reqResult accumulates the outcome of one request for logging. Each serve path
 // fills it in; serve records a RequestLog once on completion.
@@ -45,8 +47,25 @@ type reqResult struct {
 	logErr string
 }
 
+// clampErrorMessage keeps client and request-history messages within the error
+// body budget without cutting a valid UTF-8 sequence at the byte boundary.
+func clampErrorMessage(message string) string {
+	if !utf8.ValidString(message) {
+		message = strings.ToValidUTF8(message, "\uFFFD")
+	}
+	if len(message) <= upstreamErrorMax {
+		return message
+	}
+	end := upstreamErrorMax
+	for end > 0 && !utf8.RuneStart(message[end]) {
+		end--
+	}
+	return message[:end]
+}
+
 // fail writes an error envelope and records the failure on the result.
 func (res *reqResult) fail(w http.ResponseWriter, ingress codec, status int, message, errType string) {
+	message = clampErrorMessage(message)
 	res.status = status
 	res.errMsg = message
 	res.logErr = message
@@ -95,19 +114,22 @@ func committed() attemptResult { return attemptResult{written: true} }
 // penalized, and surfaces errMsg in request history. status is the HTTP status
 // already committed (typically 200 for SSE).
 func committedFailure(status int, errMsg, logErr string) attemptResult {
+	errMsg = clampErrorMessage(errMsg)
 	if logErr == "" {
 		logErr = errMsg
+	} else {
+		logErr = clampErrorMessage(logErr)
 	}
 	return attemptResult{written: true, failed: true, status: status, errMsg: errMsg, logErr: logErr, errType: "api_error"}
 }
 
 func retryable(status int, message, errType string) attemptResult {
+	message = clampErrorMessage(message)
 	return attemptResult{retry: true, status: status, errMsg: message, logErr: message, errType: errType}
 }
 
-// retryableUpstreamStatus preserves the upstream message for the client and
-// persisted request history while keeping raw non-JSON response bodies out of
-// DEBUG terminal logs.
+// retryableUpstreamStatus preserves a structured upstream message for the
+// client and request history while keeping raw bodies in bounded HAR only.
 func retryableUpstreamStatus(status int, body []byte) attemptResult {
 	if len(body) > upstreamErrorMax {
 		body = body[:upstreamErrorMax]
@@ -115,7 +137,7 @@ func retryableUpstreamStatus(status int, body []byte) attemptResult {
 	return attemptResult{
 		retry:   true,
 		status:  status,
-		errMsg:  upstreamErrorMessage(body),
+		errMsg:  clampErrorMessage(upstreamErrorMessage(status, body)),
 		logErr:  http.StatusText(status),
 		errType: "api_error",
 	}
@@ -127,7 +149,7 @@ func retryableStreamDecode(err error) attemptResult {
 	return attemptResult{
 		retry:   true,
 		status:  http.StatusBadGateway,
-		errMsg:  "upstream stream decode failed: " + err.Error(),
+		errMsg:  clampErrorMessage("upstream stream decode failed: " + err.Error()),
 		logErr:  "upstream stream decode failed",
 		errType: "api_error",
 	}
@@ -152,7 +174,7 @@ func retryableStreamFailure(err error) attemptResult {
 	return attemptResult{
 		retry:   true,
 		status:  status,
-		errMsg:  errMsg,
+		errMsg:  clampErrorMessage(errMsg),
 		logErr:  "upstream stream failed",
 		errType: "api_error",
 	}
@@ -173,6 +195,7 @@ func isServiceUnavailableFailure(sf *ir.StreamFailure) bool {
 }
 
 func terminal(status int, message, errType string) attemptResult {
+	message = clampErrorMessage(message)
 	return attemptResult{status: status, errMsg: message, logErr: message, errType: errType}
 }
 
@@ -885,21 +908,38 @@ func parseUsageObject(raw json.RawMessage, codecID string) (in, out int) {
 	return 0, 0
 }
 
-// upstreamErrorMessage extracts a human message from an upstream error body.
-// Both OpenAI and Anthropic nest it under error.message.
-func upstreamErrorMessage(body []byte) string {
-	var e struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
+// upstreamErrorMessage extracts recognized structured messages. Unstructured
+// bodies are intentionally excluded from client envelopes and request history.
+func upstreamErrorMessage(status int, body []byte) string {
+	var envelope struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Detail  string          `json:"detail"`
 	}
-	if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
-		return e.Error.Message
+	if json.Unmarshal(body, &envelope) == nil {
+		if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+			var nested struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(envelope.Error, &nested) == nil && nested.Message != "" {
+				return nested.Message
+			}
+			var message string
+			if json.Unmarshal(envelope.Error, &message) == nil && message != "" {
+				return message
+			}
+		}
+		if envelope.Message != "" {
+			return envelope.Message
+		}
+		if envelope.Detail != "" {
+			return envelope.Detail
+		}
 	}
-	if len(body) > 0 {
-		return string(body)
+	if text := http.StatusText(status); text != "" {
+		return fmt.Sprintf("upstream returned %d %s", status, text)
 	}
-	return "upstream error"
+	return fmt.Sprintf("upstream returned HTTP status %d", status)
 }
 
 // recordLog persists a request log fire-and-forget so a slow DB write never
@@ -907,10 +947,12 @@ func upstreamErrorMessage(body []byte) string {
 // done by the time the write lands.
 func (p *Proxy) recordLog(ctx context.Context, l *domain.RequestLog) {
 	logger := observability.Logger(ctx, p.logger)
+	bounded := *l
+	bounded.ErrMsg = clampErrorMessage(bounded.ErrMsg)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := p.store.CreateRequestLog(ctx, l); err != nil {
+		if err := p.store.CreateRequestLog(ctx, &bounded); err != nil {
 			logger.Error("request_log_write_failed",
 				"event", "request_log_write_failed",
 				"error", err,
@@ -920,6 +962,7 @@ func (p *Proxy) recordLog(ctx context.Context, l *domain.RequestLog) {
 }
 
 func writeErr(w http.ResponseWriter, c codec, status int, message, errType string) {
+	message = clampErrorMessage(message)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(c.encodeError(message, errType))

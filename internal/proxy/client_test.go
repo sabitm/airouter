@@ -114,7 +114,7 @@ func TestOversizedUnaryResponseFailsOver(t *testing.T) {
 	}
 }
 
-func TestUnaryUpstreamErrorMessageCappedAcrossFailover(t *testing.T) {
+func TestUnaryUnstructuredUpstreamErrorUsesSafeFallback(t *testing.T) {
 	passthrough := newScriptedUpstream(t, domain.ProtocolOpenAI)
 	translated := newScriptedUpstream(t, domain.ProtocolAnthropic)
 	base, token, p := setupComboProxy(t, domain.StrategyFailover,
@@ -153,15 +153,15 @@ func TestUnaryUpstreamErrorMessageCappedAcrossFailover(t *testing.T) {
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		t.Fatalf("decode client error: %v", err)
 	}
-	if len(envelope.Error.Message) != upstreamErrorMax {
-		t.Fatalf("client error length = %d, want %d", len(envelope.Error.Message), upstreamErrorMax)
+	if envelope.Error.Message != "upstream returned 502 Bad Gateway" {
+		t.Fatalf("client error = %q", envelope.Error.Message)
 	}
 
 	logs := waitForLogs(t, p.store, 2)
 	for _, provider := range []string{"p0", "p1"} {
 		log := findLogByProvider(t, logs, provider)
-		if len(log.ErrMsg) != upstreamErrorMax {
-			t.Errorf("provider %s error length = %d, want %d", provider, len(log.ErrMsg), upstreamErrorMax)
+		if log.ErrMsg != "upstream returned 502 Bad Gateway" {
+			t.Errorf("provider %s error = %q", provider, log.ErrMsg)
 		}
 	}
 }

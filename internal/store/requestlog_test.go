@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"airouter/internal/domain"
 )
@@ -23,6 +25,25 @@ func seedLog(t *testing.T, st *Store, combo, provider string, status int, errMsg
 		t.Fatal(err)
 	}
 	return l
+}
+
+func TestCreateRequestLogCapsErrorMessage(t *testing.T) {
+	st := testStore(t)
+	message := strings.Repeat("x", maxRequestLogErrorBytes-1) + "€tail"
+	log := seedLog(t, st, "default", "openai", 500, message)
+	logs, err := st.ListRequestLogs(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].ID != log.ID {
+		t.Fatalf("logs = %+v", logs)
+	}
+	if len(logs[0].ErrMsg) > maxRequestLogErrorBytes {
+		t.Fatalf("error length = %d, want <= %d", len(logs[0].ErrMsg), maxRequestLogErrorBytes)
+	}
+	if !utf8.ValidString(logs[0].ErrMsg) {
+		t.Fatal("persisted error is not valid UTF-8")
+	}
 }
 
 func TestListRequestLogsQueryFiltersAndPages(t *testing.T) {
