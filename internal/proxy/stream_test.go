@@ -996,6 +996,73 @@ func TestStreamPreCommitOverloadJSONError(t *testing.T) {
 	}
 }
 
+func TestStreamOnlyUnaryOversizedResponseFailsOver(t *testing.T) {
+	var primaryHits, fallbackHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"too-large\",\"model\":\"up\",\"status\":\"in_progress\"}}\n\n"); err != nil {
+			return
+		}
+		chunk := strings.Repeat("x", 1<<20)
+		for i := 0; i < 65; i++ {
+			if _, err := io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\""+chunk+"\"}\n\n"); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(primary.Close)
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, openaiUpstreamBody)
+	}))
+	t.Cleanup(fallback.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "codex-large", BaseURL: primary.URL, APIKey: "k", Protocol: domain.ProtocolOpenAICodex}
+	p2 := &domain.Provider{Name: "oai-good", BaseURL: fallback.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "codex", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "gpt", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	resp, body := post(t, server.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if primaryHits != 1 || fallbackHits != 1 {
+		t.Fatalf("hits primary=%d fallback=%d, want 1/1", primaryHits, fallbackHits)
+	}
+	if got := extractText(t, "/v1/chat/completions", body); got != "hello from openai" {
+		t.Fatalf("fallback response text = %q", got)
+	}
+	logs := waitForLogs(t, st, 2)
+	failed := findLogByProvider(t, logs, "codex-large")
+	if !strings.Contains(failed.ErrMsg, errCollectedStreamResponseTooLarge.Error()) {
+		t.Fatalf("failed attempt error = %q", failed.ErrMsg)
+	}
+}
+
 func TestStreamPreCommitOverloadFailover(t *testing.T) {
 	var n1, n2 int
 	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -2,7 +2,12 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"strings"
 	"testing"
+
+	"airouter/internal/proxy/ir"
 )
 
 func TestParseUsage(t *testing.T) {
@@ -222,6 +227,65 @@ func TestForceOpenAIStreamIncludeUsage(t *testing.T) {
 			tc.check(t, m)
 		})
 	}
+}
+
+func TestCollectStreamResponseLimits(t *testing.T) {
+	stream := func(events []ir.StreamEvent) codec {
+		return codec{decodeStream: func(_ io.Reader, emit func(ir.StreamEvent) error) error {
+			for _, ev := range events {
+				if err := emit(ev); err != nil {
+					return err
+				}
+			}
+			return nil
+		}}
+	}
+
+	t.Run("text at limit", func(t *testing.T) {
+		const limit = int64(128)
+		fallback := "m"
+		base := len(ir.NewID("resp_")) + len(fallback)
+		text := strings.Repeat("x", int(limit)-base)
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventTextDelta, Text: text},
+			{Kind: ir.EventFinish, StopReason: ir.StopEndTurn},
+		}), nil, fallback, nil, limit, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if len(resp.Content) != 1 || resp.Content[0].Text != text {
+			t.Fatalf("content = %+v", resp.Content)
+		}
+	})
+
+	t.Run("text over limit", func(t *testing.T) {
+		_, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventTextDelta, Text: strings.Repeat("x", 128)},
+		}), nil, "m", nil, 64, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("error = %v, want response-too-large", err)
+		}
+	})
+
+	t.Run("tool arguments over limit", func(t *testing.T) {
+		_, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call", ToolName: "fn"},
+			{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: strings.Repeat("x", 128)},
+		}), nil, "m", nil, 64, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("error = %v, want response-too-large", err)
+		}
+	})
+
+	t.Run("too many tools", func(t *testing.T) {
+		_, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventToolCallStart, Index: 0, ToolID: "a", ToolName: "fa"},
+			{Kind: ir.EventToolCallStart, Index: 1, ToolID: "b", ToolName: "fb"},
+		}), nil, "m", nil, 1024, 1)
+		if !errors.Is(err, errCollectedStreamTooManyTools) {
+			t.Fatalf("error = %v, want too-many-tools", err)
+		}
+	})
 }
 
 func TestUpstreamErrorMessage(t *testing.T) {

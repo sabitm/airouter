@@ -20,6 +20,16 @@ import (
 
 const maxBodyBytes = 64 << 20 // 64 MiB ceiling on inbound request bodies
 
+const (
+	maxCollectedStreamResponseBytes = maxUnaryUpstreamResponseBytes
+	maxCollectedStreamToolCalls     = 1024
+)
+
+var (
+	errCollectedStreamResponseTooLarge = errors.New("upstream stream response too large")
+	errCollectedStreamTooManyTools     = errors.New("upstream stream response has too many tool calls")
+)
+
 // upstreamErrorMax caps how many bytes of an upstream error body are read for
 // extracting a client-facing message and persisted request-history detail. HAR
 // capture is independently bounded by harlog.MaxBody.
@@ -650,6 +660,9 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode response", "api_error")
 	}
+	if int64(len(out)) > maxUnaryUpstreamResponseBytes {
+		return retryable(http.StatusBadGateway, "upstream response too large", "api_error")
+	}
 	res.status = http.StatusOK
 	res.inTok = irResp.Usage.InputTokens
 	res.outTok = irResp.Usage.OutputTokens
@@ -664,7 +677,36 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 // writeFrame is non-nil only for duplex backends (Cursor AgentService), whose
 // streams need mid-stream client replies to finish.
 func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) error, fallbackModel string, clientTools []ir.Tool) (*ir.Response, error) {
+	return collectStreamResponseWithLimits(r, backend, writeFrame, fallbackModel, clientTools, maxCollectedStreamResponseBytes, maxCollectedStreamToolCalls)
+}
+
+func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func([]byte) error, fallbackModel string, clientTools []ir.Tool, maxBytes int64, maxTools int) (*ir.Response, error) {
 	resp := &ir.Response{ID: ir.NewID("resp_"), Model: fallbackModel, StopReason: ir.StopEndTurn}
+	retainedBytes := int64(len(resp.ID) + len(resp.Model))
+	if retainedBytes > maxBytes {
+		return nil, errCollectedStreamResponseTooLarge
+	}
+	reserve := func(delta int) error {
+		if delta > 0 && int64(delta) > maxBytes-retainedBytes {
+			return errCollectedStreamResponseTooLarge
+		}
+		retainedBytes += int64(delta)
+		return nil
+	}
+	replace := func(dst *string, value string) error {
+		if err := reserve(len(value) - len(*dst)); err != nil {
+			return err
+		}
+		*dst = value
+		return nil
+	}
+	appendTo := func(dst *strings.Builder, value string) error {
+		if err := reserve(len(value)); err != nil {
+			return err
+		}
+		dst.WriteString(value)
+		return nil
+	}
 	var text strings.Builder
 	type toolBuf struct {
 		id   string
@@ -673,6 +715,18 @@ func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) e
 	}
 	tools := map[int]*toolBuf{}
 	var order []int
+	newTool := func(index int) (*toolBuf, error) {
+		if tb := tools[index]; tb != nil {
+			return tb, nil
+		}
+		if len(tools) >= maxTools {
+			return nil, errCollectedStreamTooManyTools
+		}
+		tb := &toolBuf{}
+		tools[index] = tb
+		order = append(order, index)
+		return tb, nil
+	}
 	sawEvent := false
 	decode := backend.decodeStream
 	if backend.decodeStreamDuplex != nil {
@@ -688,29 +742,43 @@ func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) e
 		switch ev.Kind {
 		case ir.EventMessageStart:
 			if ev.ID != "" {
-				resp.ID = ev.ID
+				if err := replace(&resp.ID, ev.ID); err != nil {
+					return err
+				}
 			}
 			if ev.Model != "" {
-				resp.Model = ev.Model
+				if err := replace(&resp.Model, ev.Model); err != nil {
+					return err
+				}
 			}
 			if ev.InputTokens != 0 {
 				resp.Usage.InputTokens = ev.InputTokens
 			}
 		case ir.EventTextDelta:
-			text.WriteString(ev.Text)
+			if err := appendTo(&text, ev.Text); err != nil {
+				return err
+			}
 		case ir.EventToolCallStart:
-			if _, ok := tools[ev.Index]; !ok {
+			tb := tools[ev.Index]
+			if tb == nil {
+				if len(tools) >= maxTools {
+					return errCollectedStreamTooManyTools
+				}
 				order = append(order, ev.Index)
+				tb = &toolBuf{}
+			}
+			if err := reserve(len(ev.ToolID) + len(ev.ToolName) - len(tb.id) - len(tb.name) - tb.args.Len()); err != nil {
+				return err
 			}
 			tools[ev.Index] = &toolBuf{id: ev.ToolID, name: ev.ToolName}
 		case ir.EventToolCallDelta:
-			tb := tools[ev.Index]
-			if tb == nil {
-				tb = &toolBuf{}
-				tools[ev.Index] = tb
-				order = append(order, ev.Index)
+			tb, err := newTool(ev.Index)
+			if err != nil {
+				return err
 			}
-			tb.args.WriteString(ev.ArgsFrag)
+			if err := appendTo(&tb.args, ev.ArgsFrag); err != nil {
+				return err
+			}
 		case ir.EventFinish:
 			if ev.InputTokens != 0 {
 				resp.Usage.InputTokens = ev.InputTokens
