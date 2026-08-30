@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/openai"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/thinking"
 )
@@ -132,6 +134,100 @@ func TestOpencodeTranslatedDeepseekFinalize(t *testing.T) {
 	th, _ := got["thinking"].(map[string]any)
 	if th == nil || th["type"] != "enabled" {
 		t.Fatalf("deepseek thinking = %+v, want type enabled", th)
+	}
+}
+
+func TestOpencodeTranslatedReasoningEchoPreservesRealContent(t *testing.T) {
+	p := opencodeTestProvider()
+	body := []byte(`{"model":"combo","messages":[{"role":"assistant","content":"answer","reasoning_content":"real chain"},{"role":"user","content":"next"}]}`)
+	req, err := openaiCodec.decodeRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyUpstreamModel(req, "deepseek-v4-pro")
+	backend := backendCodec(p.Protocol, "deepseek-v4-pro")
+	upstreamBody, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamBody, err = prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, upstreamBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []struct {
+			Role             string `json:"role"`
+			ReasoningContent string `json:"reasoning_content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(upstreamBody, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 2 || got.Messages[0].ReasoningContent != "real chain" {
+		t.Fatalf("real reasoning was not preserved: %s", upstreamBody)
+	}
+}
+
+func TestOpencodeUnaryResponseReasoningPreserved(t *testing.T) {
+	backend := backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro")
+	resp, err := backend.decodeResponse([]byte(`{"id":"chatcmpl-1","model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"answer","reasoning_content":"chain"},"finish_reason":"stop"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := openaiCodec.encodeResponse(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Choices []struct {
+			Message struct {
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Choices) != 1 || got.Choices[0].Message.ReasoningContent != "chain" {
+		t.Fatalf("reasoning response lost: %s", out)
+	}
+}
+
+func TestOpencodeStreamResponseReasoningPreserved(t *testing.T) {
+	backend := backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro")
+	body := "data: {\"id\":\"chatcmpl-1\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"chain\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-1\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	var reasoning string
+	if err := backend.decodeStream(strings.NewReader(body), func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventReasoningDelta {
+			reasoning += ev.Text
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if reasoning != "chain" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
+
+	resp, err := collectStreamResponse(strings.NewReader(body), backend, nil, "deepseek-v4-pro", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Type != ir.BlockReasoning || resp.Content[0].Text != "chain" {
+		t.Fatalf("collected content = %+v", resp.Content)
+	}
+	out, err := openai.EncodeResponse(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"reasoning_content":"chain"`) {
+		t.Fatalf("collected unary response lost reasoning: %s", out)
 	}
 }
 

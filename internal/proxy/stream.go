@@ -459,7 +459,7 @@ func (s *translatedSink) handle(ev ir.StreamEvent) error {
 			return nil
 		}
 		switch ev.Kind {
-		case ir.EventTextDelta, ir.EventToolCallStart, ir.EventToolCallDelta, ir.EventFinish:
+		case ir.EventTextDelta, ir.EventReasoningDelta, ir.EventToolCallStart, ir.EventToolCallDelta, ir.EventFinish:
 			if err := s.commit(); err != nil {
 				return err
 			}

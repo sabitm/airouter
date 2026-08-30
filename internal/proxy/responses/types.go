@@ -35,9 +35,12 @@ type tool struct {
 }
 
 type inputItem struct {
-	Type    string          `json:"type"` // message | function_call | function_call_output
+	Type    string          `json:"type"` // message | reasoning | function_call | function_call_output
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"` // string or []contentPart
+
+	// reasoning
+	Summary []reasoningSummary `json:"summary"`
 
 	// function_call
 	CallID    string `json:"call_id"`
@@ -46,6 +49,11 @@ type inputItem struct {
 
 	// function_call_output
 	Output json.RawMessage `json:"output"` // string or []contentPart
+}
+
+type reasoningSummary struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 type contentPart struct {

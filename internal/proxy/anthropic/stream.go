@@ -32,6 +32,7 @@ type streamContentBlockDelta struct {
 	Delta struct {
 		Type        string `json:"type"`
 		Text        string `json:"text"`
+		Thinking    string `json:"thinking"`
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
 }
@@ -109,6 +110,10 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				continue
 			}
 			switch d.Delta.Type {
+			case "thinking_delta":
+				if err := emit(ir.StreamEvent{Kind: ir.EventReasoningDelta, Text: d.Delta.Thinking}); err != nil {
+					return err
+				}
 			case "text_delta":
 				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: d.Delta.Text}); err != nil {
 					return err
@@ -160,6 +165,7 @@ func stopReason2(s string) ir.StopReason {
 const (
 	blockNone = iota
 	blockText
+	blockReasoning
 	blockTool
 )
 
@@ -244,6 +250,27 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		}
 		return e.event(w, "content_block_delta", map[string]any{
 			"index": e.openIndex, "delta": map[string]any{"type": "text_delta", "text": ev.Text},
+		})
+
+	case ir.EventReasoningDelta:
+		if err := e.ensureStart(w); err != nil {
+			return err
+		}
+		if e.openKind != blockReasoning {
+			if err := e.closeBlock(w); err != nil {
+				return err
+			}
+			e.openIndex = e.nextIndex
+			e.nextIndex++
+			e.openKind = blockReasoning
+			if err := e.event(w, "content_block_start", map[string]any{
+				"index": e.openIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""},
+			}); err != nil {
+				return err
+			}
+		}
+		return e.event(w, "content_block_delta", map[string]any{
+			"index": e.openIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": ev.Text},
 		})
 
 	case ir.EventToolCallStart:

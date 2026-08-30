@@ -67,6 +67,70 @@ func TestOpenAIToAnthropicRequest(t *testing.T) {
 	}
 }
 
+func TestReasoningOpenAIToAnthropicRequest(t *testing.T) {
+	in := []byte(`{
+		"model":"default",
+		"messages":[
+			{"role":"assistant","content":"answer","reasoning_content":"chain"},
+			{"role":"user","content":"next"}
+		]
+	}`)
+	req, err := openai.DecodeRequest(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := anthropic.EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []struct {
+			Content []struct {
+				Type     string `json:"type"`
+				Thinking string `json:"thinking"`
+				Text     string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 2 || len(got.Messages[0].Content) != 2 || got.Messages[0].Content[0].Type != "thinking" || got.Messages[0].Content[0].Thinking != "chain" || got.Messages[0].Content[1].Text != "answer" {
+		t.Fatalf("translated messages = %s", out)
+	}
+}
+
+func TestReasoningAnthropicToOpenAIResponse(t *testing.T) {
+	in := []byte(`{
+		"id":"msg_1","model":"claude","role":"assistant","type":"message",
+		"stop_reason":"end_turn",
+		"content":[{"type":"thinking","thinking":"chain"},{"type":"text","text":"answer"}],
+		"usage":{"input_tokens":5,"output_tokens":7}
+	}`)
+	resp, err := anthropic.DecodeResponse(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := openai.EncodeResponse(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Choices []struct {
+			Message struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Choices) != 1 || got.Choices[0].Message.ReasoningContent != "chain" || got.Choices[0].Message.Content != "answer" {
+		t.Fatalf("translated response = %s", out)
+	}
+}
+
 // A tool call round-trips from an Anthropic response into an OpenAI response.
 func TestAnthropicToolUseToOpenAIResponse(t *testing.T) {
 	in := []byte(`{

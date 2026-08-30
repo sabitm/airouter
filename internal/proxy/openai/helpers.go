@@ -25,6 +25,37 @@ func parseStop(raw json.RawMessage) []string {
 	return arr
 }
 
+// chatReasoningText normalizes the common OpenAI-compatible reasoning aliases.
+// The first populated scalar wins; reasoning_details fragments are concatenated.
+func chatReasoningText(content string, reasoning json.RawMessage, details []json.RawMessage) string {
+	if content != "" {
+		return content
+	}
+	var scalar string
+	if len(reasoning) > 0 && json.Unmarshal(reasoning, &scalar) == nil && scalar != "" {
+		return scalar
+	}
+	var out strings.Builder
+	for _, raw := range details {
+		var detail struct {
+			Text    string `json:"text"`
+			Content string `json:"content"`
+		}
+		if json.Unmarshal(raw, &detail) == nil {
+			if detail.Text != "" {
+				out.WriteString(detail.Text)
+			} else {
+				out.WriteString(detail.Content)
+			}
+			continue
+		}
+		if json.Unmarshal(raw, &scalar) == nil {
+			out.WriteString(scalar)
+		}
+	}
+	return out.String()
+}
+
 // contentToText flattens a message content field (string, null, or array of
 // parts) into plain text, concatenating any text parts.
 func contentToText(raw json.RawMessage) string {

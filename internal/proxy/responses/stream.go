@@ -128,6 +128,15 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 					return err
 				}
 			}
+		case "response.reasoning_summary_text.delta":
+			if env.Delta != "" {
+				if err := ensureStarted("", ""); err != nil {
+					return err
+				}
+				if err := emit(ir.StreamEvent{Kind: ir.EventReasoningDelta, Text: env.Delta}); err != nil {
+					return err
+				}
+			}
 		case "response.function_call_arguments.delta":
 			if env.Delta != "" {
 				if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: env.OutputIndex, ArgsFrag: env.Delta}); err != nil {
@@ -189,6 +198,7 @@ func streamFailureFrom(errObj *respErrorObject, resp *respObject) *ir.StreamFail
 const (
 	openNone = iota
 	openMessage
+	openReasoning
 	openFunction
 )
 
@@ -211,10 +221,11 @@ type StreamEncoder struct {
 	openItemID  string
 	openOutIdx  int
 
-	textBuf  strings.Builder
-	argBuf   strings.Builder
-	fcCallID string
-	fcName   string
+	textBuf      strings.Builder
+	reasoningBuf strings.Builder
+	argBuf       strings.Builder
+	fcCallID     string
+	fcName       string
 
 	toolItem map[int]string
 	toolIdx  map[int]int
@@ -290,6 +301,24 @@ func (e *StreamEncoder) closeOpen(w *sse.Writer) error {
 		if err := e.emit(w, "response.output_item.done", map[string]any{"output_index": e.openOutIdx, "item": item}); err != nil {
 			return err
 		}
+	case openReasoning:
+		full := e.reasoningBuf.String()
+		if err := e.emit(w, "response.reasoning_summary_text.done", map[string]any{
+			"item_id": e.openItemID, "output_index": e.openOutIdx, "summary_index": 0, "text": full,
+		}); err != nil {
+			return err
+		}
+		part := map[string]any{"type": "summary_text", "text": full}
+		if err := e.emit(w, "response.reasoning_summary_part.done", map[string]any{
+			"item_id": e.openItemID, "output_index": e.openOutIdx, "summary_index": 0, "part": part,
+		}); err != nil {
+			return err
+		}
+		item := map[string]any{"id": e.openItemID, "type": "reasoning", "summary": []any{part}}
+		e.items = append(e.items, item)
+		if err := e.emit(w, "response.output_item.done", map[string]any{"output_index": e.openOutIdx, "item": item}); err != nil {
+			return err
+		}
 	case openFunction:
 		full := e.argBuf.String()
 		if err := e.emit(w, "response.function_call_arguments.done", map[string]any{
@@ -332,6 +361,20 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		e.textBuf.WriteString(ev.Text)
 		return e.emit(w, "response.output_text.delta", map[string]any{
 			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": 0, "delta": ev.Text,
+		})
+
+	case ir.EventReasoningDelta:
+		if err := e.ensureCreated(w); err != nil {
+			return err
+		}
+		if e.open != openReasoning {
+			if err := e.openReasoningItem(w); err != nil {
+				return err
+			}
+		}
+		e.reasoningBuf.WriteString(ev.Text)
+		return e.emit(w, "response.reasoning_summary_text.delta", map[string]any{
+			"item_id": e.openItemID, "output_index": e.openOutIdx, "summary_index": 0, "delta": ev.Text,
 		})
 
 	case ir.EventToolCallStart:
@@ -429,6 +472,27 @@ func (e *StreamEncoder) openMessageItem(w *sse.Writer) error {
 	return e.emit(w, "response.content_part.added", map[string]any{
 		"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": 0,
 		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+	})
+}
+
+func (e *StreamEncoder) openReasoningItem(w *sse.Writer) error {
+	if err := e.closeOpen(w); err != nil {
+		return err
+	}
+	e.openItemID = ir.NewID("rs_")
+	e.openOutIdx = e.outputIndex
+	e.outputIndex++
+	e.open = openReasoning
+	e.reasoningBuf.Reset()
+	if err := e.emit(w, "response.output_item.added", map[string]any{
+		"output_index": e.openOutIdx,
+		"item":         map[string]any{"id": e.openItemID, "type": "reasoning", "summary": []any{}},
+	}); err != nil {
+		return err
+	}
+	return e.emit(w, "response.reasoning_summary_part.added", map[string]any{
+		"item_id": e.openItemID, "output_index": e.openOutIdx, "summary_index": 0,
+		"part": map[string]any{"type": "summary_text", "text": ""},
 	})
 }
 

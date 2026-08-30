@@ -27,10 +27,13 @@ type streamOptions struct {
 }
 
 type chatMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content,omitempty"` // string or []chatPart, may be null
-	ToolCalls  []chatToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Role             string            `json:"role"`
+	Content          json.RawMessage   `json:"content,omitempty"` // string or []chatPart, may be null
+	ReasoningContent string            `json:"reasoning_content,omitempty"`
+	Reasoning        json.RawMessage   `json:"reasoning,omitempty"`
+	ReasoningDetails []json.RawMessage `json:"reasoning_details,omitempty"`
+	ToolCalls        []chatToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID       string            `json:"tool_call_id,omitempty"`
 }
 
 type chatPart struct {
@@ -95,8 +98,11 @@ type chatRespMessage struct {
 	Role string `json:"role"`
 	// Pointer so an absent text body marshals to null (OpenAI's convention when
 	// the turn is only tool calls).
-	Content   *string        `json:"content"`
-	ToolCalls []chatToolCall `json:"tool_calls,omitempty"`
+	Content          *string           `json:"content"`
+	ReasoningContent string            `json:"reasoning_content,omitempty"`
+	Reasoning        json.RawMessage   `json:"reasoning,omitempty"`
+	ReasoningDetails []json.RawMessage `json:"reasoning_details,omitempty"`
+	ToolCalls        []chatToolCall    `json:"tool_calls,omitempty"`
 }
 
 type chatUsage struct {

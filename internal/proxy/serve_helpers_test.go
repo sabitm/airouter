@@ -270,6 +270,29 @@ func TestCollectStreamResponseLimits(t *testing.T) {
 		}
 	})
 
+	t.Run("reasoning-only stream", func(t *testing.T) {
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventMessageStart, ID: "r1", Model: "m"},
+			{Kind: ir.EventReasoningDelta, Text: "chain"},
+			{Kind: ir.EventFinish, StopReason: ir.StopEndTurn},
+		}), nil, "m", nil, 1024, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if len(resp.Content) != 1 || resp.Content[0].Type != ir.BlockReasoning || resp.Content[0].Text != "chain" {
+			t.Fatalf("content = %+v", resp.Content)
+		}
+	})
+
+	t.Run("reasoning over limit", func(t *testing.T) {
+		_, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventReasoningDelta, Text: strings.Repeat("x", 128)},
+		}), nil, "m", nil, 64, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("error = %v, want response-too-large", err)
+		}
+	})
+
 	t.Run("tool arguments over limit", func(t *testing.T) {
 		_, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
 			{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call", ToolName: "fn"},

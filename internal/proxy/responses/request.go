@@ -72,6 +72,12 @@ func decodeInput(raw json.RawMessage, systemOut *string) []ir.Message {
 
 	for _, it := range items {
 		switch it.Type {
+		case "reasoning":
+			for _, summary := range it.Summary {
+				if summary.Text != "" {
+					appendBlock(ir.RoleAssistant, ir.ContentBlock{Type: ir.BlockReasoning, Text: summary.Text})
+				}
+			}
 		case "", "message":
 			if it.Role == "system" || it.Role == "developer" {
 				if s := contentToText(it.Content); s != "" {
@@ -86,7 +92,12 @@ func decodeInput(raw json.RawMessage, systemOut *string) []ir.Message {
 			if it.Role == "assistant" {
 				role = ir.RoleAssistant
 			}
-			msgs = append(msgs, ir.Message{Role: role, Content: decodeParts(it.Content)})
+			blocks := decodeParts(it.Content)
+			if role == ir.RoleAssistant && len(msgs) > 0 && msgs[len(msgs)-1].Role == ir.RoleAssistant {
+				msgs[len(msgs)-1].Content = append(msgs[len(msgs)-1].Content, blocks...)
+			} else {
+				msgs = append(msgs, ir.Message{Role: role, Content: blocks})
+			}
 		case "function_call":
 			appendBlock(ir.RoleAssistant, ir.ContentBlock{
 				Type: ir.BlockToolUse, ToolID: it.CallID, ToolName: it.Name, ToolInput: rawArgs(it.Arguments),
@@ -226,6 +237,13 @@ func encodeInput(req *ir.Request) []map[string]any {
 	var items []map[string]any
 	for _, m := range req.Messages {
 		if m.Role == ir.RoleAssistant {
+			for _, b := range m.Content {
+				if b.Type == ir.BlockReasoning && b.Text != "" {
+					items = append(items, map[string]any{
+						"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": b.Text}},
+					})
+				}
+			}
 			var parts []map[string]any
 			for _, b := range m.Content {
 				if b.Type == ir.BlockText {

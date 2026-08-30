@@ -22,6 +22,10 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 	}
 	for _, b := range resp.Content {
 		switch b.Type {
+		case "thinking":
+			if b.Thinking != "" {
+				out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockReasoning, Text: b.Thinking})
+			}
 		case "text":
 			out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockText, Text: b.Text})
 		case "tool_use":
@@ -46,6 +50,8 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	content := make([]anthBlock, 0, len(resp.Content))
 	for _, b := range resp.Content {
 		switch b.Type {
+		case ir.BlockReasoning:
+			content = append(content, anthBlock{Type: "thinking", Thinking: b.Text})
 		case ir.BlockText:
 			content = append(content, anthBlock{Type: "text", Text: b.Text})
 		case ir.BlockToolUse:

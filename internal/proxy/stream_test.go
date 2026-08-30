@@ -240,6 +240,39 @@ func TestStreamMatrix(t *testing.T) {
 	}
 }
 
+func TestStreamReasoningTranslatedToOpenAI(t *testing.T) {
+	anthropicReasoningSSE := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_reason","type":"message","role":"assistant","model":"up","content":[],"usage":{"input_tokens":3,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"chain"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	base, token := setupStreaming(t, domain.ProtocolAnthropic, anthropicReasoningSSE)
+	resp, body := postStream(t, base+"/v1/chat/completions", token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"reasoning_content":"chain"`) {
+		t.Fatalf("translated stream lost reasoning: %s", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"stop"`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("translated stream did not finish: %s", body)
+	}
+}
+
 // TestStreamToolClaudeCodeDecloak verifies a claude-code backend stream with a
 // cloaked tool_use name is decloaked to the original on the way to an OpenAI
 // ingress.

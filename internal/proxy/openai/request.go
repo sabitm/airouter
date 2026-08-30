@@ -114,6 +114,9 @@ func decodeUserContent(raw json.RawMessage) []ir.ContentBlock {
 
 func decodeAssistantContent(m chatMessage) []ir.ContentBlock {
 	var blocks []ir.ContentBlock
+	if reasoning := chatReasoningText(m.ReasoningContent, m.Reasoning, m.ReasoningDetails); reasoning != "" {
+		blocks = append(blocks, ir.ContentBlock{Type: ir.BlockReasoning, Text: reasoning})
+	}
 	if t := contentToText(m.Content); t != "" {
 		blocks = append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: t})
 	}
@@ -229,9 +232,11 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 func encodeMessage(m ir.Message) []chatMessage {
 	if m.Role == ir.RoleAssistant {
 		msg := chatMessage{Role: "assistant"}
-		var text strings.Builder
+		var text, reasoning strings.Builder
 		for _, b := range m.Content {
 			switch b.Type {
+			case ir.BlockReasoning:
+				reasoning.WriteString(b.Text)
 			case ir.BlockText:
 				text.WriteString(b.Text)
 			case ir.BlockToolUse:
@@ -248,6 +253,7 @@ func encodeMessage(m ir.Message) []chatMessage {
 		if t := text.String(); t != "" {
 			msg.Content = mustText(t)
 		}
+		msg.ReasoningContent = reasoning.String()
 		return []chatMessage{msg}
 	}
 

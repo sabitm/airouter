@@ -19,6 +19,9 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 	out := &ir.Response{ID: resp.ID, Model: resp.Model, StopReason: ir.StopEndTurn}
 	if len(resp.Choices) > 0 {
 		c := resp.Choices[0]
+		if reasoning := chatReasoningText(c.Message.ReasoningContent, c.Message.Reasoning, c.Message.ReasoningDetails); reasoning != "" {
+			out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockReasoning, Text: reasoning})
+		}
 		if c.Message.Content != nil && *c.Message.Content != "" {
 			out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockText, Text: *c.Message.Content})
 		}
@@ -46,9 +49,11 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 		id = ir.NewID("chatcmpl-")
 	}
 	msg := chatRespMessage{Role: "assistant"}
-	var text strings.Builder
+	var text, reasoning strings.Builder
 	for _, b := range resp.Content {
 		switch b.Type {
+		case ir.BlockReasoning:
+			reasoning.WriteString(b.Text)
 		case ir.BlockText:
 			text.WriteString(b.Text)
 		case ir.BlockToolUse:
@@ -65,6 +70,7 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	if t := text.String(); t != "" {
 		msg.Content = &t
 	}
+	msg.ReasoningContent = reasoning.String()
 	out := chatResponse{
 		ID:      id,
 		Object:  "chat.completion",

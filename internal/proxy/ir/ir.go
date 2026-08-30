@@ -21,6 +21,7 @@ type BlockType string
 
 const (
 	BlockText       BlockType = "text"
+	BlockReasoning  BlockType = "reasoning"
 	BlockImage      BlockType = "image"
 	BlockFile       BlockType = "file"
 	BlockToolUse    BlockType = "tool_use"
@@ -51,7 +52,7 @@ type File struct {
 type ContentBlock struct {
 	Type BlockType
 
-	Text  string // BlockText
+	Text  string // BlockText or BlockReasoning
 	Image *Image // BlockImage
 	File  *File  // BlockFile
 
@@ -141,7 +142,7 @@ type Usage struct {
 type Response struct {
 	ID         string
 	Model      string
-	Content    []ContentBlock // text and tool_use blocks
+	Content    []ContentBlock // text, reasoning, and tool_use blocks
 	StopReason StopReason
 	Usage      Usage
 }

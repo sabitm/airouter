@@ -39,7 +39,8 @@ type anthMessage struct {
 type anthBlock struct {
 	Type string `json:"type"`
 
-	Text string `json:"text,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
 
 	// image | document
 	Source *anthSource `json:"source,omitempty"`

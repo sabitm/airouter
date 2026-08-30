@@ -26,9 +26,12 @@ type chunkChoice struct {
 }
 
 type chunkDelta struct {
-	Role      string          `json:"role,omitempty"`
-	Content   string          `json:"content,omitempty"`
-	ToolCalls []chunkToolCall `json:"tool_calls,omitempty"`
+	Role             string            `json:"role,omitempty"`
+	Content          string            `json:"content,omitempty"`
+	ReasoningContent string            `json:"reasoning_content,omitempty"`
+	Reasoning        json.RawMessage   `json:"reasoning,omitempty"`
+	ReasoningDetails []json.RawMessage `json:"reasoning_details,omitempty"`
+	ToolCalls        []chunkToolCall   `json:"tool_calls,omitempty"`
 }
 
 type chunkToolCall struct {
@@ -145,7 +148,8 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		hasContent := chunk.ID != "" || chunk.Model != "" || chunk.Usage != nil
 		if !hasContent {
 			for _, c := range chunk.Choices {
-				if c.Delta.Role != "" || c.Delta.Content != "" || len(c.Delta.ToolCalls) > 0 ||
+				reasoning := chatReasoningText(c.Delta.ReasoningContent, c.Delta.Reasoning, c.Delta.ReasoningDetails)
+				if c.Delta.Role != "" || c.Delta.Content != "" || reasoning != "" || len(c.Delta.ToolCalls) > 0 ||
 					(c.FinishReason != nil && *c.FinishReason != "") {
 					hasContent = true
 					break
@@ -166,6 +170,11 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			outputTokens = chunk.Usage.CompletionTokens
 		}
 		for _, c := range chunk.Choices {
+			if reasoning := chatReasoningText(c.Delta.ReasoningContent, c.Delta.Reasoning, c.Delta.ReasoningDetails); reasoning != "" {
+				if err := emit(ir.StreamEvent{Kind: ir.EventReasoningDelta, Text: reasoning}); err != nil {
+					return err
+				}
+			}
 			if c.Delta.Content != "" {
 				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: c.Delta.Content}); err != nil {
 					return err
@@ -240,6 +249,8 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		return e.emit(w, chunkDelta{Role: "assistant"}, nil)
 	case ir.EventTextDelta:
 		return e.emit(w, chunkDelta{Content: ev.Text}, nil)
+	case ir.EventReasoningDelta:
+		return e.emit(w, chunkDelta{ReasoningContent: ev.Text}, nil)
 	case ir.EventToolCallStart:
 		idx := e.nextTool
 		e.nextTool++

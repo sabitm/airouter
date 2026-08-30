@@ -6,6 +6,7 @@ type StreamEventKind int
 const (
 	EventMessageStart StreamEventKind = iota
 	EventTextDelta
+	EventReasoningDelta
 	EventToolCallStart
 	EventToolCallDelta
 	EventFinish
@@ -22,7 +23,7 @@ type StreamEvent struct {
 	Model       string
 	InputTokens int
 
-	// EventTextDelta
+	// EventTextDelta / EventReasoningDelta
 	Text string
 
 	// EventToolCallStart / EventToolCallDelta

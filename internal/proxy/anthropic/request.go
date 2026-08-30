@@ -79,6 +79,10 @@ func decodeBlocks(raw json.RawMessage) []ir.ContentBlock {
 	var out []ir.ContentBlock
 	for _, b := range blocks {
 		switch b.Type {
+		case "thinking":
+			if b.Thinking != "" {
+				out = append(out, ir.ContentBlock{Type: ir.BlockReasoning, Text: b.Thinking})
+			}
 		case "text":
 			out = append(out, ir.ContentBlock{Type: ir.BlockText, Text: b.Text})
 		case "image":
@@ -212,6 +216,8 @@ func encodeBlocks(blocks []ir.ContentBlock) []anthBlock {
 	out := make([]anthBlock, 0, len(blocks))
 	for _, b := range blocks {
 		switch b.Type {
+		case ir.BlockReasoning:
+			out = append(out, anthBlock{Type: "thinking", Thinking: b.Text})
 		case ir.BlockText:
 			out = append(out, anthBlock{Type: "text", Text: b.Text})
 		case ir.BlockImage:

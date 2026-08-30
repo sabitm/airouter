@@ -730,7 +730,7 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		dst.WriteString(value)
 		return nil
 	}
-	var text strings.Builder
+	var text, reasoning strings.Builder
 	type toolBuf struct {
 		id   string
 		name string
@@ -779,6 +779,10 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			}
 		case ir.EventTextDelta:
 			if err := appendTo(&text, ev.Text); err != nil {
+				return err
+			}
+		case ir.EventReasoningDelta:
+			if err := appendTo(&reasoning, ev.Text); err != nil {
 				return err
 			}
 		case ir.EventToolCallStart:
@@ -830,6 +834,9 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 	// empty response instead of failing over.
 	if !sawEvent {
 		return nil, &ir.StreamFailure{Message: "upstream returned an empty stream"}
+	}
+	if reasoning.Len() > 0 {
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockReasoning, Text: reasoning.String()})
 	}
 	if text.Len() > 0 {
 		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText, Text: text.String()})

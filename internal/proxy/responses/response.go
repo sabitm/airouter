@@ -88,8 +88,9 @@ type respUsage struct {
 }
 
 type respOutputItem struct {
-	Type      string              `json:"type"` // message | function_call
+	Type      string              `json:"type"` // message | reasoning | function_call
 	Content   []respOutputContent `json:"content"`
+	Summary   []reasoningSummary  `json:"summary"`
 	CallID    string              `json:"call_id"`
 	Name      string              `json:"name"`
 	Arguments string              `json:"arguments"`
@@ -118,6 +119,12 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 	sawTool := false
 	for _, it := range resp.Output {
 		switch it.Type {
+		case "reasoning":
+			for _, summary := range it.Summary {
+				if summary.Text != "" {
+					out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockReasoning, Text: summary.Text})
+				}
+			}
 		case "message":
 			var text strings.Builder
 			for _, c := range it.Content {
@@ -190,6 +197,14 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 // each tool_use block as a function_call item, preserving order.
 func buildOutput(blocks []ir.ContentBlock) []map[string]any {
 	var output []map[string]any
+	for _, b := range blocks {
+		if b.Type == ir.BlockReasoning && b.Text != "" {
+			output = append(output, map[string]any{
+				"type": "reasoning", "id": ir.NewID("rs_"),
+				"summary": []any{map[string]any{"type": "summary_text", "text": b.Text}},
+			})
+		}
+	}
 	var textParts []map[string]any
 	for _, b := range blocks {
 		if b.Type == ir.BlockText {
