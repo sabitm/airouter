@@ -2,6 +2,7 @@ package sse
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -100,6 +101,50 @@ func TestReaderMultipleEvents(t *testing.T) {
 	}
 }
 
+func TestReaderSizeLimits(t *testing.T) {
+	t.Run("line at limit", func(t *testing.T) {
+		payload := strings.Repeat("x", maxLineBytes-len("data: "))
+		ev, err := NewReader(strings.NewReader("data: " + payload + "\n\n")).Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if string(ev.Data) != payload {
+			t.Fatalf("data length = %d, want %d", len(ev.Data), len(payload))
+		}
+	})
+
+	t.Run("line over limit", func(t *testing.T) {
+		input := "data: " + strings.Repeat("x", maxLineBytes-len("data: ")+1) + "\n\n"
+		_, err := NewReader(strings.NewReader(input)).Next()
+		var sizeErr *SizeLimitError
+		if !errors.As(err, &sizeErr) || sizeErr.Scope != "line" || sizeErr.Limit != maxLineBytes {
+			t.Fatalf("error = %v, want line SizeLimitError", err)
+		}
+	})
+
+	t.Run("multiline event at limit", func(t *testing.T) {
+		first := strings.Repeat("a", maxEventBytes/2)
+		second := strings.Repeat("b", maxEventBytes-len(first)-1)
+		ev, err := NewReader(strings.NewReader("data: " + first + "\ndata: " + second + "\n\n")).Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if len(ev.Data) != maxEventBytes {
+			t.Fatalf("data length = %d, want %d", len(ev.Data), maxEventBytes)
+		}
+	})
+
+	t.Run("multiline event over limit", func(t *testing.T) {
+		first := strings.Repeat("a", maxEventBytes/2)
+		second := strings.Repeat("b", maxEventBytes-len(first))
+		_, err := NewReader(strings.NewReader("data: " + first + "\ndata: " + second + "\n\n")).Next()
+		var sizeErr *SizeLimitError
+		if !errors.As(err, &sizeErr) || sizeErr.Scope != "event" || sizeErr.Limit != maxEventBytes {
+			t.Fatalf("error = %v, want event SizeLimitError", err)
+		}
+	})
+}
+
 func newWriter(t *testing.T) (*Writer, *httptest.ResponseRecorder) {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -181,7 +226,7 @@ func TestNewWriterSetsHeaders(t *testing.T) {
 	_, rec := newWriter(t)
 	h := rec.Header()
 	for k, want := range map[string]string{
-		"Content-Type": "text/event-stream",
+		"Content-Type":  "text/event-stream",
 		"Cache-Control": "no-cache",
 		"Connection":    "keep-alive",
 	} {
@@ -194,10 +239,10 @@ func TestNewWriterSetsHeaders(t *testing.T) {
 // failingWriter is an http.ResponseWriter + http.Flusher that fails all writes.
 type failingWriter struct{}
 
-func (failingWriter) Header() http.Header                 { return http.Header{} }
-func (failingWriter) Write([]byte) (int, error)           { return 0, io.ErrShortWrite }
-func (failingWriter) WriteHeader(statusCode int)          {}
-func (failingWriter) Flush()                              {}
+func (failingWriter) Header() http.Header        { return http.Header{} }
+func (failingWriter) Write([]byte) (int, error)  { return 0, io.ErrShortWrite }
+func (failingWriter) WriteHeader(statusCode int) {}
+func (failingWriter) Flush()                     {}
 
 // nonFlusherWriter implements http.ResponseWriter but NOT http.Flusher.
 type nonFlusherWriter struct{}

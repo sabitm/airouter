@@ -11,6 +11,22 @@ import (
 	"strings"
 )
 
+const (
+	maxLineBytes  = 8 << 20
+	maxEventBytes = 8 << 20
+)
+
+// SizeLimitError reports an SSE line or assembled event that exceeded its
+// parser budget.
+type SizeLimitError struct {
+	Scope string
+	Limit int
+}
+
+func (e *SizeLimitError) Error() string {
+	return fmt.Sprintf("sse %s exceeds %d bytes", e.Scope, e.Limit)
+}
+
 // Event is one parsed SSE event. Name is empty for OpenAI-style streams that
 // only use data lines; Anthropic streams set it (e.g. "content_block_delta").
 type Event struct {
@@ -18,8 +34,8 @@ type Event struct {
 	Data []byte
 }
 
-// Reader parses an SSE byte stream into events. It uses bufio.Reader rather than
-// Scanner so individual data lines are not bounded by a token size limit.
+// Reader parses an SSE byte stream into events. ReadSlice keeps allocation
+// bounded while still allowing lines larger than the internal 64 KiB buffer.
 type Reader struct {
 	br *bufio.Reader
 }
@@ -32,36 +48,80 @@ func NewReader(r io.Reader) *Reader {
 // (starting with ':') are ignored; multiple data lines are joined with '\n'.
 func (r *Reader) Next() (Event, error) {
 	var ev Event
-	var data []string
 	hasData := false
 
 	for {
-		line, err := r.br.ReadString('\n')
+		line, err := r.readLine()
 		if len(line) > 0 {
-			trimmed := strings.TrimRight(line, "\r\n")
 			switch {
-			case trimmed == "":
-				if hasData || ev.Name != "" {
-					ev.Data = []byte(strings.Join(data, "\n"))
-					return ev, nil
+			case line[0] == ':':
+				// Comment, ignore.
+			case bytes.HasPrefix(line, []byte("event:")):
+				name := strings.TrimSpace(string(line[len("event:"):]))
+				if len(name)+len(ev.Data) > maxEventBytes {
+					return Event{}, &SizeLimitError{Scope: "event", Limit: maxEventBytes}
 				}
-				// stray blank line before any field; keep reading
-			case strings.HasPrefix(trimmed, ":"):
-				// comment, ignore
-			case strings.HasPrefix(trimmed, "event:"):
-				ev.Name = strings.TrimSpace(trimmed[len("event:"):])
-			case strings.HasPrefix(trimmed, "data:"):
-				// Per the SSE spec a single optional space after the colon is stripped.
-				data = append(data, strings.TrimPrefix(trimmed[len("data:"):], " "))
+				ev.Name = name
+			case bytes.HasPrefix(line, []byte("data:")):
+				payload := line[len("data:"):]
+				if len(payload) > 0 && payload[0] == ' ' {
+					payload = payload[1:]
+				}
+				extra := len(payload)
+				if hasData {
+					extra++
+				}
+				if len(ev.Name)+len(ev.Data)+extra > maxEventBytes {
+					return Event{}, &SizeLimitError{Scope: "event", Limit: maxEventBytes}
+				}
+				if hasData {
+					ev.Data = append(ev.Data, '\n')
+				}
+				ev.Data = append(ev.Data, payload...)
 				hasData = true
 			}
+		} else if err == nil {
+			if hasData || ev.Name != "" {
+				return ev, nil
+			}
+			// Stray blank line before any field; keep reading.
 		}
 		if err != nil {
 			if (hasData || ev.Name != "") && err == io.EOF {
-				ev.Data = []byte(strings.Join(data, "\n"))
 				return ev, nil
 			}
 			return Event{}, err
+		}
+	}
+}
+
+func (r *Reader) readLine() ([]byte, error) {
+	var line []byte
+	for {
+		fragment, err := r.br.ReadSlice('\n')
+		hasNewline := len(fragment) > 0 && fragment[len(fragment)-1] == '\n'
+		if hasNewline {
+			fragment = fragment[:len(fragment)-1]
+		}
+		if len(line)+len(fragment) > maxLineBytes+1 {
+			return nil, &SizeLimitError{Scope: "line", Limit: maxLineBytes}
+		}
+		line = append(line, fragment...)
+
+		if hasNewline || err == io.EOF {
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+			if len(line) > maxLineBytes {
+				return nil, &SizeLimitError{Scope: "line", Limit: maxLineBytes}
+			}
+			return line, err
+		}
+		if len(line) > maxLineBytes && line[len(line)-1] != '\r' {
+			return nil, &SizeLimitError{Scope: "line", Limit: maxLineBytes}
+		}
+		if err != nil && err != bufio.ErrBufferFull {
+			return line, err
 		}
 	}
 }

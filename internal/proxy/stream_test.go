@@ -1902,6 +1902,67 @@ func TestPassthroughPreCommitReadFailureFailover(t *testing.T) {
 	}
 }
 
+func TestPassthroughOversizedPreCommitEventFailsOver(t *testing.T) {
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: "+strings.Repeat("x", 8<<20)+"\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "oversized", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	p2 := &domain.Provider{Name: "good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	resp, body := postStream(t, server.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d, want 1/1", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body length = %d", resp.StatusCode, len(body))
+	}
+	if strings.Contains(body, strings.Repeat("x", 1024)) {
+		t.Fatal("oversized first-target bytes leaked to client")
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" || !finished {
+		t.Fatalf("fallback stream text=%q finished=%v", text, finished)
+	}
+}
+
 func TestPassthroughPostCommitReadFailureNoFailover(t *testing.T) {
 	var n1, n2 int
 	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
