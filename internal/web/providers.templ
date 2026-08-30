@@ -4,6 +4,7 @@ import (
 	"strconv"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/opencode"
 )
 
 templ ProvidersPage(providers []*domain.Provider, baseURL string) {
@@ -359,6 +360,34 @@ templ ProviderRecipeForm(r recipe) {
 					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
 				</div>
 			</form>
+		case kindOpencode:
+			<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
+				<input type="hidden" name="auth_method" value="apikey"/>
+				<input type="hidden" name="auth_scheme" value="bearer"/>
+				<label class="field">
+					<span class="field-name">Name</span>
+					<input name="name" placeholder="e.g. opencode zen" required/>
+				</label>
+				<label class="field">
+					<span class="field-name">Tier</span>
+					<select name="opencode_tier" title="opencode.ai tier" aria-label="opencode tier">
+						<option value="zen">zen (free, key "public")</option>
+						<option value="go">go (paid, API key)</option>
+					</select>
+				</label>
+				<label class="field">
+					<span class="field-name">API key</span>
+					<input name="api_key" type="password" placeholder="blank for zen (uses public)"/>
+				</label>
+				<div class="form-actions">
+					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+					<span class="check-indicator htmx-indicator">checking...</span>
+					<span class="check-result" aria-live="polite"></span>
+					<button type="submit">Add</button>
+					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				</div>
+			</form>
 		case kindGenericAPIKey:
 			<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
@@ -533,6 +562,8 @@ templ ProviderEditRow(p *domain.Provider) {
 				@providerEditRowQoder(p)
 			} else if p.Protocol == domain.ProtocolCursor {
 				@providerEditRowCursor(p)
+			} else if p.Protocol == domain.ProtocolOpencode {
+				@providerEditRowOpencode(p)
 			} else if p.Method() == domain.AuthOAuth && providerEditInteractiveOAuth(p.Protocol) {
 				@providerEditRowInteractiveOAuth(p)
 			} else {
@@ -540,6 +571,35 @@ templ ProviderEditRow(p *domain.Provider) {
 			}
 		</td>
 	</tr>
+}
+
+templ providerEditRowOpencode(p *domain.Provider) {
+	<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(p.Protocol) } hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
+		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
+		<input type="hidden" name="protocol" value={ string(p.Protocol) }/>
+		<input type="hidden" name="auth_method" value="apikey"/>
+		<input type="hidden" name="auth_scheme" value="bearer"/>
+		<input type="hidden" name="reasoning_dialect" value={ string(lockedReasoningDialect(p.Protocol)) }/>
+		<label class="field">
+			<span class="field-name">Name</span>
+			<input name="name" value={ p.Name } required/>
+		</label>
+		<label class="field">
+			<span class="field-name">Tier</span>
+			<select name="opencode_tier" title="opencode.ai tier" aria-label="opencode tier">
+				<option value="zen" selected?={ opencode.Tier(p.BaseURL) != "go" }>zen (free, key "public")</option>
+				<option value="go" selected?={ opencode.Tier(p.BaseURL) == "go" }>go (paid, API key)</option>
+			</select>
+		</label>
+		<label class="field">
+			<span class="field-name">API key</span>
+			<input name="api_key" type="password" placeholder="leave blank to keep current"/>
+		</label>
+		<div class="form-actions">
+			@providerEditCheck()
+			@providerEditSaveCancel(p)
+		</div>
+	</form>
 }
 
 templ providerEditRowGenericAPIKey(p *domain.Provider) {

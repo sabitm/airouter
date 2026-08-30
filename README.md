@@ -53,9 +53,21 @@ Anthropic-compatible APIs. The dashboard also includes guided connections for:
 | Antigravity (Google Cloud Code) | OAuth; unofficial |
 | Cursor | OAuth or imported CLI/IDE token; unofficial |
 | Claude Code | OAuth; unofficial |
+| OpenCode Zen | zen tier: key `public`; go tier: opencode.ai API key |
 
 Provider credentials and OAuth tokens are encrypted in SQLite using
 `AIROUTER_SECRET`. OAuth tokens are refreshed automatically when supported.
+
+### OpenCode Zen notes
+
+One provider row covers both opencode.ai tiers; the dashboard tier selector
+(zen / go) fixes the base URL (`https://opencode.ai/zen/v1` or
+`.../zen/go/v1`) and the credential (`public` for zen, a real API key for go).
+The wire format is model-dependent, not fixed: muse-spark models are served
+over the Responses API while every other model uses Chat Completions; the proxy
+picks the endpoint per target model. All upstream requests carry the opencode
+client fingerprint (the zen tier rate-limits traffic without it), and
+reasoning levels are clamped to what each upstream model accepts.
 
 ## Client API
 

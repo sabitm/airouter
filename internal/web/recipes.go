@@ -8,6 +8,7 @@ import (
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 )
 
@@ -19,6 +20,7 @@ const (
 	kindQoder            recipeKind = "qoder"
 	kindCursor           recipeKind = "cursor"
 	kindGenericAPIKey    recipeKind = "generic-apikey"
+	kindOpencode         recipeKind = "opencode"
 )
 
 // recipe is a provider-creation template: a card in the gallery that, when
@@ -46,6 +48,7 @@ var recipes = []recipe{
 	{ID: "antigravity", Label: "Antigravity", Sublabel: "Google Cloud Code (unofficial)", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolAntigravity, Method: domain.AuthOAuth, Preset: "antigravity", BaseURL: antigravity.DefaultBaseURL},
 	{ID: "cursor", Label: "Cursor", Sublabel: "cursor.com (unofficial)", Tag: "OAuth", Kind: kindCursor, Protocol: domain.ProtocolCursor, Method: domain.AuthOAuth, Preset: "cursor", BaseURL: cursor.DefaultBaseURL},
 	{ID: "claude", Label: "Claude Code", Sublabel: "claude.ai (unofficial)", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolClaudeCode, Method: domain.AuthOAuth, Preset: "claude", BaseURL: claudecode.DefaultBaseURL},
+	{ID: "opencode", Label: "OpenCode", Sublabel: "opencode.ai free tier", Tag: "API key", Kind: kindOpencode, Protocol: domain.ProtocolOpencode, Method: domain.AuthAPIKey, BaseURL: opencode.ZenBaseURL},
 	{ID: "openai", Label: "OpenAI-compatible", Sublabel: "OpenRouter, OpenAI, vLLM...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAI, Method: domain.AuthAPIKey},
 	{ID: "openai-responses", Label: "OpenAI Responses", Sublabel: "Responses API upstreams", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAIResponses, Method: domain.AuthAPIKey},
 	{ID: "anthropic", Label: "Anthropic-compatible", Sublabel: "Claude API...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolAnthropic, Method: domain.AuthAPIKey},

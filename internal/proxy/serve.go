@@ -315,7 +315,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		provider := t.Provider
 		rec.Provider = provider.Name
 		rec.UpstreamModel = t.UpstreamModel
-		backend := backendCodec(provider.Protocol)
+		backend := backendCodec(provider.Protocol, t.UpstreamModel)
 
 		attemptStart := time.Now()
 		if ingress.id == backend.id {
@@ -483,7 +483,7 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 		for _, t := range enabled {
 			backend := openaiCodec
 			if t.Provider != nil {
-				backend = backendCodec(t.Provider.Protocol)
+				backend = backendCodec(t.Provider.Protocol, t.UpstreamModel)
 			}
 			translated := ingress.id != backend.id
 			if reason := prep.checkCompatible(backend, translated); reason != "" {

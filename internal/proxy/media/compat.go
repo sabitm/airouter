@@ -32,7 +32,7 @@ type BackendCaps struct {
 // CapsForCodecID returns transport attachment capabilities for a backend codec id.
 func CapsForCodecID(id string) BackendCaps {
 	switch id {
-	case "oai-chat":
+	case "oai-chat", "opencode-chat":
 		// Chat file_data carries PDFs and generic files the same way; there is
 		// no stable public file_url field.
 		return BackendCaps{
@@ -51,7 +51,7 @@ func CapsForCodecID(id string) BackendCaps {
 			PDFURL:          true,
 			ToolResultMedia: true,
 		}
-	case "oai-responses":
+	case "oai-responses", "opencode-responses":
 		// input_file carries PDFs via the same inline/URL forms as generic files.
 		return BackendCaps{
 			ImageInline: true,

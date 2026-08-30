@@ -6,7 +6,7 @@ func TestProtocolValid(t *testing.T) {
 	valid := []Protocol{
 		ProtocolOpenAI, ProtocolAnthropic, ProtocolOpenAIResponses,
 		ProtocolOpenAICodex, ProtocolKiro, ProtocolQoder,
-		ProtocolAntigravity, ProtocolCursor, ProtocolClaudeCode,
+		ProtocolAntigravity, ProtocolCursor, ProtocolClaudeCode, ProtocolOpencode,
 	}
 	for _, p := range valid {
 		if !p.Valid() {
@@ -204,6 +204,7 @@ func TestDefaultReasoningDialect(t *testing.T) {
 		{ProtocolQoder, ReasoningNone},
 		{ProtocolAntigravity, ReasoningNone},
 		{ProtocolCursor, ReasoningNone},
+		{ProtocolOpencode, ReasoningOpencode},
 	}
 	for _, tc := range cases {
 		if got := DefaultReasoningDialect(tc.p); got != tc.want {

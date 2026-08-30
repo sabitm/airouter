@@ -582,6 +582,8 @@ func protocolForCodec(c codec) domain.Protocol {
 		return domain.ProtocolOpenAICodex
 	case "claude-code":
 		return domain.ProtocolClaudeCode
+	case "opencode-chat", "opencode-responses":
+		return domain.ProtocolOpencode
 	case "cursor":
 		return domain.ProtocolCursor
 	case "kiro":

@@ -227,6 +227,67 @@ func TestCapsIncompatible(t *testing.T) {
 	}
 }
 
+func TestOpencodeCapsMatchWireCodecs(t *testing.T) {
+	aliases := []struct {
+		opencode string
+		wire     string
+	}{
+		{opencode: "opencode-chat", wire: "oai-chat"},
+		{opencode: "opencode-responses", wire: "oai-responses"},
+	}
+	for _, alias := range aliases {
+		if got, want := CapsForCodecID(alias.opencode), CapsForCodecID(alias.wire); got != want {
+			t.Errorf("CapsForCodecID(%q) = %+v, want %q capabilities %+v", alias.opencode, got, alias.wire, want)
+		}
+	}
+}
+
+func TestOpencodeCapsIncompatible(t *testing.T) {
+	accepted := []struct {
+		name  string
+		codec string
+		att   Attachment
+	}{
+		{name: "chat inline image", codec: "opencode-chat", att: Attachment{Kind: KindImage, IsImage: true, HasData: true}},
+		{name: "chat URL image", codec: "opencode-chat", att: Attachment{Kind: KindImage, IsImage: true, HasURL: true}},
+		{name: "chat inline PDF", codec: "opencode-chat", att: Attachment{Kind: KindPDF, HasData: true}},
+		{name: "chat inline file", codec: "opencode-chat", att: Attachment{Kind: KindGeneric, HasData: true}},
+		{name: "responses inline image", codec: "opencode-responses", att: Attachment{Kind: KindImage, IsImage: true, HasData: true}},
+		{name: "responses URL image", codec: "opencode-responses", att: Attachment{Kind: KindImage, IsImage: true, HasURL: true}},
+		{name: "responses inline PDF", codec: "opencode-responses", att: Attachment{Kind: KindPDF, HasData: true}},
+		{name: "responses URL PDF", codec: "opencode-responses", att: Attachment{Kind: KindPDF, HasURL: true}},
+		{name: "responses inline file", codec: "opencode-responses", att: Attachment{Kind: KindGeneric, HasData: true}},
+		{name: "responses URL file", codec: "opencode-responses", att: Attachment{Kind: KindGeneric, HasURL: true}},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if reason := CapsForCodecID(tc.codec).Incompatible([]Attachment{tc.att}, true); reason != "" {
+				t.Fatalf("unexpected incompatibility: %s", reason)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name  string
+		codec string
+		att   Attachment
+	}{
+		{name: "chat URL PDF", codec: "opencode-chat", att: Attachment{Kind: KindPDF, HasURL: true}},
+		{name: "chat URL file", codec: "opencode-chat", att: Attachment{Kind: KindGeneric, HasURL: true}},
+		{name: "chat nested image", codec: "opencode-chat", att: Attachment{Kind: KindImage, IsImage: true, HasData: true, InToolResult: true}},
+		{name: "responses nested image", codec: "opencode-responses", att: Attachment{Kind: KindImage, IsImage: true, HasData: true, InToolResult: true}},
+		{name: "chat translated file ID", codec: "opencode-chat", att: Attachment{Kind: KindGeneric, HasID: true}},
+		{name: "responses translated file ID", codec: "opencode-responses", att: Attachment{Kind: KindGeneric, HasID: true}},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			if reason := CapsForCodecID(tc.codec).Incompatible([]Attachment{tc.att}, true); reason == "" {
+				t.Fatal("expected incompatibility")
+			}
+		})
+	}
+}
+
 func TestInspectRequestToolResultPlacement(t *testing.T) {
 	req := &ir.Request{Messages: []ir.Message{
 		{Role: ir.RoleUser, Content: []ir.ContentBlock{

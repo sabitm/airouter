@@ -16,6 +16,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 )
 
@@ -41,9 +42,13 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	baseURL := strings.TrimSpace(r.FormValue("base_url"))
-	if baseURL == "" {
-		render(w, r, CheckResult(false, "enter a base URL"))
-		return
+	// The opencode tier select fully determines the base URL; an empty form
+	// value (tier-only forms) falls back to zen.
+	if proto == domain.ProtocolOpencode {
+		if baseURL == "" {
+			baseURL = opencode.ZenBaseURL
+		}
+		baseURL = opencodeBaseURLForTier(opencodeTierFromForm(r, baseURL))
 	}
 
 	method := domain.AuthMethod(r.FormValue("auth_method"))
@@ -59,6 +64,13 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 			if p, err := h.store.GetProvider(r.Context(), id); err == nil {
 				apiKey = p.APIKey
 			}
+		}
+	}
+	// The opencode tier select fully determines the base URL (derived above).
+	if proto == domain.ProtocolOpencode {
+		baseURL = opencodeBaseURLForTier(opencodeTierFromForm(r, baseURL))
+		if apiKey == "" && baseURL == opencode.ZenBaseURL {
+			apiKey = opencode.PublicKey
 		}
 	}
 	if apiKey == "" {
@@ -158,6 +170,9 @@ func checkUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider)
 	if p.Protocol == domain.ProtocolClaudeCode {
 		return checkClaudeCodeUpstream(ctx, logger, p)
 	}
+	if p.Protocol == domain.ProtocolOpencode {
+		return checkOpencodeUpstream(ctx, logger, p)
+	}
 	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
 		return checkClineUpstream(ctx, logger, p)
 	}
@@ -241,6 +256,42 @@ func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain
 		return false, "reachable, but response shape unexpected"
 	}
 	return true, fmt.Sprintf("OK - reachable, token accepted (%d models)", len(parsed.Data))
+}
+
+// checkOpencodeUpstream validates a zen/go tier credential against the
+// opencode.ai /models endpoint with the client fingerprint: without it the zen
+// tier rejects even valid "public" probes as unidentified traffic.
+func checkOpencodeUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
+	url := strings.TrimRight(p.BaseURL, "/") + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, "invalid base URL"
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+	opencode.FingerprintHeaders(req.Header, "")
+
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_opencode")
+	if err != nil {
+		return false, "could not reach URL: " + err.Error()
+	}
+	switch {
+	case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
+		return false, fmt.Sprintf("API key rejected (HTTP %d)", pr.StatusCode)
+	case pr.StatusCode == http.StatusNotFound:
+		return false, "not found (HTTP 404) - check base URL and tier"
+	case pr.StatusCode >= 400:
+		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(pr.Body, &parsed); err != nil || parsed.Data == nil {
+		return false, "reachable, but response shape unexpected"
+	}
+	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
 }
 
 // checkQoderUpstream validates a Qoder device token against openapi userinfo.

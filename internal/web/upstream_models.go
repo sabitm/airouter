@@ -14,6 +14,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
 )
@@ -69,6 +70,11 @@ func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 			return codexModels(), nil
 		}
 		return models, nil
+	}
+	// OpenCode needs the client fingerprint even for /models: without it the zen
+	// tier classifies the probe as unidentified traffic.
+	if p.Protocol == domain.ProtocolOpencode {
+		return fetchOpencodeModels(ctx, logger, p)
 	}
 	// Kiro has no /models endpoint; live discovery is out of scope. Serve the
 	// static catalog so combo autocomplete still offers the known model ids.
@@ -127,6 +133,42 @@ func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 		return nil, fmt.Errorf("HTTP %d", pr.StatusCode)
 	}
 
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(pr.Body, &parsed); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		if m.ID != "" {
+			out = append(out, m.ID)
+		}
+	}
+	return out, nil
+}
+
+// fetchOpencodeModels queries the opencode.ai /models endpoint with the
+// opencode client fingerprint. The response is the standard OpenAI {data:[{id}]}
+// shape on both tiers.
+func fetchOpencodeModels(ctx context.Context, logger *slog.Logger, p *domain.Provider) ([]string, error) {
+	url := strings.TrimRight(p.BaseURL, "/") + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+	opencode.FingerprintHeaders(req.Header, "")
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, "fetch_opencode_models")
+	if err != nil {
+		return nil, err
+	}
+	if pr.StatusCode < 200 || pr.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d", pr.StatusCode)
+	}
 	var parsed struct {
 		Data []struct {
 			ID string `json:"id"`

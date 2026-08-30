@@ -19,6 +19,7 @@ import (
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/store"
 	"airouter/internal/usage"
@@ -226,7 +227,28 @@ func kiroBaseURLOr(proto domain.Protocol, base string) string {
 	if proto == domain.ProtocolClaudeCode && strings.TrimSpace(base) == "" {
 		return claudecode.DefaultBaseURL
 	}
+	if proto == domain.ProtocolOpencode && strings.TrimSpace(base) == "" {
+		return opencode.ZenBaseURL
+	}
 	return base
+}
+
+// opencodeTierFromForm resolves the tier select ("zen"/"go") sent by the
+// opencode forms; the tier fully determines the base URL. Empty returns the
+// provider's stored URL-derived tier.
+func opencodeTierFromForm(r *http.Request, stored string) string {
+	if t := strings.TrimSpace(r.FormValue("opencode_tier")); t == "zen" || t == "go" {
+		return t
+	}
+	return opencode.Tier(stored)
+}
+
+// opencodeBaseURLForTier maps a tier to its base URL.
+func opencodeBaseURLForTier(tier string) string {
+	if tier == "go" {
+		return opencode.GoBaseURL
+	}
+	return opencode.ZenBaseURL
 }
 
 func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +272,15 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := strings.TrimSpace(r.FormValue("api_key"))
 	// Generic apikey providers need a credential at create time. Kiro may still
-	// rely on profile/oauth paths and is validated separately there.
+	// rely on profile/oauth paths and is validated separately there. OpenCode
+	// zen defaults the credential to the literal "public" key.
+	baseURL := kiroBaseURLOr(proto, r.FormValue("base_url"))
+	if proto == domain.ProtocolOpencode {
+		baseURL = opencodeBaseURLForTier(opencodeTierFromForm(r, baseURL))
+		if apiKey == "" && baseURL == opencode.ZenBaseURL {
+			apiKey = opencode.PublicKey
+		}
+	}
 	if proto != domain.ProtocolKiro && apiKey == "" {
 		htmxBadRequest(w, r, "provider-flash", "API key is required")
 		return
@@ -261,8 +291,8 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := &domain.Provider{
-		Name:             r.FormValue("name"),
-		BaseURL:          kiroBaseURLOr(proto, r.FormValue("base_url")),
+		Name:    r.FormValue("name"),
+		BaseURL: baseURL,
 		APIKey:           apiKey,
 		Protocol:         proto,
 		AuthScheme:       auth,
@@ -437,6 +467,9 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	cur.Name = r.FormValue("name")
 	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))
+	if proto == domain.ProtocolOpencode {
+		cur.BaseURL = opencodeBaseURLForTier(opencodeTierFromForm(r, cur.BaseURL))
+	}
 	cur.Protocol = proto
 	cur.AuthScheme = auth
 	cur.ReasoningDialect = dialect
@@ -453,6 +486,11 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	// Blank api_key means keep the existing one (form never echoes secrets).
 	if k := r.FormValue("api_key"); k != "" {
 		cur.APIKey = k
+	}
+	// Tier zen with no stored key: default to the literal "public" credential.
+	if proto == domain.ProtocolOpencode && cur.BaseURL == opencode.ZenBaseURL &&
+		strings.TrimSpace(cur.APIKey) == "" {
+		cur.APIKey = opencode.PublicKey
 	}
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
 		htmxBadRequest(w, r, "provider-flash", err.Error())
@@ -527,8 +565,7 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	cur.Protocol = proto
 	cur.AuthMethod = domain.AuthOAuth
 	cur.AuthScheme = domain.AuthBearer
-	cur.APIKey = ""
-	// Preserve current dialect when the form omits the field (fixed backends
+	cur.APIKey = ""	// Preserve current dialect when the form omits the field (fixed backends
 	// still submit a locked hidden value).
 	if r.FormValue("reasoning_dialect") != "" || reasoningDialectEditable(proto) {
 		cur.ReasoningDialect = dialect

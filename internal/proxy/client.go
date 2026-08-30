@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/kiro"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
 )
@@ -70,6 +72,10 @@ func newCodexSessionID() string {
 //     context for the X-Claude-Code-Session-Id header) and applies the OAuth-only
 //     cloak/decoy transform. The cloak gate and seed read OAuthCreds directly
 //     because the access token is resolved later, inside forward/forwardStream.
+//   - OpenCode: derives the conversation-stable x-opencode-session from the
+//     request body (saved on the trace context for the header emission) and
+//     applies the model-specific patch: muse-spark Responses normalization or
+//     the Chat reasoning_content echo for kimi/deepseek.
 //
 // Other backends return the body unchanged. A non-nil error is terminal for the
 // attempt (e.g. Qoder model_config unknown).
@@ -108,6 +114,18 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 			t.ClaudeCodeSessionID = sid
 		}
 		return claudecode.ApplyOAuthCloaking(body, claudeCodeToken(provider), sid, claudeCodeSeed(provider))
+	case "opencode-chat":
+		sid := opencode.DeriveSessionID(opencode.SessionSeedFromCreds(provider.APIKey, provider.BaseURL), opencode.AccumulateAssistantText(body))
+		if t := traceInfoFrom(ctx); t != nil {
+			t.OpencodeSessionID = sid
+		}
+		return opencode.InjectReasoningEcho(body, reqModelFromBody(body))
+	case "opencode-responses":
+		sid := opencode.DeriveSessionID(opencode.SessionSeedFromCreds(provider.APIKey, provider.BaseURL), opencode.AccumulateAssistantText(body))
+		if t := traceInfoFrom(ctx); t != nil {
+			t.OpencodeSessionID = sid
+		}
+		return opencode.PrepareMuseSparkResponse(body)
 	case "cursor":
 		// Cursor needs no body mutation; headers (checksum, identity) are applied
 		// in applyUpstreamHeaders after the client-header copy.
@@ -158,6 +176,16 @@ func kiroProfileArn(provider *domain.Provider) string {
 		return provider.OAuthCreds.ProfileArn
 	}
 	return ""
+}
+
+// reqModelFromBody reads the model field of an encoded upstream body; empty
+// when absent (the echo patch then stays a no-op).
+func reqModelFromBody(body []byte) string {
+	var m struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &m)
+	return m.Model
 }
 
 // hopByHopOrControlled are request headers we never copy from the client: either
@@ -249,6 +277,12 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	if provider.Protocol == domain.ProtocolClaudeCode {
 		applyClaudeCodeHeaders(req, ctx)
 	}
+	// OpenCode gates the free tier on the opencode client fingerprint; set it
+	// after the client-header copy so a forwarded non-opencode UA is replaced.
+	// Authorization keeps the scheme-switch value ("public" or a real key).
+	if provider.Protocol == domain.ProtocolOpencode {
+		applyOpencodeHeaders(req, ctx)
+	}
 }
 
 // applyQoderHeaders COSY-signs the wire body and sets Qoder identity headers.
@@ -322,6 +356,18 @@ func applyKiroHeaders(req *http.Request, provider *domain.Provider) {
 	if provider.Method() == domain.AuthAPIKey {
 		req.Header.Set("tokentype", "API_KEY")
 	}
+}
+
+// applyOpencodeHeaders sets the opencode client fingerprint (User-Agent,
+// x-opencode-client/project/session/request) for the zen tier's traffic
+// classification. A forwarded client User-Agent already containing "opencode"
+// is preserved so a real client's own version string wins.
+func applyOpencodeHeaders(req *http.Request, ctx context.Context) {
+	sid := ""
+	if t := traceInfoFrom(ctx); t != nil {
+		sid = t.OpencodeSessionID
+	}
+	opencode.FingerprintHeaders(req.Header, sid)
 }
 
 // applyClaudeCodeHeaders sets the Claude Code CLI identity fingerprint and the

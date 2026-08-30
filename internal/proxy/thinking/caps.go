@@ -83,6 +83,8 @@ func CapsFor(model string, protocol domain.Protocol, dialect domain.ReasoningDia
 		return zaiCaps(m)
 	case domain.ReasoningGrok:
 		return grokCaps(m, protocol)
+	case domain.ReasoningOpencode:
+		return opencodeCaps(m, protocol)
 	default:
 		return Caps{Reasoning: false, CanDisable: true, Format: FormatNone}
 	}
@@ -245,6 +247,40 @@ func grokCaps(m string, protocol domain.Protocol) Caps {
 		c.Format = FormatNone
 	}
 	return c
+}
+
+// opencodeCaps dispatches per model family: opencode.ai serves multi-vendor
+// models behind one endpoint, so the dialect has no single native shape.
+// muse-spark is the Responses-only exception; the vendor families reuse their
+// own caps on the Chat Completions transport.
+func opencodeCaps(m string, protocol domain.Protocol) Caps {
+	if strings.Contains(m, "muse-spark") {
+		// Upstream rejects reasoning.effort=none and accepts up to xhigh.
+		return Caps{
+			Reasoning:  true,
+			CanDisable: false,
+			Format:     FormatOpenAIResponses,
+			Levels:     []string{"minimal", "low", "medium", "high", "xhigh"},
+			MaxOutput:  131072,
+		}
+	}
+	switch {
+	case strings.Contains(m, "kimi"):
+		return kimiCaps(m)
+	case strings.Contains(m, "deepseek"):
+		return deepseekCaps(m)
+	case strings.Contains(m, "qwen"):
+		return qwenCaps(m)
+	case strings.Contains(m, "glm"):
+		return zaiCaps(m)
+	case strings.Contains(m, "minimax") || strings.Contains(m, "mimo"):
+		// MiniMax/MiMo adaptive thinking: binary on/off, cannot disable.
+		return Caps{Reasoning: true, CanDisable: false, Format: FormatZAI, Levels: []string{"thinking"}, MaxOutput: 131072}
+	default:
+		c := openaiCaps(m, protocol)
+		c.MaxOutput = 131072
+		return c
+	}
 }
 
 func claudeAdaptiveModel(m string) bool {

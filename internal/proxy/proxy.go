@@ -19,6 +19,7 @@ import (
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/openai"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
@@ -213,7 +214,42 @@ var claudeCodeCodec = codec{
 	newStreamEncoder: func(model string) streamEncoder { return anthropic.NewStreamEncoder(model) },
 }
 
-func backendCodec(p domain.Protocol) codec {
+// opencodeChatCodec is the opencode.ai Zen backend for most models: the
+// standard OpenAI Chat Completions wire format spoken with the opencode client
+// fingerprint. Its id differs from oai-chat so an OpenAI ingress request still
+// translates (through finalizeEncodedBody and the reasoning-echo patch) rather
+// than passing through raw.
+var opencodeChatCodec = codec{
+	id:               "opencode-chat",
+	protocol:         domain.ProtocolOpencode,
+	decodeRequest:    openai.DecodeRequest,
+	encodeRequest:    openai.EncodeRequest,
+	decodeResponse:   openai.DecodeResponse,
+	encodeResponse:   openai.EncodeResponse,
+	encodeError:      openai.EncodeError,
+	upstreamPath:     opencode.ChatPath,
+	decodeStream:     openai.DecodeStream,
+	newStreamEncoder: func(model string) streamEncoder { return openai.NewStreamEncoder(model) },
+}
+
+// opencodeResponsesCodec is the opencode.ai Zen backend for muse-spark models
+// (Responses-only upstream): the standard Responses wire format plus the
+// muse-spark normalization applied in prepareUpstreamRequest. Its id differs
+// from oai-responses so a Responses ingress request still translates.
+var opencodeResponsesCodec = codec{
+	id:               "opencode-responses",
+	protocol:         domain.ProtocolOpencode,
+	decodeRequest:    responses.DecodeRequest,
+	encodeRequest:    responses.EncodeRequest,
+	decodeResponse:   responses.DecodeResponse,
+	encodeResponse:   responses.EncodeResponse,
+	encodeError:      responses.EncodeError,
+	upstreamPath:     opencode.ResponsesPath,
+	decodeStream:     responses.DecodeStream,
+	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
+}
+
+func backendCodec(p domain.Protocol, model string) codec {
 	switch p {
 	case domain.ProtocolAnthropic:
 		return anthropicCodec
@@ -231,6 +267,11 @@ func backendCodec(p domain.Protocol) codec {
 		return cursorCodec
 	case domain.ProtocolClaudeCode:
 		return claudeCodeCodec
+	case domain.ProtocolOpencode:
+		if opencode.IsResponsesModel(model) {
+			return opencodeResponsesCodec
+		}
+		return opencodeChatCodec
 	default:
 		return openaiCodec
 	}

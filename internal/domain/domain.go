@@ -44,10 +44,17 @@ const (
 	// request never passes through and always translates through the cloak
 	// prepare step rather than forwarding the raw body.
 	ProtocolClaudeCode Protocol = "claude-code"
+	// ProtocolOpencode is the opencode.ai Zen backend. Backend only: two
+	// model-dependent wire variants share one provider row — most models speak
+	// OpenAI Chat Completions on /chat/completions while muse-spark models are
+	// Responses-only on /responses (each endpoint 500s for the other's models).
+	// The free (zen) tier authenticates with the literal key "public" and gates
+	// on a client fingerprint; the go (paid) tier uses a real API key.
+	ProtocolOpencode Protocol = "opencode"
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity || p == ProtocolCursor || p == ProtocolClaudeCode
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity || p == ProtocolCursor || p == ProtocolClaudeCode || p == ProtocolOpencode
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It
@@ -94,6 +101,10 @@ const (
 	ReasoningDeepSeek ReasoningDialect = "deepseek"
 	ReasoningZAI      ReasoningDialect = "zai"
 	ReasoningGrok     ReasoningDialect = "grok"
+	// ReasoningOpencode dispatches per model: opencode.ai serves multi-vendor
+	// models behind one endpoint, so the effective native semantics depend on
+	// the model family rather than one wire shape.
+	ReasoningOpencode ReasoningDialect = "opencode"
 )
 
 // ParseReasoningDialect canonicalizes a user/import value. Empty input yields
@@ -121,6 +132,8 @@ func ParseReasoningDialect(s string) (ReasoningDialect, bool) {
 		return ReasoningZAI, true
 	case "grok", "xai":
 		return ReasoningGrok, true
+	case "opencode", "zen":
+		return ReasoningOpencode, true
 	default:
 		return "", false
 	}
@@ -129,7 +142,8 @@ func ParseReasoningDialect(s string) (ReasoningDialect, bool) {
 func (d ReasoningDialect) Valid() bool {
 	switch d {
 	case "", ReasoningNone, ReasoningOpenAI, ReasoningClaude, ReasoningCodex,
-		ReasoningKimi, ReasoningQwen, ReasoningDeepSeek, ReasoningZAI, ReasoningGrok:
+		ReasoningKimi, ReasoningQwen, ReasoningDeepSeek, ReasoningZAI, ReasoningGrok,
+		ReasoningOpencode:
 		return true
 	default:
 		return false
@@ -147,6 +161,8 @@ func DefaultReasoningDialect(p Protocol) ReasoningDialect {
 		return ReasoningCodex
 	case ProtocolAnthropic, ProtocolClaudeCode:
 		return ReasoningClaude
+	case ProtocolOpencode:
+		return ReasoningOpencode
 	default:
 		// Kiro, Qoder, Antigravity, Cursor: protocol-managed, no generic writer.
 		return ReasoningNone
