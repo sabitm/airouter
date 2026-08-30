@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -110,5 +111,57 @@ func TestOversizedUnaryResponseFailsOver(t *testing.T) {
 	}
 	if got := extractText(t, "/v1/chat/completions", body); got != "hello from openai" {
 		t.Fatalf("fallback response text = %q", got)
+	}
+}
+
+func TestUnaryUpstreamErrorMessageCappedAcrossFailover(t *testing.T) {
+	passthrough := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	translated := newScriptedUpstream(t, domain.ProtocolAnthropic)
+	base, token, p := setupComboProxy(t, domain.StrategyFailover,
+		[]*scriptedUpstream{passthrough, translated},
+		[]domain.Protocol{domain.ProtocolOpenAI, domain.ProtocolAnthropic})
+
+	var passthroughHits, translatedHits atomic.Int64
+	errorSize := int64(upstreamErrorMax + 1)
+	p.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasPrefix(req.URL.String(), passthrough.server.URL) {
+			passthroughHits.Add(1)
+		} else {
+			translatedHits.Add(1)
+		}
+		return &http.Response{
+			StatusCode:    http.StatusBadGateway,
+			Header:        http.Header{"Content-Type": []string{"text/plain"}},
+			Body:          io.NopCloser(io.LimitReader(repeatingReader('x'), errorSize)),
+			ContentLength: errorSize,
+			Request:       req,
+		}, nil
+	})}
+
+	resp, body := post(t, base+"/v1/chat/completions", token, oaiReq)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if passthroughHits.Load() != 1 || translatedHits.Load() != 1 {
+		t.Fatalf("hits passthrough=%d translated=%d, want 1/1", passthroughHits.Load(), translatedHits.Load())
+	}
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("decode client error: %v", err)
+	}
+	if len(envelope.Error.Message) != upstreamErrorMax {
+		t.Fatalf("client error length = %d, want %d", len(envelope.Error.Message), upstreamErrorMax)
+	}
+
+	logs := waitForLogs(t, p.store, 2)
+	for _, provider := range []string{"p0", "p1"} {
+		log := findLogByProvider(t, logs, provider)
+		if len(log.ErrMsg) != upstreamErrorMax {
+			t.Errorf("provider %s error length = %d, want %d", provider, len(log.ErrMsg), upstreamErrorMax)
+		}
 	}
 }

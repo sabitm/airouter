@@ -99,6 +99,9 @@ func retryable(status int, message, errType string) attemptResult {
 // persisted request history while keeping raw non-JSON response bodies out of
 // DEBUG terminal logs.
 func retryableUpstreamStatus(status int, body []byte) attemptResult {
+	if len(body) > upstreamErrorMax {
+		body = body[:upstreamErrorMax]
+	}
 	return attemptResult{
 		retry:   true,
 		status:  status,
