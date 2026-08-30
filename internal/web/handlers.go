@@ -243,12 +243,26 @@ func opencodeTierFromForm(r *http.Request, stored string) string {
 	return opencode.Tier(stored)
 }
 
-// opencodeBaseURLForTier maps a tier to its base URL.
-func opencodeBaseURLForTier(tier string) string {
-	if tier == "go" {
-		return opencode.GoBaseURL
+// resolveOpencodeCredential applies the tier transition rules shared by Create,
+// Save, and Check. Zen never retains a paid credential. A blank key is reusable
+// only when editing an existing Go provider, because "public" cannot authenticate
+// the paid endpoint.
+func resolveOpencodeCredential(tier, submitted string, existing *domain.Provider) (baseURL, apiKey string, err error) {
+	if tier != "go" {
+		return opencode.ZenBaseURL, opencode.PublicKey, nil
 	}
-	return opencode.ZenBaseURL
+	submitted = strings.TrimSpace(submitted)
+	if submitted != "" && submitted != opencode.PublicKey {
+		return opencode.GoBaseURL, submitted, nil
+	}
+	if submitted == "" && existing != nil && existing.Protocol == domain.ProtocolOpencode &&
+		opencode.Tier(existing.BaseURL) == "go" {
+		stored := strings.TrimSpace(existing.APIKey)
+		if stored != "" && stored != opencode.PublicKey {
+			return opencode.GoBaseURL, stored, nil
+		}
+	}
+	return "", "", errors.New("OpenCode Go API key is required")
 }
 
 func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
@@ -272,13 +286,14 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := strings.TrimSpace(r.FormValue("api_key"))
 	// Generic apikey providers need a credential at create time. Kiro may still
-	// rely on profile/oauth paths and is validated separately there. OpenCode
-	// zen defaults the credential to the literal "public" key.
+	// rely on profile/oauth paths and is validated separately there.
 	baseURL := kiroBaseURLOr(proto, r.FormValue("base_url"))
 	if proto == domain.ProtocolOpencode {
-		baseURL = opencodeBaseURLForTier(opencodeTierFromForm(r, baseURL))
-		if apiKey == "" && baseURL == opencode.ZenBaseURL {
-			apiKey = opencode.PublicKey
+		var err error
+		baseURL, apiKey, err = resolveOpencodeCredential(opencodeTierFromForm(r, baseURL), apiKey, nil)
+		if err != nil {
+			htmxBadRequest(w, r, "provider-flash", err.Error())
+			return
 		}
 	}
 	if proto != domain.ProtocolKiro && apiKey == "" {
@@ -291,8 +306,8 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := &domain.Provider{
-		Name:    r.FormValue("name"),
-		BaseURL: baseURL,
+		Name:             r.FormValue("name"),
+		BaseURL:          baseURL,
 		APIKey:           apiKey,
 		Protocol:         proto,
 		AuthScheme:       auth,
@@ -465,11 +480,21 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return
 	}
-	cur.Name = r.FormValue("name")
-	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))
-	if proto == domain.ProtocolOpencode {
-		cur.BaseURL = opencodeBaseURLForTier(opencodeTierFromForm(r, cur.BaseURL))
+	baseURL := kiroBaseURLOr(proto, r.FormValue("base_url"))
+	apiKey := cur.APIKey
+	if submitted := strings.TrimSpace(r.FormValue("api_key")); submitted != "" {
+		apiKey = submitted
 	}
+	if proto == domain.ProtocolOpencode {
+		var err error
+		baseURL, apiKey, err = resolveOpencodeCredential(opencodeTierFromForm(r, cur.BaseURL), r.FormValue("api_key"), cur)
+		if err != nil {
+			htmxBadRequest(w, r, "provider-flash", err.Error())
+			return
+		}
+	}
+	cur.Name = r.FormValue("name")
+	cur.BaseURL = baseURL
 	cur.Protocol = proto
 	cur.AuthScheme = auth
 	cur.ReasoningDialect = dialect
@@ -483,15 +508,7 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		applyKiroConfig(creds, r)
 		cur.OAuthCreds = creds
 	}
-	// Blank api_key means keep the existing one (form never echoes secrets).
-	if k := r.FormValue("api_key"); k != "" {
-		cur.APIKey = k
-	}
-	// Tier zen with no stored key: default to the literal "public" credential.
-	if proto == domain.ProtocolOpencode && cur.BaseURL == opencode.ZenBaseURL &&
-		strings.TrimSpace(cur.APIKey) == "" {
-		cur.APIKey = opencode.PublicKey
-	}
+	cur.APIKey = apiKey
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
@@ -565,7 +582,7 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	cur.Protocol = proto
 	cur.AuthMethod = domain.AuthOAuth
 	cur.AuthScheme = domain.AuthBearer
-	cur.APIKey = ""	// Preserve current dialect when the form omits the field (fixed backends
+	cur.APIKey = "" // Preserve current dialect when the form omits the field (fixed backends
 	// still submit a locked hidden value).
 	if r.FormValue("reasoning_dialect") != "" || reasoningDialectEditable(proto) {
 		cur.ReasoningDialect = dialect

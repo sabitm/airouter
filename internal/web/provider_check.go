@@ -44,11 +44,8 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 	baseURL := strings.TrimSpace(r.FormValue("base_url"))
 	// The opencode tier select fully determines the base URL; an empty form
 	// value (tier-only forms) falls back to zen.
-	if proto == domain.ProtocolOpencode {
-		if baseURL == "" {
-			baseURL = opencode.ZenBaseURL
-		}
-		baseURL = opencodeBaseURLForTier(opencodeTierFromForm(r, baseURL))
+	if proto == domain.ProtocolOpencode && baseURL == "" {
+		baseURL = opencode.ZenBaseURL
 	}
 
 	method := domain.AuthMethod(r.FormValue("auth_method"))
@@ -57,21 +54,21 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiKey := r.FormValue("api_key")
-	if apiKey == "" {
-		// Edit form left the key blank to keep the current one; recover it.
-		if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
-			if p, err := h.store.GetProvider(r.Context(), id); err == nil {
-				apiKey = p.APIKey
-			}
-		}
+	apiKey := strings.TrimSpace(r.FormValue("api_key"))
+	var existing *domain.Provider
+	if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
+		existing, _ = h.store.GetProvider(r.Context(), id)
 	}
-	// The opencode tier select fully determines the base URL (derived above).
 	if proto == domain.ProtocolOpencode {
-		baseURL = opencodeBaseURLForTier(opencodeTierFromForm(r, baseURL))
-		if apiKey == "" && baseURL == opencode.ZenBaseURL {
-			apiKey = opencode.PublicKey
+		var err error
+		baseURL, apiKey, err = resolveOpencodeCredential(opencodeTierFromForm(r, baseURL), apiKey, existing)
+		if err != nil {
+			render(w, r, CheckResult(false, err.Error()))
+			return
 		}
+	} else if apiKey == "" && existing != nil {
+		// Edit form left the key blank to keep the current one; recover it.
+		apiKey = existing.APIKey
 	}
 	if apiKey == "" {
 		render(w, r, CheckResult(false, "enter an API key"))
