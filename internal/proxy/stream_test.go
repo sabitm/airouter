@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1630,6 +1631,115 @@ func TestPassthroughSuccessfulLifecycleFlush(t *testing.T) {
 	l := waitForLogs(t, st, 1)[0]
 	if l.InputTokens != 3 || l.OutputTokens != 2 {
 		t.Errorf("tokens = %d/%d, want 3/2", l.InputTokens, l.OutputTokens)
+	}
+}
+
+func TestPassthroughLifecycleBufferOverflowCommits(t *testing.T) {
+	cases := []struct {
+		name       string
+		events     int
+		paddingLen int
+	}{
+		{name: "byte budget", events: 16, paddingLen: passthroughPendingMaxBytes / 16},
+		{name: "event budget", events: passthroughPendingMaxEvents + 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stream strings.Builder
+			padding := strings.Repeat("x", tc.paddingLen)
+			for i := 0; i < tc.events; i++ {
+				fmt.Fprintf(&stream, "event: ping\ndata: {\"type\":\"ping\",\"sequence\":%d,\"padding\":%q}\n\n", i, padding)
+			}
+			stream.WriteString("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"after overflow\"}}\n\n")
+
+			var primaryHits, fallbackHits int
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				primaryHits++
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, stream.String())
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(primary.Close)
+			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fallbackHits++
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, responsesSSE)
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(fallback.Close)
+
+			st := newTestStore(t)
+			ctx := context.Background()
+			p1 := &domain.Provider{Name: "overflow", BaseURL: primary.URL, APIKey: "k", Protocol: domain.ProtocolOpenAIResponses}
+			p2 := &domain.Provider{Name: "unused", BaseURL: fallback.URL, APIKey: "k", Protocol: domain.ProtocolOpenAIResponses}
+			if err := st.CreateProvider(ctx, p1); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateProvider(ctx, p2); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+				{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+				{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			key, err := st.NewAccessKey(ctx, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			New(st, nil).Mount(mux)
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			resp, body := postStream(t, server.URL+"/v1/responses", key.Token, `{"model":"default","input":"hi","stream":true}`)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			if primaryHits != 1 || fallbackHits != 0 {
+				t.Fatalf("hits primary=%d fallback=%d, want 1/0", primaryHits, fallbackHits)
+			}
+
+			reader := sse.NewReader(strings.NewReader(body))
+			var sequences []int
+			sawError := false
+			for {
+				ev, err := reader.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				var envelope struct {
+					Type     string `json:"type"`
+					Sequence int    `json:"sequence"`
+				}
+				if err := json.Unmarshal(ev.Data, &envelope); err != nil {
+					t.Fatalf("decode relayed event: %v", err)
+				}
+				switch envelope.Type {
+				case "ping":
+					sequences = append(sequences, envelope.Sequence)
+				case "error":
+					sawError = strings.Contains(string(ev.Data), "after overflow")
+				}
+			}
+			if len(sequences) != tc.events {
+				t.Fatalf("relayed pings = %d, want %d", len(sequences), tc.events)
+			}
+			for i, sequence := range sequences {
+				if sequence != i {
+					t.Fatalf("relayed ping %d has sequence %d", i, sequence)
+				}
+			}
+			if !sawError {
+				t.Fatal("post-commit error event was not relayed")
+			}
+		})
 	}
 }
 

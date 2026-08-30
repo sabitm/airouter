@@ -16,6 +16,11 @@ import (
 	"airouter/internal/proxy/thinking"
 )
 
+const (
+	passthroughPendingMaxBytes  = 1 << 20
+	passthroughPendingMaxEvents = 1024
+)
+
 // streamPassthrough relays an upstream SSE response of the same codec as the
 // ingress, rewriting only the request model. Lifecycle-only events are buffered
 // until visible output or a successful terminal so an explicit protocol error
@@ -61,6 +66,7 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	var sw *sse.Writer
 	committedOut := false
 	var pending []sse.Event
+	pendingBytes := 0
 	reader := sse.NewReader(resp.Body)
 
 	commit := func() attemptResult {
@@ -84,6 +90,7 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 			}
 		}
 		pending = nil
+		pendingBytes = 0
 		return attemptResult{}
 	}
 
@@ -123,13 +130,22 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 		if !committedOut {
 			switch class {
 			case passLifecycle:
-				pending = append(pending, ev)
-				continue
+				eventBytes := len(ev.Name) + len(ev.Data)
+				if len(pending) < passthroughPendingMaxEvents && eventBytes <= passthroughPendingMaxBytes-pendingBytes {
+					pending = append(pending, ev)
+					pendingBytes += eventBytes
+					continue
+				}
+				if ar := commit(); ar.written || ar.status != 0 {
+					return ar
+				}
 			case passFailure:
 				return retryableStreamFailure(fail)
 			}
-			if ar := commit(); ar.written || ar.status != 0 {
-				return ar
+			if !committedOut {
+				if ar := commit(); ar.written || ar.status != 0 {
+					return ar
+				}
 			}
 		}
 
