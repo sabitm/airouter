@@ -25,7 +25,10 @@ import (
 	"airouter/internal/proxy/responses"
 )
 
-const anthropicVersion = "2023-06-01"
+const (
+	anthropicVersion                    = "2023-06-01"
+	maxUnaryUpstreamResponseBytes int64 = 64 << 20
+)
 
 // applyCodexHeaders sets the Codex-CLI identity headers the ChatGPT backend
 // requires: User-Agent, originator, session_id (the per-request CodexSessionID
@@ -377,8 +380,15 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 			return 0, nil, err
 		}
 		defer resp.Body.Close()
-		respBody, err := io.ReadAll(resp.Body)
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUnaryUpstreamResponseBytes+1))
 		if err != nil {
+			if harRecorder(ctx) != nil {
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody), err.Error())
+			}
+			return resp.StatusCode, nil, err
+		}
+		if int64(len(respBody)) > maxUnaryUpstreamResponseBytes {
+			err := fmt.Errorf("upstream response too large (exceeds %d bytes)", maxUnaryUpstreamResponseBytes)
 			if harRecorder(ctx) != nil {
 				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody), err.Error())
 			}
