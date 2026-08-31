@@ -42,10 +42,13 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	baseURL := strings.TrimSpace(r.FormValue("base_url"))
-	// The opencode tier select fully determines the base URL; an empty form
-	// value (tier-only forms) falls back to zen.
+	// OpenCode tier-only forms derive their URL from the tier. Every other
+	// protocol requires an explicit URL and must fail before credentials or I/O.
 	if proto == domain.ProtocolOpencode && baseURL == "" {
 		baseURL = opencode.ZenBaseURL
+	} else if baseURL == "" {
+		render(w, r, CheckResult(false, "enter a base URL"))
+		return
 	}
 
 	method := domain.AuthMethod(r.FormValue("auth_method"))
