@@ -19,6 +19,7 @@ const (
 	FormatQwen
 	FormatDeepSeek
 	FormatZAI
+	FormatMiniMax
 	FormatGrok
 	FormatCursor
 )
@@ -228,6 +229,21 @@ func zaiCaps(m string) Caps {
 	}
 }
 
+func minimaxCaps(m string) Caps {
+	c := Caps{
+		Reasoning:  true,
+		CanDisable: false,
+		Format:     FormatMiniMax,
+		Levels:     []string{"none", "thinking"},
+		MaxOutput:  131072,
+	}
+	// M3 can disable; M2.7 / M2.5 / remaining MiniMax models cannot.
+	if strings.Contains(m, "minimax-m3") {
+		c.CanDisable = true
+	}
+	return c
+}
+
 func grokCaps(m string, protocol domain.Protocol) Caps {
 	fmt := FormatGrok
 	if protocol == domain.ProtocolOpenAIResponses {
@@ -273,9 +289,12 @@ func opencodeCaps(m string, protocol domain.Protocol) Caps {
 		return qwenCaps(m)
 	case strings.Contains(m, "glm"):
 		return zaiCaps(m)
-	case strings.Contains(m, "minimax") || strings.Contains(m, "mimo"):
-		// MiniMax/MiMo adaptive thinking: binary on/off, cannot disable.
-		return Caps{Reasoning: true, CanDisable: false, Format: FormatZAI, Levels: []string{"thinking"}, MaxOutput: 131072}
+	case strings.Contains(m, "minimax"):
+		// MiniMax uses thinking.type=adaptive, not Z.ai enabled/enable_thinking.
+		return minimaxCaps(m)
+	case strings.Contains(m, "mimo"):
+		// Xiaomi MiMo is not a reasoning model.
+		return Caps{Reasoning: false, CanDisable: true, Format: FormatNone, MaxOutput: 131072}
 	default:
 		c := openaiCaps(m, protocol)
 		c.MaxOutput = 131072

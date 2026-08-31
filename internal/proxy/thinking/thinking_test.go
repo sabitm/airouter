@@ -2,6 +2,7 @@ package thinking
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 
 	"airouter/internal/domain"
@@ -586,6 +587,103 @@ func TestResolveIntentNoInjectionFromDialectAlone(t *testing.T) {
 	cfg := ResolveIntent(nil, nil, caps)
 	if cfg == nil || cfg.Level != "low" {
 		t.Fatalf("codex required default: %+v", cfg)
+	}
+}
+
+func TestCapsForOpencodeMiniMaxAndMiMo(t *testing.T) {
+	cases := []struct {
+		model      string
+		reasoning  bool
+		format     Format
+		canDisable bool
+		maxOutput  int
+	}{
+		{"minimax-m3", true, FormatMiniMax, true, 131072},
+		{"MiniMax-M3-highspeed", true, FormatMiniMax, true, 131072},
+		{"minimax-m2.7", true, FormatMiniMax, false, 131072},
+		{"minimax-m2.5", true, FormatMiniMax, false, 131072},
+		{"minimax-m2", true, FormatMiniMax, false, 131072},
+		{"mimo-v2.5-pro", false, FormatNone, true, 131072},
+		{"xiaomi/mimo-v2.5", false, FormatNone, true, 131072},
+		{"glm-5", true, FormatZAI, true, 128000},
+	}
+	for _, tc := range cases {
+		caps := CapsFor(tc.model, domain.ProtocolOpencode, domain.ReasoningOpencode)
+		if caps.Reasoning != tc.reasoning || caps.Format != tc.format || caps.CanDisable != tc.canDisable {
+			t.Errorf("%s caps = %+v", tc.model, caps)
+		}
+		if tc.maxOutput != 0 && caps.MaxOutput != tc.maxOutput {
+			t.Errorf("%s MaxOutput = %d want %d", tc.model, caps.MaxOutput, tc.maxOutput)
+		}
+		if caps.Format == FormatMiniMax && !slices.Equal(caps.Levels, []string{"none", "thinking"}) {
+			t.Errorf("%s levels = %v", tc.model, caps.Levels)
+		}
+	}
+}
+
+func TestApplyWireMiniMaxAdaptive(t *testing.T) {
+	body := []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low","enable_thinking":true,"thinking":{"type":"enabled","vendor":"keep"},"output_config":{"effort":"low","format":{"type":"json_object"}}}`)
+	cases := []struct {
+		name     string
+		model    string
+		cfg      *Config
+		wantType string
+	}{
+		{"m3-high", "minimax-m3", &Config{Mode: ModeLevel, Level: "high"}, "adaptive"},
+		{"m3-auto", "minimax-m3", &Config{Mode: ModeAuto}, "adaptive"},
+		{"m3-budget", "minimax-m3", &Config{Mode: ModeBudget, Budget: 8192}, "adaptive"},
+		{"m3-none", "minimax-m3", &Config{Mode: ModeNone}, "disabled"},
+		{"m27-none-clamped", "minimax-m2.7", &Config{Mode: ModeNone}, "adaptive"},
+		{"m25-high", "minimax-m2.5", &Config{Mode: ModeLevel, Level: "high"}, "adaptive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ApplyWire("oai-chat", body, tc.model, tc.cfg, domain.ProtocolOpencode, domain.ReasoningOpencode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m map[string]any
+			if err := json.Unmarshal(out, &m); err != nil {
+				t.Fatal(err)
+			}
+			th, _ := m["thinking"].(map[string]any)
+			if th == nil || th["type"] != tc.wantType {
+				t.Fatalf("thinking=%v want type %q body=%s", th, tc.wantType, out)
+			}
+			if th["vendor"] != "keep" {
+				t.Fatalf("thinking sibling lost: %v", th)
+			}
+			if _, ok := m["enable_thinking"]; ok {
+				t.Fatalf("enable_thinking leaked: %s", out)
+			}
+			if _, ok := m["reasoning_effort"]; ok {
+				t.Fatalf("reasoning_effort leaked: %s", out)
+			}
+			if th["type"] == "enabled" {
+				t.Fatalf("minimax must not emit type enabled: %s", out)
+			}
+			if oc, ok := m["output_config"].(map[string]any); ok {
+				if _, has := oc["effort"]; has {
+					t.Fatalf("output_config.effort leaked: %s", out)
+				}
+				if oc["format"] == nil {
+					t.Fatalf("output_config sibling lost: %s", out)
+				}
+			}
+		})
+	}
+}
+
+func TestEffectiveMiniMaxCannotDisable(t *testing.T) {
+	caps := CapsFor("minimax-m2.7", domain.ProtocolOpencode, domain.ReasoningOpencode)
+	cfg := Effective(&Config{Mode: ModeNone}, caps)
+	if cfg == nil || cfg.Mode == ModeNone {
+		t.Fatalf("m2.7 none should clamp: %+v", cfg)
+	}
+	caps = CapsFor("minimax-m3", domain.ProtocolOpencode, domain.ReasoningOpencode)
+	cfg = Effective(&Config{Mode: ModeNone}, caps)
+	if cfg == nil || cfg.Mode != ModeNone {
+		t.Fatalf("m3 none should stay none: %+v", cfg)
 	}
 }
 

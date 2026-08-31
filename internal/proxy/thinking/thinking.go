@@ -352,6 +352,8 @@ func writeNative(m map[string]any, cfg *Config, caps Caps, formatID string, prot
 		writeDeepSeek(m, cfg, caps)
 	case FormatZAI:
 		writeZAI(m, cfg, caps)
+	case FormatMiniMax:
+		writeMiniMax(m, cfg, caps)
 	case FormatCursor, FormatNone:
 		// Cursor and protocol-managed formats are handled by their codecs.
 	default:
@@ -562,6 +564,14 @@ func writeZAI(m map[string]any, cfg *Config, caps Caps) {
 		return
 	}
 	m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "enabled"})
+}
+
+func writeMiniMax(m map[string]any, cfg *Config, caps Caps) {
+	typ := "adaptive"
+	if cfg.Mode == ModeNone && caps.CanDisable {
+		typ = "disabled"
+	}
+	m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": typ})
 }
 
 func mergeObject(existing any, fields map[string]any) map[string]any {

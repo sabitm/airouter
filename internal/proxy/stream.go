@@ -555,6 +555,12 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 		return body, nil
 	}
 	caps := thinking.CapsFor(req.Model, provider.Protocol, dialect)
+	// Chat/Responses encoders write transport-default reasoning fields using
+	// OpenAI caps. Non-reasoning targets must drop those controls even when
+	// IR still carries ingress intent.
+	if !caps.Reasoning || caps.Format == thinking.FormatNone {
+		return thinking.ApplyWire(backend.id, body, req.Model, nil, provider.Protocol, dialect)
+	}
 	eff := thinking.ResolveIntent(cfg, nil, caps)
 	if eff == nil && caps.RequiredDefault == "" {
 		return body, nil

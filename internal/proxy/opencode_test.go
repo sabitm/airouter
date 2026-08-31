@@ -33,6 +33,11 @@ func opencodeTestProvider() *domain.Provider {
 
 func setupOpencodeTranslated(t *testing.T, handler http.HandlerFunc) (base, token string, mux *http.ServeMux) {
 	t.Helper()
+	return setupOpencodeTranslatedModel(t, "big-pickle", handler)
+}
+
+func setupOpencodeTranslatedModel(t *testing.T, upstreamModel string, handler http.HandlerFunc) (base, token string, mux *http.ServeMux) {
+	t.Helper()
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 	st := newTestStore(t)
@@ -41,7 +46,7 @@ func setupOpencodeTranslated(t *testing.T, handler http.HandlerFunc) (base, toke
 	if err := st.CreateProvider(ctx, prov); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "big-pickle", Enabled: true}}}); err != nil {
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: upstreamModel, Enabled: true}}}); err != nil {
 		t.Fatal(err)
 	}
 	key, err := st.NewAccessKey(ctx, "test")
@@ -688,8 +693,166 @@ func TestOpencodeTranslatedInvalidIdentityFallsBack(t *testing.T) {
 	}
 }
 
-// muse-spark thinking levels: none is rejected upstream, so the caps must not
-// disable and the effective writer keeps an explicit level.
+func assertNoRecognizedReasoningControls(t *testing.T, m map[string]any) {
+	t.Helper()
+	for _, field := range []string{"reasoning_effort", "thinking", "enable_thinking", "thinking_budget"} {
+		if _, ok := m[field]; ok {
+			t.Fatalf("%s leaked: %v", field, m[field])
+		}
+	}
+	if r, ok := m["reasoning"].(map[string]any); ok {
+		if _, ok := r["effort"]; ok {
+			t.Fatalf("reasoning.effort leaked: %v", r)
+		}
+	}
+	if oc, ok := m["output_config"].(map[string]any); ok {
+		if _, ok := oc["effort"]; ok {
+			t.Fatalf("output_config.effort leaked: %v", oc)
+		}
+	}
+}
+
+func TestOpencodeMiniMaxMiMoCaps(t *testing.T) {
+	m3 := thinkingCapsFor(t, "minimax-m3")
+	if !m3.Reasoning || m3.Format != thinking.FormatMiniMax || !m3.CanDisable {
+		t.Fatalf("m3 caps = %+v", m3)
+	}
+	m27 := thinkingCapsFor(t, "minimax-m2.7")
+	if !m27.Reasoning || m27.Format != thinking.FormatMiniMax || m27.CanDisable {
+		t.Fatalf("m2.7 caps = %+v", m27)
+	}
+	m25 := thinkingCapsFor(t, "minimax-m2.5")
+	if !m25.Reasoning || m25.Format != thinking.FormatMiniMax || m25.CanDisable {
+		t.Fatalf("m2.5 caps = %+v", m25)
+	}
+	mimo := thinkingCapsFor(t, "mimo-v2.5-pro")
+	if mimo.Reasoning || mimo.Format != thinking.FormatNone || mimo.MaxOutput != 131072 {
+		t.Fatalf("mimo caps = %+v", mimo)
+	}
+	glm := thinkingCapsFor(t, "glm-4.7")
+	if glm.Format != thinking.FormatZAI {
+		t.Fatalf("glm format = %v", glm.Format)
+	}
+}
+
+func prepareOpencodeTranslated(t *testing.T, ingress codec, ingressBody []byte, upstreamModel string) map[string]any {
+	t.Helper()
+	p := opencodeTestProvider()
+	req, err := ingress.decodeRequest(ingressBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured := thinking.Capture(ingressBody); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
+	applyUpstreamModel(req, upstreamModel)
+	backend := backendCodec(p.Protocol, upstreamModel)
+	upstreamBody, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamBody, err = New(nil, nil).prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, upstreamBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(upstreamBody, &got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestOpencodeTranslatedMiniMaxAdaptive(t *testing.T) {
+	body := []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	got := prepareOpencodeTranslated(t, openaiCodec, body, "minimax-m3")
+	th, _ := got["thinking"].(map[string]any)
+	if th == nil || th["type"] != "adaptive" {
+		t.Fatalf("minimax thinking = %+v, want adaptive", th)
+	}
+	if _, ok := got["enable_thinking"]; ok {
+		t.Fatalf("enable_thinking leaked: %v", got)
+	}
+	if _, ok := got["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort leaked: %v", got)
+	}
+	if th["type"] == "enabled" {
+		t.Fatalf("minimax must not emit enabled: %v", got)
+	}
+}
+
+func TestOpencodeTranslatedMiMoStripsReasoningControls(t *testing.T) {
+	chat := []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	got := prepareOpencodeTranslated(t, openaiCodec, chat, "mimo-v2.5-pro")
+	if got["model"] != "mimo-v2.5-pro" {
+		t.Fatalf("model = %v", got["model"])
+	}
+	assertNoRecognizedReasoningControls(t, got)
+
+	anthropicBody := []byte(`{"model":"combo","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":4096}}`)
+	got = prepareOpencodeTranslated(t, anthropicCodec, anthropicBody, "mimo-v2.5")
+	assertNoRecognizedReasoningControls(t, got)
+
+	responsesBody := []byte(`{"model":"combo","reasoning":{"effort":"high"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	got = prepareOpencodeTranslated(t, responsesCodec, responsesBody, "mimo-v2.5-pro")
+	assertNoRecognizedReasoningControls(t, got)
+}
+
+func TestOpencodeTranslatedNoIntentDoesNotInjectReasoning(t *testing.T) {
+	body := []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}]}`)
+	for _, model := range []string{"mimo-v2.5-pro", "minimax-m3", "glm-4.7"} {
+		got := prepareOpencodeTranslated(t, openaiCodec, body, model)
+		assertNoRecognizedReasoningControls(t, got)
+	}
+}
+
+func TestOpencodeTranslatedMiMoUnaryAndStreamStripReasoning(t *testing.T) {
+	upstreamBodies := make(chan []byte, 2)
+	base, token, _ := setupOpencodeTranslatedModel(t, "mimo-v2.5-pro", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upstreamBodies <- body
+		if r.Header.Get("Accept") == "text/event-stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, openaiSSE)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, openaiUpstreamBody)
+	})
+
+	for _, stream := range []bool{false, true} {
+		body := `{"model":"default","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`
+		if stream {
+			body = `{"model":"default","stream":true,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`
+		}
+		req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("stream=%v status=%d body=%s", stream, resp.StatusCode, out)
+		}
+
+		var got map[string]any
+		if err := json.Unmarshal(<-upstreamBodies, &got); err != nil {
+			t.Fatal(err)
+		}
+		gotStream, _ := got["stream"].(bool)
+		if got["model"] != "mimo-v2.5-pro" || gotStream != stream {
+			t.Fatalf("stream=%v upstream body=%v", stream, got)
+		}
+		assertNoRecognizedReasoningControls(t, got)
+	}
+}
+
+// Muse Spark rejects reasoning level none, so its caps cannot disable it.
 func TestOpencodeMuseSparkCaps(t *testing.T) {
 	caps := thinkingCapsFor(t, "muse-spark-1.2-contributor-free")
 	if caps.CanDisable {
