@@ -209,9 +209,9 @@ func routerBaseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-// kiroBaseURLOr defaults a blank Kiro base URL to the CodeWhisperer host so the
-// user need not memorize it; non-Kiro or non-blank values pass through.
-func kiroBaseURLOr(proto domain.Protocol, base string) string {
+// providerBaseURLOrDefault supplies fixed backend URLs when a specialized
+// provider form omits its base URL; custom non-blank URLs pass through.
+func providerBaseURLOrDefault(proto domain.Protocol, base string) string {
 	if proto == domain.ProtocolKiro && strings.TrimSpace(base) == "" {
 		return kiro.DefaultBaseURL
 	}
@@ -287,7 +287,7 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	apiKey := strings.TrimSpace(r.FormValue("api_key"))
 	// Generic apikey providers need a credential at create time. Kiro may still
 	// rely on profile/oauth paths and is validated separately there.
-	baseURL := kiroBaseURLOr(proto, r.FormValue("base_url"))
+	baseURL := providerBaseURLOrDefault(proto, r.FormValue("base_url"))
 	if proto == domain.ProtocolOpencode {
 		var err error
 		baseURL, apiKey, err = resolveOpencodeCredential(opencodeTierFromForm(r, baseURL), apiKey, nil)
@@ -386,7 +386,7 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 	}
 	p := &domain.Provider{
 		Name:             r.FormValue("name"),
-		BaseURL:          kiroBaseURLOr(proto, r.FormValue("base_url")),
+		BaseURL:          providerBaseURLOrDefault(proto, r.FormValue("base_url")),
 		Protocol:         proto,
 		AuthMethod:       domain.AuthOAuth,
 		AuthScheme:       domain.AuthBearer,
@@ -480,7 +480,7 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return
 	}
-	baseURL := kiroBaseURLOr(proto, r.FormValue("base_url"))
+	baseURL := providerBaseURLOrDefault(proto, r.FormValue("base_url"))
 	apiKey := cur.APIKey
 	if submitted := strings.TrimSpace(r.FormValue("api_key")); submitted != "" {
 		apiKey = submitted
@@ -578,12 +578,13 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		return
 	}
 	cur.Name = r.FormValue("name")
-	cur.BaseURL = kiroBaseURLOr(proto, r.FormValue("base_url"))
+	cur.BaseURL = providerBaseURLOrDefault(proto, r.FormValue("base_url"))
 	cur.Protocol = proto
 	cur.AuthMethod = domain.AuthOAuth
 	cur.AuthScheme = domain.AuthBearer
-	cur.APIKey = "" // Preserve current dialect when the form omits the field (fixed backends
-	// still submit a locked hidden value).
+	cur.APIKey = ""
+	// Preserve current dialect when the form omits the field; fixed backends
+	// still submit a locked hidden value.
 	if r.FormValue("reasoning_dialect") != "" || reasoningDialectEditable(proto) {
 		cur.ReasoningDialect = dialect
 	}

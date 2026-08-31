@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -20,6 +21,12 @@ import (
 )
 
 var upstreamClient = &http.Client{Timeout: 15 * time.Second}
+
+var (
+	errOpencodeInvalidBaseURL = errors.New("invalid OpenCode base URL")
+	errOpencodeHTTPStatus     = errors.New("OpenCode models returned non-success status")
+	errOpencodeResponseShape  = errors.New("OpenCode models response shape unexpected")
+)
 
 // providerModels fetches the selected provider's live model list and returns it
 // as a datalist for the combo form's upstream_model autocomplete. Best-effort:
@@ -150,40 +157,50 @@ func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 	return out, nil
 }
 
-// fetchOpencodeModels queries the opencode.ai /models endpoint with the
-// opencode client fingerprint. The response is the standard OpenAI {data:[{id}]}
-// shape on both tiers.
-func fetchOpencodeModels(ctx context.Context, logger *slog.Logger, p *domain.Provider) ([]string, error) {
+// queryOpencodeModels is the shared OpenCode model probe used by Check and
+// discovery so authentication, fingerprinting, and response parsing stay equal.
+func queryOpencodeModels(ctx context.Context, logger *slog.Logger, p *domain.Provider, operation string) ([]string, probeResult, error) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, probeResult{}, errOpencodeInvalidBaseURL
 	}
 	req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	req.Header.Set("Accept", "application/json")
 	opencode.FingerprintHeaders(req.Header, "")
-	pr, err := executeProbe(ctx, logger, upstreamClient, req, "fetch_opencode_models")
+
+	pr, err := executeProbe(ctx, logger, upstreamClient, req, operation)
 	if err != nil {
-		return nil, err
+		return nil, pr, err
 	}
-	if pr.StatusCode < 200 || pr.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d", pr.StatusCode)
+	if pr.StatusCode >= 400 {
+		return nil, pr, errOpencodeHTTPStatus
 	}
 	var parsed struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(pr.Body, &parsed); err != nil {
-		return nil, err
+	if err := json.Unmarshal(pr.Body, &parsed); err != nil || parsed.Data == nil {
+		return nil, pr, errOpencodeResponseShape
 	}
 	out := make([]string, 0, len(parsed.Data))
-	for _, m := range parsed.Data {
-		if m.ID != "" {
-			out = append(out, m.ID)
+	for _, model := range parsed.Data {
+		if model.ID != "" {
+			out = append(out, model.ID)
 		}
 	}
-	return out, nil
+	return out, pr, nil
+}
+
+// fetchOpencodeModels queries the opencode.ai /models endpoint with the
+// shared OpenCode fingerprinted model query.
+func fetchOpencodeModels(ctx context.Context, logger *slog.Logger, p *domain.Provider) ([]string, error) {
+	models, pr, err := queryOpencodeModels(ctx, logger, p, "fetch_opencode_models")
+	if pr.StatusCode != 0 && (pr.StatusCode < 200 || pr.StatusCode >= 300) {
+		return nil, fmt.Errorf("HTTP %d", pr.StatusCode)
+	}
+	return models, err
 }
 
 func fetchCodexModels(ctx context.Context, logger *slog.Logger, p *domain.Provider) ([]string, int, []byte, error) {

@@ -259,39 +259,26 @@ func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain
 }
 
 // checkOpencodeUpstream validates a zen/go tier credential against the
-// opencode.ai /models endpoint with the client fingerprint: without it the zen
-// tier rejects even valid "public" probes as unidentified traffic.
+// opencode.ai /models endpoint with the shared fingerprinted model query.
 func checkOpencodeUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
-	url := strings.TrimRight(p.BaseURL, "/") + "/models"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	models, pr, err := queryOpencodeModels(ctx, logger, p, "check_opencode")
 	if err != nil {
-		return false, "invalid base URL"
+		switch {
+		case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
+			return false, fmt.Sprintf("API key rejected (HTTP %d)", pr.StatusCode)
+		case pr.StatusCode == http.StatusNotFound:
+			return false, "not found (HTTP 404) - check base URL and tier"
+		case pr.StatusCode >= 400:
+			return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
+		case err == errOpencodeInvalidBaseURL:
+			return false, "invalid base URL"
+		case err == errOpencodeResponseShape:
+			return false, "reachable, but response shape unexpected"
+		default:
+			return false, "could not reach URL: " + err.Error()
+		}
 	}
-	req.Header.Set("Authorization", "Bearer "+p.APIKey)
-	req.Header.Set("Accept", "application/json")
-	opencode.FingerprintHeaders(req.Header, "")
-
-	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_opencode")
-	if err != nil {
-		return false, "could not reach URL: " + err.Error()
-	}
-	switch {
-	case pr.StatusCode == http.StatusUnauthorized || pr.StatusCode == http.StatusForbidden:
-		return false, fmt.Sprintf("API key rejected (HTTP %d)", pr.StatusCode)
-	case pr.StatusCode == http.StatusNotFound:
-		return false, "not found (HTTP 404) - check base URL and tier"
-	case pr.StatusCode >= 400:
-		return false, fmt.Sprintf("upstream returned HTTP %d", pr.StatusCode)
-	}
-	var parsed struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(pr.Body, &parsed); err != nil || parsed.Data == nil {
-		return false, "reachable, but response shape unexpected"
-	}
-	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
+	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(models))
 }
 
 // checkQoderUpstream validates a Qoder device token against openapi userinfo.

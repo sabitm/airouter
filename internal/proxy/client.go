@@ -121,11 +121,11 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 			t.ClaudeCodeSessionID = sid
 		}
 		return claudecode.ApplyOAuthCloaking(body, claudeCodeToken(provider), sid, claudeCodeSeed(provider))
-	case "opencode-chat":
+	case "opencode-chat", "opencode-responses":
 		prepareOpencodeSession(ctx, provider, body)
-		return opencode.InjectReasoningEcho(body, reqModelFromBody(body))
-	case "opencode-responses":
-		prepareOpencodeSession(ctx, provider, body)
+		if backend.id == "opencode-chat" {
+			return opencode.InjectReasoningEcho(body, reqModelFromBody(body))
+		}
 		return opencode.PrepareMuseSparkResponse(body)
 	case "cursor":
 		// Cursor needs no body mutation; headers (checksum, identity) are applied
