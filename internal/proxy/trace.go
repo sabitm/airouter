@@ -28,8 +28,9 @@ type TraceInfo struct {
 	QoderModelKey       string
 	QoderModelSource    string
 	ClaudeCodeSessionID string
-	// OpencodeSessionID is the conversation-stable x-opencode-session derived
-	// in prepareUpstreamRequest; empty for non-opencode backends.
+	// OpencodeSessionID is the conversation-stable x-opencode-session resolved
+	// in prepareUpstreamRequest (client identity, else namespaced fallback);
+	// empty for non-opencode backends.
 	OpencodeSessionID string
 	// RequestID correlates terminal logs, the X-Airouter-Request-ID response
 	// header, and HAR pages (page_<RequestID>). Always set by the server

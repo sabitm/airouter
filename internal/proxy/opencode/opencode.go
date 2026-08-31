@@ -44,13 +44,9 @@ func Tier(baseURL string) string {
 	return "zen"
 }
 
-// DeriveSessionID computes the x-opencode-session value for one conversation:
-// stable across requests and restarts so prompt caching survives, but bound to
-// the conversation content. The upstream keys cache reuse on this header, so a
-// fresh id per request would forfeit caching while an account-stable id would
-// collide unrelated conversations. hashSeed is a per-provider secret (the
-// stored API key); transcript is the accumulated assistant text of the request
-// body (empty on the first turn, which then derives a stable per-account id).
+// DeriveSessionID hashes seed and transcript into an opaque ses_ id. The
+// proxy must namespace seed with a per-Proxy nonce and provider identity so a
+// shared credential such as "public" cannot collide first-turn sessions.
 func DeriveSessionID(hashSeed, transcript string) string {
 	sum := sha256.Sum256([]byte("opencode-session\x00" + hashSeed + "\x00" + transcript))
 	return "ses_" + hex.EncodeToString(sum[:])
@@ -62,14 +58,4 @@ func NewRequestID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return "msg_" + hex.EncodeToString(b[:])
-}
-
-// SessionSeedFromCreds picks the hash seed: a real API key when present, else
-// the base URL. "public" is shared by every zen user, so transcript becomes
-// the distinguishing input there.
-func SessionSeedFromCreds(apiKey, baseURL string) string {
-	if s := strings.TrimSpace(apiKey); s != "" {
-		return s
-	}
-	return baseURL
 }

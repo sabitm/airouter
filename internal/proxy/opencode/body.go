@@ -131,10 +131,9 @@ func InjectReasoningEcho(body []byte, model string) ([]byte, error) {
 const sessionTranscriptCap = 512
 
 // AccumulateAssistantText folds assistant text content from either wire family
-// (messages[].content or input[] items) into one string, capped. It keys the
-// conversation-stable session id: only turns that already produced output
-// distinguish conversations; a first user prompt intentionally shares the
-// per-account session.
+// (messages[].content or input[] items) into one string, capped. Fallback
+// sessions key on this plus a per-Proxy/provider namespace; empty transcript
+// (first turn) still differs across Proxy instances and providers.
 func AccumulateAssistantText(body []byte) string {
 	var m struct {
 		Messages []struct {

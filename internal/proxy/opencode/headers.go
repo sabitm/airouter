@@ -5,12 +5,10 @@ import (
 	"strings"
 )
 
-// FingerprintHeaders sets the opencode client identity on an upstream request.
-// The zen tier classifies requests without this fingerprint as unidentified
-// traffic and rate-limits the free tier, so it is applied to every opencode
-// request (harmless on the go tier). A client User-Agent already containing
-// "opencode" is preserved so a real opencode client's own version string wins.
-// sessionID is the conversation-stable x-opencode-session value.
+// FingerprintHeaders fills missing opencode identity headers. Existing values
+// (a real client's UA/fingerprint, or sanitized fields applied by the proxy)
+// are left in place. sessionID is used only when x-opencode-session is unset.
+// Dashboard/model probes call this without request context.
 func FingerprintHeaders(h http.Header, sessionID string) {
 	ua := h.Get("User-Agent")
 	if ua == "" || !strings.Contains(strings.ToLower(ua), UserAgent) {

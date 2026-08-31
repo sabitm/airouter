@@ -273,7 +273,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
 	}
-	upstreamBody, err = prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
+	upstreamBody, err = p.prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
@@ -348,7 +348,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			retryBody, rerr = finalizeEncodedBody(retryBody, retryReq, backend, provider)
 		}
 		if rerr == nil {
-			retryBody, rerr = prepareUpstreamRequest(ctx, backend, provider, retryBody)
+			retryBody, rerr = p.prepareUpstreamRequest(ctx, backend, provider, retryBody)
 		}
 		var retryResp *http.Response
 		var retryWrite func([]byte) error

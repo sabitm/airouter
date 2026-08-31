@@ -72,13 +72,20 @@ func newCodexSessionID() string {
 //     context for the X-Claude-Code-Session-Id header) and applies the OAuth-only
 //     cloak/decoy transform. The cloak gate and seed read OAuthCreds directly
 //     because the access token is resolved later, inside forward/forwardStream.
-//   - OpenCode: derives the conversation-stable x-opencode-session from the
-//     request body (saved on the trace context for the header emission) and
-//     applies the model-specific patch: muse-spark Responses normalization or
-//     the Chat reasoning_content echo for kimi/deepseek.
+//   - OpenCode: resolves x-opencode-session (client identity, else a fallback
+//     namespaced by this Proxy's nonce and the provider) onto the trace context
+//     and applies the model-specific patch: muse-spark Responses normalization
+//     or the Chat reasoning_content echo for kimi/deepseek.
 //
 // Other backends return the body unchanged. A non-nil error is terminal for the
 // attempt (e.g. Qoder model_config unknown).
+func (p *Proxy) prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain.Provider, body []byte) ([]byte, error) {
+	if p != nil && (backend.id == "opencode-chat" || backend.id == "opencode-responses") {
+		ctx = withOpencodeNonce(ctx, p.opencodeNonce)
+	}
+	return prepareUpstreamRequest(ctx, backend, provider, body)
+}
+
 func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain.Provider, body []byte) ([]byte, error) {
 	switch backend.id {
 	case "oai-codex":
@@ -115,16 +122,10 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 		}
 		return claudecode.ApplyOAuthCloaking(body, claudeCodeToken(provider), sid, claudeCodeSeed(provider))
 	case "opencode-chat":
-		sid := opencode.DeriveSessionID(opencode.SessionSeedFromCreds(provider.APIKey, provider.BaseURL), opencode.AccumulateAssistantText(body))
-		if t := traceInfoFrom(ctx); t != nil {
-			t.OpencodeSessionID = sid
-		}
+		prepareOpencodeSession(ctx, provider, body)
 		return opencode.InjectReasoningEcho(body, reqModelFromBody(body))
 	case "opencode-responses":
-		sid := opencode.DeriveSessionID(opencode.SessionSeedFromCreds(provider.APIKey, provider.BaseURL), opencode.AccumulateAssistantText(body))
-		if t := traceInfoFrom(ctx); t != nil {
-			t.OpencodeSessionID = sid
-		}
+		prepareOpencodeSession(ctx, provider, body)
 		return opencode.PrepareMuseSparkResponse(body)
 	case "cursor":
 		// Cursor needs no body mutation; headers (checksum, identity) are applied
@@ -358,16 +359,86 @@ func applyKiroHeaders(req *http.Request, provider *domain.Provider) {
 	}
 }
 
-// applyOpencodeHeaders sets the opencode client fingerprint (User-Agent,
-// x-opencode-client/project/session/request) for the zen tier's traffic
-// classification. A forwarded client User-Agent already containing "opencode"
-// is preserved so a real client's own version string wins.
+// applyOpencodeHeaders sets the opencode client fingerprint. Sanitized ingress
+// identity (captured before translation) wins for UA/client/project/request/
+// session; FingerprintHeaders fills whatever is still missing. Authorization
+// stays on the provider credential set by the auth-scheme switch.
 func applyOpencodeHeaders(req *http.Request, ctx context.Context) {
+	opencode.SanitizeIdentityHeaders(req.Header)
+	st := opencodeStateFrom(ctx)
+	if st != nil {
+		opencode.ApplyIdentity(req.Header, st.identity)
+	}
 	sid := ""
-	if t := traceInfoFrom(ctx); t != nil {
-		sid = t.OpencodeSessionID
+	if st != nil {
+		sid = st.session
+	}
+	if sid == "" {
+		if t := traceInfoFrom(ctx); t != nil {
+			sid = t.OpencodeSessionID
+		}
 	}
 	opencode.FingerprintHeaders(req.Header, sid)
+}
+
+// opencodeReqState is request-private OpenCode identity plus the session
+// resolved for the current upstream attempt. Client Session stays on identity;
+// session is rewritten per provider so failover does not reuse a fallback.
+type opencodeReqState struct {
+	identity opencode.Identity
+	nonce    string
+	session  string
+}
+
+type opencodeStateKeyT struct{}
+
+var opencodeStateKey opencodeStateKeyT
+
+func withOpencodeRequest(ctx context.Context, nonce string, h http.Header, body []byte) context.Context {
+	st := &opencodeReqState{
+		identity: opencode.CaptureIdentity(h, body),
+		nonce:    nonce,
+	}
+	return context.WithValue(ctx, opencodeStateKey, st)
+}
+
+func opencodeStateFrom(ctx context.Context) *opencodeReqState {
+	st, _ := ctx.Value(opencodeStateKey).(*opencodeReqState)
+	return st
+}
+
+func withOpencodeNonce(ctx context.Context, nonce string) context.Context {
+	if st := opencodeStateFrom(ctx); st != nil {
+		if st.nonce == "" {
+			st.nonce = nonce
+		}
+		return ctx
+	}
+	return withOpencodeRequest(ctx, nonce, nil, nil)
+}
+
+func prepareOpencodeSession(ctx context.Context, provider *domain.Provider, body []byte) {
+	st := opencodeStateFrom(ctx)
+	var id opencode.Identity
+	nonce := ""
+	if st != nil {
+		id = st.identity
+		nonce = st.nonce
+	}
+	var providerID int64
+	var baseURL, apiKey string
+	if provider != nil {
+		providerID = provider.ID
+		baseURL = provider.BaseURL
+		apiKey = provider.APIKey
+	}
+	sid := opencode.ResolveSession(id, nonce, providerID, baseURL, apiKey, opencode.AccumulateAssistantText(body))
+	if st != nil {
+		st.session = sid
+	}
+	if t := traceInfoFrom(ctx); t != nil {
+		t.OpencodeSessionID = sid
+	}
 }
 
 // applyClaudeCodeHeaders sets the Claude Code CLI identity fingerprint and the

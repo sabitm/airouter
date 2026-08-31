@@ -5,6 +5,8 @@
 package proxy
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,8 +21,8 @@ import (
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
-	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/openai"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/sse"
@@ -302,6 +304,11 @@ type Proxy struct {
 	// on restart.
 	boMu sync.Mutex
 	bo   map[int64]*backoffState
+
+	// opencodeNonce namespaces OpenCode fallback session ids for this Proxy.
+	// It is generated in New so instances and process restarts do not share
+	// Zen/public first-turn ids. Explicit client sessions ignore it.
+	opencodeNonce string
 }
 
 // backoffState tracks a provider's consecutive pre-commit failures and the number
@@ -329,15 +336,28 @@ func New(s *store.Store, logger *slog.Logger) *Proxy {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Proxy{
-		store:        s,
-		oauth:        oauth.New(s),
-		client:       &http.Client{Timeout: 5 * time.Minute},
-		streamClient: &http.Client{},
-		logger:       logger,
-		rr:           map[int64]uint64{},
-		bo:           map[int64]*backoffState{},
+	nonce, err := newOpencodeNonce()
+	if err != nil {
+		panic("proxy: generate OpenCode session nonce: " + err.Error())
 	}
+	return &Proxy{
+		store:         s,
+		oauth:         oauth.New(s),
+		client:        &http.Client{Timeout: 5 * time.Minute},
+		streamClient:  &http.Client{},
+		logger:        logger,
+		rr:            map[int64]uint64{},
+		bo:            map[int64]*backoffState{},
+		opencodeNonce: nonce,
+	}
+}
+
+func newOpencodeNonce() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // nextRoundRobin returns the starting target index for a round-robin combo with

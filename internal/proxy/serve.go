@@ -302,6 +302,11 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		res.fail(w, ingress, http.StatusInternalServerError, "combo has no targets: "+meta.Model, "api_error")
 		return
 	}
+	if hasOpencodeTarget(candidates) {
+		// Capture only for requests that can reach OpenCode. The original body is
+		// needed because translation drops unknown session metadata.
+		r = r.WithContext(withOpencodeRequest(r.Context(), p.opencodeNonce, r.Header, body))
+	}
 
 	// Walk the ordered (attachment-compatible) targets. A target that fails before
 	// any byte reaches the client falls through to the next; the first that commits
@@ -452,6 +457,15 @@ func activeComboTargets(combo *domain.Combo) []domain.ComboTarget {
 		}
 	}
 	return targets
+}
+
+func hasOpencodeTarget(targets []domain.ComboTarget) bool {
+	for _, target := range targets {
+		if target.Provider != nil && target.Provider.Protocol == domain.ProtocolOpencode {
+			return true
+		}
+	}
+	return false
 }
 
 // orderTargets returns the combo's targets in the order the resolution loop
@@ -607,7 +621,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
 	}
-	upstreamBody, err = prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
+	upstreamBody, err = p.prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}

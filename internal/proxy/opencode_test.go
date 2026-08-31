@@ -3,7 +3,9 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -27,6 +29,30 @@ func opencodeTestProvider() *domain.Provider {
 		APIKey:   opencode.PublicKey,
 		Protocol: domain.ProtocolOpencode,
 	}
+}
+
+func setupOpencodeTranslated(t *testing.T, handler http.HandlerFunc) (base, token string, mux *http.ServeMux) {
+	t.Helper()
+	upstream := httptest.NewServer(handler)
+	t.Cleanup(upstream.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "big-pickle", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux = http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL, key.Token, mux
 }
 
 func TestOpencodeBackendCodecPerModel(t *testing.T) {
@@ -59,10 +85,12 @@ func TestOpencodeNeverPassthrough(t *testing.T) {
 }
 
 func TestOpencodePrepareUpstreamRequestChat(t *testing.T) {
+	px := New(nil, nil)
 	p := opencodeTestProvider()
+	p.ID = 7
 	body := []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"again"}]}`)
 	trace := &TraceInfo{}
-	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro"), p, body)
+	out, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro"), p, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,20 +100,24 @@ func TestOpencodePrepareUpstreamRequestChat(t *testing.T) {
 	if !strings.HasPrefix(trace.OpencodeSessionID, "ses_") {
 		t.Fatalf("trace session id = %q", trace.OpencodeSessionID)
 	}
-	// Session id is conversation-stable: same body derives the same value.
-	out2, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro"), p, body)
+	// Session id is conversation-stable: same Proxy+provider+body derives the same value.
+	trace2 := &TraceInfo{}
+	out2, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), trace2), backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro"), p, body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(out) != string(out2) {
 		t.Fatalf("same conversation produced different bodies: %s vs %s", out, out2)
 	}
+	if trace.OpencodeSessionID != trace2.OpencodeSessionID {
+		t.Fatalf("same conversation produced different sessions: %q vs %q", trace.OpencodeSessionID, trace2.OpencodeSessionID)
+	}
 }
 
 func TestOpencodePrepareUpstreamRequestMuseSpark(t *testing.T) {
 	p := opencodeTestProvider()
 	body := []byte(`{"model":"muse-spark-1.2-contributor-free","reasoning":{"effort":"max"},"max_output_tokens":400}`)
-	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backendCodec(domain.ProtocolOpencode, "muse-spark-1.2-contributor-free"), p, body)
+	out, err := New(nil, nil).prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backendCodec(domain.ProtocolOpencode, "muse-spark-1.2-contributor-free"), p, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +151,7 @@ func TestOpencodeTranslatedDeepseekFinalize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstreamBody, err = prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, upstreamBody)
+	upstreamBody, err = New(nil, nil).prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, upstreamBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +186,7 @@ func TestOpencodeTranslatedReasoningEchoPreservesRealContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstreamBody, err = prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, upstreamBody)
+	upstreamBody, err = New(nil, nil).prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, upstreamBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,6 +301,390 @@ func TestApplyOpencodeHeadersPreservesClientUA(t *testing.T) {
 	}
 	if got := req.Header.Get("x-opencode-client"); got != "my-cli" {
 		t.Fatalf("client x-opencode-client clobbered: %q", got)
+	}
+}
+
+func TestOpencodeChatAndResponsesShareSessionPolicy(t *testing.T) {
+	px := New(nil, nil)
+	p := opencodeTestProvider()
+	p.ID = 3
+	chatBody := []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)
+	respBody := []byte(`{"model":"muse-spark-1.2","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	chatTrace := &TraceInfo{}
+	respTrace := &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), chatTrace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, chatBody); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), respTrace), backendCodec(domain.ProtocolOpencode, "muse-spark-1.2"), p, respBody); err != nil {
+		t.Fatal(err)
+	}
+	if chatTrace.OpencodeSessionID == "" || chatTrace.OpencodeSessionID != respTrace.OpencodeSessionID {
+		t.Fatalf("chat/responses first-turn sessions differ: %q vs %q", chatTrace.OpencodeSessionID, respTrace.OpencodeSessionID)
+	}
+
+	h := http.Header{}
+	h.Set("x-opencode-session", "ses_shared")
+	ctx := withOpencodeRequest(context.Background(), px.opencodeNonce, h, nil)
+	chatTrace = &TraceInfo{}
+	respTrace = &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, chatTrace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, chatBody); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, respTrace), backendCodec(domain.ProtocolOpencode, "muse-spark-1.2"), p, respBody); err != nil {
+		t.Fatal(err)
+	}
+	if chatTrace.OpencodeSessionID != "ses_shared" || respTrace.OpencodeSessionID != "ses_shared" {
+		t.Fatalf("explicit session not shared: %q vs %q", chatTrace.OpencodeSessionID, respTrace.OpencodeSessionID)
+	}
+}
+
+func TestOpencodeFallbackNamespacedByProxyAndProvider(t *testing.T) {
+	body := []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)
+	zenA := opencodeTestProvider()
+	zenA.ID = 1
+	zenB := opencodeTestProvider()
+	zenB.ID = 2
+	px := New(nil, nil)
+	traceA := &TraceInfo{}
+	traceB := &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), traceA), backendCodec(domain.ProtocolOpencode, "big-pickle"), zenA, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), traceB), backendCodec(domain.ProtocolOpencode, "big-pickle"), zenB, body); err != nil {
+		t.Fatal(err)
+	}
+	if traceA.OpencodeSessionID == "" || traceA.OpencodeSessionID == traceB.OpencodeSessionID {
+		t.Fatalf("zen providers collided: %q vs %q", traceA.OpencodeSessionID, traceB.OpencodeSessionID)
+	}
+	px2 := New(nil, nil)
+	traceC := &TraceInfo{}
+	if _, err := px2.prepareUpstreamRequest(WithTraceInfo(context.Background(), traceC), backendCodec(domain.ProtocolOpencode, "big-pickle"), zenA, body); err != nil {
+		t.Fatal(err)
+	}
+	if traceC.OpencodeSessionID == "" || traceC.OpencodeSessionID == traceA.OpencodeSessionID {
+		t.Fatalf("proxy instances collided: %q vs %q", traceA.OpencodeSessionID, traceC.OpencodeSessionID)
+	}
+}
+
+func TestOpencodeRequestIDFreshPerSendUnlessClientSupplied(t *testing.T) {
+	px := New(nil, nil)
+	p := opencodeTestProvider()
+	body := []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)
+	ctx := withOpencodeRequest(context.Background(), px.opencodeNonce, nil, body)
+	trace := &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, trace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, body); err != nil {
+		t.Fatal(err)
+	}
+	req1, _ := http.NewRequestWithContext(WithTraceInfo(ctx, trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
+	applyUpstreamHeaders(req1, p, nil, req1.Context(), nil)
+	req2, _ := http.NewRequestWithContext(WithTraceInfo(ctx, trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
+	applyUpstreamHeaders(req2, p, nil, req2.Context(), nil)
+	if req1.Header.Get("x-opencode-session") == "" || req1.Header.Get("x-opencode-session") != req2.Header.Get("x-opencode-session") {
+		t.Fatalf("session not stable across sends: %q vs %q", req1.Header.Get("x-opencode-session"), req2.Header.Get("x-opencode-session"))
+	}
+	if req1.Header.Get("x-opencode-request") == "" || req1.Header.Get("x-opencode-request") == req2.Header.Get("x-opencode-request") {
+		t.Fatalf("request id not fresh: %q vs %q", req1.Header.Get("x-opencode-request"), req2.Header.Get("x-opencode-request"))
+	}
+
+	h := http.Header{}
+	h.Set("x-opencode-request", "msg_client")
+	ctx = withOpencodeRequest(context.Background(), px.opencodeNonce, h, body)
+	trace = &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, trace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, body); err != nil {
+		t.Fatal(err)
+	}
+	req3, _ := http.NewRequestWithContext(WithTraceInfo(ctx, trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
+	applyUpstreamHeaders(req3, p, nil, req3.Context(), nil)
+	if req3.Header.Get("x-opencode-request") != "msg_client" {
+		t.Fatalf("client request id lost: %q", req3.Header.Get("x-opencode-request"))
+	}
+}
+
+func TestApplyOpencodeHeadersFromCapturedIdentity(t *testing.T) {
+	h := http.Header{}
+	h.Set("User-Agent", "opencode/0.16.7")
+	h.Set("x-opencode-client", "my-cli")
+	h.Set("x-opencode-project", "proj-a")
+	h.Set("x-opencode-request", "msg_client")
+	h.Set("x-opencode-session", "ses_client")
+	ctx := withOpencodeRequest(context.Background(), "nonce", h, nil)
+	trace := &TraceInfo{}
+	px := New(nil, nil)
+	p := opencodeTestProvider()
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, trace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequestWithContext(WithTraceInfo(ctx, trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
+	applyUpstreamHeaders(req, p, nil, req.Context(), nil)
+	if got := req.Header.Get("User-Agent"); got != "opencode/0.16.7" {
+		t.Fatalf("UA = %q", got)
+	}
+	if got := req.Header.Get("x-opencode-client"); got != "my-cli" {
+		t.Fatalf("client = %q", got)
+	}
+	if got := req.Header.Get("x-opencode-project"); got != "proj-a" {
+		t.Fatalf("project = %q", got)
+	}
+	if got := req.Header.Get("x-opencode-request"); got != "msg_client" {
+		t.Fatalf("request = %q", got)
+	}
+	if got := req.Header.Get("x-opencode-session"); got != "ses_client" {
+		t.Fatalf("session = %q", got)
+	}
+}
+
+func TestApplyOpencodeHeadersIgnoresInvalidPassthroughIdentity(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
+	clientHeaders := http.Header{}
+	clientHeaders.Set("User-Agent", "curl/8.0")
+	clientHeaders.Set("x-opencode-session", "ses_ok\r\nX-Injected: 1")
+	clientHeaders.Set("x-opencode-client", strings.Repeat("c", 300))
+	trace := &TraceInfo{OpencodeSessionID: "ses_fallback"}
+	applyUpstreamHeaders(req, opencodeTestProvider(), clientHeaders, WithTraceInfo(context.Background(), trace), nil)
+	if got := req.Header.Get("User-Agent"); got != "opencode" {
+		t.Fatalf("UA = %q", got)
+	}
+	if got := req.Header.Get("x-opencode-session"); got != "ses_fallback" {
+		t.Fatalf("session = %q", got)
+	}
+	if got := req.Header.Get("x-opencode-client"); got != "desktop" {
+		t.Fatalf("client = %q", got)
+	}
+}
+
+func TestOpencodeTranslatedIdentityDoesNotLeak(t *testing.T) {
+	var cap struct {
+		auth      string
+		session   string
+		client    string
+		project   string
+		request   string
+		ua        string
+		cookie    string
+		custom    string
+		clientReq string
+	}
+	base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
+		cap.auth = r.Header.Get("Authorization")
+		cap.session = r.Header.Get("x-opencode-session")
+		cap.client = r.Header.Get("x-opencode-client")
+		cap.project = r.Header.Get("x-opencode-project")
+		cap.request = r.Header.Get("x-opencode-request")
+		cap.ua = r.Header.Get("User-Agent")
+		cap.cookie = r.Header.Get("Cookie")
+		cap.custom = r.Header.Get("X-Custom")
+		cap.clientReq = r.Header.Get("x-client-request-id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, openaiUpstreamBody)
+	})
+
+	body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "curl/8.0")
+	req.Header.Set("Cookie", "sid=secret")
+	req.Header.Set("X-Custom", "nope")
+	req.Header.Set("x-client-request-id", "client-req")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	if cap.auth != "Bearer public" {
+		t.Fatalf("auth leaked or missing: %q", cap.auth)
+	}
+	if cap.session != "client-req" {
+		t.Fatalf("generic request id not used as session: %q", cap.session)
+	}
+	if cap.clientReq != "" {
+		t.Fatalf("x-client-request-id leaked: %q", cap.clientReq)
+	}
+	if cap.cookie != "" || cap.custom != "" {
+		t.Fatalf("unrelated headers leaked cookie=%q custom=%q", cap.cookie, cap.custom)
+	}
+	if cap.ua != "opencode" {
+		t.Fatalf("non-opencode UA = %q", cap.ua)
+	}
+	if cap.client != "desktop" || cap.project != "global" {
+		t.Fatalf("defaults missing client=%q project=%q", cap.client, cap.project)
+	}
+	if !strings.HasPrefix(cap.request, "msg_") {
+		t.Fatalf("request id = %q", cap.request)
+	}
+}
+
+func TestOpencodeTranslatedExplicitIdentityUnaryAndStream(t *testing.T) {
+	var last http.Header
+	base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
+		last = r.Header.Clone()
+		if r.Header.Get("Accept") == "text/event-stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, openaiSSE)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, openaiUpstreamBody)
+	})
+
+	send := func(stream bool) {
+		body := `{"model":"default","stream":false,"messages":[{"role":"user","content":"hi"}]}`
+		if stream {
+			body = `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+		}
+		req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("User-Agent", "opencode/0.16.7")
+		req.Header.Set("x-opencode-client", "my-cli")
+		req.Header.Set("x-opencode-project", "proj-a")
+		req.Header.Set("x-opencode-request", "msg_client")
+		req.Header.Set("x-opencode-session", "ses_client")
+		req.Header.Set("Cookie", "sid=secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("stream=%v status = %d, body = %s", stream, resp.StatusCode, out)
+		}
+		if last.Get("x-opencode-session") != "ses_client" {
+			t.Fatalf("stream=%v session = %q", stream, last.Get("x-opencode-session"))
+		}
+		if last.Get("x-opencode-client") != "my-cli" || last.Get("x-opencode-project") != "proj-a" || last.Get("x-opencode-request") != "msg_client" {
+			t.Fatalf("stream=%v identity = %v", stream, last)
+		}
+		if last.Get("User-Agent") != "opencode/0.16.7" {
+			t.Fatalf("stream=%v UA = %q", stream, last.Get("User-Agent"))
+		}
+		if last.Get("Authorization") != "Bearer public" {
+			t.Fatalf("stream=%v auth = %q", stream, last.Get("Authorization"))
+		}
+		if last.Get("Cookie") != "" {
+			t.Fatalf("stream=%v cookie leaked", stream)
+		}
+	}
+	send(false)
+	send(true)
+}
+
+func TestOpencodeTranslatedBodySessionField(t *testing.T) {
+	var session string
+	base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
+		session = r.Header.Get("x-opencode-session")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, openaiUpstreamBody)
+	})
+
+	body := `{"model":"default","prompt_cache_key":"cache-from-body","messages":[{"role":"user","content":"hi"}]}`
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	if session != "cache-from-body" {
+		t.Fatalf("body session = %q", session)
+	}
+}
+
+func TestOpencodeTranslatedZenFirstTurnDistinctAcrossProxies(t *testing.T) {
+	sessions := make([]string, 2)
+	for i := range sessions {
+		var session string
+		base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
+			session = r.Header.Get("x-opencode-session")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, openaiUpstreamBody)
+		})
+		body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
+		req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+		}
+		sessions[i] = session
+	}
+	if sessions[0] == "" || sessions[1] == "" || sessions[0] == sessions[1] {
+		t.Fatalf("zen first-turn sessions collided: %q vs %q", sessions[0], sessions[1])
+	}
+}
+
+func TestOpencodeTranslatedInvalidBodySessionFallsBack(t *testing.T) {
+	var session string
+	base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
+		session = r.Header.Get("x-opencode-session")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, openaiUpstreamBody)
+	})
+
+	body := `{"model":"default","prompt_cache_key":"bad\nvalue","messages":[{"role":"user","content":"hi"}]}`
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	if session == "" || !strings.HasPrefix(session, "ses_") || strings.Contains(session, "\n") {
+		t.Fatalf("fallback session = %q", session)
+	}
+}
+
+func TestOpencodeTranslatedInvalidIdentityFallsBack(t *testing.T) {
+	var session, ua, client string
+	_, token, mux := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
+		session = r.Header.Get("x-opencode-session")
+		ua = r.Header.Get("User-Agent")
+		client = r.Header.Get("x-opencode-client")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, openaiUpstreamBody)
+	})
+
+	body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
+	// ServeHTTP accepts values the HTTP client would reject (CR/LF), so this
+	// path can prove injection candidates are dropped before upstream.
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "curl/8.0")
+	req.Header.Set("x-opencode-session", "ses_ok\r\nX-Injected: 1")
+	req.Header.Set("x-opencode-client", strings.Repeat("c", 300))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	resp := rec.Result()
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
+	}
+	if session == "" || !strings.HasPrefix(session, "ses_") || strings.Contains(session, "\n") || strings.Contains(session, "\r") {
+		t.Fatalf("fallback session = %q", session)
+	}
+	if ua != "opencode" {
+		t.Fatalf("UA = %q", ua)
+	}
+	if client != "desktop" {
+		t.Fatalf("client = %q", client)
 	}
 }
 
