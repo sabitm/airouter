@@ -312,6 +312,67 @@ func TestCollectStreamResponseLimits(t *testing.T) {
 			t.Fatalf("error = %v, want too-many-tools", err)
 		}
 	})
+
+	t.Run("tool delta before start keeps args", func(t *testing.T) {
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `{"ci`},
+			{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call_1", ToolName: "get_weather"},
+			{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `ty":"SF"}`},
+			{Kind: ir.EventFinish, StopReason: ir.StopToolUse},
+		}), nil, "m", nil, 1024, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if len(resp.Content) != 1 {
+			t.Fatalf("content = %+v", resp.Content)
+		}
+		b := resp.Content[0]
+		if b.Type != ir.BlockToolUse || b.ToolID != "call_1" || b.ToolName != "get_weather" {
+			t.Fatalf("tool identity = %+v", b)
+		}
+		if string(b.ToolInput) != `{"city":"SF"}` {
+			t.Fatalf("tool input = %s, want {\"city\":\"SF\"}", b.ToolInput)
+		}
+	})
+
+	t.Run("split identity across starts keeps args", func(t *testing.T) {
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call_1"},
+			{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `{"ci`},
+			{Kind: ir.EventToolCallStart, Index: 0, ToolName: "get_weather"},
+			{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `ty":"SF"}`},
+			{Kind: ir.EventFinish, StopReason: ir.StopToolUse},
+		}), nil, "m", nil, 1024, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if len(resp.Content) != 1 {
+			t.Fatalf("content = %+v", resp.Content)
+		}
+		b := resp.Content[0]
+		if b.Type != ir.BlockToolUse || b.ToolID != "call_1" || b.ToolName != "get_weather" {
+			t.Fatalf("tool identity = %+v", b)
+		}
+		if string(b.ToolInput) != `{"city":"SF"}` {
+			t.Fatalf("tool input = %s, want {\"city\":\"SF\"}", b.ToolInput)
+		}
+	})
+
+	t.Run("late start does not refund retained args", func(t *testing.T) {
+		const limit = int64(64)
+		fallback := "m"
+		base := len(ir.NewID("resp_")) + len(fallback)
+		// Leave 4 bytes after args; identity "call"+"fn" is 6, so a late
+		// Start that refunded args would succeed and this must not.
+		args := strings.Repeat("x", int(limit)-base-4)
+		_, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: args},
+			{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call", ToolName: "fn"},
+		}), nil, fallback, nil, limit, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("error = %v, want response-too-large", err)
+		}
+	})
 }
 
 func TestClampErrorMessage(t *testing.T) {

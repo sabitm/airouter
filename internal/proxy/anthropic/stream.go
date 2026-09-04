@@ -301,15 +301,28 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		})
 
 	case ir.EventFinish:
+		startEmitted := e.started
+		startInput := e.inputTokens
+		// OpenAI-family backends report input at Finish. Capture it before
+		// ensureStart so a Finish-first stream puts the count on message_start.
+		if ev.InputTokens != 0 {
+			e.inputTokens = ev.InputTokens
+		}
 		if err := e.ensureStart(w); err != nil {
 			return err
 		}
 		if err := e.closeBlock(w); err != nil {
 			return err
 		}
+		usage := map[string]any{"output_tokens": ev.OutputTokens}
+		// message_start already went out: expose a late/changed input count
+		// on the terminal delta. Skip when it would duplicate the start frame.
+		if startEmitted && ev.InputTokens != 0 && ev.InputTokens != startInput {
+			usage["input_tokens"] = ev.InputTokens
+		}
 		if err := e.event(w, "message_delta", map[string]any{
 			"delta": map[string]any{"stop_reason": stopReasonWire(ev.StopReason), "stop_sequence": nil},
-			"usage": map[string]any{"output_tokens": ev.OutputTokens},
+			"usage": usage,
 		}); err != nil {
 			return err
 		}

@@ -563,6 +563,12 @@ func TestStreamUsageChunk(t *testing.T) {
 		// Responses ingress encoder; OpenAI backend reports input at finish (late).
 		{"responses<-openai", domain.ProtocolOpenAI, "/v1/responses",
 			`{"model":"default","input":"hi","stream":true}`, 3, 2},
+		// Anthropic ingress encoder; OpenAI/Responses report input at finish, so
+		// the client must see it on terminal message_delta, not only in logs.
+		{"anthropic<-openai", domain.ProtocolOpenAI, "/v1/messages",
+			`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`, 3, 2},
+		{"anthropic<-responses", domain.ProtocolOpenAIResponses, "/v1/messages",
+			`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`, 3, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -572,9 +578,12 @@ func TestStreamUsageChunk(t *testing.T) {
 				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 			}
 			in, out, total := -1, -1, -1
-			if strings.HasPrefix(tc.ingress, "/v1/responses") {
+			switch {
+			case strings.HasPrefix(tc.ingress, "/v1/responses"):
 				in, out, total = collectResponsesUsage(t, body)
-			} else {
+			case strings.HasSuffix(tc.ingress, "/messages"):
+				in, out, total = collectAnthropicUsage(t, body)
+			default:
 				in, out, total = collectOpenAIUsage(t, body)
 			}
 			if in != tc.wantIn || out != tc.wantOut {
@@ -892,6 +901,56 @@ func collectResponsesUsage(t *testing.T, body string) (in, out, total int) {
 		}
 	}
 	return 0, 0, 0
+}
+
+// collectAnthropicUsage reads client-visible Anthropic stream usage. Input may
+// arrive on message_start or, when the backend reports it late, on the terminal
+// message_delta; a later nonzero count wins.
+func collectAnthropicUsage(t *testing.T, body string) (in, out, total int) {
+	t.Helper()
+	reader := sse.NewReader(strings.NewReader(body))
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch ev.Name {
+		case "message_start":
+			var d struct {
+				Message struct {
+					Usage *struct {
+						InputTokens  int `json:"input_tokens"`
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(ev.Data, &d) != nil || d.Message.Usage == nil {
+				continue
+			}
+			if d.Message.Usage.InputTokens != 0 {
+				in = d.Message.Usage.InputTokens
+			}
+			out = d.Message.Usage.OutputTokens
+		case "message_delta":
+			var d struct {
+				Usage *struct {
+					InputTokens  *int `json:"input_tokens"`
+					OutputTokens int  `json:"output_tokens"`
+				} `json:"usage"`
+			}
+			if json.Unmarshal(ev.Data, &d) != nil || d.Usage == nil {
+				continue
+			}
+			if d.Usage.InputTokens != nil && *d.Usage.InputTokens != 0 {
+				in = *d.Usage.InputTokens
+			}
+			out = d.Usage.OutputTokens
+		}
+	}
+	return in, out, in + out
 }
 
 // collectAnthropicToolStream reconstructs an Anthropic tool_use block from a

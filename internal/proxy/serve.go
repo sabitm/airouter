@@ -800,18 +800,25 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 				return err
 			}
 		case ir.EventToolCallStart:
-			tb := tools[ev.Index]
-			if tb == nil {
-				if len(tools) >= maxTools {
-					return errCollectedStreamTooManyTools
-				}
-				order = append(order, ev.Index)
-				tb = &toolBuf{}
-			}
-			if err := reserve(len(ev.ToolID) + len(ev.ToolName) - len(tb.id) - len(tb.name) - tb.args.Len()); err != nil {
+			tb, err := newTool(ev.Index)
+			if err != nil {
 				return err
 			}
-			tools[ev.Index] = &toolBuf{id: ev.ToolID, name: ev.ToolName}
+			// Identity may arrive after argument fragments, or split across
+			// repeated Starts. Update in place so retained args and already-
+			// learned id/name survive; charge only the net identity change.
+			id, name := tb.id, tb.name
+			if ev.ToolID != "" {
+				id = ev.ToolID
+			}
+			if ev.ToolName != "" {
+				name = ev.ToolName
+			}
+			if err := reserve(len(id) + len(name) - len(tb.id) - len(tb.name)); err != nil {
+				return err
+			}
+			tb.id = id
+			tb.name = name
 		case ir.EventToolCallDelta:
 			tb, err := newTool(ev.Index)
 			if err != nil {
