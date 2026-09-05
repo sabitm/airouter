@@ -30,6 +30,10 @@ func usageCardURL(id int64, force bool) string {
 	return u
 }
 
+func usageCodexResetURL(id int64) string {
+	return "/dashboard/usage/card/" + strconv.FormatInt(id, 10) + "/codex-reset"
+}
+
 func remainingPct(q usage.Quota) float64 {
 	if q.RemainingPct != nil {
 		return clamp01to100(*q.RemainingPct)

@@ -111,8 +111,19 @@ templ UsageCard(p *domain.Provider, report *usage.Report, errMsg string) {
 		} else if report != nil && report.Message != "" && len(report.Quotas) == 0 {
 			<p class="usage-msg">{ report.Message }</p>
 		} else if report != nil {
-			if report.ResetCredits > 0 {
-				<p class="muted">reset credits: { strconv.Itoa(report.ResetCredits) }</p>
+			if p.Protocol == domain.ProtocolOpenAICodex && report.ResetCredits > 0 {
+				<p class="muted usage-reset-row">
+					<span>reset credits: { strconv.Itoa(report.ResetCredits) }</span>
+					<button
+						type="button"
+						class="link danger"
+						hx-post={ usageCodexResetURL(p.ID) }
+						hx-target={ "#usage-card-" + strconv.FormatInt(p.ID, 10) }
+						hx-swap="outerHTML"
+						hx-confirm={ "Use 1 Codex reset credit for \"" + p.Name + "\"? This cannot be undone. Remaining credits: " + strconv.Itoa(report.ResetCredits) + "." }
+						hx-disabled-elt="this"
+					>Reset usage</button>
+				</p>
 			}
 			if report.Message != "" {
 				<p class="usage-msg">{ report.Message }</p>

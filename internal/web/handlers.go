@@ -119,6 +119,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	// Usage (upstream account quota)
 	mux.HandleFunc("GET /dashboard/usage", h.usagePage)
 	mux.HandleFunc("GET /dashboard/usage/card/{id}", h.usageCard)
+	mux.HandleFunc("POST /dashboard/usage/card/{id}/codex-reset", h.usageCodexReset)
 
 	// Logs
 	mux.HandleFunc("GET /dashboard/logs", h.logsPage)
@@ -1323,4 +1324,35 @@ func (h *Handler) usageCard(w http.ResponseWriter, r *http.Request) {
 	force := r.URL.Query().Get("force") == "1"
 	rep, ferr := h.usage.FetchWith(r.Context(), p, usage.FetchOpts{Force: force})
 	render(w, r, UsageCard(p, rep, usageErrMessage(p, ferr)))
+}
+
+func (h *Handler) usageCodexReset(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	p, err := h.store.GetProvider(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if p.Archived || p.Protocol != domain.ProtocolOpenAICodex {
+		http.NotFound(w, r)
+		return
+	}
+	result, rep, cerr := h.usage.ConsumeCodexResetCredit(r.Context(), p)
+	if cerr != nil {
+		render(w, r, UsageCard(p, nil, usageErrMessage(p, cerr)))
+		return
+	}
+	if rep != nil {
+		render(w, r, UsageCard(p, rep, ""))
+		return
+	}
+	msg := ""
+	if result != nil {
+		msg = result.Message
+	}
+	render(w, r, UsageCard(p, &usage.Report{Plan: "Codex", Message: msg}, ""))
 }

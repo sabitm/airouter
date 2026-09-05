@@ -229,6 +229,264 @@ func TestUsageLoadAllPartialAutoloads(t *testing.T) {
 	}
 }
 
+func TestUsageCardShowsCodexResetButton(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"plan_type": "plus",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{"used_percent": 20},
+			},
+			"rate_limit_reset_credits": map[string]any{"available_count": 2},
+		})
+	}))
+	t.Cleanup(up.Close)
+	prev := usage.CodexUsageURL
+	usage.CodexUsageURL = up.URL
+	t.Cleanup(func() { usage.CodexUsageURL = prev })
+
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "codex-live", Protocol: domain.ProtocolOpenAICodex,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "tok", ExpiresAt: 0},
+	}
+	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(p.ID, 10)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage/card/"+id, nil)
+	req.SetPathValue("id", id)
+	h.usageCard(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "Reset usage") {
+		t.Fatalf("missing reset button: %s", body)
+	}
+	wantPost := "hx-post=\"/dashboard/usage/card/" + id + "/codex-reset\""
+	if !strings.Contains(body, wantPost) {
+		t.Fatalf("missing hx-post: %s", body)
+	}
+	if !strings.Contains(body, "hx-swap=\"outerHTML\"") {
+		t.Fatalf("missing hx-swap: %s", body)
+	}
+	if !strings.Contains(body, "Remaining credits: 2.") {
+		t.Fatalf("missing hx-confirm remaining credits: %s", body)
+	}
+}
+
+func TestUsageCardHidesCodexResetWhenNoCredits(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"plan_type": "plus",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{"used_percent": 20},
+			},
+			"rate_limit_reset_credits": map[string]any{"available_count": 0},
+		})
+	}))
+	t.Cleanup(up.Close)
+	prev := usage.CodexUsageURL
+	usage.CodexUsageURL = up.URL
+	t.Cleanup(func() { usage.CodexUsageURL = prev })
+
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "codex-live", Protocol: domain.ProtocolOpenAICodex,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "tok", ExpiresAt: 0},
+	}
+	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(p.ID, 10)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage/card/"+id, nil)
+	req.SetPathValue("id", id)
+	h.usageCard(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "Reset usage") || strings.Contains(body, "codex-reset") {
+		t.Fatalf("reset button should be hidden: %s", body)
+	}
+}
+
+func TestUsageCardNonCodexHasNoResetPath(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"five_hour": map[string]any{"utilization": 10, "resets_at": "2026-01-01T00:00:00Z"},
+		})
+	}))
+	t.Cleanup(up.Close)
+	prev := usage.ClaudeUsageURL
+	usage.ClaudeUsageURL = up.URL
+	t.Cleanup(func() { usage.ClaudeUsageURL = prev })
+
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "claude-live", Protocol: domain.ProtocolClaudeCode,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "tok", ExpiresAt: 0},
+	}
+	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(p.ID, 10)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage/card/"+id, nil)
+	req.SetPathValue("id", id)
+	h.usageCard(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "codex-reset") || strings.Contains(body, "Reset usage") {
+		t.Fatalf("non-codex card must not expose reset: %s", body)
+	}
+}
+
+func TestUsageCodexResetPOSTSuccess(t *testing.T) {
+	consumeHits, usageHits := 0, 0
+	consume := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		consumeHits++
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s", r.Method)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "reset", "windows_reset": 1})
+	}))
+	t.Cleanup(consume.Close)
+	usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		usageHits++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"plan_type": "plus",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{"used_percent": 5},
+			},
+			"rate_limit_reset_credits": map[string]any{"available_count": 1},
+		})
+	}))
+	t.Cleanup(usageSrv.Close)
+	prevU, prevC := usage.CodexUsageURL, usage.CodexResetConsumeURL
+	usage.CodexUsageURL = usageSrv.URL
+	usage.CodexResetConsumeURL = consume.URL
+	t.Cleanup(func() {
+		usage.CodexUsageURL = prevU
+		usage.CodexResetConsumeURL = prevC
+	})
+
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "codex-live", Protocol: domain.ProtocolOpenAICodex,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "tok", ExpiresAt: 0},
+	}
+	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(p.ID, 10)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/usage/card/"+id+"/codex-reset", nil)
+	req.SetPathValue("id", id)
+	h.usageCodexReset(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if consumeHits != 1 || usageHits != 1 {
+		t.Fatalf("consume=%d usage=%d", consumeHits, usageHits)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "Usage reset.") || !strings.Contains(body, "session (5h)") {
+		t.Fatalf("card = %s", body)
+	}
+}
+
+func TestUsageCodexResetPOSTNoCredit(t *testing.T) {
+	consume := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "no_credit", "windows_reset": 0})
+	}))
+	t.Cleanup(consume.Close)
+	usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"plan_type": "plus",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{"used_percent": 20},
+			},
+			"rate_limit_reset_credits": map[string]any{"available_count": 0},
+		})
+	}))
+	t.Cleanup(usageSrv.Close)
+	prevU, prevC := usage.CodexUsageURL, usage.CodexResetConsumeURL
+	usage.CodexUsageURL = usageSrv.URL
+	usage.CodexResetConsumeURL = consume.URL
+	t.Cleanup(func() {
+		usage.CodexUsageURL = prevU
+		usage.CodexResetConsumeURL = prevC
+	})
+
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "codex-live", Protocol: domain.ProtocolOpenAICodex,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "tok", ExpiresAt: 0},
+	}
+	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(p.ID, 10)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/usage/card/"+id+"/codex-reset", nil)
+	req.SetPathValue("id", id)
+	h.usageCodexReset(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "No reset credits available.") {
+		t.Fatalf("body = %s", rr.Body.String())
+	}
+}
+
+func TestUsageCodexResetPOSTNotFound(t *testing.T) {
+	h := testHandler(t)
+	ctx := httptest.NewRequest(http.MethodGet, "/", nil).Context()
+
+	plain := &domain.Provider{Name: "oai", Protocol: domain.ProtocolOpenAI, APIKey: "k"}
+	if err := h.store.CreateProvider(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	archived := &domain.Provider{
+		Name: "codex-archived", Protocol: domain.ProtocolOpenAICodex,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "tok"},
+		Archived:   true,
+	}
+	if err := h.store.CreateProvider(ctx, archived); err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(id int64) int {
+		t.Helper()
+		s := strconv.FormatInt(id, 10)
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/dashboard/usage/card/"+s+"/codex-reset", nil)
+		req.SetPathValue("id", s)
+		h.usageCodexReset(rr, req)
+		return rr.Code
+	}
+	if got := post(plain.ID); got != http.StatusNotFound {
+		t.Fatalf("plain openai status = %d", got)
+	}
+	if got := post(archived.ID); got != http.StatusNotFound {
+		t.Fatalf("archived status = %d", got)
+	}
+	if got := post(99999); got != http.StatusNotFound {
+		t.Fatalf("unknown id status = %d", got)
+	}
+}
+
 func TestFormatResetCountdown(t *testing.T) {
 	if formatResetCountdown(nil) != "-" {
 		t.Fatal("nil")

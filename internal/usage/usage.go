@@ -42,6 +42,7 @@ type FetchOpts struct {
 // Endpoint URLs are vars so tests can point them at an httptest server.
 var (
 	CodexUsageURL        = "https://chatgpt.com/backend-api/wham/usage"
+	CodexResetConsumeURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 	ClaudeUsageURL       = "https://api.anthropic.com/api/oauth/usage"
 	QoderUsageURL        = "https://openapi.qoder.sh/api/v2/quota/usage"
 	AntigravityModelsURL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
@@ -69,6 +70,23 @@ var (
 	ErrNoToken = errors.New("usage: no access token")
 )
 
+// CodexResetCode is the consume endpoint's `code` field.
+type CodexResetCode string
+
+const (
+	CodexResetReset           CodexResetCode = "reset"
+	CodexResetNothingToReset  CodexResetCode = "nothing_to_reset"
+	CodexResetNoCredit        CodexResetCode = "no_credit"
+	CodexResetAlreadyRedeemed CodexResetCode = "already_redeemed"
+)
+
+// CodexResetResult is the dashboard-facing outcome of consuming a Codex reset credit.
+type CodexResetResult struct {
+	Code         CodexResetCode
+	WindowsReset int
+	Message      string
+}
+
 // tokenResolver is the oauth.Service.Resolve seam. Tests inject a stub.
 type tokenResolver interface {
 	Resolve(ctx context.Context, provider *domain.Provider, force bool) (string, error)
@@ -95,6 +113,7 @@ type Service struct {
 	mu       sync.Mutex
 	cache    map[int64]cacheEntry
 	inflight map[int64]*inflight
+	cacheGen map[int64]uint64
 	// cooldownUntil is the Claude 429 bookkeeping. The OAuth usage endpoint
 	// rate-limits polling; chat on the same token still works, so we cool down
 	// per provider instead of hammering it.
@@ -124,6 +143,7 @@ func newService(o tokenResolver, logger *slog.Logger, client *http.Client) *Serv
 		now:           time.Now,
 		cache:         map[int64]cacheEntry{},
 		inflight:      map[int64]*inflight{},
+		cacheGen:      map[int64]uint64{},
 		cooldownUntil: map[int64]time.Time{},
 	}
 }
@@ -215,6 +235,9 @@ func waitInflight(ctx context.Context, f *inflight) (*Report, error) {
 }
 
 func (s *Service) finishInflight(ctx context.Context, p *domain.Provider, f *inflight) (*Report, error) {
+	s.mu.Lock()
+	gen := s.cacheGen[p.ID]
+	s.mu.Unlock()
 	defer func() {
 		close(f.done)
 		s.mu.Lock()
@@ -227,10 +250,24 @@ func (s *Service) finishInflight(ctx context.Context, p *domain.Provider, f *inf
 	f.report, f.err = report, err
 	if err == nil && report != nil {
 		s.mu.Lock()
-		s.cache[p.ID] = cacheEntry{report: report, expiresAt: s.now().Add(cacheTTL)}
+		if s.cacheGen[p.ID] == gen {
+			s.cache[p.ID] = cacheEntry{report: report, expiresAt: s.now().Add(cacheTTL)}
+		}
 		s.mu.Unlock()
 	}
 	return report, err
+}
+
+// dropCache evicts a cached report and bumps the generation so an in-flight
+// fetch that started before a mutation detect it must not write a now-stale report.
+func (s *Service) dropCache(id int64) {
+	if id == 0 {
+		return
+	}
+	s.mu.Lock()
+	delete(s.cache, id)
+	s.cacheGen[id]++
+	s.mu.Unlock()
 }
 
 func (s *Service) fetchLive(ctx context.Context, p *domain.Provider) (*Report, error) {

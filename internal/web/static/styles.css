@@ -616,6 +616,7 @@ tr.archived { opacity: 0.6; }
 	margin-left: 6px;
 }
 .usage-msg { color: var(--muted); margin: 0; }
+.usage-reset-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; }
 .quota-row { display: flex; flex-direction: column; gap: 4px; }
 .quota-row-head,
 .quota-row-foot {
