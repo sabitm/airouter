@@ -3,6 +3,7 @@ package responses
 import (
 	"encoding/json"
 	"io"
+	"sort"
 	"strings"
 
 	"airouter/internal/proxy/ir"
@@ -223,19 +224,34 @@ type StreamEncoder struct {
 
 	textBuf      strings.Builder
 	reasoningBuf strings.Builder
-	argBuf       strings.Builder
-	fcCallID     string
-	fcName       string
 
-	toolItem map[int]string
-	toolIdx  map[int]int
+	tools      map[int]*respTool
+	pendingLen int
 
 	items []map[string]any // completed output items, for response.completed
 }
 
-func NewStreamEncoder(model string) *StreamEncoder {
-	return &StreamEncoder{model: model, open: openNone, toolItem: map[int]string{}, toolIdx: map[int]int{}}
+// respTool is one IR-index function call. itemID is empty until
+// output_item.added has been written; identity may arrive across repeated
+// Starts and argument fragments may precede the first Start.
+type respTool struct {
+	itemID  string
+	outIdx  int
+	callID  string
+	name    string
+	pending string
+	args    strings.Builder
+	done    bool
 }
+
+func NewStreamEncoder(model string) *StreamEncoder {
+	return &StreamEncoder{model: model, open: openNone, tools: map[int]*respTool{}}
+}
+
+// maxPendingArgs bounds fragments buffered for an index whose Start has not
+// arrived yet, so a stream that never resolves identity cannot retain
+// unbounded bytes.
+const maxPendingArgs = 1 << 20
 
 func (e *StreamEncoder) emit(w *sse.Writer, name string, data map[string]any) error {
 	data["type"] = name
@@ -319,19 +335,99 @@ func (e *StreamEncoder) closeOpen(w *sse.Writer) error {
 		if err := e.emit(w, "response.output_item.done", map[string]any{"output_index": e.openOutIdx, "item": item}); err != nil {
 			return err
 		}
-	case openFunction:
-		full := e.argBuf.String()
+	}
+	e.open = openNone
+	return nil
+}
+
+func (e *StreamEncoder) tool(irIndex int) *respTool {
+	if t, ok := e.tools[irIndex]; ok {
+		return t
+	}
+	t := &respTool{}
+	e.tools[irIndex] = t
+	return t
+}
+
+func (e *StreamEncoder) bufferPending(t *respTool, frag string) {
+	if frag == "" || e.pendingLen+len(frag) > maxPendingArgs {
+		return
+	}
+	t.pending += frag
+	e.pendingLen += len(frag)
+}
+
+// openFunctionItem writes output_item.added once identity is known. Fragments
+// buffered before that are flushed immediately after so the client never sees
+// a delta keyed to a nonexistent item_id.
+func (e *StreamEncoder) openFunctionItem(w *sse.Writer, t *respTool) error {
+	if t.itemID != "" || t.name == "" {
+		return nil
+	}
+	if e.open == openMessage || e.open == openReasoning {
+		if err := e.closeOpen(w); err != nil {
+			return err
+		}
+	}
+	e.open = openFunction
+	t.itemID = ir.NewID("fc_")
+	t.outIdx = e.outputIndex
+	e.outputIndex++
+	e.openItemID = t.itemID
+	e.openOutIdx = t.outIdx
+	if t.callID == "" {
+		t.callID = ir.NewID("call_")
+	}
+	if err := e.emit(w, "response.output_item.added", map[string]any{
+		"output_index": t.outIdx,
+		"item": map[string]any{
+			"id": t.itemID, "type": "function_call", "status": "in_progress",
+			"call_id": t.callID, "name": t.name, "arguments": "",
+		},
+	}); err != nil {
+		return err
+	}
+	return e.flushToolPending(w, t)
+}
+
+func (e *StreamEncoder) flushToolPending(w *sse.Writer, t *respTool) error {
+	if t.itemID == "" || t.pending == "" {
+		return nil
+	}
+	frag := t.pending
+	t.pending = ""
+	e.pendingLen -= len(frag)
+	t.args.WriteString(frag)
+	return e.emit(w, "response.function_call_arguments.delta", map[string]any{
+		"item_id": t.itemID, "output_index": t.outIdx, "delta": frag,
+	})
+}
+
+func (e *StreamEncoder) closeOpenFunctions(w *sse.Writer) error {
+	idxs := make([]int, 0, len(e.tools))
+	for irIndex, t := range e.tools {
+		if t.itemID != "" && !t.done {
+			idxs = append(idxs, irIndex)
+		}
+	}
+	sort.Slice(idxs, func(i, j int) bool {
+		return e.tools[idxs[i]].outIdx < e.tools[idxs[j]].outIdx
+	})
+	for _, irIndex := range idxs {
+		t := e.tools[irIndex]
+		t.done = true
+		full := t.args.String()
 		if err := e.emit(w, "response.function_call_arguments.done", map[string]any{
-			"item_id": e.openItemID, "output_index": e.openOutIdx, "arguments": full,
+			"item_id": t.itemID, "output_index": t.outIdx, "arguments": full,
 		}); err != nil {
 			return err
 		}
 		item := map[string]any{
-			"id": e.openItemID, "type": "function_call", "status": "completed",
-			"call_id": e.fcCallID, "name": e.fcName, "arguments": full,
+			"id": t.itemID, "type": "function_call", "status": "completed",
+			"call_id": t.callID, "name": t.name, "arguments": full,
 		}
 		e.items = append(e.items, item)
-		if err := e.emit(w, "response.output_item.done", map[string]any{"output_index": e.openOutIdx, "item": item}); err != nil {
+		if err := e.emit(w, "response.output_item.done", map[string]any{"output_index": t.outIdx, "item": item}); err != nil {
 			return err
 		}
 	}
@@ -381,36 +477,29 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		if err := e.ensureCreated(w); err != nil {
 			return err
 		}
-		if err := e.closeOpen(w); err != nil {
-			return err
+		t := e.tool(ev.Index)
+		if ev.ToolID != "" {
+			t.callID = ev.ToolID
 		}
-		e.openItemID = ir.NewID("fc_")
-		e.openOutIdx = e.outputIndex
-		e.outputIndex++
-		e.open = openFunction
-		e.argBuf.Reset()
-		e.fcCallID = ev.ToolID
-		e.fcName = ev.ToolName
-		e.toolItem[ev.Index] = e.openItemID
-		e.toolIdx[ev.Index] = e.openOutIdx
-		return e.emit(w, "response.output_item.added", map[string]any{
-			"output_index": e.openOutIdx,
-			"item": map[string]any{
-				"id": e.openItemID, "type": "function_call", "status": "in_progress",
-				"call_id": ev.ToolID, "name": ev.ToolName, "arguments": "",
-			},
-		})
+		if ev.ToolName != "" {
+			t.name = ev.ToolName
+		}
+		return e.openFunctionItem(w, t)
 
 	case ir.EventToolCallDelta:
-		itemID := e.openItemID
-		outIdx := e.openOutIdx
-		if id, ok := e.toolItem[ev.Index]; ok {
-			itemID = id
-			outIdx = e.toolIdx[ev.Index]
+		t := e.tool(ev.Index)
+		if t.itemID == "" {
+			// No item for this index yet: buffer instead of emitting a delta
+			// keyed to a nonexistent item or writing into another item's args.
+			e.bufferPending(t, ev.ArgsFrag)
+			return nil
 		}
-		e.argBuf.WriteString(ev.ArgsFrag)
+		if t.done {
+			return nil
+		}
+		t.args.WriteString(ev.ArgsFrag)
 		return e.emit(w, "response.function_call_arguments.delta", map[string]any{
-			"item_id": itemID, "output_index": outIdx, "delta": ev.ArgsFrag,
+			"item_id": t.itemID, "output_index": t.outIdx, "delta": ev.ArgsFrag,
 		})
 
 	case ir.EventFinish:
@@ -425,6 +514,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 			return err
 		}
 		if err := e.closeOpen(w); err != nil {
+			return err
+		}
+		if err := e.closeOpenFunctions(w); err != nil {
 			return err
 		}
 		status := "completed"
@@ -456,6 +548,9 @@ func (e *StreamEncoder) openMessageItem(w *sse.Writer) error {
 	if err := e.closeOpen(w); err != nil {
 		return err
 	}
+	if err := e.closeOpenFunctions(w); err != nil {
+		return err
+	}
 	e.openItemID = ir.NewID("msg_")
 	e.openOutIdx = e.outputIndex
 	e.outputIndex++
@@ -477,6 +572,9 @@ func (e *StreamEncoder) openMessageItem(w *sse.Writer) error {
 
 func (e *StreamEncoder) openReasoningItem(w *sse.Writer) error {
 	if err := e.closeOpen(w); err != nil {
+		return err
+	}
+	if err := e.closeOpenFunctions(w); err != nil {
 		return err
 	}
 	e.openItemID = ir.NewID("rs_")
@@ -504,6 +602,9 @@ func (e *StreamEncoder) Close(w *sse.Writer) error {
 		return err
 	}
 	if err := e.closeOpen(w); err != nil {
+		return err
+	}
+	if err := e.closeOpenFunctions(w); err != nil {
 		return err
 	}
 	return e.emit(w, "response.completed", map[string]any{"response": e.responseObj("completed", e.items, true)})

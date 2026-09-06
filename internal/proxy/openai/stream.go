@@ -220,6 +220,20 @@ func NewStreamEncoder(model string) *StreamEncoder {
 	return &StreamEncoder{model: model, created: time.Now().Unix(), toolIndex: map[int]int{}}
 }
 
+// ensureToolIndex lazily allocates the client tool_calls index on first sight
+// of an IR index. Backends may stream argument fragments before (or split
+// across) the chunk carrying tool identity, so Start and Delta share this
+// allocation path to keep one client-visible call per IR index.
+func (e *StreamEncoder) ensureToolIndex(irIndex int) int {
+	if idx, ok := e.toolIndex[irIndex]; ok {
+		return idx
+	}
+	idx := e.nextTool
+	e.nextTool++
+	e.toolIndex[irIndex] = idx
+	return idx
+}
+
 func (e *StreamEncoder) emit(w *sse.Writer, delta chunkDelta, finish *string) error {
 	chunk := chatChunk{
 		ID:      e.id,
@@ -252,17 +266,14 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 	case ir.EventReasoningDelta:
 		return e.emit(w, chunkDelta{ReasoningContent: ev.Text}, nil)
 	case ir.EventToolCallStart:
-		idx := e.nextTool
-		e.nextTool++
-		e.toolIndex[ev.Index] = idx
+		// Repeated Starts for a known index reuse the client index; identity
+		// backfills on the same tool_calls entry rather than splitting the call.
+		idx := e.ensureToolIndex(ev.Index)
 		tc := chunkToolCall{Index: idx, ID: ev.ToolID}
 		tc.Function.Name = ev.ToolName
 		return e.emit(w, chunkDelta{ToolCalls: []chunkToolCall{tc}}, nil)
 	case ir.EventToolCallDelta:
-		idx, ok := e.toolIndex[ev.Index]
-		if !ok {
-			idx = ev.Index
-		}
+		idx := e.ensureToolIndex(ev.Index)
 		tc := chunkToolCall{Index: idx}
 		tc.Function.Arguments = ev.ArgsFrag
 		return e.emit(w, chunkDelta{ToolCalls: []chunkToolCall{tc}}, nil)

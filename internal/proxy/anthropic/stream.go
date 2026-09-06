@@ -3,6 +3,7 @@ package anthropic
 import (
 	"encoding/json"
 	"io"
+	"sort"
 
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/sse"
@@ -190,13 +191,30 @@ type StreamEncoder struct {
 	openKind      int
 	openIndex     int
 	nextIndex     int
-	toolBlock     map[int]int // IR tool Index -> anthropic block index
+	tools         map[int]*streamTool
+	openToolIdx   []int // anthropic block indices started and not yet stopped
+	pendingBytes  int
 	finishEmitted bool
 }
 
-func NewStreamEncoder(model string) *StreamEncoder {
-	return &StreamEncoder{model: model, openKind: blockNone, toolBlock: map[int]int{}}
+// streamTool is one IR-index tool call. block is -1 until content_block_start
+// has been written; identity may arrive across repeated Starts and argument
+// fragments may precede the first Start.
+type streamTool struct {
+	block   int
+	id      string
+	name    string
+	pending string
 }
+
+func NewStreamEncoder(model string) *StreamEncoder {
+	return &StreamEncoder{model: model, openKind: blockNone, tools: map[int]*streamTool{}}
+}
+
+// maxPendingArgs bounds fragments buffered for an index whose Start has not
+// arrived yet, so a stream that never resolves identity cannot retain
+// unbounded bytes.
+const maxPendingArgs = 1 << 20
 
 func (e *StreamEncoder) event(w *sse.Writer, name string, payload map[string]any) error {
 	payload["type"] = name
@@ -223,12 +241,89 @@ func (e *StreamEncoder) ensureStart(w *sse.Writer) error {
 }
 
 func (e *StreamEncoder) closeBlock(w *sse.Writer) error {
-	if e.openKind == blockNone {
+	if e.openKind != blockText && e.openKind != blockReasoning {
 		return nil
 	}
 	idx := e.openIndex
 	e.openKind = blockNone
 	return e.event(w, "content_block_stop", map[string]any{"index": idx})
+}
+
+func (e *StreamEncoder) tool(irIndex int) *streamTool {
+	if t, ok := e.tools[irIndex]; ok {
+		return t
+	}
+	t := &streamTool{block: -1}
+	e.tools[irIndex] = t
+	return t
+}
+
+func (e *StreamEncoder) bufferPending(t *streamTool, frag string) {
+	if frag == "" || e.pendingBytes+len(frag) > maxPendingArgs {
+		return
+	}
+	t.pending += frag
+	e.pendingBytes += len(frag)
+}
+
+// openToolBlock writes content_block_start once the tool name is known.
+// Fragments buffered before that are flushed immediately after so the wire
+// stays message/block-before-delta. Id-only Starts wait for the name so a
+// split identity does not open a nameless block.
+func (e *StreamEncoder) openToolBlock(w *sse.Writer, t *streamTool) error {
+	if t.block >= 0 || t.name == "" {
+		return nil
+	}
+	if e.openKind != blockNone && e.openKind != blockTool {
+		if err := e.closeBlock(w); err != nil {
+			return err
+		}
+	}
+	e.openKind = blockTool
+	t.block = e.nextIndex
+	e.nextIndex++
+	e.openIndex = t.block
+	e.openToolIdx = append(e.openToolIdx, t.block)
+	if t.id == "" {
+		t.id = ir.NewID("toolu_")
+	}
+	if err := e.event(w, "content_block_start", map[string]any{
+		"index": t.block,
+		"content_block": map[string]any{
+			"type": "tool_use", "id": t.id, "name": t.name, "input": map[string]any{},
+		},
+	}); err != nil {
+		return err
+	}
+	return e.flushToolPending(w, t)
+}
+
+func (e *StreamEncoder) flushToolPending(w *sse.Writer, t *streamTool) error {
+	if t.block < 0 || t.pending == "" {
+		return nil
+	}
+	frag := t.pending
+	t.pending = ""
+	e.pendingBytes -= len(frag)
+	return e.event(w, "content_block_delta", map[string]any{
+		"index": t.block, "delta": map[string]any{"type": "input_json_delta", "partial_json": frag},
+	})
+}
+
+func (e *StreamEncoder) closeOpenTools(w *sse.Writer) error {
+	if len(e.openToolIdx) == 0 {
+		return nil
+	}
+	idxs := append([]int(nil), e.openToolIdx...)
+	sort.Ints(idxs)
+	e.openToolIdx = nil
+	e.openKind = blockNone
+	for _, idx := range idxs {
+		if err := e.event(w, "content_block_stop", map[string]any{"index": idx}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
@@ -247,6 +342,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		}
 		if e.openKind != blockText {
 			if err := e.closeBlock(w); err != nil {
+				return err
+			}
+			if err := e.closeOpenTools(w); err != nil {
 				return err
 			}
 			e.openIndex = e.nextIndex
@@ -270,6 +368,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 			if err := e.closeBlock(w); err != nil {
 				return err
 			}
+			if err := e.closeOpenTools(w); err != nil {
+				return err
+			}
 			e.openIndex = e.nextIndex
 			e.nextIndex++
 			e.openKind = blockReasoning
@@ -287,27 +388,26 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		if err := e.ensureStart(w); err != nil {
 			return err
 		}
-		if err := e.closeBlock(w); err != nil {
-			return err
+		t := e.tool(ev.Index)
+		if ev.ToolID != "" {
+			t.id = ev.ToolID
 		}
-		e.openIndex = e.nextIndex
-		e.nextIndex++
-		e.openKind = blockTool
-		e.toolBlock[ev.Index] = e.openIndex
-		return e.event(w, "content_block_start", map[string]any{
-			"index": e.openIndex,
-			"content_block": map[string]any{
-				"type": "tool_use", "id": ev.ToolID, "name": ev.ToolName, "input": map[string]any{},
-			},
-		})
+		if ev.ToolName != "" {
+			t.name = ev.ToolName
+		}
+		return e.openToolBlock(w, t)
 
 	case ir.EventToolCallDelta:
-		idx, ok := e.toolBlock[ev.Index]
-		if !ok {
-			idx = e.openIndex
+		t := e.tool(ev.Index)
+		if t.block < 0 {
+			// No content_block_start yet: buffer instead of emitting a delta
+			// outside any content block (or onto whichever block happens to be
+			// open, which would merge another call's arguments into it).
+			e.bufferPending(t, ev.ArgsFrag)
+			return nil
 		}
 		return e.event(w, "content_block_delta", map[string]any{
-			"index": idx, "delta": map[string]any{"type": "input_json_delta", "partial_json": ev.ArgsFrag},
+			"index": t.block, "delta": map[string]any{"type": "input_json_delta", "partial_json": ev.ArgsFrag},
 		})
 
 	case ir.EventFinish:
@@ -322,6 +422,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 			return err
 		}
 		if err := e.closeBlock(w); err != nil {
+			return err
+		}
+		if err := e.closeOpenTools(w); err != nil {
 			return err
 		}
 		usage := map[string]any{"output_tokens": ev.OutputTokens}
@@ -356,6 +459,9 @@ func (e *StreamEncoder) Close(w *sse.Writer) error {
 		return nil
 	}
 	if err := e.closeBlock(w); err != nil {
+		return err
+	}
+	if err := e.closeOpenTools(w); err != nil {
 		return err
 	}
 	if err := e.event(w, "message_delta", map[string]any{

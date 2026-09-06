@@ -156,6 +156,44 @@ data: [DONE]
 
 `
 
+// openAIToolSSEDeltaFirst streams arguments on a tool_calls index that has not
+// yet carried id/name, then identity, then the rest of the JSON. Mirrors live
+// OpenAI-compatible backends that split identity from the first argument chunk.
+const openAIToolSSEDeltaFirst = `data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_9","type":"function","function":{"name":"get_weather"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"paris\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"up","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":9,"total_tokens":12}}
+
+data: [DONE]
+
+`
+
+// responsesToolSSEDeltaFirst streams function_call_arguments.delta before the
+// matching output_item.added, then identity, then the rest of the JSON.
+const responsesToolSSEDeltaFirst = `event: response.created
+data: {"type":"response.created","response":{"id":"resp_2","model":"up","status":"in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"{\"city\":"}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","status":"in_progress","call_id":"call_9","name":"get_weather","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"\"paris\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_2","model":"up","status":"completed","usage":{"input_tokens":3,"output_tokens":9,"total_tokens":12}}}
+
+`
+
 func streamingUpstream(t *testing.T, anthropicBody string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -411,6 +449,140 @@ func TestStreamToolOpenAIToAnthropic(t *testing.T) {
 	if !stopped {
 		t.Error("stream did not signal message_stop")
 	}
+}
+
+func setupStreamingBackend(t *testing.T, protocol domain.Protocol, sseBody string) (base, token string) {
+	t.Helper()
+	st := newTestStore(t)
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, sseBody)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(upstream.Close)
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: "up-key", Protocol: protocol}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "real-model", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL, key.Token
+}
+
+func collectResponsesToolStream(t *testing.T, body string) (name, args, done string) {
+	t.Helper()
+	reader := sse.NewReader(strings.NewReader(body))
+	var argBuf strings.Builder
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch ev.Name {
+		case "response.output_item.added":
+			var d struct {
+				Item struct {
+					Type string `json:"type"`
+					Name string `json:"name"`
+				} `json:"item"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			if d.Item.Type == "function_call" && d.Item.Name != "" {
+				name = d.Item.Name
+			}
+		case "response.function_call_arguments.delta":
+			var d struct {
+				Delta  string `json:"delta"`
+				ItemID string `json:"item_id"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			if d.ItemID == "" {
+				t.Fatalf("function_call_arguments.delta with empty item_id: %s", ev.Data)
+			}
+			argBuf.WriteString(d.Delta)
+		case "response.function_call_arguments.done":
+			var d struct {
+				Arguments string `json:"arguments"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			done = d.Arguments
+		}
+	}
+	return name, argBuf.String(), done
+}
+
+// An OpenAI-compatible backend that streams argument fragments before tool
+// identity must still reassemble one client-visible tool call on every ingress.
+func TestStreamToolDeltaBeforeStartTranslated(t *testing.T) {
+	const wantArgs = `{"city":"paris"}`
+	t.Run("openai ingress", func(t *testing.T) {
+		base, token := setupStreamingBackend(t, domain.ProtocolOpenAIResponses, responsesToolSSEDeltaFirst)
+		resp, body := postStream(t, base+"/v1/chat/completions", token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"weather?"}]}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+		}
+		name, args, finish := collectOpenAIToolStream(t, body)
+		if name != "get_weather" {
+			t.Errorf("tool name = %q", name)
+		}
+		if args != wantArgs {
+			t.Errorf("tool args = %q", args)
+		}
+		if finish != "tool_calls" {
+			t.Errorf("finish_reason = %q", finish)
+		}
+	})
+	t.Run("anthropic ingress", func(t *testing.T) {
+		base, token := setupStreamingBackend(t, domain.ProtocolOpenAI, openAIToolSSEDeltaFirst)
+		resp, body := postStream(t, base+"/v1/messages", token, `{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"weather?"}]}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+		}
+		name, args, stop, stopped := collectAnthropicToolStream(t, body)
+		if name != "get_weather" {
+			t.Errorf("tool name = %q", name)
+		}
+		if args != wantArgs {
+			t.Errorf("tool args = %q", args)
+		}
+		if stop != "tool_use" {
+			t.Errorf("stop_reason = %q", stop)
+		}
+		if !stopped {
+			t.Error("stream did not signal message_stop")
+		}
+	})
+	t.Run("responses ingress", func(t *testing.T) {
+		base, token := setupStreamingBackend(t, domain.ProtocolOpenAI, openAIToolSSEDeltaFirst)
+		resp, body := postStream(t, base+"/v1/responses", token, `{"model":"default","input":"weather?","stream":true}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+		}
+		name, args, done := collectResponsesToolStream(t, body)
+		if name != "get_weather" {
+			t.Errorf("tool name = %q", name)
+		}
+		if args != wantArgs {
+			t.Errorf("tool args = %q", args)
+		}
+		if done != wantArgs {
+			t.Errorf("done snapshot = %q", done)
+		}
+	})
 }
 
 // TestResponsesStreamPassthrough verifies a streaming /v1/responses request to a
