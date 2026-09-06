@@ -32,6 +32,19 @@ func TestDecodeResponseDecloaksToolNames(t *testing.T) {
 	}
 }
 
+func TestDecodeStreamEmptyYieldsNoEvents(t *testing.T) {
+	var events []ir.StreamEvent
+	if err := DecodeStream(strings.NewReader(": ping\n\n"), func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("wrapper reintroduced fabrication: %+v", events)
+	}
+}
+
 func TestDecodeStreamDecloaksToolNames(t *testing.T) {
 	const sse = `event: message_start
 data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}

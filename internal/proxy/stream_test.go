@@ -1525,6 +1525,107 @@ func TestStreamEmptyBodyFailover(t *testing.T) {
 	}
 }
 
+func TestAnthropicEmptyStreamFailover(t *testing.T) {
+	// An empty (comment-only) 200 SSE from an Anthropic-family backend must not
+	// fabricate Finish; the attempt stays uncommitted and fails over.
+	cases := []struct {
+		name    string
+		ingress string
+		body    string
+		p1      domain.Protocol
+		p2      domain.Protocol
+		p2SSE   string
+	}{
+		{"openai<-anthropic", "/v1/chat/completions",
+			`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			domain.ProtocolAnthropic, domain.ProtocolOpenAI, openaiSSE},
+		{"openai<-claude-code", "/v1/chat/completions",
+			`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			domain.ProtocolClaudeCode, domain.ProtocolOpenAI, openaiSSE},
+		{"responses<-anthropic", "/v1/responses",
+			`{"model":"default","input":"hi","stream":true}`,
+			domain.ProtocolAnthropic, domain.ProtocolOpenAI, openaiSSE},
+		{"anthropic<-claude-code", "/v1/messages",
+			`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			domain.ProtocolClaudeCode, domain.ProtocolAnthropic, anthropicSSE},
+		{"anthropic<-anthropic passthrough", "/v1/messages",
+			`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			domain.ProtocolAnthropic, domain.ProtocolAnthropic, anthropicSSE},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var n1, n2 int
+			up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n1++
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, ": ping\n\n")
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(up1.Close)
+			up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n2++
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, tc.p2SSE)
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(up2.Close)
+
+			st := newTestStore(t)
+			ctx := context.Background()
+			p1 := &domain.Provider{Name: "empty", BaseURL: up1.URL, APIKey: "k", Protocol: tc.p1}
+			p2 := &domain.Provider{Name: "good", BaseURL: up2.URL, APIKey: "k", Protocol: tc.p2}
+			if err := st.CreateProvider(ctx, p1); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateProvider(ctx, p2); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+				{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+				{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			key, err := st.NewAccessKey(ctx, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			px := New(st, nil)
+			px.Mount(mux)
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+
+			resp, body := postStream(t, ts.URL+tc.ingress, key.Token, tc.body)
+			if n1 != 1 || n2 != 1 {
+				t.Fatalf("hits n1=%d n2=%d, want 1/1; status=%d body=%s", n1, n2, resp.StatusCode, body)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+			}
+			switch {
+			case strings.HasPrefix(tc.ingress, "/v1/responses"):
+				if !strings.Contains(body, `"delta":"world"`) || !strings.Contains(body, "response.completed") {
+					t.Fatalf("fallback stream missing expected events: %s", body)
+				}
+			default:
+				text, finished := collectStreamText(t, tc.ingress, body)
+				if text != "Hello world" {
+					t.Errorf("text = %q", text)
+				}
+				if !finished {
+					t.Error("stream not finished")
+				}
+			}
+			if got := backoffSkips(px, p1.ID); got == 0 {
+				t.Fatal("failed provider was not penalized")
+			}
+		})
+	}
+}
+
 const responsesPreCommitErrSSE = `event: response.created
 data: {"type":"response.created","response":{"id":"resp_bad","model":"up","status":"in_progress"}}
 

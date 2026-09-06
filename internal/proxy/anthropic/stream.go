@@ -54,6 +54,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	inputTokens := 0
 	outputTokens := 0
 	finished := false
+	started := false
 
 	for {
 		ev, err := reader.Next()
@@ -91,6 +92,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			}); err != nil {
 				return err
 			}
+			started = true
 		case "content_block_start":
 			var s streamContentBlockStart
 			if json.Unmarshal(ev.Data, &s) != nil {
@@ -103,6 +105,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				}); err != nil {
 					return err
 				}
+				started = true
 			}
 		case "content_block_delta":
 			var d streamContentBlockDelta
@@ -114,14 +117,17 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if err := emit(ir.StreamEvent{Kind: ir.EventReasoningDelta, Text: d.Delta.Thinking}); err != nil {
 					return err
 				}
+				started = true
 			case "text_delta":
 				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: d.Delta.Text}); err != nil {
 					return err
 				}
+				started = true
 			case "input_json_delta":
 				if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: d.Index, ArgsFrag: d.Delta.PartialJSON}); err != nil {
 					return err
 				}
+				started = true
 			}
 		case "message_delta":
 			var m streamMessageDelta
@@ -146,6 +152,10 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		}
 	}
 	if !finished {
+		if !started {
+			// Empty / comment-only stream: do not fabricate a successful completion.
+			return nil
+		}
 		return emit(ir.StreamEvent{
 			Kind: ir.EventFinish, StopReason: stopReason,
 			InputTokens: inputTokens, OutputTokens: outputTokens,
