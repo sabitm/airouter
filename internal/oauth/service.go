@@ -32,8 +32,17 @@ type Service struct {
 	// now is overridable in tests; production uses time.Now.
 	now func() time.Time
 
-	mu       sync.Mutex
-	inflight map[int64]*call // provider id -> in-flight or recently cached refresh
+	mu sync.Mutex
+	// inflight deduplicates concurrent refreshes by provider id and mode:
+	// forced (reactive 401/403) refreshes coalesce among themselves but are
+	// never shared with proactive callers, whose cached result may reflect a
+	// different outcome. Keyed on (provider id, force).
+	inflight map[refreshKey]*call
+}
+
+type refreshKey struct {
+	id    int64
+	force bool
 }
 
 type call struct {
@@ -44,7 +53,7 @@ type call struct {
 
 // New returns a Service backed by the given store.
 func New(store ProviderStore) *Service {
-	return &Service{store: store, now: time.Now, inflight: map[int64]*call{}}
+	return &Service{store: store, now: time.Now, inflight: map[refreshKey]*call{}}
 }
 
 // Resolve returns the bearer token to send upstream for a provider.
@@ -63,16 +72,28 @@ func (s *Service) Resolve(ctx context.Context, provider *domain.Provider, force 
 	}
 	creds := provider.OAuthCreds
 
-	if !force && !shouldRefresh(creds, s.now()) {
-		return creds.AccessToken, nil
+	// The caller's creds are a request-local snapshot taken at combo hydration.
+	// A concurrent dashboard reconnect or edit may have replaced the stored
+	// row since; refreshing the snapshot and persisting the result would
+	// clobber the live row (old refresh token, old auxiliary fields) and can
+	// double-use a rotated single-use refresh token. Re-read the live creds
+	// as the refresh basis. Best effort: on error fall back to the snapshot,
+	// matching the best-available-token philosophy of the failure paths below.
+	// A live row that is no longer near expiry (a concurrent rotation already
+	// persisted a fresh token) skips the token endpoint entirely.
+	if live, err := s.store.GetProvider(ctx, provider.ID); err == nil && live != nil && live.OAuthCreds != nil {
+		if !force && !shouldRefresh(live.OAuthCreds, s.now()) {
+			return live.OAuthCreds.AccessToken, nil
+		}
+		creds = live.OAuthCreds
 	}
 
-	// The cached/in-flight result is only valid for a forced refresh when force
-	// was requested: a proactive caller must not reuse a forced refresh's
-	// possibly-different outcome, and vice versa. Key on (id, force) by running
-	// the forced path outside the dedup map.
+	// A proactive caller must not reuse a forced refresh's possibly-different
+	// outcome, and vice versa; the (id, force) inflight key keeps them isolated
+	// while concurrent forced refreshes (parallel 401 reactions on one
+	// provider) coalesce instead of double-using a rotating refresh token.
 	if force {
-		updated, err := s.doRefresh(ctx, provider.ID, creds)
+		updated, err := s.dedupRefresh(ctx, refreshKey{id: provider.ID, force: true}, creds)
 		if err != nil {
 			// On a forced refresh failure, fall back to the current token: the
 			// 401 may have been transient, and an expired token is no worse than
@@ -82,21 +103,21 @@ func (s *Service) Resolve(ctx context.Context, provider *domain.Provider, force 
 		return updated.AccessToken, nil
 	}
 
-	updated, err := s.dedupRefresh(ctx, provider.ID, creds)
+	updated, err := s.dedupRefresh(ctx, refreshKey{id: provider.ID, force: false}, creds)
 	if err != nil {
 		return creds.AccessToken, err
 	}
 	return updated.AccessToken, nil
 }
 
-// dedupRefresh collapses concurrent proactive refreshes for the same provider
+// dedupRefresh collapses concurrent refreshes for the same provider and mode
 // into one token-endpoint call: the first caller performs the refresh, later
-// callers wait on its result and reuse the refreshed creds. The window is short
-// (the HTTP round-trip); the cached call is dropped once done so the next
+// callers wait on its result and reuse the refreshed creds. Only the
+// HTTP round-trip window is shared; the entry is removed once done so the next
 // request re-evaluates expiry against the now-current token.
-func (s *Service) dedupRefresh(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+func (s *Service) dedupRefresh(ctx context.Context, key refreshKey, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
 	s.mu.Lock()
-	if c, ok := s.inflight[id]; ok {
+	if c, ok := s.inflight[key]; ok {
 		s.mu.Unlock()
 		select {
 		case <-c.done:
@@ -106,7 +127,7 @@ func (s *Service) dedupRefresh(ctx context.Context, id int64, creds *domain.OAut
 		}
 	}
 	c := &call{done: make(chan struct{})}
-	s.inflight[id] = c
+	s.inflight[key] = c
 	s.mu.Unlock()
 
 	defer func() {
@@ -115,21 +136,23 @@ func (s *Service) dedupRefresh(ctx context.Context, id int64, creds *domain.OAut
 		// Only clear if this call still owns the slot; a later caller may have
 		// already replaced it (it cannot, since we hold the slot until close,
 		// but the guard is cheap and correct).
-		if cur := s.inflight[id]; cur == c {
-			delete(s.inflight, id)
+		if cur := s.inflight[key]; cur == c {
+			delete(s.inflight, key)
 		}
 		s.mu.Unlock()
 	}()
 
-	updated, err := s.doRefresh(ctx, id, creds)
+	updated, err := s.doRefresh(ctx, key.id, creds)
 	c.creds, c.err = updated, err
 	return updated, err
 }
 
-// doRefresh performs a single refresh and persists the result. It re-reads the
-// provider from the store first so a concurrent dashboard edit to the OAuth
-// config does not cause a stale-refresh-token writeback to clobber it: the
-// refresh runs against the live creds, and only the token fields are written.
+// doRefresh performs a single refresh against the given creds basis and
+// persists the whole rotated creds row. The basis is chosen by the caller:
+// Resolve passes the live stored creds (re-read from the store) so the
+// writeback cannot clobber a concurrent dashboard reconnect, while
+// RefreshAndPersist intentionally passes form-pasted creds that must win over
+// the stored row. It is not re-read here.
 func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
 	// Work on a copy so a failed refresh leaves the caller's creds untouched.
 	cp := *creds

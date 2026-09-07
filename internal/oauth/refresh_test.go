@@ -25,6 +25,7 @@ type fakeStore struct {
 	creds    map[int64]*domain.OAuthCreds
 	writes   atomic.Int64
 	writeErr error
+	getErr   error
 }
 
 func newFakeStore() *fakeStore {
@@ -34,6 +35,9 @@ func newFakeStore() *fakeStore {
 func (f *fakeStore) GetProvider(_ context.Context, id int64) (*domain.Provider, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	c, ok := f.creds[id]
 	if !ok {
 		return nil, errors.New("not found")
@@ -359,8 +363,8 @@ func TestResolveProactiveRefreshPersists(t *testing.T) {
 		return 200, `{"access_token":"tok-fresh","refresh_token":"rt-fresh","expires_in":3600}`
 	})
 	store := newFakeStore()
-	// Seed the store with the provider's existing creds; Resolve re-reads from
-	// the store (doRefresh works against the live creds).
+	// Seed the store with the provider's existing creds; Resolve re-reads the
+	// stored row and uses it as the refresh basis.
 	creds := newCreds(srv)
 	creds.ExpiresAt = 1
 	store.creds[7] = creds
@@ -635,5 +639,238 @@ func TestResolveForcedCursorAccessOnlySurfacesInvalidGrant(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Errorf("token endpoint hits = %d, want 0", hits.Load())
+	}
+}
+
+// snapshotCreds returns a near-expiry creds pair whose refresh token differs
+// from the stored row, modelling a request-local snapshot taken before a
+// dashboard reconnect or concurrent rotation.
+func snapshotCreds(srv *httptest.Server) (snapshot, stored *domain.OAuthCreds) {
+	snapshot = &domain.OAuthCreds{
+		Mode: domain.OAuthManual, TokenURL: srv.URL, ClientID: "cid",
+		RefreshToken: "rt-snapshot", AccessToken: "tok-snapshot",
+		ExpiresAt: time.Now().Add(time.Minute).Unix(),
+	}
+	stored = &domain.OAuthCreds{
+		Mode: domain.OAuthManual, TokenURL: srv.URL, ClientID: "cid",
+		RefreshToken: "rt-live", AccessToken: "tok-live", Email: "live@x.com",
+		ExpiresAt: 1,
+	}
+	return snapshot, stored
+}
+
+// TestResolveUsesLiveCredsOverSnapshot verifies the refresh basis is the
+// stored row, not the request-local snapshot: the token endpoint must receive
+// the stored refresh token, and the writeback must preserve the stored
+// auxiliary fields instead of regressing them to snapshot values.
+func TestResolveUsesLiveCredsOverSnapshot(t *testing.T) {
+	var gotRefresh string
+	srv, hits := tokenTestServer(t, func(form url.Values) (int, string) {
+		gotRefresh = form.Get("refresh_token")
+		return 200, `{"access_token":"tok-new","refresh_token":"rt-new","expires_in":3600}`
+	})
+	store := newFakeStore()
+	snapshot, stored := snapshotCreds(srv)
+	store.creds[1] = stored
+
+	s := New(store)
+	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: snapshot}
+	tok, err := s.Resolve(context.Background(), p, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok-new" {
+		t.Errorf("token = %q, want tok-new", tok)
+	}
+	if gotRefresh != "rt-live" {
+		t.Errorf("refresh_token sent = %q, want stored rt-live", gotRefresh)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("hits = %d, want 1", hits.Load())
+	}
+	store.mu.Lock()
+	persisted := store.creds[1]
+	store.mu.Unlock()
+	if persisted.RefreshToken != "rt-new" || persisted.AccessToken != "tok-new" {
+		t.Errorf("persisted tokens = %+v", persisted)
+	}
+	if persisted.Email != "live@x.com" {
+		t.Errorf("persisted email = %q, want stored live value (no snapshot regression)", persisted.Email)
+	}
+}
+
+// TestResolveSkipsRefreshWhenLiveCredsFresh verifies the live expiry re-check:
+// a caller holding a near-expiry snapshot must not hit the token endpoint when
+// a concurrent rotation already persisted a fresh token.
+func TestResolveSkipsRefreshWhenLiveCredsFresh(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
+		t.Error("token endpoint must not be hit when live creds are fresh")
+		return 500, ""
+	})
+	store := newFakeStore()
+	snapshot, stored := snapshotCreds(srv)
+	stored.ExpiresAt = time.Now().Add(1 * time.Hour).Unix() // freshly rotated
+	store.creds[1] = stored
+
+	s := New(store)
+	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: snapshot}
+	tok, err := s.Resolve(context.Background(), p, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok-live" {
+		t.Errorf("token = %q, want stored tok-live", tok)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("token endpoint hits = %d, want 0", hits.Load())
+	}
+}
+
+// TestResolveGetProviderErrorFallsBackToSnapshot verifies the re-read is best
+// effort: a transient store error must not break resolution; the snapshot
+// becomes the refresh basis.
+func TestResolveGetProviderErrorFallsBackToSnapshot(t *testing.T) {
+	var gotRefresh string
+	srv, hits := tokenTestServer(t, func(form url.Values) (int, string) {
+		gotRefresh = form.Get("refresh_token")
+		return 200, `{"access_token":"tok-new","expires_in":3600}`
+	})
+	store := newFakeStore()
+	snapshot, _ := snapshotCreds(srv)
+	store.getErr = errors.New("db unavailable")
+
+	s := New(store)
+	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: snapshot}
+	tok, err := s.Resolve(context.Background(), p, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok-new" {
+		t.Errorf("token = %q, want tok-new", tok)
+	}
+	if gotRefresh != "rt-snapshot" {
+		t.Errorf("refresh_token sent = %q, want snapshot rt-snapshot", gotRefresh)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("hits = %d, want 1", hits.Load())
+	}
+}
+
+// TestForcedRefreshCoalesced verifies concurrent forced refreshes (parallel
+// 401 reactions on one provider) share a single token-endpoint call instead
+// of double-using a rotating single-use refresh token.
+func TestForcedRefreshCoalesced(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
+		time.Sleep(20 * time.Millisecond) // widen the window so callers overlap
+		return 200, `{"access_token":"tok-forced","refresh_token":"rt-forced","expires_in":3600}`
+	})
+	store := newFakeStore()
+	creds := newCreds(srv)
+	creds.ExpiresAt = time.Now().Add(1 * time.Hour).Unix()
+	store.creds[1] = creds
+
+	s := New(store)
+	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: creds}
+
+	const n = 8
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			tok, err := s.Resolve(context.Background(), p, true)
+			if err != nil {
+				t.Errorf("forced resolve err: %v", err)
+			}
+			if tok != "tok-forced" {
+				t.Errorf("forced token = %q, want tok-forced", tok)
+			}
+		}()
+	}
+	wg.Wait()
+	if hits.Load() != 1 {
+		t.Errorf("token endpoint hits = %d, want 1 (coalesced)", hits.Load())
+	}
+}
+
+// TestForcedNotReusedByProactive locks in the isolation between modes: a
+// proactive Resolve concurrent with a forced one must not consume the forced
+// refresh's slot, so both make their own token-endpoint call.
+func TestForcedNotReusedByProactive(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(form url.Values) (int, string) {
+		if form.Get("refresh_token") != "rt-old" {
+			t.Errorf("refresh_token = %q, want rt-old", form.Get("refresh_token"))
+		}
+		time.Sleep(20 * time.Millisecond) // force overlap between the two calls
+		return 200, `{"access_token":"tok-f","refresh_token":"rt-f","expires_in":3600}`
+	})
+	store := newFakeStore()
+	creds := newCreds(srv)
+	creds.ExpiresAt = 1
+	store.creds[1] = creds
+
+	s := New(store)
+	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: creds}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if tok, err := s.Resolve(context.Background(), p, true); err != nil || tok != "tok-f" {
+			t.Errorf("forced resolve = (%q, %v), want (tok-f, nil)", tok, err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if tok, err := s.Resolve(context.Background(), p, false); err != nil || tok != "tok-f" {
+			t.Errorf("proactive resolve = (%q, %v), want (tok-f, nil)", tok, err)
+		}
+	}()
+	wg.Wait()
+	if hits.Load() != 2 {
+		t.Errorf("token endpoint hits = %d, want 2 (forced and proactive isolated)", hits.Load())
+	}
+}
+
+// TestRefreshAndPersistUsesCallerCreds guards the dashboard form path: pasted,
+// unsaved tokens must win over the stored row. A regression that re-reads the
+// store inside doRefresh would refresh the stored basis and silently discard
+// the pasted tokens.
+func TestRefreshAndPersistUsesCallerCreds(t *testing.T) {
+	var gotRefresh string
+	srv, hits := tokenTestServer(t, func(form url.Values) (int, string) {
+		gotRefresh = form.Get("refresh_token")
+		return 200, `{"access_token":"tok-form","expires_in":3600}`
+	})
+	store := newFakeStore()
+	stored := &domain.OAuthCreds{
+		Mode: domain.OAuthManual, TokenURL: srv.URL, ClientID: "cid",
+		RefreshToken: "rt-stored", AccessToken: "tok-stored", ExpiresAt: 1,
+	}
+	store.creds[1] = stored
+
+	s := New(store)
+	pasted := &domain.OAuthCreds{
+		Mode: domain.OAuthManual, TokenURL: srv.URL, ClientID: "cid",
+		RefreshToken: "rt-pasted", AccessToken: "tok-old", ExpiresAt: 1,
+	}
+	updated, err := s.RefreshAndPersist(context.Background(), 1, pasted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRefresh != "rt-pasted" {
+		t.Errorf("refresh_token sent = %q, want pasted rt-pasted", gotRefresh)
+	}
+	if updated.AccessToken != "tok-form" {
+		t.Errorf("access = %q, want tok-form", updated.AccessToken)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("hits = %d, want 1", hits.Load())
+	}
+	store.mu.Lock()
+	persisted := store.creds[1]
+	store.mu.Unlock()
+	if persisted.AccessToken != "tok-form" || persisted.RefreshToken != "rt-pasted" {
+		t.Errorf("persisted = %+v, want pasted basis preserved on writeback", persisted)
 	}
 }
