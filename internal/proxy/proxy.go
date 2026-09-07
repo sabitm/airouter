@@ -329,12 +329,23 @@ const (
 	backoffShiftCap = 30
 )
 
-// New builds a Proxy. logger may be nil (falls back to slog.Default). Prefer a
-// component=proxy logger from the server constructor so attrs stay consistent.
-// HAR capture is request-pinned via TraceInfo.HAR set by server middleware.
+// New builds a Proxy with its own oauth.Service. logger may be nil (falls back
+// to slog.Default). Prefer a component=proxy logger from the server constructor
+// so attrs stay consistent. HAR capture is request-pinned via TraceInfo.HAR set
+// by server middleware.
 func New(s *store.Store, logger *slog.Logger) *Proxy {
+	return NewWithOAuth(s, logger, nil)
+}
+
+// NewWithOAuth builds a Proxy that uses oauthSvc for token resolution. A nil
+// oauthSvc constructs a new service from s, matching New. Production injects
+// the process-wide service so proxy and dashboard coalesce refreshes together.
+func NewWithOAuth(s *store.Store, logger *slog.Logger, oauthSvc *oauth.Service) *Proxy {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if oauthSvc == nil {
+		oauthSvc = oauth.New(s)
 	}
 	nonce, err := newOpencodeNonce()
 	if err != nil {
@@ -342,7 +353,7 @@ func New(s *store.Store, logger *slog.Logger) *Proxy {
 	}
 	return &Proxy{
 		store:         s,
-		oauth:         oauth.New(s),
+		oauth:         oauthSvc,
 		client:        &http.Client{Timeout: 5 * time.Minute},
 		streamClient:  &http.Client{},
 		logger:        logger,

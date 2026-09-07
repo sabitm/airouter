@@ -11,9 +11,15 @@ import (
 )
 
 // httpClient is the client used for OAuth token endpoint calls (refresh and the
-// connect exchange). It is shared across the package; refresh/connect calls are
-// short and bounded by the request context.
+// connect exchange). It is shared across the package. Connect still uses the
+// request context; coalesced Resolve refreshes use a service-owned timeout.
 var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// refreshTimeout bounds a coalesced Resolve refresh: token-endpoint HTTP plus
+// persistence. The package HTTP client already times out at 30s; the extra
+// slack covers store writeback without leaving the detached goroutine
+// unbounded if the database hangs.
+const refreshTimeout = 45 * time.Second
 
 // ProviderStore is the subset of the store the service needs: loading a provider
 // to read its current OAuth creds, and persisting refreshed creds. Defining it
@@ -38,6 +44,11 @@ type Service struct {
 	// never shared with proactive callers, whose cached result may reflect a
 	// different outcome. Keyed on (provider id, force).
 	inflight map[refreshKey]*call
+
+	// testOnJoin, if set, is called after this caller has obtained the
+	// inflight slot (leader or waiter) and before it waits. Tests use it as
+	// a join barrier; production leaves it nil.
+	testOnJoin func()
 }
 
 type refreshKey struct {
@@ -46,9 +57,25 @@ type refreshKey struct {
 }
 
 type call struct {
-	done  chan struct{}
+	done chan struct{}
+
+	mu    sync.Mutex
 	creds *domain.OAuthCreds
 	err   error
+}
+
+// publish stores the refresh outcome before close(done). Callers must publish
+// then close so waiters that observe done never race with the write.
+func (c *call) publish(creds *domain.OAuthCreds, err error) {
+	c.mu.Lock()
+	c.creds, c.err = creds, err
+	c.mu.Unlock()
+}
+
+func (c *call) result() (*domain.OAuthCreds, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.creds, c.err
 }
 
 // New returns a Service backed by the given store.
@@ -76,16 +103,20 @@ func (s *Service) Resolve(ctx context.Context, provider *domain.Provider, force 
 	// A concurrent dashboard reconnect or edit may have replaced the stored
 	// row since; refreshing the snapshot and persisting the result would
 	// clobber the live row (old refresh token, old auxiliary fields) and can
-	// double-use a rotated single-use refresh token. Re-read the live creds
-	// as the refresh basis. Best effort: on error fall back to the snapshot,
-	// matching the best-available-token philosophy of the failure paths below.
-	// A live row that is no longer near expiry (a concurrent rotation already
-	// persisted a fresh token) skips the token endpoint entirely.
+	// double-use a rotated single-use refresh token. Prefer the live stored
+	// creds as the basis. Best effort: on GetProvider error fall back to the
+	// snapshot, matching the best-available-token philosophy of the failure
+	// paths below.
 	if live, err := s.store.GetProvider(ctx, provider.ID); err == nil && live != nil && live.OAuthCreds != nil {
-		if !force && !shouldRefresh(live.OAuthCreds, s.now()) {
-			return live.OAuthCreds.AccessToken, nil
-		}
 		creds = live.OAuthCreds
+	}
+	// Every non-force Resolve consults shouldRefresh on the selected basis.
+	// A live row that is no longer near expiry (a concurrent rotation already
+	// persisted a fresh token) skips the token endpoint. The same skip applies
+	// to a fresh, unknown-expiry, or non-refreshable snapshot when the live
+	// row could not be read, so a store error does not force a token call.
+	if !force && !shouldRefresh(creds, s.now()) {
+		return creds.AccessToken, nil
 	}
 
 	// A proactive caller must not reuse a forced refresh's possibly-different
@@ -111,40 +142,56 @@ func (s *Service) Resolve(ctx context.Context, provider *domain.Provider, force 
 }
 
 // dedupRefresh collapses concurrent refreshes for the same provider and mode
-// into one token-endpoint call: the first caller performs the refresh, later
-// callers wait on its result and reuse the refreshed creds. Only the
-// HTTP round-trip window is shared; the entry is removed once done so the next
+// into one token-endpoint call. The first caller starts a detached refresh;
+// later callers wait on its result. The shared work uses a service-owned
+// timeout so a cancelled starter does not abort waiters or persistence.
+// The inflight entry is removed after the result is published so a later
 // request re-evaluates expiry against the now-current token.
 func (s *Service) dedupRefresh(ctx context.Context, key refreshKey, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	c := s.startOrJoin(ctx, key, creds)
+	if s.testOnJoin != nil {
+		s.testOnJoin()
+	}
+	select {
+	case <-c.done:
+		return c.result()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// startOrJoin returns the inflight call for key, starting a detached refresh
+// when none is running. Shared work uses WithoutCancel of the starter's ctx
+// (keeps request values, drops cancellation) plus refreshTimeout so the token
+// HTTP client (30s) and persistence cannot inherit a cancelled caller and are
+// not left unbounded.
+func (s *Service) startOrJoin(ctx context.Context, key refreshKey, creds *domain.OAuthCreds) *call {
 	s.mu.Lock()
 	if c, ok := s.inflight[key]; ok {
 		s.mu.Unlock()
-		select {
-		case <-c.done:
-			return c.creds, c.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+		return c
 	}
 	c := &call{done: make(chan struct{})}
 	s.inflight[key] = c
 	s.mu.Unlock()
 
-	defer func() {
+	go func() {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
+		defer cancel()
+		updated, err := s.doRefresh(rctx, key.id, creds)
+		c.publish(updated, err)
 		close(c.done)
 		s.mu.Lock()
-		// Only clear if this call still owns the slot; a later caller may have
-		// already replaced it (it cannot, since we hold the slot until close,
-		// but the guard is cheap and correct).
+		// Delete after close so a concurrent arrival either joins this finished
+		// call (and reads the published result) or, once the slot is gone,
+		// starts a new Resolve that re-checks live expiry instead of launching
+		// a duplicate while this one is still visible.
 		if cur := s.inflight[key]; cur == c {
 			delete(s.inflight, key)
 		}
 		s.mu.Unlock()
 	}()
-
-	updated, err := s.doRefresh(ctx, key.id, creds)
-	c.creds, c.err = updated, err
-	return updated, err
+	return c
 }
 
 // doRefresh performs a single refresh against the given creds basis and

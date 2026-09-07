@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/harlog"
+	"airouter/internal/oauth"
 	"airouter/internal/observability"
 	"airouter/internal/proxy"
 	"airouter/internal/store"
@@ -42,10 +43,13 @@ func New(s *store.Store, logger *slog.Logger, harFile, creatorVersion string, di
 	har := harlog.NewController(harFile != "", creatorVersion, logger.With("component", "har"))
 	mux := http.NewServeMux()
 	httpLog := logger.With("component", "http")
+	// One process-wide oauth.Service so proxy requests and dashboard probes
+	// coalesce token-endpoint refreshes instead of racing a rotating refresh token.
+	oauthSvc := oauth.New(s)
 	if !disableDashboard {
-		web.NewHandler(s, logger.With("component", "web"), har).Mount(mux)
+		web.NewHandlerWithOAuth(s, logger.With("component", "web"), har, oauthSvc).Mount(mux)
 	}
-	proxy.New(s, logger.With("component", "proxy")).Mount(mux)
+	proxy.NewWithOAuth(s, logger.With("component", "proxy"), oauthSvc).Mount(mux)
 	srv := &Server{mux: mux, logger: httpLog, har: har}
 	mux.HandleFunc("GET /debug/har", srv.handleHAR)
 	return srv

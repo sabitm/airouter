@@ -87,6 +87,69 @@ func newCreds(srv *httptest.Server) *domain.OAuthCreds {
 	}
 }
 
+// blockingTokenServer holds each request until release is closed. It sends on
+// entered (if non-nil) after counting the hit and before waiting, so tests can
+// prove the endpoint is occupied without sleeping.
+func blockingTokenServer(t *testing.T, entered chan<- struct{}, release <-chan struct{}, fn func(form url.Values) (status int, body string)) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_ = r.ParseForm()
+		if entered != nil {
+			select {
+			case entered <- struct{}{}:
+			case <-time.After(testWait):
+				http.Error(w, "entered stalled", http.StatusInternalServerError)
+				return
+			}
+		}
+		if release != nil {
+			select {
+			case <-release:
+			case <-time.After(testWait):
+				http.Error(w, "release stalled", http.StatusInternalServerError)
+				return
+			}
+		}
+		status, body := fn(r.PostForm)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+const testWait = 5 * time.Second
+
+func waitN(t *testing.T, ch <-chan struct{}, n int) {
+	t.Helper()
+	timer := time.NewTimer(testWait)
+	defer timer.Stop()
+	for i := 0; i < n; i++ {
+		select {
+		case <-ch:
+		case <-timer.C:
+			t.Fatalf("timed out waiting for signal %d/%d", i+1, n)
+		}
+	}
+}
+
+func waitGroup(t *testing.T, wg *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(testWait):
+		t.Fatal("timed out waiting for goroutines")
+	}
+}
+
 func TestRefreshSuccess(t *testing.T) {
 	srv, hits := tokenTestServer(t, func(form url.Values) (int, string) {
 		if form.Get("grant_type") != "refresh_token" {
@@ -438,10 +501,11 @@ func TestResolveForcedRefreshOn401(t *testing.T) {
 }
 
 // TestResolveDedupesConcurrentRefreshes fires N concurrent proactive resolves
-// for an expired token; the token endpoint must be hit exactly once.
+// for an expired token; the token endpoint must be hit exactly once. The
+// endpoint is held until every caller has joined the inflight slot.
 func TestResolveDedupesConcurrentRefreshes(t *testing.T) {
-	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
-		time.Sleep(20 * time.Millisecond) // widen the window so callers overlap
+	release := make(chan struct{})
+	srv, hits := blockingTokenServer(t, nil, release, func(url.Values) (int, string) {
 		return 200, `{"access_token":"tok-x","refresh_token":"rt-x","expires_in":3600}`
 	})
 	store := newFakeStore()
@@ -449,10 +513,12 @@ func TestResolveDedupesConcurrentRefreshes(t *testing.T) {
 	creds.ExpiresAt = 1
 	store.creds[1] = creds
 
+	const n = 8
+	joined := make(chan struct{}, n)
 	s := New(store)
+	s.testOnJoin = func() { joined <- struct{}{} }
 	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: creds}
 
-	const n = 8
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
@@ -463,7 +529,9 @@ func TestResolveDedupesConcurrentRefreshes(t *testing.T) {
 			}
 		}()
 	}
-	wg.Wait()
+	waitN(t, joined, n)
+	close(release)
+	waitGroup(t, &wg)
 	if hits.Load() != 1 {
 		t.Errorf("token endpoint hits = %d, want 1 (dedup)", hits.Load())
 	}
@@ -727,8 +795,8 @@ func TestResolveSkipsRefreshWhenLiveCredsFresh(t *testing.T) {
 }
 
 // TestResolveGetProviderErrorFallsBackToSnapshot verifies the re-read is best
-// effort: a transient store error must not break resolution; the snapshot
-// becomes the refresh basis.
+// effort: a transient store error must not break resolution; a near-expiry
+// snapshot remains the refresh basis.
 func TestResolveGetProviderErrorFallsBackToSnapshot(t *testing.T) {
 	var gotRefresh string
 	srv, hits := tokenTestServer(t, func(form url.Values) (int, string) {
@@ -756,12 +824,65 @@ func TestResolveGetProviderErrorFallsBackToSnapshot(t *testing.T) {
 	}
 }
 
+// TestResolveGetProviderErrorSkipsWhenSnapshotFresh verifies a store error plus
+// a fresh/unknown/non-refreshable snapshot does not call the token endpoint or
+// persist; Resolve returns the snapshot access token immediately.
+func TestResolveGetProviderErrorSkipsWhenSnapshotFresh(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
+		t.Error("token endpoint must not be hit when snapshot is not due for refresh")
+		return 500, ""
+	})
+	now := time.Unix(10000, 0)
+	cases := []struct {
+		name  string
+		creds *domain.OAuthCreds
+	}{
+		{"fresh", &domain.OAuthCreds{
+			Mode: domain.OAuthManual, TokenURL: srv.URL, ClientID: "cid",
+			RefreshToken: "rt-snapshot", AccessToken: "tok-fresh",
+			ExpiresAt: now.Add(1 * time.Hour).Unix(),
+		}},
+		{"unknown expiry", &domain.OAuthCreds{
+			Mode: domain.OAuthManual, TokenURL: srv.URL, ClientID: "cid",
+			RefreshToken: "rt-snapshot", AccessToken: "tok-unknown",
+		}},
+		{"non-refreshable", &domain.OAuthCreds{
+			Mode: domain.OAuthManual, QoderAuth: true, TokenURL: srv.URL,
+			AccessToken: "device-tok", RefreshToken: "ignored",
+			ExpiresAt: now.Add(-time.Minute).Unix(),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			store.getErr = errors.New("db unavailable")
+			s := New(store)
+			s.now = func() time.Time { return now }
+			p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: tc.creds}
+			tok, err := s.Resolve(context.Background(), p, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tok != tc.creds.AccessToken {
+				t.Errorf("token = %q, want snapshot %q", tok, tc.creds.AccessToken)
+			}
+			if hits.Load() != 0 {
+				t.Errorf("token endpoint hits = %d, want 0", hits.Load())
+			}
+			if store.writes.Load() != 0 {
+				t.Errorf("persists = %d, want 0", store.writes.Load())
+			}
+		})
+	}
+}
+
 // TestForcedRefreshCoalesced verifies concurrent forced refreshes (parallel
 // 401 reactions on one provider) share a single token-endpoint call instead
-// of double-using a rotating single-use refresh token.
+// of double-using a rotating single-use refresh token. The endpoint is held
+// until every caller has joined the inflight slot.
 func TestForcedRefreshCoalesced(t *testing.T) {
-	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
-		time.Sleep(20 * time.Millisecond) // widen the window so callers overlap
+	release := make(chan struct{})
+	srv, hits := blockingTokenServer(t, nil, release, func(url.Values) (int, string) {
 		return 200, `{"access_token":"tok-forced","refresh_token":"rt-forced","expires_in":3600}`
 	})
 	store := newFakeStore()
@@ -769,10 +890,12 @@ func TestForcedRefreshCoalesced(t *testing.T) {
 	creds.ExpiresAt = time.Now().Add(1 * time.Hour).Unix()
 	store.creds[1] = creds
 
+	const n = 8
+	joined := make(chan struct{}, n)
 	s := New(store)
+	s.testOnJoin = func() { joined <- struct{}{} }
 	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: creds}
 
-	const n = 8
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
@@ -787,7 +910,9 @@ func TestForcedRefreshCoalesced(t *testing.T) {
 			}
 		}()
 	}
-	wg.Wait()
+	waitN(t, joined, n)
+	close(release)
+	waitGroup(t, &wg)
 	if hits.Load() != 1 {
 		t.Errorf("token endpoint hits = %d, want 1 (coalesced)", hits.Load())
 	}
@@ -795,13 +920,15 @@ func TestForcedRefreshCoalesced(t *testing.T) {
 
 // TestForcedNotReusedByProactive locks in the isolation between modes: a
 // proactive Resolve concurrent with a forced one must not consume the forced
-// refresh's slot, so both make their own token-endpoint call.
+// refresh's slot, so both make their own token-endpoint call. Each request is
+// blocked until both have entered the endpoint.
 func TestForcedNotReusedByProactive(t *testing.T) {
-	srv, hits := tokenTestServer(t, func(form url.Values) (int, string) {
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	srv, hits := blockingTokenServer(t, entered, release, func(form url.Values) (int, string) {
 		if form.Get("refresh_token") != "rt-old" {
 			t.Errorf("refresh_token = %q, want rt-old", form.Get("refresh_token"))
 		}
-		time.Sleep(20 * time.Millisecond) // force overlap between the two calls
 		return 200, `{"access_token":"tok-f","refresh_token":"rt-f","expires_in":3600}`
 	})
 	store := newFakeStore()
@@ -826,9 +953,80 @@ func TestForcedNotReusedByProactive(t *testing.T) {
 			t.Errorf("proactive resolve = (%q, %v), want (tok-f, nil)", tok, err)
 		}
 	}()
-	wg.Wait()
+	waitN(t, entered, 2)
+	close(release)
+	waitGroup(t, &wg)
 	if hits.Load() != 2 {
 		t.Errorf("token endpoint hits = %d, want 2 (forced and proactive isolated)", hits.Load())
+	}
+}
+
+// TestResolveLeaderCancelDoesNotAbortWaiter starts a blocked refresh, joins a
+// second caller, then cancels the starter. The starter returns promptly; the
+// waiter still receives the rotated token after the endpoint is released.
+func TestResolveLeaderCancelDoesNotAbortWaiter(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv, hits := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 200, `{"access_token":"tok-new","refresh_token":"rt-new","expires_in":3600}`
+	})
+	store := newFakeStore()
+	creds := newCreds(srv)
+	creds.ExpiresAt = 1
+	store.creds[1] = creds
+
+	joined := make(chan struct{}, 2)
+	s := New(store)
+	s.testOnJoin = func() { joined <- struct{}{} }
+	p := &domain.Provider{ID: 1, AuthMethod: domain.AuthOAuth, OAuthCreds: creds}
+
+	type result struct {
+		tok string
+		err error
+	}
+	ctxA, cancelA := context.WithCancel(context.Background())
+	aDone := make(chan result, 1)
+	go func() {
+		tok, err := s.Resolve(ctxA, p, false)
+		aDone <- result{tok, err}
+	}()
+	waitN(t, joined, 1)
+	waitN(t, entered, 1)
+
+	bDone := make(chan result, 1)
+	go func() {
+		tok, err := s.Resolve(context.Background(), p, false)
+		bDone <- result{tok, err}
+	}()
+	waitN(t, joined, 1)
+
+	cancelA()
+	select {
+	case got := <-aDone:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("starter err = %v, want context.Canceled", got.err)
+		}
+	case <-time.After(testWait):
+		t.Fatal("starter did not return after cancel")
+	}
+
+	close(release)
+	select {
+	case got := <-bDone:
+		if got.err != nil {
+			t.Fatalf("waiter err = %v", got.err)
+		}
+		if got.tok != "tok-new" {
+			t.Errorf("waiter token = %q, want tok-new", got.tok)
+		}
+	case <-time.After(testWait):
+		t.Fatal("waiter did not return after release")
+	}
+	if hits.Load() != 1 {
+		t.Errorf("token endpoint hits = %d, want 1", hits.Load())
+	}
+	if store.writes.Load() != 1 {
+		t.Errorf("persists = %d, want 1", store.writes.Load())
 	}
 }
 

@@ -41,14 +41,24 @@ type Handler struct {
 	har *harlog.Controller
 }
 
-// NewHandler builds the dashboard handler. logger may be nil (falls back to
-// slog.Default). Prefer a component=web logger from the server constructor.
-// har may be nil (HAR panel renders as disabled/idle).
+// NewHandler builds the dashboard handler with its own oauth.Service. logger may
+// be nil (falls back to slog.Default). Prefer a component=web logger from the
+// server constructor. har may be nil (HAR panel renders as disabled/idle).
 func NewHandler(s *store.Store, logger *slog.Logger, har *harlog.Controller) *Handler {
+	return NewHandlerWithOAuth(s, logger, har, nil)
+}
+
+// NewHandlerWithOAuth builds the dashboard handler that uses oauthSvc for token
+// resolution and usage probes. A nil oauthSvc constructs a new service from s,
+// matching NewHandler. Production injects the process-wide service so dashboard
+// probes coalesce with proxy refreshes.
+func NewHandlerWithOAuth(s *store.Store, logger *slog.Logger, har *harlog.Controller, oauthSvc *oauth.Service) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	oauthSvc := oauth.New(s)
+	if oauthSvc == nil {
+		oauthSvc = oauth.New(s)
+	}
 	return &Handler{
 		store:    s,
 		oauth:    oauthSvc,
