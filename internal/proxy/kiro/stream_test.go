@@ -120,19 +120,21 @@ func TestDecodeStreamText(t *testing.T) {
 
 func TestDecodeStreamMetricsCacheAccounting(t *testing.T) {
 	cases := []struct {
-		name    string
-		metrics string
-		wantIn  int
-		wantOut int
+		name      string
+		metrics   string
+		wantIn    int
+		wantOut   int
+		wantRead  int
+		wantWrite int
 	}{
-		{"base only", `{"inputTokens":11,"outputTokens":5}`, 11, 5},
-		{"cache read camel", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4}`, 15, 5},
-		{"cache read snake", `{"inputTokens":11,"outputTokens":5,"cache_read_input_tokens":4}`, 15, 5},
-		{"cache creation camel", `{"inputTokens":11,"outputTokens":5,"cacheCreationInputTokens":7}`, 18, 5},
-		{"cache creation snake", `{"inputTokens":11,"outputTokens":5,"cache_creation_input_tokens":7}`, 18, 5},
-		{"both cache fields", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4,"cacheCreationInputTokens":7}`, 22, 5},
-		{"camel preferred over snake", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4,"cache_read_input_tokens":99,"cacheCreationInputTokens":7,"cache_creation_input_tokens":88}`, 22, 5},
-		{"missing fields", `{}`, 0, 0},
+		{"base only", `{"inputTokens":11,"outputTokens":5}`, 11, 5, 0, 0},
+		{"cache read camel", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4}`, 15, 5, 4, 0},
+		{"cache read snake", `{"inputTokens":11,"outputTokens":5,"cache_read_input_tokens":4}`, 15, 5, 4, 0},
+		{"cache creation camel", `{"inputTokens":11,"outputTokens":5,"cacheCreationInputTokens":7}`, 18, 5, 0, 7},
+		{"cache creation snake", `{"inputTokens":11,"outputTokens":5,"cache_creation_input_tokens":7}`, 18, 5, 0, 7},
+		{"both cache fields", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4,"cacheCreationInputTokens":7}`, 22, 5, 4, 7},
+		{"camel preferred over snake", `{"inputTokens":11,"outputTokens":5,"cacheReadInputTokens":4,"cache_read_input_tokens":99,"cacheCreationInputTokens":7,"cache_creation_input_tokens":88}`, 22, 5, 4, 7},
+		{"missing fields", `{}`, 0, 0, 0, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -146,6 +148,9 @@ func TestDecodeStreamMetricsCacheAccounting(t *testing.T) {
 			finish := events[1]
 			if finish.InputTokens != tc.wantIn || finish.OutputTokens != tc.wantOut {
 				t.Errorf("usage = %d/%d, want %d/%d", finish.InputTokens, finish.OutputTokens, tc.wantIn, tc.wantOut)
+			}
+			if finish.CacheReadTokens != tc.wantRead || finish.CacheWriteTokens != tc.wantWrite {
+				t.Errorf("cache = %d/%d, want %d/%d", finish.CacheReadTokens, finish.CacheWriteTokens, tc.wantRead, tc.wantWrite)
 			}
 		})
 	}

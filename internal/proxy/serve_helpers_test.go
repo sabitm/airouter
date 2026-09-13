@@ -358,6 +358,36 @@ func TestCollectStreamResponseLimits(t *testing.T) {
 		}
 	})
 
+	t.Run("cache details from start and finish", func(t *testing.T) {
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventMessageStart, ID: "r1", Model: "m", InputTokens: 13, CacheWriteTokens: 10},
+			{Kind: ir.EventTextDelta, Text: "hi"},
+			{Kind: ir.EventFinish, StopReason: ir.StopEndTurn, InputTokens: 2600, OutputTokens: 300, CacheReadTokens: 2000, CacheWriteTokens: 400},
+		}), nil, "m", nil, 1024, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if resp.Usage.InputTokens != 2600 || resp.Usage.OutputTokens != 300 {
+			t.Fatalf("totals = %+v", resp.Usage)
+		}
+		if resp.Usage.CacheReadTokens != 2000 || resp.Usage.CacheWriteTokens != 400 {
+			t.Fatalf("cache = %+v", resp.Usage)
+		}
+	})
+
+	t.Run("finish without cache keeps start cache", func(t *testing.T) {
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventMessageStart, ID: "r1", Model: "m", InputTokens: 13, CacheWriteTokens: 10},
+			{Kind: ir.EventFinish, StopReason: ir.StopEndTurn, OutputTokens: 2},
+		}), nil, "m", nil, 1024, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if resp.Usage.InputTokens != 13 || resp.Usage.CacheWriteTokens != 10 || resp.Usage.OutputTokens != 2 {
+			t.Fatalf("usage = %+v", resp.Usage)
+		}
+	})
+
 	t.Run("late start does not refund retained args", func(t *testing.T) {
 		const limit = int64(64)
 		fallback := "m"

@@ -57,8 +57,7 @@ func codexEffortForModel(model string) (base, effort string) {
 // instructions, a model-name effort suffix mapped to reasoning.effort, and the
 // reasoning-encrypted-content include when effort != none. Fields the Codex
 // backend rejects (temperature, top_p, max_output_tokens) are omitted. The
-// prompt_cache_key is injected by the proxy (it must be a stable per-request id
-// shared with the session_id header).
+// prompt_cache_key is injected by the proxy (it must equal the session_id header).
 func EncodeCodexRequest(req *ir.Request) ([]byte, error) {
 	// Prefer IR thinking (body intent or upstream model(level) suffix). Else the
 	// Codex-native hyphen suffix on the model id. Else default low.
@@ -169,8 +168,8 @@ func SyncCodexReasoningInclude(body []byte) []byte {
 
 // InjectCodexRequestKey sets prompt_cache_key on an already-encoded Codex
 // request body. It is a no-op parse/patch so the encoder stays free of the
-// per-request id, which the proxy generates alongside the session_id header.
-// Returns the body unchanged (and the error) if the body is not a JSON object.
+// derived cache key, which the proxy generates alongside the session_id header.
+// Returns the body unchanged if the body is not a JSON object.
 func InjectCodexRequestKey(body []byte, key string) []byte {
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {

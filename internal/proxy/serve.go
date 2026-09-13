@@ -202,6 +202,9 @@ func terminal(status int, message, errType string) attemptResult {
 // serve runs the full ingress lifecycle for one request. ingress is the codec
 // for the endpoint the client called.
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
+	if traceInfoFrom(r.Context()) == nil {
+		r = r.WithContext(WithTraceInfo(r.Context(), &TraceInfo{}))
+	}
 	start := time.Now()
 	res := &reqResult{status: http.StatusOK}
 	rec := &domain.RequestLog{Format: ingress.id}
@@ -225,12 +228,12 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		p.recordLog(r.Context(), rec)
 	}()
 
-	keyName, ok := p.authenticate(r)
+	auth, ok := p.authenticate(r)
 	if !ok {
 		res.fail(w, ingress, http.StatusUnauthorized, "invalid or missing access key", "authentication_error")
 		return
 	}
-	rec.AccessKeyName = keyName
+	rec.AccessKeyName = auth.Name
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -306,6 +309,12 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// Capture only for requests that can reach OpenCode. The original body is
 		// needed because translation drops unknown session metadata.
 		r = r.WithContext(withOpencodeRequest(r.Context(), p.opencodeNonce, r.Header, body))
+	}
+	if hasCodexTarget(candidates) {
+		// Capture Codex identity from the original headers/body before translation
+		// drops unknown session fields. Tenant scope is the verified access-key
+		// hash, or openTenantScope in open mode.
+		r = r.WithContext(withCodexRequest(r.Context(), auth.Scope, r.Header, body))
 	}
 
 	// Walk the ordered (attachment-compatible) targets. A target that fails before
@@ -713,6 +722,18 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 // It is used only for backends that are SSE-only even for non-streaming clients.
 // writeFrame is non-nil only for duplex backends (Cursor AgentService), whose
 // streams need mid-stream client replies to finish.
+func applyCollectedUsage(u *ir.Usage, ev ir.StreamEvent) {
+	if ev.InputTokens != 0 {
+		u.InputTokens = ev.InputTokens
+	}
+	if ev.CacheReadTokens != 0 {
+		u.CacheReadTokens = ev.CacheReadTokens
+	}
+	if ev.CacheWriteTokens != 0 {
+		u.CacheWriteTokens = ev.CacheWriteTokens
+	}
+}
+
 func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) error, fallbackModel string, clientTools []ir.Tool) (*ir.Response, error) {
 	return collectStreamResponseWithLimits(r, backend, writeFrame, fallbackModel, clientTools, maxCollectedStreamResponseBytes, maxCollectedStreamToolCalls)
 }
@@ -788,9 +809,7 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 					return err
 				}
 			}
-			if ev.InputTokens != 0 {
-				resp.Usage.InputTokens = ev.InputTokens
-			}
+			applyCollectedUsage(&resp.Usage, ev)
 		case ir.EventTextDelta:
 			if err := appendTo(&text, ev.Text); err != nil {
 				return err
@@ -828,9 +847,7 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 				return err
 			}
 		case ir.EventFinish:
-			if ev.InputTokens != 0 {
-				resp.Usage.InputTokens = ev.InputTokens
-			}
+			applyCollectedUsage(&resp.Usage, ev)
 			resp.Usage.OutputTokens = ev.OutputTokens
 			if ev.StopReason != "" {
 				resp.StopReason = ev.StopReason
@@ -996,21 +1013,29 @@ func writeErr(w http.ResponseWriter, c codec, status int, message, errType strin
 	_, _ = w.Write(c.encodeError(message, errType))
 }
 
-// authenticate verifies the bearer/x-api-key token against stored access keys,
-// returning the key's label on success. When no access keys exist the proxy
-// runs in open mode and accepts every request unauthenticated.
-func (p *Proxy) authenticate(r *http.Request) (string, bool) {
+// authResult is the display label plus a uniqueness-safe tenant scope.
+// Name is the access-key label (or "(open)") for request logs. Scope is the
+// stored key hash, never the display name; open mode uses openTenantScope.
+type authResult struct {
+	Name  string
+	Scope string
+}
+
+// authenticate verifies the bearer/x-api-key token against stored access keys.
+// When no access keys exist the proxy runs in open mode and accepts every
+// request unauthenticated.
+func (p *Proxy) authenticate(r *http.Request) (authResult, bool) {
 	token := extractToken(r)
 	if token != "" {
 		if key, err := p.store.VerifyToken(r.Context(), token); err == nil {
-			return key.Name, true
+			return authResult{Name: key.Name, Scope: key.Hash}, true
 		}
 	}
 	// No valid token: allow only when there are no keys configured at all.
 	if n, err := p.store.CountAccessKeys(r.Context()); err == nil && n == 0 {
-		return "(open)", true
+		return authResult{Name: "(open)", Scope: openTenantScope}, true
 	}
-	return "", false
+	return authResult{}, false
 }
 
 func extractToken(r *http.Request) string {

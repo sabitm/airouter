@@ -20,6 +20,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	var stopReason ir.StopReason = ir.StopEndTurn
 	inputTokens := 0
 	outputTokens := 0
+	cacheRead := 0
 	msgID := ""
 	model := ""
 
@@ -53,8 +54,13 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			// Latest authoritative usage wins, including late-only metadata chunks.
 			// Prompt stays positive-only: Gemini usage is cumulative and a bare
 			// zero is not a meaningful overwrite of earlier prompt counts.
+			// CachedContentTokenCount is a subset of prompt and is also
+			// positive-only so a later partial usage object cannot clear it.
 			if in := resp.UsageMetadata.inputTokens(); in > 0 {
 				inputTokens = in
+			}
+			if cached := resp.UsageMetadata.CachedContentTokenCount; cached > 0 {
+				cacheRead = cached
 			}
 			// Output accepts explicit candidates (including zero), a present total
 			// used for derivation, or positive thoughts reported on their own.
@@ -66,7 +72,8 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if msgID == "" {
 				msgID = ir.NewID("msg_")
 			}
-			if err := emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: msgID, Model: model, InputTokens: inputTokens}); err != nil {
+			read, _ := ir.ClampCacheTokens(inputTokens, cacheRead, 0)
+			if err := emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: msgID, Model: model, InputTokens: inputTokens, CacheReadTokens: read}); err != nil {
 				return err
 			}
 			started = true
@@ -133,11 +140,13 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		// Empty / error-only stream: do not fabricate a successful completion.
 		return nil
 	}
+	read, _ := ir.ClampCacheTokens(inputTokens, cacheRead, 0)
 	return emit(ir.StreamEvent{
-		Kind:         ir.EventFinish,
-		StopReason:   stopReason,
-		OutputTokens: outputTokens,
-		InputTokens:  inputTokens,
+		Kind:            ir.EventFinish,
+		StopReason:      stopReason,
+		OutputTokens:    outputTokens,
+		InputTokens:     inputTokens,
+		CacheReadTokens: read,
 	})
 }
 

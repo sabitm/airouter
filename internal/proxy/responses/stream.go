@@ -39,6 +39,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	sawTool := false
 	stop := ir.StopEndTurn
 	inputTokens, outputTokens := 0, 0
+	cacheRead, cacheWrite := 0, 0
 	var pendingFail *ir.StreamFailure
 
 	ensureStarted := func(id, model string) error {
@@ -147,8 +148,11 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		case "response.completed", "response.incomplete":
 			if env.Response != nil {
 				if env.Response.Usage != nil {
-					inputTokens = env.Response.Usage.InputTokens
-					outputTokens = env.Response.Usage.OutputTokens
+					u := usageFromWire(env.Response.Usage)
+					inputTokens = u.InputTokens
+					outputTokens = u.OutputTokens
+					cacheRead = u.CacheReadTokens
+					cacheWrite = u.CacheWriteTokens
 				}
 				if env.Response.Status == "incomplete" {
 					stop = ir.StopMaxTokens
@@ -164,7 +168,11 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	if !started {
 		return nil
 	}
-	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stop, InputTokens: inputTokens, OutputTokens: outputTokens})
+	return emit(ir.StreamEvent{
+		Kind: ir.EventFinish, StopReason: stop,
+		InputTokens: inputTokens, OutputTokens: outputTokens,
+		CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
+	})
 }
 
 // streamFailureFrom builds a StreamFailure from a top-level error object and/or
@@ -213,6 +221,8 @@ type StreamEncoder struct {
 	seq         int
 	inputTokens int
 	usageOut    int
+	cacheRead   int
+	cacheWrite  int
 
 	createdEmitted bool
 	finishEmitted  bool
@@ -253,6 +263,18 @@ func NewStreamEncoder(model string) *StreamEncoder {
 // unbounded bytes.
 const maxPendingArgs = 1 << 20
 
+func (e *StreamEncoder) applyUsage(ev ir.StreamEvent) {
+	if ev.InputTokens != 0 {
+		e.inputTokens = ev.InputTokens
+	}
+	if ev.CacheReadTokens != 0 {
+		e.cacheRead = ev.CacheReadTokens
+	}
+	if ev.CacheWriteTokens != 0 {
+		e.cacheWrite = ev.CacheWriteTokens
+	}
+}
+
 func (e *StreamEncoder) emit(w *sse.Writer, name string, data map[string]any) error {
 	data["type"] = name
 	data["sequence_number"] = e.seq
@@ -274,11 +296,12 @@ func (e *StreamEncoder) responseObj(status string, output []map[string]any, with
 		"output": out,
 	}
 	if withUsage {
-		obj["usage"] = map[string]any{
-			"input_tokens":  e.inputTokens,
-			"output_tokens": e.usageOut,
-			"total_tokens":  e.inputTokens + e.usageOut,
-		}
+		obj["usage"] = usageToWire(ir.Usage{
+			InputTokens:      e.inputTokens,
+			OutputTokens:     e.usageOut,
+			CacheReadTokens:  e.cacheRead,
+			CacheWriteTokens: e.cacheWrite,
+		})
 	}
 	return obj
 }
@@ -442,7 +465,7 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		if ev.Model != "" {
 			e.model = ev.Model
 		}
-		e.inputTokens = ev.InputTokens
+		e.applyUsage(ev)
 		return e.ensureCreated(w)
 
 	case ir.EventTextDelta:
@@ -505,10 +528,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 	case ir.EventFinish:
 		// OpenAI-family backends report input at finish; response.completed is the
 		// only Responses event carrying usage and it is emitted below, so a late
-		// input value can still be reflected.
-		if ev.InputTokens != 0 {
-			e.inputTokens = ev.InputTokens
-		}
+		// input value can still be reflected. Do not reset nonzero start cache
+		// with absent later fields.
+		e.applyUsage(ev)
 		e.usageOut = ev.OutputTokens
 		if err := e.ensureCreated(w); err != nil {
 			return err

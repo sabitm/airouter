@@ -82,9 +82,15 @@ type respIncomplete struct {
 	Reason string `json:"reason"`
 }
 
+type respInputTokensDetails struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+}
+
 type respUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens        int                     `json:"input_tokens"`
+	OutputTokens       int                     `json:"output_tokens"`
+	InputTokensDetails *respInputTokensDetails `json:"input_tokens_details,omitempty"`
 }
 
 type respOutputItem struct {
@@ -144,9 +150,34 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 	}
 	out.StopReason = responsesStopReason(resp.Status, sawTool)
 	if resp.Usage != nil {
-		out.Usage = ir.Usage{InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens}
+		out.Usage = usageFromWire(resp.Usage)
 	}
 	return out, nil
+}
+
+func usageFromWire(u *respUsage) ir.Usage {
+	out := ir.Usage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens}
+	if u.InputTokensDetails != nil {
+		out.CacheReadTokens = u.InputTokensDetails.CachedTokens
+		out.CacheWriteTokens = u.InputTokensDetails.CacheWriteTokens
+	}
+	return out.Clamped()
+}
+
+func usageToWire(u ir.Usage) map[string]any {
+	u = u.Clamped()
+	wire := map[string]any{
+		"input_tokens":  u.InputTokens,
+		"output_tokens": u.OutputTokens,
+		"total_tokens":  u.InputTokens + u.OutputTokens,
+	}
+	if u.CacheReadTokens != 0 || u.CacheWriteTokens != 0 {
+		wire["input_tokens_details"] = map[string]any{
+			"cached_tokens":      u.CacheReadTokens,
+			"cache_write_tokens": u.CacheWriteTokens,
+		}
+	}
+	return wire
 }
 
 // responsesStopReason maps a Responses status to an IR stop reason. Truncation
@@ -184,11 +215,7 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 		"model":              resp.Model,
 		"output":             output,
 		"incomplete_details": incomplete,
-		"usage": map[string]any{
-			"input_tokens":  resp.Usage.InputTokens,
-			"output_tokens": resp.Usage.OutputTokens,
-			"total_tokens":  resp.Usage.InputTokens + resp.Usage.OutputTokens,
-		},
+		"usage":              usageToWire(resp.Usage),
 	}
 	return json.Marshal(out)
 }

@@ -39,6 +39,17 @@ func agentTurnEndedFrame(t *testing.T, in, out uint64) []byte {
 	return interactionUpdateFrame(t, iuTurnEnded, inner)
 }
 
+func agentTurnEndedCacheFrame(t *testing.T, in, out, read, write uint64) []byte {
+	t.Helper()
+	inner := concatBytes(
+		encodeField(teInputTokens, wireVarint, in),
+		encodeField(teOutputTokens, wireVarint, out),
+		encodeField(teCacheReadTokens, wireVarint, read),
+		encodeField(teCacheWriteTokens, wireVarint, write),
+	)
+	return interactionUpdateFrame(t, iuTurnEnded, inner)
+}
+
 // kvServerFrame builds a KvServerMessage (field 4) with the given variant.
 func kvServerFrame(t *testing.T, variant int) []byte {
 	t.Helper()
@@ -127,8 +138,45 @@ func TestDecodeAgentStreamTextDeltas(t *testing.T) {
 	if last.InputTokens != 12 || last.OutputTokens != 3 {
 		t.Errorf("usage = %d/%d, want 12/3", last.InputTokens, last.OutputTokens)
 	}
+	if last.CacheReadTokens != 0 || last.CacheWriteTokens != 0 {
+		t.Errorf("cache = %d/%d, want 0/0", last.CacheReadTokens, last.CacheWriteTokens)
+	}
 	if events[0].Kind != ir.EventMessageStart {
 		t.Errorf("first event = %+v, want message start", events[0])
+	}
+}
+
+func TestDecodeAgentStreamCacheTokensInclusive(t *testing.T) {
+	events := collectAgentEvents(t,
+		agentTextFrame(t, "ok"),
+		agentTurnEndedCacheFrame(t, 10, 2, 4, 3),
+	)
+	last := events[len(events)-1]
+	if last.Kind != ir.EventFinish {
+		t.Fatalf("last event = %+v, want finish", last)
+	}
+	if last.InputTokens != 10 || last.OutputTokens != 2 {
+		t.Errorf("usage = %d/%d, want 10/2", last.InputTokens, last.OutputTokens)
+	}
+	if last.CacheReadTokens != 4 || last.CacheWriteTokens != 3 {
+		t.Errorf("cache = %d/%d, want 4/3", last.CacheReadTokens, last.CacheWriteTokens)
+	}
+}
+
+func TestDecodeAgentStreamCacheTokensClamped(t *testing.T) {
+	events := collectAgentEvents(t,
+		agentTextFrame(t, "ok"),
+		agentTurnEndedCacheFrame(t, 10, 2, 12, 3),
+	)
+	last := events[len(events)-1]
+	if last.Kind != ir.EventFinish {
+		t.Fatalf("last event = %+v, want finish", last)
+	}
+	if last.InputTokens != 10 || last.OutputTokens != 2 {
+		t.Errorf("usage = %d/%d, want 10/2", last.InputTokens, last.OutputTokens)
+	}
+	if last.CacheReadTokens != 10 || last.CacheWriteTokens != 0 {
+		t.Errorf("cache = %d/%d, want 10/0", last.CacheReadTokens, last.CacheWriteTokens)
 	}
 }
 

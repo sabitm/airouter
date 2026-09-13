@@ -134,9 +134,54 @@ const (
 	StopToolUse      StopReason = "tool_use"
 )
 
+// Usage is token accounting for a completed turn.
+//
+// InputTokens is the inclusive prompt/input total. CacheReadTokens and
+// CacheWriteTokens are subsets of that total and must never be added again.
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
+	InputTokens      int
+	OutputTokens     int
+	CacheReadTokens  int
+	CacheWriteTokens int
+}
+
+// ClampCacheTokens bounds cache read/write so they cannot exceed inclusive
+// input. Negative buckets become 0. An overlarge sum keeps reads first, then
+// clamps writes to the remainder. Input itself is not modified.
+func ClampCacheTokens(input, read, write int) (int, int) {
+	if read < 0 {
+		read = 0
+	}
+	if write < 0 {
+		write = 0
+	}
+	if input < 0 {
+		return 0, 0
+	}
+	if read > input {
+		read = input
+	}
+	rem := input - read
+	if write > rem {
+		write = rem
+	}
+	return read, write
+}
+
+// Clamped returns a copy with cache buckets bounded by inclusive InputTokens.
+func (u Usage) Clamped() Usage {
+	u.CacheReadTokens, u.CacheWriteTokens = ClampCacheTokens(u.InputTokens, u.CacheReadTokens, u.CacheWriteTokens)
+	return u
+}
+
+// OrdinaryInputTokens is inclusive input minus clamped cache read/write.
+func (u Usage) OrdinaryInputTokens() int {
+	u = u.Clamped()
+	n := u.InputTokens - u.CacheReadTokens - u.CacheWriteTokens
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 type Response struct {

@@ -35,6 +35,9 @@ func TestDecodeStreamTextAndFinish(t *testing.T) {
 	if finish == nil || finish.StopReason != ir.StopEndTurn || finish.InputTokens != 3 || finish.OutputTokens != 2 {
 		t.Fatalf("finish %+v", finish)
 	}
+	if finish.CacheReadTokens != 0 {
+		t.Fatalf("cache read = %d, want 0", finish.CacheReadTokens)
+	}
 }
 
 func TestUsageMetadataAccounting(t *testing.T) {
@@ -127,6 +130,81 @@ func TestDecodeStreamLateUsageMetadata(t *testing.T) {
 	}
 	if finish.InputTokens != 12 || finish.OutputTokens != 10 {
 		t.Fatalf("usage = %d/%d, want 12/10", finish.InputTokens, finish.OutputTokens)
+	}
+	if finish.CacheReadTokens != 4 {
+		t.Fatalf("cache read = %d, want 4", finish.CacheReadTokens)
+	}
+}
+
+func TestDecodeStreamCacheDetailNoDoubleCount(t *testing.T) {
+	sse := "" +
+		"data: {\"response\":{\"responseId\":\"r-cache\",\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":40,\"candidatesTokenCount\":8},\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}}\n\n"
+	var start, finish *ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		switch ev.Kind {
+		case ir.EventMessageStart:
+			cp := ev
+			start = &cp
+		case ir.EventFinish:
+			cp := ev
+			finish = &cp
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start == nil || start.InputTokens != 100 || start.CacheReadTokens != 40 {
+		t.Fatalf("start = %+v, want input 100 cache 40", start)
+	}
+	if finish == nil || finish.InputTokens != 100 || finish.CacheReadTokens != 40 || finish.OutputTokens != 8 {
+		t.Fatalf("finish = %+v, want input 100 cache 40 output 8", finish)
+	}
+}
+
+func TestDecodeStreamClampsCacheReadToInput(t *testing.T) {
+	sse := "" +
+		"data: {\"response\":{\"responseId\":\"r-bad-cache\",\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":40,\"candidatesTokenCount\":2},\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}}\n\n"
+	var start, finish *ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		switch ev.Kind {
+		case ir.EventMessageStart:
+			cp := ev
+			start = &cp
+		case ir.EventFinish:
+			cp := ev
+			finish = &cp
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start == nil || start.InputTokens != 10 || start.CacheReadTokens != 10 {
+		t.Fatalf("start = %+v, want input 10 cache 10", start)
+	}
+	if finish == nil || finish.InputTokens != 10 || finish.CacheReadTokens != 10 {
+		t.Fatalf("finish = %+v, want input 10 cache 10", finish)
+	}
+}
+
+func TestDecodeStreamPreservesPriorCacheRead(t *testing.T) {
+	sse := "" +
+		"data: {\"response\":{\"responseId\":\"r3\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":40,\"candidatesTokenCount\":5}}}\n\n" +
+		"data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":0,\"candidatesTokenCount\":5}}}\n\n"
+	var finish *ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			cp := ev
+			finish = &cp
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finish == nil || finish.InputTokens != 100 || finish.CacheReadTokens != 40 {
+		t.Fatalf("finish = %+v, want preserved cache 40", finish)
 	}
 }
 

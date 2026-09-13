@@ -52,8 +52,8 @@ type streamMessageDelta struct {
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	var stopReason ir.StopReason = ir.StopEndTurn
-	inputTokens := 0
-	outputTokens := 0
+	inputTokens, outputTokens := 0, 0
+	cacheRead, cacheWrite := 0, 0
 	finished := false
 	started := false
 
@@ -86,10 +86,14 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if json.Unmarshal(ev.Data, &m) != nil {
 				continue
 			}
-			inputTokens = m.Message.Usage.TotalInput()
+			u := usageFromAnth(m.Message.Usage)
+			inputTokens = u.InputTokens
+			cacheRead = u.CacheReadTokens
+			cacheWrite = u.CacheWriteTokens
 			if err := emit(ir.StreamEvent{
 				Kind: ir.EventMessageStart, ID: m.Message.ID, Model: m.Message.Model,
-				InputTokens: inputTokens,
+				InputTokens:     inputTokens,
+				CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
 			}); err != nil {
 				return err
 			}
@@ -138,14 +142,22 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			stopReason = stopReason2(m.Delta.StopReason)
 			// Some Anthropic-compatible providers defer all usage until the final
 			// delta instead of reporting input at message_start.
-			if in := m.Usage.TotalInput(); in != 0 {
-				inputTokens = in
+			u := usageFromAnth(m.Usage)
+			if u.InputTokens != 0 {
+				inputTokens = u.InputTokens
+			}
+			if u.CacheReadTokens != 0 {
+				cacheRead = u.CacheReadTokens
+			}
+			if u.CacheWriteTokens != 0 {
+				cacheWrite = u.CacheWriteTokens
 			}
 			outputTokens = m.Usage.OutputTokens
 		case "message_stop":
 			if err := emit(ir.StreamEvent{
 				Kind: ir.EventFinish, StopReason: stopReason,
 				InputTokens: inputTokens, OutputTokens: outputTokens,
+				CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
 			}); err != nil {
 				return err
 			}
@@ -160,6 +172,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		return emit(ir.StreamEvent{
 			Kind: ir.EventFinish, StopReason: stopReason,
 			InputTokens: inputTokens, OutputTokens: outputTokens,
+			CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
 		})
 	}
 	return nil
@@ -187,7 +200,10 @@ type StreamEncoder struct {
 	id            string
 	model         string
 	inputTokens   int
+	cacheRead     int
+	cacheWrite    int
 	started       bool
+	startWire     anthUsage // partition actually sent on message_start
 	openKind      int
 	openIndex     int
 	nextIndex     int
@@ -216,6 +232,30 @@ func NewStreamEncoder(model string) *StreamEncoder {
 // unbounded bytes.
 const maxPendingArgs = 1 << 20
 
+func (e *StreamEncoder) applyUsage(ev ir.StreamEvent) {
+	if ev.InputTokens != 0 {
+		e.inputTokens = ev.InputTokens
+	}
+	if ev.CacheReadTokens != 0 {
+		e.cacheRead = ev.CacheReadTokens
+	}
+	if ev.CacheWriteTokens != 0 {
+		e.cacheWrite = ev.CacheWriteTokens
+	}
+}
+
+func anthUsageMap(u ir.Usage, output int) map[string]any {
+	a := usageToAnth(u)
+	m := map[string]any{"input_tokens": a.InputTokens, "output_tokens": output}
+	if a.CacheReadInputTokens != 0 {
+		m["cache_read_input_tokens"] = a.CacheReadInputTokens
+	}
+	if a.CacheCreationInputTokens != 0 {
+		m["cache_creation_input_tokens"] = a.CacheCreationInputTokens
+	}
+	return m
+}
+
 func (e *StreamEncoder) event(w *sse.Writer, name string, payload map[string]any) error {
 	payload["type"] = name
 	raw, _ := json.Marshal(payload)
@@ -231,11 +271,15 @@ func (e *StreamEncoder) ensureStart(w *sse.Writer) error {
 	if id == "" {
 		id = ir.NewID("msg_")
 	}
+	startUsage := ir.Usage{
+		InputTokens: e.inputTokens, CacheReadTokens: e.cacheRead, CacheWriteTokens: e.cacheWrite,
+	}
+	e.startWire = usageToAnth(startUsage)
 	return e.event(w, "message_start", map[string]any{
 		"message": map[string]any{
 			"id": id, "type": "message", "role": "assistant", "model": e.model,
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]any{"input_tokens": e.inputTokens, "output_tokens": 0},
+			"usage": anthUsageMap(startUsage, 0),
 		},
 	})
 }
@@ -333,7 +377,7 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		if ev.Model != "" {
 			e.model = ev.Model
 		}
-		e.inputTokens = ev.InputTokens
+		e.applyUsage(ev)
 		return e.ensureStart(w)
 
 	case ir.EventTextDelta:
@@ -412,12 +456,10 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 
 	case ir.EventFinish:
 		startEmitted := e.started
-		startInput := e.inputTokens
 		// OpenAI-family backends report input at Finish. Capture it before
 		// ensureStart so a Finish-first stream puts the count on message_start.
-		if ev.InputTokens != 0 {
-			e.inputTokens = ev.InputTokens
-		}
+		// Do not reset a nonzero start count with absent later fields.
+		e.applyUsage(ev)
 		if err := e.ensureStart(w); err != nil {
 			return err
 		}
@@ -428,10 +470,22 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 			return err
 		}
 		usage := map[string]any{"output_tokens": ev.OutputTokens}
-		// message_start already went out: expose a late/changed input count
-		// on the terminal delta. Skip when it would duplicate the start frame.
-		if startEmitted && ev.InputTokens != 0 && ev.InputTokens != startInput {
-			usage["input_tokens"] = ev.InputTokens
+		// message_start already went out: expose a late/changed wire partition
+		// on the terminal delta. Compare ordinary input against the start frame,
+		// not inclusive totals, so a cache-only finish still corrects input_tokens.
+		if startEmitted {
+			part := usageToAnth(ir.Usage{
+				InputTokens: e.inputTokens, CacheReadTokens: e.cacheRead, CacheWriteTokens: e.cacheWrite,
+			})
+			if part.InputTokens != e.startWire.InputTokens {
+				usage["input_tokens"] = part.InputTokens
+			}
+			if part.CacheReadInputTokens != 0 && part.CacheReadInputTokens != e.startWire.CacheReadInputTokens {
+				usage["cache_read_input_tokens"] = part.CacheReadInputTokens
+			}
+			if part.CacheCreationInputTokens != 0 && part.CacheCreationInputTokens != e.startWire.CacheCreationInputTokens {
+				usage["cache_creation_input_tokens"] = part.CacheCreationInputTokens
+			}
 		}
 		if err := e.event(w, "message_delta", map[string]any{
 			"delta": map[string]any{"stop_reason": stopReasonWire(ev.StopReason), "stop_sequence": nil},

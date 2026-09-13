@@ -25,6 +25,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	sawTool := false
 	stop := ir.StopEndTurn
 	inputTokens, outputTokens := 0, 0
+	cacheRead, cacheWrite := 0, 0
 
 	// Tool calls are keyed by toolUseId. Each distinct id gets a monotonic index
 	// so argument fragments attribute to the right call; a start event is emitted
@@ -143,15 +144,15 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if err := ensureStarted(); err != nil {
 					return err
 				}
-				cacheRead := p.CacheReadInputTokens
+				cacheRead = p.CacheReadInputTokens
 				if cacheRead == 0 {
 					cacheRead = p.CacheReadInputTokensSnake
 				}
-				cacheCreation := p.CacheCreationInputTokens
-				if cacheCreation == 0 {
-					cacheCreation = p.CacheCreationInputTokensSnake
+				cacheWrite = p.CacheCreationInputTokens
+				if cacheWrite == 0 {
+					cacheWrite = p.CacheCreationInputTokensSnake
 				}
-				inputTokens = p.InputTokens + cacheRead + cacheCreation
+				inputTokens = p.InputTokens + cacheRead + cacheWrite
 				outputTokens = p.OutputTokens
 			}
 
@@ -170,7 +171,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	if sawTool {
 		stop = ir.StopToolUse
 	}
-	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stop, InputTokens: inputTokens, OutputTokens: outputTokens})
+	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stop, InputTokens: inputTokens, OutputTokens: outputTokens, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite})
 }
 
 // kiroStreamFailure parses known safe fields from an EventStream exception frame.

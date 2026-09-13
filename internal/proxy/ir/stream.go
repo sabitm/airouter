@@ -22,6 +22,11 @@ type StreamEvent struct {
 	ID          string
 	Model       string
 	InputTokens int
+	// CacheReadTokens and CacheWriteTokens are subsets of InputTokens when
+	// present on MessageStart or Finish. InputTokens is inclusive; cache
+	// fields must never be added again.
+	CacheReadTokens  int
+	CacheWriteTokens int
 
 	// EventTextDelta / EventReasoningDelta
 	Text string

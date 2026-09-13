@@ -105,8 +105,14 @@ type chatRespMessage struct {
 	ToolCalls        []chatToolCall    `json:"tool_calls,omitempty"`
 }
 
+type chatPromptTokensDetails struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+}
+
 type chatUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                      `json:"prompt_tokens"`
+	CompletionTokens    int                      `json:"completion_tokens"`
+	TotalTokens         int                      `json:"total_tokens"`
+	PromptTokensDetails *chatPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
 }

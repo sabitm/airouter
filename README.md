@@ -97,6 +97,13 @@ curl http://localhost:31415/v1/chat/completions \
 
 When no access keys exist, proxy endpoints run in open mode.
 
+Custom Chat Completions models that route to OpenAI Codex should set
+`sendSessionAffinityHeaders=true` and `sessionAffinityFormat=openai`. Those
+headers are the authoritative conversation identity for Codex caching. When no
+identity arrives, Airouter derives a fallback from an available initial
+conversation prefix. If no safe bounded anchor is available, Airouter uses a
+request-local key.
+
 ## Routing
 
 - A **provider** is an upstream URL, protocol, and credential.

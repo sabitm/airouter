@@ -36,9 +36,34 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 		out.StopReason = stopReasonFromFinish(c.FinishReason)
 	}
 	if resp.Usage != nil {
-		out.Usage = ir.Usage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens}
+		out.Usage = usageFromWire(resp.Usage)
 	}
 	return out, nil
+}
+
+func usageFromWire(u *chatUsage) ir.Usage {
+	out := ir.Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens}
+	if u.PromptTokensDetails != nil {
+		out.CacheReadTokens = u.PromptTokensDetails.CachedTokens
+		out.CacheWriteTokens = u.PromptTokensDetails.CacheWriteTokens
+	}
+	return out.Clamped()
+}
+
+func usageToWire(u ir.Usage) *chatUsage {
+	u = u.Clamped()
+	out := &chatUsage{
+		PromptTokens:     u.InputTokens,
+		CompletionTokens: u.OutputTokens,
+		TotalTokens:      u.InputTokens + u.OutputTokens,
+	}
+	if u.CacheReadTokens != 0 || u.CacheWriteTokens != 0 {
+		out.PromptTokensDetails = &chatPromptTokensDetails{
+			CachedTokens:     u.CacheReadTokens,
+			CacheWriteTokens: u.CacheWriteTokens,
+		}
+	}
+	return out
 }
 
 // EncodeResponse renders the IR as an OpenAI Chat Completions response. Used
@@ -81,11 +106,7 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 			Message:      msg,
 			FinishReason: finishFromStopReason(resp.StopReason),
 		}},
-		Usage: &chatUsage{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
-		},
+		Usage: usageToWire(resp.Usage),
 	}
 	return json.Marshal(out)
 }

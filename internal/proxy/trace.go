@@ -11,7 +11,7 @@ import (
 // request context before the handler runs and reads it afterward; the serve path
 // records the resolved upstream URL into it once a target is forwarded to.
 //
-// CodexSessionID is the per-request id the codex backend translate path sets
+// CodexSessionID is the derived cache key the codex backend prepare path sets
 // for the session_id header and prompt_cache_key (the two must match upstream).
 // Empty for non-codex requests.
 //

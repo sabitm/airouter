@@ -41,7 +41,7 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 	toolCalls := map[string]*tcall{}
 	toolOrder := []string{}
 	var stopReason ir.StopReason = ir.StopEndTurn
-	var inTok, outTok int
+	var inTok, outTok, cacheRead, cacheWrite int
 	var unmatched string
 
 	emitStart := func() error {
@@ -77,7 +77,8 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		if err := emitStart(); err != nil {
 			return err
 		}
-		return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, InputTokens: inTok, OutputTokens: outTok})
+		cacheRead, cacheWrite = ir.ClampCacheTokens(inTok, cacheRead, cacheWrite)
+		return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, InputTokens: inTok, OutputTokens: outTok, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite})
 	}
 
 	// finishOrRetry ends the turn unless a built-in was dropped. In that
@@ -267,15 +268,21 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 					}
 				}
 				// token_delta: running output count; authoritative usage arrives
-				// with turn_ended.
-				// turn_ended: final usage and stop.
+				// with turn_ended. inputTokens is already the inclusive prompt
+				// total; cache read/write partition it and must not be added.
 				if tes, ok := update[iuTurnEnded]; ok && len(tes) > 0 {
 					te, _ := decodeMessage(tes[0].value)
 					if v, ok := varintField(te, teInputTokens); ok {
-						inTok = int(v)
+						inTok = usageInt(v)
 					}
 					if v, ok := varintField(te, teOutputTokens); ok {
-						outTok = int(v)
+						outTok = usageInt(v)
+					}
+					if v, ok := varintField(te, teCacheReadTokens); ok {
+						cacheRead = usageInt(v)
+					}
+					if v, ok := varintField(te, teCacheWriteTokens); ok {
+						cacheWrite = usageInt(v)
 					}
 					return finishOrRetry()
 				}
@@ -602,4 +609,11 @@ func protoStructToGo(b []byte) map[string]any {
 
 func float64FromBits(bits uint64) float64 {
 	return math.Float64frombits(bits)
+}
+
+func usageInt(v uint64) int {
+	if v > math.MaxInt {
+		return math.MaxInt
+	}
+	return int(v)
 }

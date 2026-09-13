@@ -33,36 +33,28 @@ const (
 )
 
 // applyCodexHeaders sets the Codex-CLI identity headers the ChatGPT backend
-// requires: User-Agent, originator, session_id (the per-request CodexSessionID
+// requires: User-Agent, originator, session_id (the derived CodexSessionID
 // carried on the trace context), and chatgpt-account-id (from the id_token when
-// the connection extracted one). session_id is also used as prompt_cache_key.
+// the connection extracted one). session_id must equal prompt_cache_key.
 func applyCodexHeaders(req *http.Request, provider *domain.Provider, ctx context.Context) {
 	req.Header.Set("User-Agent", "codex_cli_rs/"+responses.CodexCLIVersion)
 	req.Header.Set("originator", "codex_cli_rs")
-	if t := traceInfoFrom(ctx); t != nil && t.CodexSessionID != "" {
-		req.Header.Set("session_id", t.CodexSessionID)
+	if id := codexSessionID(ctx); id != "" {
+		req.Header.Set("session_id", id)
 	}
 	if provider.OAuthCreds != nil && provider.OAuthCreds.AccountID != "" {
 		req.Header.Set("chatgpt-account-id", provider.OAuthCreds.AccountID)
 	}
 }
 
-// newCodexSessionID returns a random id suitable for the Codex session_id header
-// and prompt_cache_key. Anthropic-style UUIDs are not required here; a hex token
-// is enough and avoids the format's hyphens in a header value.
-func newCodexSessionID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
-
 // prepareUpstreamRequest applies backend-specific post-encode patches to the
 // upstream body that need per-request state or provider config the codec's
 // encodeRequest cannot see:
 //
-//   - Codex: sets up the per-request session id and injects it as
-//     prompt_cache_key; the id is saved on the trace context so applyCodexHeaders
-//     emits it as the session_id header.
+//   - Codex: derives a tenant+provider-scoped cache key from captured client
+//     identity (or a conversation-prefix / request-local fallback) and injects
+//     it as prompt_cache_key; the same value is saved on the trace context so
+//     applyCodexHeaders emits it as the session_id header.
 //   - Kiro: injects the provider's CodeWhisperer profile ARN into the request.
 //   - Qoder: injects live model_config and WAF-encodes the body (COSY signs
 //     these wire bytes in applyUpstreamHeaders).
@@ -89,7 +81,7 @@ func (p *Proxy) prepareUpstreamRequest(ctx context.Context, backend codec, provi
 func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain.Provider, body []byte) ([]byte, error) {
 	switch backend.id {
 	case "oai-codex":
-		id := newCodexSessionID()
+		id := resolveCodexCacheKey(ctx, provider)
 		if t := traceInfoFrom(ctx); t != nil {
 			t.CodexSessionID = id
 		}

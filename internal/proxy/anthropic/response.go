@@ -18,7 +18,7 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 		ID:         resp.ID,
 		Model:      resp.Model,
 		StopReason: stopReason(resp.StopReason),
-		Usage:      ir.Usage{InputTokens: resp.Usage.TotalInput(), OutputTokens: resp.Usage.OutputTokens},
+		Usage:      usageFromAnth(resp.Usage),
 	}
 	for _, b := range resp.Content {
 		switch b.Type {
@@ -69,9 +69,31 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 		Model:      resp.Model,
 		Content:    content,
 		StopReason: stopReasonWire(resp.StopReason),
-		Usage:      anthUsage{InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens},
+		Usage:      usageToAnth(resp.Usage),
 	}
 	return json.Marshal(out)
+}
+
+func usageFromAnth(u anthUsage) ir.Usage {
+	return ir.Usage{
+		InputTokens:      u.TotalInput(),
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CacheReadInputTokens,
+		CacheWriteTokens: u.CacheCreationInputTokens,
+	}.Clamped()
+}
+
+func usageToAnth(u ir.Usage) anthUsage {
+	u = u.Clamped()
+	out := anthUsage{OutputTokens: u.OutputTokens}
+	if u.CacheReadTokens == 0 && u.CacheWriteTokens == 0 {
+		out.InputTokens = u.InputTokens
+		return out
+	}
+	out.InputTokens = u.OrdinaryInputTokens()
+	out.CacheReadInputTokens = u.CacheReadTokens
+	out.CacheCreationInputTokens = u.CacheWriteTokens
+	return out
 }
 
 func stopReason(s string) ir.StopReason {

@@ -103,7 +103,9 @@ func TestEncodeError(t *testing.T) {
 	t.Run("set errType", func(t *testing.T) {
 		raw := EncodeError("nope", "overloaded_error")
 		var got struct {
-			Error struct{ Type string `json:"type"` } `json:"error"`
+			Error struct {
+				Type string `json:"type"`
+			} `json:"error"`
 		}
 		_ = json.Unmarshal(raw, &got)
 		if got.Error.Type != "overloaded_error" {

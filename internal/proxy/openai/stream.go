@@ -104,8 +104,8 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	started := false
 	var stopReason ir.StopReason = ir.StopEndTurn
-	inputTokens := 0
-	outputTokens := 0
+	inputTokens, outputTokens := 0, 0
+	cacheRead, cacheWrite := 0, 0
 
 	for {
 		ev, err := reader.Next()
@@ -166,8 +166,11 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			started = true
 		}
 		if chunk.Usage != nil {
-			inputTokens = chunk.Usage.PromptTokens
-			outputTokens = chunk.Usage.CompletionTokens
+			u := usageFromWire(chunk.Usage)
+			inputTokens = u.InputTokens
+			outputTokens = u.OutputTokens
+			cacheRead = u.CacheReadTokens
+			cacheWrite = u.CacheWriteTokens
 		}
 		for _, c := range chunk.Choices {
 			if reasoning := chatReasoningText(c.Delta.ReasoningContent, c.Delta.Reasoning, c.Delta.ReasoningDetails); reasoning != "" {
@@ -200,20 +203,26 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	if !started {
 		return nil
 	}
-	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, InputTokens: inputTokens, OutputTokens: outputTokens})
+	return emit(ir.StreamEvent{
+		Kind: ir.EventFinish, StopReason: stopReason,
+		InputTokens: inputTokens, OutputTokens: outputTokens,
+		CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
+	})
 }
 
 // StreamEncoder renders IR stream events as an OpenAI Chat Completions SSE
 // stream. Used when OpenAI is the ingress format.
 type StreamEncoder struct {
-	id        string
-	created   int64
-	model     string
-	roleSent  bool
-	usageIn   int
-	usageOut  int
-	toolIndex map[int]int // IR tool Index -> OpenAI tool_calls index
-	nextTool  int
+	id         string
+	created    int64
+	model      string
+	roleSent   bool
+	usageIn    int
+	usageOut   int
+	cacheRead  int
+	cacheWrite int
+	toolIndex  map[int]int // IR tool Index -> OpenAI tool_calls index
+	nextTool   int
 }
 
 func NewStreamEncoder(model string) *StreamEncoder {
@@ -256,9 +265,8 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		}
 		// Anthropic backends report input on message start; OpenAI-family backends
 		// report it on finish. Take it from whichever event carries a nonzero value.
-		if ev.InputTokens != 0 {
-			e.usageIn = ev.InputTokens
-		}
+		// Do not reset a nonzero start count with absent later fields.
+		e.applyUsage(ev)
 		e.roleSent = true
 		return e.emit(w, chunkDelta{Role: "assistant"}, nil)
 	case ir.EventTextDelta:
@@ -278,9 +286,7 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		tc.Function.Arguments = ev.ArgsFrag
 		return e.emit(w, chunkDelta{ToolCalls: []chunkToolCall{tc}}, nil)
 	case ir.EventFinish:
-		if ev.InputTokens != 0 {
-			e.usageIn = ev.InputTokens
-		}
+		e.applyUsage(ev)
 		e.usageOut = ev.OutputTokens
 		fr := finishFromStopReason(ev.StopReason)
 		if err := e.emit(w, chunkDelta{}, &fr); err != nil {
@@ -294,12 +300,29 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 // emitUsage sends a final choices-empty chunk carrying usage, mirroring OpenAI's
 // stream_options.include_usage behavior. Sent by default; clients that don't
 // expect it ignore the empty-choices chunk.
+func (e *StreamEncoder) applyUsage(ev ir.StreamEvent) {
+	if ev.InputTokens != 0 {
+		e.usageIn = ev.InputTokens
+	}
+	if ev.CacheReadTokens != 0 {
+		e.cacheRead = ev.CacheReadTokens
+	}
+	if ev.CacheWriteTokens != 0 {
+		e.cacheWrite = ev.CacheWriteTokens
+	}
+}
+
 func (e *StreamEncoder) emitUsage(w *sse.Writer) error {
 	chunk := chatChunk{
 		ID:      e.id,
 		Model:   e.model,
 		Choices: []chunkChoice{},
-		Usage:   &chatUsage{PromptTokens: e.usageIn, CompletionTokens: e.usageOut, TotalTokens: e.usageIn + e.usageOut},
+		Usage: usageToWire(ir.Usage{
+			InputTokens:      e.usageIn,
+			OutputTokens:     e.usageOut,
+			CacheReadTokens:  e.cacheRead,
+			CacheWriteTokens: e.cacheWrite,
+		}),
 	}
 	raw, _ := marshalChunk(chunk, e.created)
 	return w.WriteEvent("", raw)
