@@ -66,9 +66,9 @@ func TestQoderDeviceConnectPoll(t *testing.T) {
 		qoderLoginURL, qoderDeviceTokenURL, qoderUserInfoURL = origLogin, origPoll, origInfo
 	})
 	// speed up poll
-	origMin := devicePollMin
-	devicePollMin = 10 * time.Millisecond
-	t.Cleanup(func() { devicePollMin = origMin })
+	origInterval := qoderDevicePollInterval
+	qoderDevicePollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { qoderDevicePollInterval = origInterval })
 
 	var polls int
 	mux := http.NewServeMux()

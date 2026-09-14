@@ -22,15 +22,15 @@ import (
 
 // Overridable for tests.
 var (
-	qoderLoginURL       = qoder.LoginURL
-	qoderDeviceTokenURL = qoder.DeviceTokenURL
-	qoderUserInfoURL    = qoder.UserInfoURL
+	qoderLoginURL           = qoder.LoginURL
+	qoderDeviceTokenURL     = qoder.DeviceTokenURL
+	qoderUserInfoURL        = qoder.UserInfoURL
+	qoderDevicePollInterval = 2 * time.Second
 )
 
 const (
-	qoderDevicePollInterval = 2 * time.Second
-	qoderDeviceExpiresIn    = 5 * time.Minute
-	qoderDefaultTokenTTL    = 30 * 24 * time.Hour
+	qoderDeviceExpiresIn = 5 * time.Minute
+	qoderDefaultTokenTTL = 30 * 24 * time.Hour
 )
 
 // QoderDeviceConnect drives Qoder's custom device flow (PKCE + nonce + machineId).
@@ -131,10 +131,7 @@ func (d *QoderDeviceConnect) Close() error {
 
 func (d *QoderDeviceConnect) pollLoop(ctx context.Context) {
 	deadline := time.Now().Add(qoderDeviceExpiresIn)
-	ticker := time.NewTicker(devicePollMin)
-	if qoderDevicePollInterval > devicePollMin {
-		ticker.Reset(qoderDevicePollInterval)
-	}
+	ticker := time.NewTicker(qoderDevicePollInterval)
 	defer ticker.Stop()
 
 	// First poll immediately.
