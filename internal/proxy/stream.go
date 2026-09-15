@@ -173,10 +173,11 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 
 // sniffStreamUsage extracts token counts from one raw SSE event's data without
 // mutating the relayed bytes. OpenAI nests usage top-level; Anthropic under
-// message.usage / message_delta usage; Responses under response.usage. Each
-// field is only overwritten when the chosen family yields a nonzero total, so
-// values reported on different events across the stream accumulate rather than
-// reset. codecID selects one alias family so hybrid objects are not double-counted.
+// message.usage / message_delta usage; Responses under response.usage. OpenAI
+// and Responses overwrite a field only when that family yields a nonzero total.
+// Anthropic (anth-msg / claude-code) keeps a cumulative partition: present
+// fields replace, including explicit zero; omitted fields keep prior values.
+// codecID selects one alias family so hybrid objects are not double-counted.
 func sniffStreamUsage(data []byte, res *reqResult, codecID string) {
 	if len(data) == 0 || data[0] != '{' {
 		return
@@ -197,6 +198,10 @@ func sniffStreamUsage(data []byte, res *reqResult, codecID string) {
 		if len(raw) == 0 {
 			return
 		}
+		if codecID == "anth-msg" || codecID == "claude-code" {
+			sniffAnthropicStreamUsage(raw, res)
+			return
+		}
 		in, out := parseUsageObject(raw, codecID)
 		if in != 0 {
 			res.inTok = in
@@ -211,6 +216,34 @@ func sniffStreamUsage(data []byte, res *reqResult, codecID string) {
 	}
 	if u.Response != nil {
 		apply(u.Response.Usage)
+	}
+}
+
+func sniffAnthropicStreamUsage(raw json.RawMessage, res *reqResult) {
+	if len(raw) == 0 || raw[0] != '{' {
+		return
+	}
+	var f struct {
+		InputTokens              *int `json:"input_tokens"`
+		CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+		OutputTokens             int  `json:"output_tokens"`
+	}
+	if json.Unmarshal(raw, &f) != nil {
+		return
+	}
+	if f.InputTokens != nil {
+		res.anthOrdinary = *f.InputTokens
+	}
+	if f.CacheReadInputTokens != nil {
+		res.anthCacheRead = *f.CacheReadInputTokens
+	}
+	if f.CacheCreationInputTokens != nil {
+		res.anthCacheWrite = *f.CacheCreationInputTokens
+	}
+	res.inTok = res.anthOrdinary + res.anthCacheRead + res.anthCacheWrite
+	if f.OutputTokens != 0 {
+		res.outTok = f.OutputTokens
 	}
 }
 

@@ -42,7 +42,16 @@ type streamMessageDelta struct {
 	Delta struct {
 		StopReason string `json:"stop_reason"`
 	} `json:"delta"`
-	Usage anthUsage `json:"usage"`
+	Usage streamDeltaUsage `json:"usage"`
+}
+
+// streamDeltaUsage is a cumulative Anthropic usage snapshot. Pointers distinguish
+// omitted fields (keep prior partition) from an explicit zero (replace).
+type streamDeltaUsage struct {
+	InputTokens              *int `json:"input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	OutputTokens             int  `json:"output_tokens"`
 }
 
 // DecodeStream reads an Anthropic Messages SSE stream and emits IR stream
@@ -52,10 +61,11 @@ type streamMessageDelta struct {
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	var stopReason ir.StopReason = ir.StopEndTurn
+	ordinary, cacheRead, cacheWrite := 0, 0, 0
 	inputTokens, outputTokens := 0, 0
-	cacheRead, cacheWrite := 0, 0
 	finished := false
 	started := false
+	inclusiveInput := func() int { return ordinary + cacheRead + cacheWrite }
 
 	for {
 		ev, err := reader.Next()
@@ -86,10 +96,10 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if json.Unmarshal(ev.Data, &m) != nil {
 				continue
 			}
-			u := usageFromAnth(m.Message.Usage)
-			inputTokens = u.InputTokens
-			cacheRead = u.CacheReadTokens
-			cacheWrite = u.CacheWriteTokens
+			ordinary = m.Message.Usage.InputTokens
+			cacheRead = m.Message.Usage.CacheReadInputTokens
+			cacheWrite = m.Message.Usage.CacheCreationInputTokens
+			inputTokens = inclusiveInput()
 			if err := emit(ir.StreamEvent{
 				Kind: ir.EventMessageStart, ID: m.Message.ID, Model: m.Message.Model,
 				InputTokens:     inputTokens,
@@ -140,18 +150,16 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				continue
 			}
 			stopReason = stopReason2(m.Delta.StopReason)
-			// Some Anthropic-compatible providers defer all usage until the final
-			// delta instead of reporting input at message_start.
-			u := usageFromAnth(m.Usage)
-			if u.InputTokens != 0 {
-				inputTokens = u.InputTokens
+			if m.Usage.InputTokens != nil {
+				ordinary = *m.Usage.InputTokens
 			}
-			if u.CacheReadTokens != 0 {
-				cacheRead = u.CacheReadTokens
+			if m.Usage.CacheReadInputTokens != nil {
+				cacheRead = *m.Usage.CacheReadInputTokens
 			}
-			if u.CacheWriteTokens != 0 {
-				cacheWrite = u.CacheWriteTokens
+			if m.Usage.CacheCreationInputTokens != nil {
+				cacheWrite = *m.Usage.CacheCreationInputTokens
 			}
+			inputTokens = inclusiveInput()
 			outputTokens = m.Usage.OutputTokens
 		case "message_stop":
 			if err := emit(ir.StreamEvent{

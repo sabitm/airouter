@@ -52,6 +52,26 @@ data: {"type":"message_stop"}
 
 `
 
+const anthropicInputOnlyDeltaSSE = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_part","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":200,"output_tokens":3}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
 const anthropicLateUsageSSE = `event: message_start
 data: {"type":"message_start","message":{"id":"msg_late","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}
 
@@ -709,6 +729,45 @@ func TestAnthropicStreamLateUsageRecordedAndForwarded(t *testing.T) {
 	l := waitForLogs(t, st, 1)[0]
 	if l.InputTokens != 2271 || l.OutputTokens != 14 {
 		t.Errorf("logged tokens = %d/%d, want 2271/14", l.InputTokens, l.OutputTokens)
+	}
+}
+
+func TestAnthropicPassthroughInputOnlyDeltaKeepsLoggedCache(t *testing.T) {
+	base, token, st := setupStreamingWithStore(t, domain.ProtocolAnthropic, anthropicInputOnlyDeltaSSE)
+	resp, body := postStream(t, base+"/v1/messages", token,
+		`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"cache_read_input_tokens":2000`) || !strings.Contains(body, `"cache_creation_input_tokens":400`) {
+		t.Fatalf("passthrough rewrote cache usage: %s", body)
+	}
+	if !strings.Contains(body, `"usage":{"input_tokens":200,"output_tokens":3}`) {
+		t.Fatalf("passthrough rewrote input-only delta: %s", body)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.InputTokens != 2600 || l.OutputTokens != 3 {
+		t.Errorf("logged tokens = %d/%d, want 2600/3", l.InputTokens, l.OutputTokens)
+	}
+}
+
+func TestAnthropicToOpenAIInputOnlyDeltaKeepsInclusiveUsage(t *testing.T) {
+	base, token, st := setupStreamingWithStore(t, domain.ProtocolAnthropic, anthropicInputOnlyDeltaSSE)
+	resp, body := postStream(t, base+"/v1/chat/completions", token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	in, out, total, cached, write := collectOpenAIUsageDetails(t, body)
+	if in != 2600 || out != 3 || total != 2603 {
+		t.Errorf("client usage = %d/%d/%d, want 2600/3/2603", in, out, total)
+	}
+	if cached != 2000 || write != 400 {
+		t.Errorf("client cache = %d/%d, want 2000/400", cached, write)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.InputTokens != 2600 || l.OutputTokens != 3 {
+		t.Errorf("logged tokens = %d/%d, want 2600/3", l.InputTokens, l.OutputTokens)
 	}
 }
 

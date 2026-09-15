@@ -45,6 +45,11 @@ type reqResult struct {
 	outTok int
 	errMsg string
 	logErr string
+	// anthOrdinary/anthCache* are request-local Anthropic stream partitions for
+	// passthrough sniffing. Written only from committed/relayed events.
+	anthOrdinary   int
+	anthCacheRead  int
+	anthCacheWrite int
 }
 
 // clampErrorMessage keeps client and request-history messages within the error

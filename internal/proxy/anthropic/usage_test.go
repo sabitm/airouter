@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -112,6 +113,95 @@ data: {"type":"message_stop"}
 	finish := events[len(events)-1]
 	if finish.Kind != ir.EventFinish || finish.InputTokens != 2600 || finish.CacheReadTokens != 2000 || finish.CacheWriteTokens != 400 {
 		t.Fatalf("finish = %+v", finish)
+	}
+}
+
+func TestDecodeStreamDeltaUsagePartitions(t *testing.T) {
+	cases := []struct {
+		name      string
+		startU    string
+		deltaU    string
+		wantIn    int
+		wantRead  int
+		wantWrite int
+	}{
+		{
+			name:      "input-only delta keeps start cache",
+			startU:    `{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":0}`,
+			deltaU:    `{"input_tokens":200,"output_tokens":3}`,
+			wantIn:    2600,
+			wantRead:  2000,
+			wantWrite: 400,
+		},
+		{
+			name:      "full repeated partition",
+			startU:    `{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":0}`,
+			deltaU:    `{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":3}`,
+			wantIn:    2600,
+			wantRead:  2000,
+			wantWrite: 400,
+		},
+		{
+			name:      "output-only delta preserves start partition",
+			startU:    `{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":0}`,
+			deltaU:    `{"output_tokens":3}`,
+			wantIn:    2600,
+			wantRead:  2000,
+			wantWrite: 400,
+		},
+		{
+			name:      "deferred full partition from zero start",
+			startU:    `{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}`,
+			deltaU:    `{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":3}`,
+			wantIn:    2600,
+			wantRead:  2000,
+			wantWrite: 400,
+		},
+		{
+			name:      "deferred all-cache with explicit ordinary zero",
+			startU:    `{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}`,
+			deltaU:    `{"input_tokens":0,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":3}`,
+			wantIn:    2400,
+			wantRead:  2000,
+			wantWrite: 400,
+		},
+		{
+			name:      "cache-only delta updates cache and rebuilds inclusive",
+			startU:    `{"input_tokens":200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}`,
+			deltaU:    `{"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":3}`,
+			wantIn:    2600,
+			wantRead:  2000,
+			wantWrite: 400,
+		},
+		{
+			name:      "explicit zero clears cache; omission retains",
+			startU:    `{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":0}`,
+			deltaU:    `{"cache_read_input_tokens":0,"output_tokens":3}`,
+			wantIn:    600,
+			wantRead:  0,
+			wantWrite: 400,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m\",\"usage\":%s}}\n\n"+
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":%s}\n\n"+
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", tc.startU, tc.deltaU)
+			events, err := collectDecode(t, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(events) < 2 || events[0].Kind != ir.EventMessageStart {
+				t.Fatalf("events = %+v", events)
+			}
+			finish := events[len(events)-1]
+			if finish.Kind != ir.EventFinish {
+				t.Fatalf("finish kind = %v", finish.Kind)
+			}
+			if finish.InputTokens != tc.wantIn || finish.CacheReadTokens != tc.wantRead || finish.CacheWriteTokens != tc.wantWrite {
+				t.Fatalf("finish = in %d read %d write %d, want %d/%d/%d", finish.InputTokens, finish.CacheReadTokens, finish.CacheWriteTokens, tc.wantIn, tc.wantRead, tc.wantWrite)
+			}
+		})
 	}
 }
 

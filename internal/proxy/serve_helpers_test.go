@@ -162,6 +162,22 @@ func TestSniffStreamUsage(t *testing.T) {
 	}
 }
 
+func TestSniffStreamUsageAnthropicPartition(t *testing.T) {
+	start := `{"type":"message_start","message":{"usage":{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":0}}}`
+	res := &reqResult{}
+	sniffStreamUsage([]byte(start), res, "anth-msg")
+	sniffStreamUsage([]byte(`{"type":"message_delta","usage":{"input_tokens":200,"output_tokens":3}}`), res, "anth-msg")
+	if res.inTok != 2600 || res.outTok != 3 {
+		t.Fatalf("input-only = %d/%d, want 2600/3", res.inTok, res.outTok)
+	}
+	res = &reqResult{}
+	sniffStreamUsage([]byte(start), res, "claude-code")
+	sniffStreamUsage([]byte(`{"type":"message_delta","usage":{"output_tokens":3}}`), res, "claude-code")
+	if res.inTok != 2600 || res.outTok != 3 {
+		t.Fatalf("output-only = %d/%d, want 2600/3", res.inTok, res.outTok)
+	}
+}
+
 func TestForceOpenAIStreamIncludeUsage(t *testing.T) {
 	cases := []struct {
 		name  string
