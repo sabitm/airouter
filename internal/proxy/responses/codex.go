@@ -2,6 +2,7 @@ package responses
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"airouter/internal/proxy/ir"
@@ -135,50 +136,71 @@ func resolveCodexEffort(t *ir.Thinking, hyphenEffort, base string) string {
 // SyncCodexReasoningInclude keeps encrypted reasoning continuity aligned with
 // the effective effort after provider-aware finalization. Explicit none removes
 // only the Codex-required include; other include entries are preserved.
-func SyncCodexReasoningInclude(body []byte) []byte {
-	var m map[string]any
-	if json.Unmarshal(body, &m) != nil {
-		return body
+// Nested values stay json.RawMessage so number tokens are not coerced to float64.
+func SyncCodexReasoningInclude(body []byte) ([]byte, error) {
+	m, err := unmarshalObjectRaw(body)
+	if err != nil {
+		return nil, err
 	}
 	effort := ""
-	if reasoning, ok := m["reasoning"].(map[string]any); ok {
-		effort, _ = reasoning["effort"].(string)
-	}
-	includes, _ := m["include"].([]any)
-	filtered := make([]any, 0, len(includes)+1)
-	for _, item := range includes {
-		if value, _ := item.(string); value != "reasoning.encrypted_content" {
-			filtered = append(filtered, item)
+	if raw, ok := m["reasoning"]; ok {
+		var reasoning map[string]json.RawMessage
+		if json.Unmarshal(raw, &reasoning) == nil && reasoning != nil {
+			if eRaw, ok := reasoning["effort"]; ok {
+				_ = json.Unmarshal(eRaw, &effort)
+			}
 		}
 	}
+	var includes []json.RawMessage
+	if raw, ok := m["include"]; ok {
+		_ = json.Unmarshal(raw, &includes)
+	}
+	filtered := make([]json.RawMessage, 0, len(includes)+1)
+	for _, item := range includes {
+		var value string
+		if json.Unmarshal(item, &value) == nil && value == "reasoning.encrypted_content" {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
 	if effort != "" && effort != "none" {
-		filtered = append(filtered, "reasoning.encrypted_content")
+		filtered = append(filtered, json.RawMessage(`"reasoning.encrypted_content"`))
 	}
 	if len(filtered) == 0 {
 		delete(m, "include")
 	} else {
-		m["include"] = filtered
+		raw, err := json.Marshal(filtered)
+		if err != nil {
+			return nil, err
+		}
+		m["include"] = raw
 	}
-	out, err := json.Marshal(m)
-	if err != nil {
-		return body
-	}
-	return out
+	return json.Marshal(m)
 }
 
 // InjectCodexRequestKey sets prompt_cache_key on an already-encoded Codex
-// request body. It is a no-op parse/patch so the encoder stays free of the
-// derived cache key, which the proxy generates alongside the session_id header.
-// Returns the body unchanged if the body is not a JSON object.
-func InjectCodexRequestKey(body []byte, key string) []byte {
-	var m map[string]any
-	if json.Unmarshal(body, &m) != nil {
-		return body
-	}
-	m["prompt_cache_key"] = key
-	out, err := json.Marshal(m)
+// request body. Nested values stay json.RawMessage so number tokens are not
+// coerced to float64. Invalid JSON, a non-object, or top-level null fails closed.
+func InjectCodexRequestKey(body []byte, key string) ([]byte, error) {
+	m, err := unmarshalObjectRaw(body)
 	if err != nil {
-		return body
+		return nil, err
 	}
-	return out
+	raw, err := json.Marshal(key)
+	if err != nil {
+		return nil, err
+	}
+	m["prompt_cache_key"] = raw
+	return json.Marshal(m)
+}
+
+func unmarshalObjectRaw(body []byte) (map[string]json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return nil, fmt.Errorf("not a JSON object")
+	}
+	return m, nil
 }

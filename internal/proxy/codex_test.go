@@ -317,6 +317,116 @@ func TestCodexFinalizeKeepsNativeHyphenAndSyncsInclude(t *testing.T) {
 	}
 }
 
+func TestCodexFinalizePreservesToolSchemaNumbers(t *testing.T) {
+	req := &ir.Request{
+		Model: "gpt-5.3-codex",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{
+			{Type: ir.BlockText, Text: "hi"},
+		}}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+		Tools: []ir.Tool{{
+			Name:       "t",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"n":{"maximum":9007199254740993,"huge":1e400}}}`),
+		}},
+	}
+	body, err := responses.EncodeCodexRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := finalizeEncodedBody(body, req, codexCodec, &domain.Provider{Protocol: domain.ProtocolOpenAICodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("9007199254740993")) {
+		t.Fatalf("lost integer token: %s", out)
+	}
+	if !bytes.Contains(out, []byte("1e400")) {
+		t.Fatalf("lost 1e400 token: %s", out)
+	}
+	var got struct {
+		Include   []string `json:"include"`
+		Reasoning struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Reasoning.Effort != "high" {
+		t.Fatalf("reasoning = %+v", got.Reasoning)
+	}
+	found := false
+	for _, item := range got.Include {
+		if item == "reasoning.encrypted_content" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("missing encrypted include: %s", out)
+	}
+}
+
+func TestCodexFinalizeThenPreparePreservesNumbersAndPairsTrace(t *testing.T) {
+	req := &ir.Request{
+		Model: "gpt-5.3-codex",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{
+			{Type: ir.BlockText, Text: "hi"},
+		}}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+		Tools: []ir.Tool{{
+			Name:       "t",
+			Parameters: json.RawMessage(`{"maximum":9007199254740993,"huge":1e400}`),
+		}},
+	}
+	body, err := responses.EncodeCodexRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &domain.Provider{Protocol: domain.ProtocolOpenAICodex}
+	body, err = finalizeEncodedBody(body, req, codexCodec, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := &TraceInfo{}
+	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), codexCodec, provider, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("9007199254740993")) {
+		t.Fatalf("lost integer token: %s", out)
+	}
+	if !bytes.Contains(out, []byte("1e400")) {
+		t.Fatalf("lost 1e400 token: %s", out)
+	}
+	var got struct {
+		Key       string   `json:"prompt_cache_key"`
+		Include   []string `json:"include"`
+		Reasoning struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Reasoning.Effort != "high" {
+		t.Fatalf("effort = %q", got.Reasoning.Effort)
+	}
+	found := false
+	for _, item := range got.Include {
+		if item == "reasoning.encrypted_content" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("missing encrypted include: %s", out)
+	}
+	if got.Key == "" || got.Key != trace.CodexSessionID {
+		t.Fatalf("prompt_cache_key=%q trace=%q", got.Key, trace.CodexSessionID)
+	}
+}
+
 func TestCodexEncodeRequestIRThinkingOverridesHyphen(t *testing.T) {
 	body, err := responses.EncodeCodexRequest(&ir.Request{
 		Model:    "gpt-5.3-codex-low",

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -340,6 +341,41 @@ func TestCodexPrepareBodyMatchesSessionHeader(t *testing.T) {
 	applyCodexHeaders(req, p, ctx)
 	if req.Header.Get("session_id") != key {
 		t.Fatalf("session_id=%q, want %q", req.Header.Get("session_id"), key)
+	}
+}
+
+func TestCodexPreparePreservesToolSchemaNumbersAndPairsTrace(t *testing.T) {
+	trace := &TraceInfo{}
+	body := []byte(`{"model":"gpt-5.3-codex","tools":[{"parameters":{"maximum":9007199254740993,"huge":1e400}}]}`)
+	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), codexCodec, &domain.Provider{}, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("9007199254740993")) {
+		t.Fatalf("lost integer token: %s", out)
+	}
+	if !bytes.Contains(out, []byte("1e400")) {
+		t.Fatalf("lost 1e400 token: %s", out)
+	}
+	var got struct {
+		Key string `json:"prompt_cache_key"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Key == "" || got.Key != trace.CodexSessionID {
+		t.Fatalf("prompt_cache_key=%q trace=%q", got.Key, trace.CodexSessionID)
+	}
+}
+
+func TestCodexPrepareInjectionFailureLeavesTraceUnset(t *testing.T) {
+	trace := &TraceInfo{}
+	_, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), codexCodec, &domain.Provider{}, []byte("not json"))
+	if err == nil {
+		t.Fatal("expected injection error")
+	}
+	if trace.CodexSessionID != "" {
+		t.Fatalf("CodexSessionID=%q, want unset", trace.CodexSessionID)
 	}
 }
 

@@ -1,7 +1,9 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"airouter/internal/proxy/ir"
@@ -310,7 +312,10 @@ func TestCodexEffortForModel(t *testing.T) {
 func TestInjectCodexRequestKey(t *testing.T) {
 	t.Run("valid body inserts key", func(t *testing.T) {
 		body := []byte(`{"model":"x","input":[]}`)
-		out := InjectCodexRequestKey(body, "sess-123")
+		out, err := InjectCodexRequestKey(body, "sess-123")
+		if err != nil {
+			t.Fatal(err)
+		}
 		var m map[string]any
 		if err := json.Unmarshal(out, &m); err != nil {
 			t.Fatalf("invalid JSON: %v", err)
@@ -322,11 +327,124 @@ func TestInjectCodexRequestKey(t *testing.T) {
 			t.Errorf("model = %v, want x (preserved)", m["model"])
 		}
 	})
-	t.Run("non-json body returned unchanged", func(t *testing.T) {
-		body := []byte("not json at all")
-		out := InjectCodexRequestKey(body, "k")
-		if string(out) != string(body) {
-			t.Errorf("got %q, want unchanged body", out)
+	t.Run("preserves integer above float64 mantissa", func(t *testing.T) {
+		body := []byte(`{"model":"x","tools":[{"type":"function","name":"t","parameters":{"maximum":9007199254740993}}]}`)
+		out, err := InjectCodexRequestKey(body, "sess-123")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(out, []byte("9007199254740993")) {
+			t.Fatalf("lost integer token: %s", out)
+		}
+		if !bytes.Contains(out, []byte(`"prompt_cache_key":"sess-123"`)) {
+			t.Fatalf("missing prompt_cache_key: %s", out)
+		}
+	})
+	t.Run("preserves nested 1e400 token", func(t *testing.T) {
+		body := []byte(`{"model":"x","tools":[{"parameters":{"x":1e400}}]}`)
+		out, err := InjectCodexRequestKey(body, "sess-123")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(out, []byte("1e400")) {
+			t.Fatalf("lost 1e400 token: %s", out)
+		}
+		if !bytes.Contains(out, []byte(`"prompt_cache_key":"sess-123"`)) {
+			t.Fatalf("missing prompt_cache_key: %s", out)
+		}
+	})
+	t.Run("invalid JSON fails closed", func(t *testing.T) {
+		if _, err := InjectCodexRequestKey([]byte("not json at all"), "k"); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("top-level null fails closed", func(t *testing.T) {
+		if _, err := InjectCodexRequestKey([]byte("null"), "k"); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("non-object fails closed", func(t *testing.T) {
+		if _, err := InjectCodexRequestKey([]byte(`[1]`), "k"); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestSyncCodexReasoningInclude(t *testing.T) {
+	t.Run("adds encrypted include when effort is set", func(t *testing.T) {
+		body := []byte(`{"reasoning":{"effort":"high"},"include":["file_search_call.results"]}`)
+		out, err := SyncCodexReasoningInclude(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m struct {
+			Include []string `json:"include"`
+		}
+		if err := json.Unmarshal(out, &m); err != nil {
+			t.Fatal(err)
+		}
+		if len(m.Include) != 2 || m.Include[0] != "file_search_call.results" || m.Include[1] != "reasoning.encrypted_content" {
+			t.Fatalf("include = %v", m.Include)
+		}
+	})
+	t.Run("replaces duplicate encrypted include", func(t *testing.T) {
+		body := []byte(`{"reasoning":{"effort":"low"},"include":["reasoning.encrypted_content","other","reasoning.encrypted_content"]}`)
+		out, err := SyncCodexReasoningInclude(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m struct {
+			Include []string `json:"include"`
+		}
+		if err := json.Unmarshal(out, &m); err != nil {
+			t.Fatal(err)
+		}
+		if len(m.Include) != 2 || m.Include[0] != "other" || m.Include[1] != "reasoning.encrypted_content" {
+			t.Fatalf("include = %v", m.Include)
+		}
+	})
+	t.Run("none effort drops encrypted include and empty include", func(t *testing.T) {
+		body := []byte(`{"reasoning":{"effort":"none"},"include":["reasoning.encrypted_content"]}`)
+		out, err := SyncCodexReasoningInclude(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(out), "include") {
+			t.Fatalf("include should be omitted: %s", out)
+		}
+	})
+	t.Run("preserves nested number tokens", func(t *testing.T) {
+		body := []byte(`{"reasoning":{"effort":"high"},"include":["keep_me"],"tools":[{"parameters":{"maximum":9007199254740993,"huge":1e400}}]}`)
+		out, err := SyncCodexReasoningInclude(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(out, []byte("9007199254740993")) {
+			t.Fatalf("lost integer token: %s", out)
+		}
+		if !bytes.Contains(out, []byte("1e400")) {
+			t.Fatalf("lost 1e400 token: %s", out)
+		}
+		if !bytes.Contains(out, []byte(`"keep_me"`)) {
+			t.Fatalf("lost non-target include: %s", out)
+		}
+		if !bytes.Contains(out, []byte(`"reasoning.encrypted_content"`)) {
+			t.Fatalf("missing encrypted include: %s", out)
+		}
+	})
+	t.Run("invalid JSON fails closed", func(t *testing.T) {
+		if _, err := SyncCodexReasoningInclude([]byte("not json")); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("top-level null fails closed", func(t *testing.T) {
+		if _, err := SyncCodexReasoningInclude([]byte("null")); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("non-object fails closed", func(t *testing.T) {
+		if _, err := SyncCodexReasoningInclude([]byte(`[1]`)); err == nil {
+			t.Fatal("expected error")
 		}
 	})
 }

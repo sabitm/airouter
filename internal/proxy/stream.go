@@ -603,7 +603,10 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 		return nil, err
 	}
 	if provider.Protocol == domain.ProtocolOpenAICodex {
-		out = responses.SyncCodexReasoningInclude(out)
+		out, err = responses.SyncCodexReasoningInclude(out)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

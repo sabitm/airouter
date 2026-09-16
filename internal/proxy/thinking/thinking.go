@@ -1,7 +1,10 @@
 package thinking
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
 
 	"airouter/internal/domain"
@@ -212,8 +215,8 @@ func ResolveIntent(bodyCfg, suffixCfg *Config, caps Caps) *Config {
 // formatID selects the transport wire family (oai-chat, anth-msg, oai-responses)
 // when the dialect alone is ambiguous (e.g. openai vs responses effort field).
 func ApplyWire(formatID string, body []byte, model string, cfg *Config, protocol domain.Protocol, dialect domain.ReasoningDialect) ([]byte, error) {
-	var m map[string]any
-	if err := json.Unmarshal(body, &m); err != nil {
+	m, err := decodeObjectUseNumber(body)
+	if err != nil {
 		return nil, err
 	}
 	m["model"] = model
@@ -226,6 +229,36 @@ func ApplyWire(formatID string, body []byte, model string, cfg *Config, protocol
 		}
 	}
 	return json.Marshal(m)
+}
+
+// decodeObjectUseNumber is json.Unmarshal into map[string]any with UseNumber,
+// plus the same trailing-data rejection Unmarshal applies. Top-level null is
+// rejected so callers never see a nil object.
+func decodeObjectUseNumber(body []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return nil, fmt.Errorf("not a JSON object")
+	}
+	if err := rejectTrailingJSON(dec); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func rejectTrailingJSON(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("invalid character after top-level JSON value: %v", tok)
 }
 
 func lastMessageIsUser(m map[string]any) bool {

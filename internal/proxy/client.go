@@ -82,10 +82,14 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 	switch backend.id {
 	case "oai-codex":
 		id := resolveCodexCacheKey(ctx, provider)
+		body, err := responses.InjectCodexRequestKey(body, id)
+		if err != nil {
+			return nil, fmt.Errorf("codex prompt_cache_key: %w", err)
+		}
 		if t := traceInfoFrom(ctx); t != nil {
 			t.CodexSessionID = id
 		}
-		return responses.InjectCodexRequestKey(body, id), nil
+		return body, nil
 	case "kiro":
 		return kiro.InjectProfileArn(body, kiroProfileArn(provider)), nil
 	case "qoder":

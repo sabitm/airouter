@@ -1,6 +1,7 @@
 package thinking
 
 import (
+	"bytes"
 	"encoding/json"
 	"slices"
 	"testing"
@@ -805,4 +806,82 @@ func TestFinalizeBodyCodexAutoAndUltra(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyWirePreservesNestedLargeNumbers(t *testing.T) {
+	body := []byte(`{"model":"combo","reasoning":{"effort":"low"},"tools":[{"parameters":{"maximum":9007199254740993,"huge":1e400}}]}`)
+	out, err := ApplyWire("oai-responses", body, "gpt-5.3-codex", &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpenAICodex, domain.ReasoningCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("9007199254740993")) {
+		t.Fatalf("lost integer token: %s", out)
+	}
+	if !bytes.Contains(out, []byte("1e400")) {
+		t.Fatalf("lost 1e400 token: %s", out)
+	}
+	var got struct {
+		Reasoning struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Reasoning.Effort != "high" {
+		t.Fatalf("reasoning = %+v", got.Reasoning)
+	}
+}
+
+func TestFinalizeBodyPreservesNestedLargeNumbers(t *testing.T) {
+	body := []byte(`{"model":"combo","reasoning":{"effort":"low"},"tools":[{"parameters":{"maximum":9007199254740993,"huge":1e400}}]}`)
+	out, err := FinalizeBody(body, "gpt-5.3-codex", "oai-responses", domain.ProtocolOpenAICodex, domain.ReasoningCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("9007199254740993")) {
+		t.Fatalf("lost integer token: %s", out)
+	}
+	if !bytes.Contains(out, []byte("1e400")) {
+		t.Fatalf("lost 1e400 token: %s", out)
+	}
+	var got struct {
+		Reasoning struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Reasoning.Effort != "low" {
+		t.Fatalf("reasoning = %+v, want effort low", got.Reasoning)
+	}
+}
+
+func TestDecodeObjectUseNumberStrict(t *testing.T) {
+	t.Run("trailing data", func(t *testing.T) {
+		if _, err := decodeObjectUseNumber([]byte(`{"a":1} {"b":2}`)); err == nil {
+			t.Fatal("expected trailing-data error")
+		}
+	})
+	t.Run("top-level null", func(t *testing.T) {
+		if _, err := decodeObjectUseNumber([]byte("null")); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("non-object", func(t *testing.T) {
+		if _, err := decodeObjectUseNumber([]byte(`[1]`)); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("trailing whitespace ok", func(t *testing.T) {
+		m, err := decodeObjectUseNumber([]byte("{\"n\":9007199254740993}  \n\t "))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, ok := m["n"].(json.Number)
+		if !ok || n.String() != "9007199254740993" {
+			t.Fatalf("n = %T %v", m["n"], m["n"])
+		}
+	})
 }
