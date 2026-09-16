@@ -633,6 +633,67 @@ func TestLastUserTurn(t *testing.T) {
 	})
 }
 
+func TestInjectProfileArnPreservesLargeNumbers(t *testing.T) {
+	const arn = "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+	req := &ir.Request{
+		Model: "claude-sonnet-4.5",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "weather?"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{
+				Type: ir.BlockToolUse, ToolID: "call_1", ToolName: "lookup",
+				ToolInput: json.RawMessage(`{"id":9050000000000000001}`),
+			}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "call_1", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "ok"}}},
+				{Type: ir.BlockText, Text: "thanks"},
+			}},
+		},
+		Tools: []ir.Tool{{
+			Name:       "lookup",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"id":{"type":"integer","maximum":9223372036854775807}}}`),
+		}},
+	}
+	body, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := InjectProfileArn(body, arn)
+	if !strings.Contains(string(out), "9223372036854775807") {
+		t.Errorf("schema maximum lost:\n%s", out)
+	}
+	if !strings.Contains(string(out), "9050000000000000001") {
+		t.Errorf("tool input id lost:\n%s", out)
+	}
+	if decodeReq(t, out).ProfileArn != arn {
+		t.Errorf("profileArn missing:\n%s", out)
+	}
+}
+
+func TestInjectProfileArnPreservesHugeFloatToken(t *testing.T) {
+	const arn = "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+	req := &ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+		Tools: []ir.Tool{{
+			Name:       "lookup",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"n":{"type":"number","maximum":1e400}}}`),
+		}},
+	}
+	body, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := InjectProfileArn(body, arn)
+	if !strings.Contains(string(out), "1e400") {
+		t.Errorf("1e400 lost:\n%s", out)
+	}
+	if decodeReq(t, out).ProfileArn != arn {
+		t.Errorf("profileArn missing on 1e400 body:\n%s", out)
+	}
+}
+
 func TestInjectProfileArnErrorPaths(t *testing.T) {
 	t.Run("empty arn returns body unchanged byte-for-byte", func(t *testing.T) {
 		body := []byte(`{"content":"hi"}`)
@@ -647,6 +708,22 @@ func TestInjectProfileArnErrorPaths(t *testing.T) {
 		got := InjectProfileArn(body, "arn:aws:codewhisperer:us-east-1:123:profile/ABC")
 		if string(got) != string(body) {
 			t.Errorf("got %s, want body unchanged for invalid JSON", got)
+		}
+	})
+
+	t.Run("top-level null returns unchanged", func(t *testing.T) {
+		body := []byte(`null`)
+		got := InjectProfileArn(body, "arn:aws:codewhisperer:us-east-1:123:profile/ABC")
+		if string(got) != string(body) {
+			t.Errorf("got %s, want body unchanged for null", got)
+		}
+	})
+
+	t.Run("non-object returns unchanged", func(t *testing.T) {
+		body := []byte(`[1]`)
+		got := InjectProfileArn(body, "arn:aws:codewhisperer:us-east-1:123:profile/ABC")
+		if string(got) != string(body) {
+			t.Errorf("got %s, want body unchanged for array", got)
 		}
 	})
 }

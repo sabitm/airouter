@@ -1,6 +1,11 @@
 package antigravity
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+)
 
 // unsupportedSchemaKeys are JSON Schema keywords Gemini/Antigravity reject.
 // Ported from 9router translator/formats/gemini.js UNSUPPORTED_SCHEMA_CONSTRAINTS.
@@ -23,8 +28,8 @@ var unsupportedSchemaKeys = map[string]bool{
 // VALIDATED-mode Gemini accepts. Returns a cleaned deep copy of raw (or a
 // placeholder object schema when raw is empty/invalid).
 func CleanJSONSchemaForAntigravity(raw json.RawMessage) map[string]any {
-	var schema map[string]any
-	if len(raw) == 0 || json.Unmarshal(raw, &schema) != nil || schema == nil {
+	schema, err := decodeObjectUseNumber(raw)
+	if len(raw) == 0 || err != nil {
 		schema = map[string]any{"type": "object", "properties": map[string]any{}}
 	} else {
 		schema = deepCopyMap(schema)
@@ -41,13 +46,33 @@ func CleanJSONSchemaForAntigravity(raw json.RawMessage) map[string]any {
 	return schema
 }
 
+func decodeObjectUseNumber(raw json.RawMessage) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return nil, fmt.Errorf("not a JSON object")
+	}
+	tok, err := dec.Token()
+	if err == io.EOF {
+		return m, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("invalid character after top-level JSON value: %v", tok)
+}
+
 func deepCopyMap(m map[string]any) map[string]any {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return map[string]any{}
 	}
-	var out map[string]any
-	if json.Unmarshal(b, &out) != nil || out == nil {
+	out, err := decodeObjectUseNumber(b)
+	if err != nil {
 		return map[string]any{}
 	}
 	return out

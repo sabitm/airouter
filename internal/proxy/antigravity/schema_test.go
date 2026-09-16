@@ -2,6 +2,7 @@ package antigravity
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +47,31 @@ func TestCleanJSONSchemaEmptyObjectPlaceholder(t *testing.T) {
 	props := s["properties"].(map[string]any)
 	if props["reason"] == nil {
 		t.Fatalf("placeholder missing: %+v", s)
+	}
+}
+
+func TestCleanJSONSchemaPreservesSupportedNumberTokens(t *testing.T) {
+	raw := json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"id":{"type":"integer","maximum":9223372036854775807,"minimum":-9223372036854775808},
+			"huge":{"type":"number","maximum":1e400}
+		}
+	}`)
+	s := CleanJSONSchemaForAntigravity(raw)
+	out, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(out)
+	if !strings.Contains(body, "9223372036854775807") {
+		t.Errorf("maximum lost: %s", out)
+	}
+	if !strings.Contains(body, "-9223372036854775808") {
+		t.Errorf("minimum lost: %s", out)
+	}
+	if !strings.Contains(body, "1e400") {
+		t.Errorf("1e400 lost: %s", out)
 	}
 }
 
@@ -218,9 +244,9 @@ func TestMergeAllOf(t *testing.T) {
 
 func TestSelectBestSchema(t *testing.T) {
 	cases := []struct {
-		name   string
-		items  []map[string]any
-		want   int
+		name  string
+		items []map[string]any
+		want  int
 	}{
 		{
 			"object wins over scalar",

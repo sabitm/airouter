@@ -135,7 +135,9 @@ func buildContents(msgs []ir.Message) []geminiContent {
 			case ir.BlockToolUse:
 				args := map[string]any{}
 				if len(b.ToolInput) > 0 {
-					_ = json.Unmarshal(b.ToolInput, &args)
+					if decoded, err := decodeObjectUseNumber(b.ToolInput); err == nil {
+						args = decoded
+					}
 				}
 				if b.ToolID != "" {
 					toolNames[b.ToolID] = b.ToolName

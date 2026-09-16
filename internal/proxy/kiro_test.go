@@ -332,6 +332,22 @@ func TestKiroMetricsOnlyUsagePropagates(t *testing.T) {
 	})
 }
 
+func TestKiroUpstreamPreservesToolSchemaInteger(t *testing.T) {
+	cap := &kiroCapture{}
+	base, token, _ := setupKiro(t, kiroTextStream(), cap)
+	reqBody := `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer","maximum":9223372036854775807}}}}}]}`
+	resp, body := postStream(t, base+"/v1/chat/completions", token, reqBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(cap.body, []byte("9223372036854775807")) {
+		t.Errorf("schema maximum missing from upstream body:\n%s", cap.body)
+	}
+	if !bytes.Contains(cap.body, []byte(`"profileArn":"arn:aws:codewhisperer:us-east-1:123:profile/ABC"`)) {
+		t.Errorf("profileArn missing from upstream body:\n%s", cap.body)
+	}
+}
+
 // TestKiroToolStream verifies a Kiro toolUseEvent stream reassembles into an
 // OpenAI tool_call with concatenated arguments and a tool_calls finish reason.
 func TestKiroToolStream(t *testing.T) {

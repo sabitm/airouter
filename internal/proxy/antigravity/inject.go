@@ -11,14 +11,17 @@ func InjectProjectID(body []byte, projectID string) ([]byte, error) {
 	if projectID == "" {
 		return nil, fmt.Errorf("antigravity: missing project id; reconnect OAuth")
 	}
-	var m map[string]any
+	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("antigravity: inject project: %w", err)
 	}
-	m["project"] = projectID
-	out, err := json.Marshal(m)
+	if m == nil {
+		return nil, fmt.Errorf("antigravity: inject project: not a JSON object")
+	}
+	raw, err := json.Marshal(projectID)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	m["project"] = raw
+	return json.Marshal(m)
 }

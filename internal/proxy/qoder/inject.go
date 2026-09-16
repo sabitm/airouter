@@ -32,25 +32,64 @@ func PrepareWireBody(ctx context.Context, provider *domain.Provider, plainBody [
 // InjectModelConfig sets model_config on a plaintext Qoder JSON body and
 // updates chat_context.extra.modelConfig.is_reasoning from the catalog entry.
 func InjectModelConfig(body []byte, config json.RawMessage) ([]byte, error) {
-	var m map[string]any
+	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("qoder: inject model_config: %w", err)
 	}
-	var cfgObj map[string]any
+	if m == nil {
+		return nil, fmt.Errorf("qoder: inject model_config: not a JSON object")
+	}
+	var cfgObj map[string]json.RawMessage
 	if err := json.Unmarshal(config, &cfgObj); err != nil {
 		return nil, fmt.Errorf("qoder: invalid model_config: %w", err)
 	}
-	m["model_config"] = cfgObj
+	if cfgObj == nil {
+		return nil, fmt.Errorf("qoder: invalid model_config: not a JSON object")
+	}
+	copied := make(json.RawMessage, len(config))
+	copy(copied, config)
+	m["model_config"] = copied
 
-	isReasoning, _ := cfgObj["is_reasoning"].(bool)
-	if cc, ok := m["chat_context"].(map[string]any); ok {
-		if extra, ok := cc["extra"].(map[string]any); ok {
-			if mc, ok := extra["modelConfig"].(map[string]any); ok {
-				mc["is_reasoning"] = isReasoning
-				extra["modelConfig"] = mc
+	isReasoning := false
+	if raw, ok := cfgObj["is_reasoning"]; ok {
+		var b bool
+		if json.Unmarshal(raw, &b) == nil {
+			isReasoning = b
+		}
+	}
+	if ccRaw, ok := m["chat_context"]; ok {
+		var cc map[string]json.RawMessage
+		if json.Unmarshal(ccRaw, &cc) == nil && cc != nil {
+			if extraRaw, ok := cc["extra"]; ok {
+				var extra map[string]json.RawMessage
+				if json.Unmarshal(extraRaw, &extra) == nil && extra != nil {
+					if mcRaw, ok := extra["modelConfig"]; ok {
+						var mc map[string]json.RawMessage
+						if json.Unmarshal(mcRaw, &mc) == nil && mc != nil {
+							iraw, err := json.Marshal(isReasoning)
+							if err != nil {
+								return nil, err
+							}
+							mc["is_reasoning"] = iraw
+							mcBytes, err := json.Marshal(mc)
+							if err != nil {
+								return nil, err
+							}
+							extra["modelConfig"] = mcBytes
+							extraBytes, err := json.Marshal(extra)
+							if err != nil {
+								return nil, err
+							}
+							cc["extra"] = extraBytes
+							ccBytes, err := json.Marshal(cc)
+							if err != nil {
+								return nil, err
+							}
+							m["chat_context"] = ccBytes
+						}
+					}
+				}
 			}
-			cc["extra"] = extra
-			m["chat_context"] = cc
 		}
 	}
 	out, err := json.Marshal(m)
@@ -67,23 +106,48 @@ func clampMaxTokens(body []byte, config json.RawMessage) []byte {
 	if json.Unmarshal(config, &cfg) != nil || cfg.MaxOutputTokens <= 0 {
 		return body
 	}
-	var m map[string]any
-	if json.Unmarshal(body, &m) != nil {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil || m == nil {
 		return body
 	}
-	params, _ := m["parameters"].(map[string]any)
-	if params == nil {
+	paramsRaw, ok := m["parameters"]
+	if !ok {
 		return body
 	}
-	cur, _ := params["max_tokens"].(float64)
-	if int(cur) <= 0 || int(cur) > cfg.MaxOutputTokens {
-		params["max_tokens"] = cfg.MaxOutputTokens
-		m["parameters"] = params
-		if out, err := json.Marshal(m); err == nil {
-			return out
+	var params map[string]json.RawMessage
+	if json.Unmarshal(paramsRaw, &params) != nil || params == nil {
+		return body
+	}
+	shouldClamp := false
+	if mt, ok := params["max_tokens"]; !ok {
+		shouldClamp = true
+	} else {
+		var cur int
+		if json.Unmarshal(mt, &cur) != nil {
+			return body
+		}
+		if cur <= 0 || cur > cfg.MaxOutputTokens {
+			shouldClamp = true
 		}
 	}
-	return body
+	if !shouldClamp {
+		return body
+	}
+	raw, err := json.Marshal(cfg.MaxOutputTokens)
+	if err != nil {
+		return body
+	}
+	params["max_tokens"] = raw
+	patched, err := json.Marshal(params)
+	if err != nil {
+		return body
+	}
+	m["parameters"] = patched
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // CredsFromProvider builds COSY identity from a hydrated provider.

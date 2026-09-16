@@ -160,4 +160,61 @@ func TestInjectProjectID(t *testing.T) {
 	if _, err := InjectProjectID(body, ""); err == nil {
 		t.Fatal("expected error on empty project")
 	}
+	if _, err := InjectProjectID([]byte("null"), "proj-1"); err == nil {
+		t.Fatal("expected error on top-level null")
+	}
+}
+
+func TestInjectProjectIDPreservesNumberTokens(t *testing.T) {
+	in := []byte(`{"n":9223372036854775807,"huge":1e400,"request":{}}`)
+	out, err := InjectProjectID(in, "proj-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "9223372036854775807") {
+		t.Errorf("large integer lost: %s", out)
+	}
+	if !strings.Contains(s, "1e400") {
+		t.Errorf("1e400 lost: %s", out)
+	}
+	if !strings.Contains(s, `"project":"proj-1"`) {
+		t.Errorf("project missing: %s", out)
+	}
+}
+
+func TestEncodeRequestPreservesSchemaAndToolInputNumbers(t *testing.T) {
+	body, err := EncodeRequest(&ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "do"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{
+				Type: ir.BlockToolUse, ToolID: "t1", ToolName: "lookup",
+				ToolInput: json.RawMessage(`{"id":9050000000000000001,"huge":1e400}`),
+			}}},
+		},
+		Tools: []ir.Tool{{
+			Name: "lookup",
+			Parameters: json.RawMessage(`{
+				"type":"object",
+				"properties":{
+					"id":{"type":"integer","maximum":9223372036854775807},
+					"huge":{"type":"number","maximum":1e400}
+				}
+			}`),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	if !strings.Contains(s, "9223372036854775807") {
+		t.Errorf("schema maximum lost: %s", body)
+	}
+	if !strings.Contains(s, "9050000000000000001") {
+		t.Errorf("function-call id lost: %s", body)
+	}
+	if !strings.Contains(s, "1e400") {
+		t.Errorf("1e400 lost: %s", body)
+	}
 }

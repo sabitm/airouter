@@ -2,6 +2,7 @@ package qoder
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"airouter/internal/domain"
@@ -67,6 +68,37 @@ func TestInjectModelConfig(t *testing.T) {
 	wire := EncodeBody(out)
 	if json.Valid(wire) {
 		t.Fatal("wire body should not be plain JSON")
+	}
+}
+
+func TestInjectModelConfigPreservesNumberTokens(t *testing.T) {
+	body := []byte(`{
+		"tools":[{"function":{"parameters":{"maximum":9223372036854775807}}}],
+		"chat_context":{"extra":{"modelConfig":{"key":"auto","is_reasoning":false,"n":9050000000000000001},"huge":1e400}}
+	}`)
+	cfg := json.RawMessage(`{"key":"auto","is_reasoning":true,"cap":9223372036854775807,"huge":1e400}`)
+	out, err := InjectModelConfig(body, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "9223372036854775807") {
+		t.Errorf("client or catalog large integer lost: %s", out)
+	}
+	if !strings.Contains(s, "9050000000000000001") {
+		t.Errorf("nested sibling integer lost: %s", out)
+	}
+	if !strings.Contains(s, "1e400") {
+		t.Errorf("1e400 lost: %s", out)
+	}
+	if !strings.Contains(s, `"is_reasoning":true`) {
+		t.Errorf("is_reasoning not updated: %s", out)
+	}
+	if _, err := InjectModelConfig([]byte("null"), cfg); err == nil {
+		t.Fatal("expected error on top-level null body")
+	}
+	if _, err := InjectModelConfig([]byte(`{}`), json.RawMessage("null")); err == nil {
+		t.Fatal("expected error on null config")
 	}
 }
 
@@ -214,6 +246,32 @@ func TestClampMaxTokens(t *testing.T) {
 		body := []byte(`not json`)
 		if got := clampMaxTokens(body, cfg); string(got) != `not json` {
 			t.Errorf("got %s, want unchanged for bad body", got)
+		}
+	})
+	t.Run("preserves large sibling while clamping", func(t *testing.T) {
+		body := []byte(`{"parameters":{"max_tokens":100,"n":9050000000000000001,"huge":1e400}}`)
+		got := clampMaxTokens(body, cfg)
+		s := string(got)
+		if !strings.Contains(s, `"max_tokens":50`) {
+			t.Errorf("cap not written: %s", got)
+		}
+		if !strings.Contains(s, "9050000000000000001") {
+			t.Errorf("large sibling lost: %s", got)
+		}
+		if !strings.Contains(s, "1e400") {
+			t.Errorf("1e400 lost: %s", got)
+		}
+	})
+	t.Run("fractional max_tokens unchanged", func(t *testing.T) {
+		body := []byte(`{"parameters":{"max_tokens":12.5}}`)
+		if got := clampMaxTokens(body, cfg); string(got) != string(body) {
+			t.Errorf("got %s, want fractional unchanged", got)
+		}
+	})
+	t.Run("unparsable max_tokens unchanged", func(t *testing.T) {
+		body := []byte(`{"parameters":{"max_tokens":"high"}}`)
+		if got := clampMaxTokens(body, cfg); string(got) != string(body) {
+			t.Errorf("got %s, want unparsable unchanged", got)
 		}
 	})
 }

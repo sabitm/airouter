@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -25,29 +26,57 @@ func clampMuseSparkEffort(effort string) string {
 // none (the upstream rejects reasoning.effort=none with this model), defaults
 // summary to auto, and lifts max_output_tokens to the upstream floor.
 func PrepareMuseSparkResponse(body []byte) ([]byte, error) {
-	var m map[string]any
+	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, err
 	}
-	if r, ok := m["reasoning"].(map[string]any); ok {
-		if e, isStr := r["effort"].(string); isStr {
-			if eff := clampMuseSparkEffort(e); eff == "" || eff == "none" {
-				delete(r, "effort")
+	if m == nil {
+		return nil, fmt.Errorf("not a JSON object")
+	}
+	if rawReasoning, ok := m["reasoning"]; ok {
+		var r map[string]json.RawMessage
+		if json.Unmarshal(rawReasoning, &r) == nil && r != nil {
+			if eRaw, has := r["effort"]; has {
+				var e string
+				if json.Unmarshal(eRaw, &e) == nil {
+					if eff := clampMuseSparkEffort(e); eff == "" || eff == "none" {
+						delete(r, "effort")
+					} else {
+						raw, err := json.Marshal(eff)
+						if err != nil {
+							return nil, err
+						}
+						r["effort"] = raw
+					}
+				}
+			}
+			if _, has := r["summary"]; !has && len(r) > 0 {
+				raw, err := json.Marshal("auto")
+				if err != nil {
+					return nil, err
+				}
+				r["summary"] = raw
+			}
+			if len(r) > 0 {
+				patched, err := json.Marshal(r)
+				if err != nil {
+					return nil, err
+				}
+				m["reasoning"] = patched
 			} else {
-				r["effort"] = eff
+				delete(m, "reasoning")
 			}
 		}
-		if _, has := r["summary"]; !has && len(r) > 0 {
-			r["summary"] = "auto"
-		}
-		if len(r) > 0 {
-			m["reasoning"] = r
-		} else {
-			delete(m, "reasoning")
-		}
 	}
-	if mot, ok := m["max_output_tokens"].(float64); ok && mot < museSparkMinOutputTokens {
-		m["max_output_tokens"] = museSparkMinOutputTokens
+	if motRaw, ok := m["max_output_tokens"]; ok {
+		var mot int
+		if json.Unmarshal(motRaw, &mot) == nil && mot < museSparkMinOutputTokens {
+			raw, err := json.Marshal(museSparkMinOutputTokens)
+			if err != nil {
+				return nil, err
+			}
+			m["max_output_tokens"] = raw
+		}
 	}
 	return json.Marshal(m)
 }

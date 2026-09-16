@@ -22,11 +22,15 @@ func InjectProfileArn(body []byte, arn string) []byte {
 	if arn == "" {
 		return body
 	}
-	var m map[string]any
-	if json.Unmarshal(body, &m) != nil {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil || m == nil {
 		return body
 	}
-	m["profileArn"] = arn
+	raw, err := json.Marshal(arn)
+	if err != nil {
+		return body
+	}
+	m["profileArn"] = raw
 	out, err := json.Marshal(m)
 	if err != nil {
 		return body

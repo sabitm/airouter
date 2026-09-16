@@ -109,6 +109,41 @@ func TestPrepareMuseSparkResponse(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("preserves large sibling numbers while flooring", func(t *testing.T) {
+		in := []byte(`{"max_output_tokens":8,"n":9050000000000000001,"huge":1e400}`)
+		out, err := PrepareMuseSparkResponse(in)
+		if err != nil {
+			t.Fatalf("PrepareMuseSparkResponse: %v", err)
+		}
+		s := string(out)
+		if !strings.Contains(s, `"max_output_tokens":16`) {
+			t.Errorf("floor missing: %s", out)
+		}
+		if !strings.Contains(s, "9050000000000000001") {
+			t.Errorf("large integer lost: %s", out)
+		}
+		if !strings.Contains(s, "1e400") {
+			t.Errorf("1e400 lost: %s", out)
+		}
+	})
+
+	t.Run("fractional max_output_tokens unchanged", func(t *testing.T) {
+		in := []byte(`{"max_output_tokens":8.5}`)
+		out, err := PrepareMuseSparkResponse(in)
+		if err != nil {
+			t.Fatalf("PrepareMuseSparkResponse: %v", err)
+		}
+		if !strings.Contains(string(out), `"max_output_tokens":8.5`) {
+			t.Errorf("fractional token changed: %s", out)
+		}
+	})
+
+	t.Run("top-level null rejected", func(t *testing.T) {
+		if _, err := PrepareMuseSparkResponse([]byte("null")); err == nil {
+			t.Fatal("expected error")
+		}
+	})
 }
 
 func TestInjectReasoningEcho(t *testing.T) {
