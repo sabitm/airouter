@@ -75,7 +75,74 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
     window.scrollTo({ top: airouterProviderScrollY });
     airouterProviderScrollY = null;
   }
+  if (event.detail.target && event.detail.target.id === "provider-list") {
+    airouterApplyProviderTagFilter();
+  }
 });
+
+var airouterProviderTagFilter = "";
+var airouterUntaggedFilter = "__untagged__";
+
+function airouterSelectProviderTagFilter(btn) {
+  airouterProviderTagFilter = btn.getAttribute("data-tag-filter") || "";
+  airouterApplyProviderTagFilter();
+}
+
+function airouterRowMatchesTagFilter(row, filter) {
+  if (!filter) {
+    return true;
+  }
+  var tags = (row.getAttribute("data-tags") || "").split(",").filter(Boolean);
+  if (filter === airouterUntaggedFilter) {
+    return tags.length === 0;
+  }
+  return tags.indexOf(filter) !== -1;
+}
+
+function airouterApplyProviderTagFilter() {
+  var list = document.getElementById("provider-list");
+  if (!list) {
+    return;
+  }
+  var buttons = list.querySelectorAll(".tag-filter-btn");
+  var available = {};
+  buttons.forEach(function (btn) {
+    available[btn.getAttribute("data-tag-filter") || ""] = true;
+  });
+  if (!available.hasOwnProperty(airouterProviderTagFilter)) {
+    airouterProviderTagFilter = "";
+  }
+  buttons.forEach(function (btn) {
+    var on = (btn.getAttribute("data-tag-filter") || "") === airouterProviderTagFilter;
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  var visible = 0;
+  list.querySelectorAll("tr[data-tags]").forEach(function (row) {
+    var show = airouterRowMatchesTagFilter(row, airouterProviderTagFilter);
+    row.hidden = !show;
+    if (show) {
+      visible += 1;
+    }
+  });
+  list.querySelectorAll("[data-provider-group]").forEach(function (group) {
+    var rows = group.querySelectorAll("tr[data-tags]");
+    if (rows.length === 0) {
+      group.hidden = !!airouterProviderTagFilter;
+      return;
+    }
+    var any = false;
+    rows.forEach(function (row) {
+      if (!row.hidden) {
+        any = true;
+      }
+    });
+    group.hidden = !any;
+  });
+  var empty = document.getElementById("provider-filter-empty");
+  if (empty) {
+    empty.hidden = visible !== 0;
+  }
+}
 
 // airouterResetProviderForm restores the create form to a pristine state after a
 // successful add. form.reset() only reverts native input values; the oauth

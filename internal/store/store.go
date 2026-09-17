@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS providers (
 	auth_method TEXT NOT NULL DEFAULT '',
 	oauth_creds TEXT NOT NULL DEFAULT '',
 	reasoning_dialect TEXT NOT NULL DEFAULT '',
+	tags        TEXT NOT NULL DEFAULT '[]',
 	archived    INTEGER NOT NULL DEFAULT 0,
 	created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -164,6 +165,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateProviderReasoningDialect(); err != nil {
 		return err
 	}
+	if err := s.migrateProviderTags(); err != nil {
+		return err
+	}
 	if err := s.migrateComboTargetEnabled(); err != nil {
 		return err
 	}
@@ -183,6 +187,17 @@ func (s *Store) migrateProviderReasoningDialect() error {
 		return err
 	}
 	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN reasoning_dialect TEXT NOT NULL DEFAULT ''")
+	return err
+}
+
+// migrateProviderTags adds the tags column to a providers table created before
+// provider tags. Idempotent; existing rows default to '[]' (untagged).
+func (s *Store) migrateProviderTags() error {
+	has, err := s.columnExists("providers", "tags")
+	if err != nil || has {
+		return err
+	}
+	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
 	return err
 }
 

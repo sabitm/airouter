@@ -82,6 +82,39 @@ func kiroAuthOrBuilderID(c *domain.OAuthCreds) string {
 	return c.KiroAuth
 }
 
+const providerUntaggedFilter = "__untagged__"
+
+// providerTagsField is the shared comma-separated Tags input on create and edit forms.
+templ providerTagsField(value string) {
+	<label class="field field-span-2">
+		<span class="field-name">Tags</span>
+		<input name="tags" value={ value } placeholder="prod, team-a" aria-label="tags"/>
+		<span class="field-hint">Comma-separated. Lowercase letters, digits, and hyphens between words. At most 10 tags, 32 characters each.</span>
+	</label>
+}
+
+templ providerTagBadges(tags []string) {
+	if len(tags) > 0 {
+		<div class="provider-tags">
+			for _, t := range tags {
+				<span class="provider-tag">{ t }</span>
+			}
+		</div>
+	}
+}
+
+templ providerTagFilter(providers []*domain.Provider) {
+	<div id="provider-tag-filter" class="tag-filter" role="group" aria-label="Filter providers by tag">
+		<button type="button" class="tag-filter-btn" data-tag-filter="" aria-pressed="true" onclick="airouterSelectProviderTagFilter(this)">All</button>
+		for _, t := range domain.UniqueTags(providers) {
+			<button type="button" class="tag-filter-btn" data-tag-filter={ t } aria-pressed="false" onclick="airouterSelectProviderTagFilter(this)">{ t }</button>
+		}
+		if domain.HasUntagged(providers) {
+			<button type="button" class="tag-filter-btn" data-tag-filter={ providerUntaggedFilter } aria-pressed="false" onclick="airouterSelectProviderTagFilter(this)">Untagged</button>
+		}
+	</div>
+}
+
 // reasoningDialectField renders a dialect selector for editable protocols or a
 // locked hidden input for fixed backends. current is the stored value (may be empty).
 templ reasoningDialectField(proto domain.Protocol, current domain.ReasoningDialect) {
@@ -160,6 +193,7 @@ templ ProviderRecipeForm(r recipe) {
 					<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
 				</label>
 				@reasoningDialectField(r.Protocol, r.ReasoningDialect)
+				@providerTagsField("")
 				<label class="field">
 					<span class="field-name">Auth mode</span>
 					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
@@ -208,6 +242,7 @@ templ ProviderRecipeForm(r recipe) {
 						<input name="region" placeholder="default us-east-1"/>
 					</label>
 				</div>
+				@providerTagsField("")
 				<label class="field">
 					<span class="field-name">Auth method</span>
 					<select name="auth_method" class="auth-method" onchange="airouterToggleAuthMethod(this)" aria-label="auth method">
@@ -277,6 +312,7 @@ templ ProviderRecipeForm(r recipe) {
 					<span class="field-name">Base URL</span>
 					<input name="base_url" placeholder="https://api3.qoder.sh/algo" value={ r.BaseURL } required/>
 				</label>
+				@providerTagsField("")
 				<label class="field">
 					<span class="field-name">Auth mode</span>
 					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
@@ -330,6 +366,7 @@ templ ProviderRecipeForm(r recipe) {
 					<span class="field-name">Base URL</span>
 					<input name="base_url" placeholder="https://api2.cursor.sh" value={ r.BaseURL } required/>
 				</label>
+				@providerTagsField("")
 				<label class="field">
 					<span class="field-name">Auth mode</span>
 					<select class="oauth-mode" onchange="airouterToggleOAuthMode(this)" aria-label="how to obtain tokens">
@@ -380,6 +417,7 @@ templ ProviderRecipeForm(r recipe) {
 					<span class="field-name">API key</span>
 					<input name="api_key" type="password" placeholder="blank for zen (uses public)"/>
 				</label>
+				@providerTagsField("")
 				<div class="form-actions">
 					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
 					<span class="check-indicator htmx-indicator">checking...</span>
@@ -413,6 +451,7 @@ templ ProviderRecipeForm(r recipe) {
 					</select>
 				</label>
 				@reasoningDialectField(r.Protocol, "")
+				@providerTagsField("")
 				<div class="form-actions">
 					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
 					<span class="check-indicator htmx-indicator">checking...</span>
@@ -488,8 +527,10 @@ templ ProviderList(providers []*domain.Provider) {
 		if len(active) == 0 && len(archived) == 0 {
 			<p class="empty">No providers yet.</p>
 		} else {
+			@providerTagFilter(providers)
+			<p id="provider-filter-empty" class="empty" hidden>No providers match this tag.</p>
 			if len(active) > 0 {
-				<table>
+				<table data-provider-group="active">
 					<thead>
 						<tr><th>Name</th><th>Base URL</th><th>API key</th><th>Protocol</th><th>Auth</th><th></th></tr>
 					</thead>
@@ -500,10 +541,10 @@ templ ProviderList(providers []*domain.Provider) {
 					</tbody>
 				</table>
 			} else {
-				<p class="empty">No active providers.</p>
+				<p class="empty" data-provider-group="active-empty">No active providers.</p>
 			}
 			if len(archived) > 0 {
-				<div class="archived-section">
+				<div class="archived-section" data-provider-group="archived">
 					<div class="row-form archived-head">
 						<h2>Archived</h2>
 						<button class="link danger" hx-post="/dashboard/providers/archived/delete-all" hx-target="#provider-list" hx-swap="outerHTML" hx-confirm="Delete all archived providers and their combos?">Delete all archived</button>
@@ -524,9 +565,16 @@ templ ProviderList(providers []*domain.Provider) {
 	</div>
 }
 
+templ providerNameCell(p *domain.Provider) {
+	<td>
+		<div class="provider-name">{ p.Name }</div>
+		@providerTagBadges(p.Tags)
+	</td>
+}
+
 templ ProviderRow(p *domain.Provider) {
-	<tr id={ "provider-" + strconv.FormatInt(p.ID, 10) }>
-		<td>{ p.Name }</td>
+	<tr id={ "provider-" + strconv.FormatInt(p.ID, 10) } data-tags={ domain.TagsDataValue(p.Tags) }>
+		@providerNameCell(p)
 		<td class="mono">{ p.BaseURL }</td>
 		<td>@providerCredCell(p)</td>
 		<td>{ string(p.Protocol) } <span class="muted">({ string(p.Reasoning()) })</span></td>
@@ -540,8 +588,8 @@ templ ProviderRow(p *domain.Provider) {
 }
 
 templ ArchivedProviderRow(p *domain.Provider) {
-	<tr id={ "provider-" + strconv.FormatInt(p.ID, 10) } class="archived">
-		<td>{ p.Name }</td>
+	<tr id={ "provider-" + strconv.FormatInt(p.ID, 10) } class="archived" data-tags={ domain.TagsDataValue(p.Tags) }>
+		@providerNameCell(p)
 		<td class="mono">{ p.BaseURL }</td>
 		<td>@providerCredCell(p)</td>
 		<td>{ string(p.Protocol) } <span class="muted">({ string(p.Reasoning()) })</span></td>
@@ -595,6 +643,7 @@ templ providerEditRowOpencode(p *domain.Provider) {
 			<span class="field-name">API key</span>
 			<input name="api_key" type="password" placeholder="leave blank to keep current"/>
 		</label>
+		@providerTagsField(domain.FormatTags(p.Tags))
 		<div class="form-actions">
 			@providerEditCheck()
 			@providerEditSaveCancel(p)
@@ -643,6 +692,7 @@ templ providerEditRowGenericAPIKey(p *domain.Provider) {
 			</select>
 		</label>
 		@reasoningDialectField(p.Protocol, p.ReasoningDialect)
+		@providerTagsField(domain.FormatTags(p.Tags))
 		<div class="form-actions">
 			@providerEditCheck()
 			@providerEditSaveCancel(p)
@@ -698,6 +748,7 @@ templ providerEditRowKiro(p *domain.Provider) {
 		<div class="oauth-fields">
 			@kiroEditOAuthBlock(p)
 		</div>
+		@providerTagsField(domain.FormatTags(p.Tags))
 		<div class="form-actions">
 			@providerEditCheck()
 			@providerEditSaveCancel(p)
@@ -757,6 +808,7 @@ templ providerEditRowQoder(p *domain.Provider) {
 			</label>
 			@oauthTokenFields(&domain.OAuthCreds{}, "", "")
 		</div>
+		@providerTagsField(domain.FormatTags(p.Tags))
 		<div class="form-actions">
 			@providerEditCheck()
 			@providerEditSaveCancel(p)
@@ -827,6 +879,7 @@ templ providerEditRowCursor(p *domain.Provider) {
 			</label>
 			@oauthTokenFields(&domain.OAuthCreds{}, "", "")
 		</div>
+		@providerTagsField(domain.FormatTags(p.Tags))
 		<div class="form-actions">
 			@providerEditCheck()
 			@providerEditSaveCancel(p)
@@ -867,6 +920,7 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 			<input name="base_url" value={ p.BaseURL } required/>
 		</label>
 		@reasoningDialectField(p.Protocol, p.ReasoningDialect)
+		@providerTagsField(domain.FormatTags(p.Tags))
 		<span class="muted">Connected: { oauthLabel(p.OAuthCreds) }. Reconnect only if the refresh token is revoked.</span>
 		if c.ProjectID != "" {
 			<p class="field-hint">Cloud Code project: { c.ProjectID }</p>

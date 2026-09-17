@@ -316,6 +316,11 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return
 	}
+	tags, err := domain.ParseTagList(r.FormValue("tags"))
+	if err != nil {
+		htmxBadRequest(w, r, "provider-flash", err.Error())
+		return
+	}
 	p := &domain.Provider{
 		Name:             r.FormValue("name"),
 		BaseURL:          baseURL,
@@ -323,6 +328,7 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		Protocol:         proto,
 		AuthScheme:       auth,
 		ReasoningDialect: dialect,
+		Tags:             tags,
 	}
 	// "default" (empty auth) is an alias: expand it now to the protocol's scheme
 	// so the stored value is always concrete.
@@ -395,6 +401,11 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return
 	}
+	tags, err := domain.ParseTagList(r.FormValue("tags"))
+	if err != nil {
+		htmxBadRequest(w, r, "provider-flash", err.Error())
+		return
+	}
 	p := &domain.Provider{
 		Name:             r.FormValue("name"),
 		BaseURL:          providerBaseURLOrDefault(proto, r.FormValue("base_url")),
@@ -403,6 +414,7 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 		AuthScheme:       domain.AuthBearer,
 		OAuthCreds:       creds,
 		ReasoningDialect: dialect,
+		Tags:             tags,
 	}
 	if err := h.store.CreateProvider(r.Context(), p); err != nil {
 		htmxBadRequest(w, r, "provider-flash", err.Error())
@@ -491,6 +503,11 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return
 	}
+	tags, err := domain.ParseTagList(r.FormValue("tags"))
+	if err != nil {
+		htmxBadRequest(w, r, "provider-flash", err.Error())
+		return
+	}
 	baseURL := providerBaseURLOrDefault(proto, r.FormValue("base_url"))
 	apiKey := cur.APIKey
 	if submitted := strings.TrimSpace(r.FormValue("api_key")); submitted != "" {
@@ -509,6 +526,7 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	cur.Protocol = proto
 	cur.AuthScheme = auth
 	cur.ReasoningDialect = dialect
+	cur.Tags = tags
 	// Switching an oauth provider back to apikey: drop the stored credentials so
 	// the row no longer resolves a bearer token.
 	cur.AuthMethod = domain.AuthAPIKey
@@ -588,12 +606,18 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return
 	}
+	tags, err := domain.ParseTagList(r.FormValue("tags"))
+	if err != nil {
+		htmxBadRequest(w, r, "provider-flash", err.Error())
+		return
+	}
 	cur.Name = r.FormValue("name")
 	cur.BaseURL = providerBaseURLOrDefault(proto, r.FormValue("base_url"))
 	cur.Protocol = proto
 	cur.AuthMethod = domain.AuthOAuth
 	cur.AuthScheme = domain.AuthBearer
 	cur.APIKey = ""
+	cur.Tags = tags
 	// Preserve current dialect when the form omits the field; fixed backends
 	// still submit a locked hidden value.
 	if r.FormValue("reasoning_dialect") != "" || reasoningDialectEditable(proto) {
@@ -1306,14 +1330,16 @@ func (h *Handler) usagePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	supported := usageSupportedProviders(providers)
+	filter := parseUsageTagFilter(r.URL.Query().Get("tag"), supported)
+	shown := filterUsageProviders(supported, filter)
 	// Load all is an explicit HTMX request for the grid in autoload mode. A
 	// full navigation with ?load=1 must still render the idle page, so require
 	// the HX-Request header rather than trusting the query parameter alone.
 	if r.Header.Get("HX-Request") != "" && r.URL.Query().Get("load") == "1" {
-		render(w, r, UsageGridLoading(supported))
+		render(w, r, UsageGridLoading(shown, filter))
 		return
 	}
-	render(w, r, UsagePage(supported))
+	render(w, r, UsagePage(supported, shown, filter))
 }
 
 func (h *Handler) usageCard(w http.ResponseWriter, r *http.Request) {

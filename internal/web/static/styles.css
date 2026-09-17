@@ -181,6 +181,54 @@ td.mono { overflow-wrap: anywhere; }
 	margin-left: 6px;
 }
 
+.provider-name { font-weight: 500; }
+.provider-tags {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	margin-top: 4px;
+}
+.provider-tag {
+	font-size: 11px;
+	color: var(--text);
+	background: var(--surface-hover);
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	padding: 1px 7px;
+	line-height: 1.4;
+}
+.tag-filter {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	align-items: center;
+	margin: 0 0 16px;
+}
+.tag-filter-btn {
+	background: none;
+	color: var(--muted);
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	padding: 4px 10px;
+	font-size: 12px;
+	text-decoration: none;
+	cursor: pointer;
+	flex: 0 0 auto;
+	min-width: 0;
+	display: inline-block;
+}
+.tag-filter-btn:hover {
+	color: var(--text);
+	background: var(--surface-hover);
+	filter: none;
+}
+.tag-filter-btn[aria-pressed="true"],
+.tag-filter-btn[aria-current="page"] {
+	color: var(--text);
+	border-color: var(--accent);
+	background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
 .flash {
 	padding: 10px 12px;
 	border-radius: 6px;
@@ -606,6 +654,7 @@ tr.archived { opacity: 0.6; }
 	gap: 8px;
 }
 .usage-card-name { font-weight: 600; }
+.usage-card-head .provider-tags { margin-top: 6px; }
 .usage-plan {
 	display: inline-block;
 	font-size: 11px;

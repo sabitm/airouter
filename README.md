@@ -106,7 +106,10 @@ request-local key.
 
 ## Routing
 
-- A **provider** is an upstream URL, protocol, and credential.
+- A **provider** is an upstream URL, protocol, and credential. Optional tags
+  (lowercase letters, digits, and internal hyphens) label providers for the
+  dashboard. The Providers and Usage tabs can filter by one tag or Untagged.
+  Usage **Load all** loads only providers that match the active filter.
 - A **combo** is the model name clients use. Each target maps a provider to its
   real upstream model ID.
 - An **access key** authenticates clients to airouter. Its full value is shown
@@ -147,8 +150,8 @@ responses, authorization headers, and provider credentials.
   authenticated reverse proxy. In production, prefer `-disable-dashboard` so
   the UI, `/static` assets, config import/export, and OAuth connect flows are
   not mounted.
-- Config exports include provider API keys and OAuth tokens in plaintext. Access
-  keys and request logs are not exported.
+- Config exports include provider API keys, OAuth tokens, and tags in plaintext.
+  Access keys and request logs are not exported.
 - HAR captures contain sensitive headers and bodies. Store and share them as
   secrets. `-disable-dashboard` does not disable `GET /debug/har`; that
   endpoint remains mounted and may serve captured prompts and credentials.

@@ -3,11 +3,14 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"airouter/internal/crypto"
 	"airouter/internal/domain"
 )
 
@@ -364,6 +367,183 @@ func TestProviderReasoningDialectRoundTrip(t *testing.T) {
 	if got2.Reasoning() != domain.ReasoningNone {
 		t.Fatalf("explicit none = %q", got2.Reasoning())
 	}
+}
+
+func TestProviderTagsRoundTrip(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "tagged", BaseURL: "http://a", APIKey: "k", Protocol: domain.ProtocolOpenAI,
+		Tags: []string{"prod", "eu"},
+	}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStringSlice(got.Tags, []string{"eu", "prod"}) {
+		t.Fatalf("create tags = %v", got.Tags)
+	}
+
+	list, err := st.ListProviders(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list = %v err=%v", list, err)
+	}
+	if !equalStringSlice(list[0].Tags, []string{"eu", "prod"}) {
+		t.Fatalf("list tags = %v", list[0].Tags)
+	}
+
+	p.Tags = []string{"beta", "alpha", "beta"}
+	if err := st.UpdateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStringSlice(got.Tags, []string{"alpha", "beta"}) {
+		t.Fatalf("update tags = %v", got.Tags)
+	}
+
+	p.Tags = nil
+	if err := st.UpdateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("cleared tags = %v", got.Tags)
+	}
+}
+
+func TestUpdateProviderOAuthPreservesTags(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "grok", BaseURL: "https://api.x.ai/v1", APIKey: "k", Protocol: domain.ProtocolOpenAI,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		Tags: []string{"prod"},
+		OAuthCreds: &domain.OAuthCreds{Mode: domain.OAuthAuto, Preset: "xai",
+			AccessToken: "old-access", RefreshToken: "rt", ExpiresAt: 100},
+	}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	rotated := &domain.OAuthCreds{Mode: domain.OAuthAuto, Preset: "xai",
+		AccessToken: "new-access", RefreshToken: "rt2", ExpiresAt: 200}
+	if err := st.UpdateProviderOAuth(ctx, p.ID, rotated); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStringSlice(got.Tags, []string{"prod"}) {
+		t.Fatalf("tags after oauth refresh = %v", got.Tags)
+	}
+}
+
+func TestProviderTagsHydratedInCombo(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "p", BaseURL: "http://a", APIKey: "k", Protocol: domain.ProtocolOpenAI,
+		Tags: []string{"team-a"},
+	}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Targets: []domain.ComboTarget{
+		{ProviderID: p.ID, UpstreamModel: "m", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetComboByName(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStringSlice(got.Targets[0].Provider.Tags, []string{"team-a"}) {
+		t.Fatalf("hydrated tags = %v", got.Targets[0].Provider.Tags)
+	}
+}
+
+func TestProviderTagsLegacyMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+	c, err := crypto.New("test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := c.Encrypt("k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const schema = `
+CREATE TABLE providers (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	name TEXT NOT NULL UNIQUE,
+	base_url TEXT NOT NULL,
+	api_key TEXT NOT NULL,
+	protocol TEXT NOT NULL,
+	auth_scheme TEXT NOT NULL DEFAULT '',
+	auth_method TEXT NOT NULL DEFAULT '',
+	oauth_creds TEXT NOT NULL DEFAULT '',
+	reasoning_dialect TEXT NOT NULL DEFAULT '',
+	archived INTEGER NOT NULL DEFAULT 0,
+	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);`
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO providers (name, base_url, api_key, protocol) VALUES (?, ?, ?, ?)`,
+		"legacy", "http://a", enc, "openai"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	got, err := st.GetProvider(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("legacy tags = %v, want empty", got.Tags)
+	}
+	var raw string
+	if err := st.db.QueryRow(`SELECT tags FROM providers WHERE id=1`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != "[]" {
+		t.Fatalf("stored default = %q, want []", raw)
+	}
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestProviderReasoningDialectLegacyMigration(t *testing.T) {

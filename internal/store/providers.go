@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"airouter/internal/domain"
 )
@@ -15,13 +16,17 @@ var ErrNotFound = errors.New("store: not found")
 // into the domain struct.
 func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provider, error) {
 	var p domain.Provider
-	var enc, oauthEnc string
-	var dialect string
+	var enc, oauthEnc, dialect, tagsJSON string
 	if err := row.Scan(&p.ID, &p.Name, &p.BaseURL, &enc, &p.Protocol, &p.AuthScheme,
-		&p.AuthMethod, &oauthEnc, &dialect, &p.Archived, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		&p.AuthMethod, &oauthEnc, &dialect, &tagsJSON, &p.Archived, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	p.ReasoningDialect = domain.ReasoningDialect(dialect)
+	tags, err := decodeProviderTags(tagsJSON)
+	if err != nil {
+		return nil, err
+	}
+	p.Tags = tags
 	key, err := s.cipher.Decrypt(enc)
 	if err != nil {
 		return nil, err
@@ -41,7 +46,33 @@ func (s *Store) scanProvider(row interface{ Scan(...any) error }) (*domain.Provi
 	return &p, nil
 }
 
-const providerCols = "id, name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, reasoning_dialect, archived, created_at, updated_at"
+const providerCols = "id, name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, reasoning_dialect, tags, archived, created_at, updated_at"
+
+func encodeProviderTags(tags []string) (string, error) {
+	norm, err := domain.NormalizeTags(tags)
+	if err != nil {
+		return "", err
+	}
+	if norm == nil {
+		norm = []string{}
+	}
+	b, err := json.Marshal(norm)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func decodeProviderTags(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var tags []string
+	if err := json.Unmarshal([]byte(raw), &tags); err != nil {
+		return nil, err
+	}
+	return domain.NormalizeTags(tags)
+}
 
 func (s *Store) ListProviders(ctx context.Context) ([]*domain.Provider, error) {
 	return s.listProviders(ctx, s.db)
@@ -101,9 +132,13 @@ func (s *Store) createProvider(ctx context.Context, ex executor, p *domain.Provi
 	if err != nil {
 		return err
 	}
+	tagsJSON, err := encodeProviderTags(p.Tags)
+	if err != nil {
+		return err
+	}
 	res, err := ex.ExecContext(ctx,
-		"INSERT INTO providers (name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, reasoning_dialect, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.ReasoningDialect, p.Archived)
+		"INSERT INTO providers (name, base_url, api_key, protocol, auth_scheme, auth_method, oauth_creds, reasoning_dialect, tags, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.ReasoningDialect, tagsJSON, p.Archived)
 	if err != nil {
 		return err
 	}
@@ -125,9 +160,13 @@ func (s *Store) updateProvider(ctx context.Context, ex executor, p *domain.Provi
 	if err != nil {
 		return err
 	}
+	tagsJSON, err := encodeProviderTags(p.Tags)
+	if err != nil {
+		return err
+	}
 	_, err = ex.ExecContext(ctx,
-		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, auth_scheme=?, auth_method=?, oauth_creds=?, reasoning_dialect=?, archived=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.ReasoningDialect, p.Archived, p.ID)
+		"UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, auth_scheme=?, auth_method=?, oauth_creds=?, reasoning_dialect=?, tags=?, archived=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		p.Name, p.BaseURL, enc, p.Protocol, p.AuthScheme, p.AuthMethod, oauthEnc, p.ReasoningDialect, tagsJSON, p.Archived, p.ID)
 	return err
 }
 

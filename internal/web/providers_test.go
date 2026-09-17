@@ -3,6 +3,10 @@ package web
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -171,5 +175,152 @@ func TestProviderEditRowReasoningDialectLocked(t *testing.T) {
 	html := renderComponent(t, providerEditRowInteractiveOAuth(p))
 	if !strings.Contains(html, `type="hidden" name="reasoning_dialect" value="codex"`) {
 		t.Fatalf("want locked codex dialect; html=%s", html)
+	}
+}
+
+func TestProviderRecipeFormsIncludeTagsField(t *testing.T) {
+	for _, r := range recipes {
+		html := renderComponent(t, ProviderRecipeForm(r))
+		if !strings.Contains(html, `name="tags"`) {
+			t.Errorf("recipe %s missing tags field", r.ID)
+		}
+	}
+}
+
+func TestProviderEditRowsIncludeTagsField(t *testing.T) {
+	generic := &domain.Provider{ID: 1, Name: "p", BaseURL: "https://x", Protocol: domain.ProtocolOpenAI, Tags: []string{"prod"}}
+	if html := renderComponent(t, providerEditRowGenericAPIKey(generic)); !strings.Contains(html, `name="tags"`) || !strings.Contains(html, `value="prod"`) {
+		t.Fatalf("generic edit tags: %s", html)
+	}
+	opencodeP := &domain.Provider{ID: 2, Name: "p", BaseURL: "https://opencode.ai/zen/v1", Protocol: domain.ProtocolOpencode, Tags: []string{"eu"}}
+	if html := renderComponent(t, providerEditRowOpencode(opencodeP)); !strings.Contains(html, `name="tags"`) {
+		t.Fatalf("opencode edit tags: %s", html)
+	}
+	kiro := &domain.Provider{ID: 3, Name: "k", BaseURL: "https://x", Protocol: domain.ProtocolKiro}
+	if html := renderComponent(t, providerEditRowKiro(kiro)); !strings.Contains(html, `name="tags"`) {
+		t.Fatalf("kiro edit tags: %s", html)
+	}
+	qoder := &domain.Provider{ID: 4, Name: "q", BaseURL: "https://x", Protocol: domain.ProtocolQoder, AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{}}
+	if html := renderComponent(t, providerEditRowQoder(qoder)); !strings.Contains(html, `name="tags"`) {
+		t.Fatalf("qoder edit tags: %s", html)
+	}
+	cursor := &domain.Provider{ID: 5, Name: "c", BaseURL: "https://x", Protocol: domain.ProtocolCursor, AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{}}
+	if html := renderComponent(t, providerEditRowCursor(cursor)); !strings.Contains(html, `name="tags"`) {
+		t.Fatalf("cursor edit tags: %s", html)
+	}
+	oauth := &domain.Provider{ID: 6, Name: "o", BaseURL: "https://x", Protocol: domain.ProtocolOpenAICodex, AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{}}
+	if html := renderComponent(t, providerEditRowInteractiveOAuth(oauth)); !strings.Contains(html, `name="tags"`) {
+		t.Fatalf("interactive oauth edit tags: %s", html)
+	}
+}
+
+func TestProviderListTagBadgesAndFilterMetadata(t *testing.T) {
+	ps := []*domain.Provider{
+		{ID: 1, Name: "tagged", BaseURL: "https://a", Protocol: domain.ProtocolOpenAI, Tags: []string{"eu", "prod"}},
+		{ID: 2, Name: "plain", BaseURL: "https://b", Protocol: domain.ProtocolOpenAI},
+		{ID: 3, Name: "old", BaseURL: "https://c", Protocol: domain.ProtocolOpenAI, Tags: []string{"prod"}, Archived: true},
+	}
+	html := renderComponent(t, ProviderList(ps))
+	if !strings.Contains(html, `class="provider-tag">eu</span>`) || !strings.Contains(html, `class="provider-tag">prod</span>`) {
+		t.Fatalf("missing badges: %s", html)
+	}
+	if strings.Contains(html, `class="provider-tag">Untagged</span>`) {
+		t.Fatalf("must not show Untagged badge: %s", html)
+	}
+	if !strings.Contains(html, `data-tags="eu,prod"`) || !strings.Contains(html, `data-tags=""`) {
+		t.Fatalf("missing row tag metadata: %s", html)
+	}
+	if !strings.Contains(html, `id="provider-tag-filter"`) {
+		t.Fatalf("missing filter: %s", html)
+	}
+	if !strings.Contains(html, `data-tag-filter="eu"`) || !strings.Contains(html, `data-tag-filter="prod"`) {
+		t.Fatalf("missing tag buttons: %s", html)
+	}
+	if !strings.Contains(html, `data-tag-filter="__untagged__"`) {
+		t.Fatalf("missing Untagged control: %s", html)
+	}
+	if !strings.Contains(html, `id="provider-filter-empty"`) {
+		t.Fatalf("missing no-match message: %s", html)
+	}
+}
+
+func TestCreateProviderParsesTags(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{
+		"name":        {"p1"},
+		"base_url":    {"https://x"},
+		"api_key":     {"k"},
+		"protocol":    {"openai"},
+		"auth_method": {"apikey"},
+		"tags":        {" Beta, alpha, Alpha "},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	list, err := h.store.ListProviders(context.Background())
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list = %v err=%v", list, err)
+	}
+	if got := strings.Join(list[0].Tags, ","); got != "alpha,beta" {
+		t.Fatalf("tags = %v", list[0].Tags)
+	}
+}
+
+func TestCreateProviderRejectsInvalidTags(t *testing.T) {
+	h := testHandler(t)
+	form := url.Values{
+		"name":        {"p1"},
+		"base_url":    {"https://x"},
+		"api_key":     {"k"},
+		"protocol":    {"openai"},
+		"auth_method": {"apikey"},
+		"tags":        {"foo--bar"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.createProvider(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	list, err := h.store.ListProviders(context.Background())
+	if err != nil || len(list) != 0 {
+		t.Fatalf("should not persist invalid tags: %v err=%v", list, err)
+	}
+}
+
+func TestUpdateProviderReplacesTags(t *testing.T) {
+	h := testHandler(t)
+	p := &domain.Provider{Name: "p1", BaseURL: "https://x", APIKey: "k", Protocol: domain.ProtocolOpenAI, Tags: []string{"old"}}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"name":        {"p1"},
+		"base_url":    {"https://x"},
+		"protocol":    {"openai"},
+		"auth_method": {"apikey"},
+		"auth_scheme": {"bearer"},
+		"tags":        {""},
+	}
+	path := "/dashboard/providers/" + strconv.FormatInt(p.ID, 10)
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("cleared tags = %v", got.Tags)
 	}
 }

@@ -2,7 +2,9 @@ package web
 
 import (
 	"fmt"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/a-h/templ"
@@ -10,6 +12,8 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/usage"
 )
+
+const usageUntaggedFilter = "__untagged__"
 
 func usageSupportedProviders(all []*domain.Provider) []*domain.Provider {
 	out := make([]*domain.Provider, 0, len(all))
@@ -20,6 +24,63 @@ func usageSupportedProviders(all []*domain.Provider) []*domain.Provider {
 		out = append(out, p)
 	}
 	return out
+}
+
+// parseUsageTagFilter accepts All (empty), Untagged, or one exact tag present
+// on the supported set. Unknown values fall back to All.
+func parseUsageTagFilter(raw string, supported []*domain.Provider) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if raw == usageUntaggedFilter {
+		if domain.HasUntagged(supported) {
+			return usageUntaggedFilter
+		}
+		return ""
+	}
+	for _, t := range domain.UniqueTags(supported) {
+		if t == raw {
+			return t
+		}
+	}
+	return ""
+}
+
+func filterUsageProviders(providers []*domain.Provider, filter string) []*domain.Provider {
+	if filter == "" {
+		return providers
+	}
+	out := make([]*domain.Provider, 0, len(providers))
+	for _, p := range providers {
+		if p == nil {
+			continue
+		}
+		if filter == usageUntaggedFilter {
+			if len(p.Tags) == 0 {
+				out = append(out, p)
+			}
+			continue
+		}
+		if p.HasTag(filter) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func usageLoadAllURL(filter string) string {
+	if filter == "" {
+		return "/dashboard/usage?load=1"
+	}
+	return "/dashboard/usage?tag=" + url.QueryEscape(filter) + "&load=1"
+}
+
+func usageFilterURL(filter string) string {
+	if filter == "" {
+		return "/dashboard/usage"
+	}
+	return "/dashboard/usage?tag=" + url.QueryEscape(filter)
 }
 
 func usageCardURL(id int64, force bool) string {

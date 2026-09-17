@@ -101,6 +101,42 @@ func TestUsagePageEmptyCopyMentionsCursor(t *testing.T) {
 	}
 }
 
+func TestUsageCardShowsProviderTags(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"plan_type": "plus",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{"used_percent": 20},
+			},
+		})
+	}))
+	t.Cleanup(up.Close)
+	prev := usage.CodexUsageURL
+	usage.CodexUsageURL = up.URL
+	t.Cleanup(func() { usage.CodexUsageURL = prev })
+
+	h := testHandler(t)
+	p := usageCodexProvider("codex-live", []string{"prod"})
+	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(p.ID, 10)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage/card/"+id, nil)
+	req.SetPathValue("id", id)
+	h.usageCard(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `class="provider-tag">prod</span>`) {
+		t.Fatalf("filled card missing tag badge: %s", body)
+	}
+	if strings.Contains(body, "tag=") {
+		t.Fatalf("individual card must not require filter param: %s", body)
+	}
+}
+
 func TestUsageCardFilledAndForceBypassesCache(t *testing.T) {
 	hits := 0
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +213,132 @@ func TestUsageCardUnsupported404(t *testing.T) {
 	h.usageCard(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d", rr.Code)
+	}
+}
+
+func usageCodexProvider(name string, tags []string) *domain.Provider {
+	return &domain.Provider{
+		Name: name, Protocol: domain.ProtocolOpenAICodex,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "t"},
+		Tags:       tags,
+	}
+}
+
+func TestUsagePageFiltersByTag(t *testing.T) {
+	h := testHandler(t)
+	ctx := httptest.NewRequest(http.MethodGet, "/", nil).Context()
+	if err := h.store.CreateProvider(ctx, usageCodexProvider("prod-one", []string{"prod"})); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateProvider(ctx, usageCodexProvider("eu-one", []string{"eu"})); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateProvider(ctx, usageCodexProvider("plain", nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.usagePage(rr, httptest.NewRequest(http.MethodGet, "/dashboard/usage?tag=prod", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "prod-one") {
+		t.Fatalf("exact tag missing match: %s", body)
+	}
+	if strings.Contains(body, "eu-one") || strings.Contains(body, "plain") {
+		t.Fatalf("exact tag leaked other cards: %s", body)
+	}
+	if !strings.Contains(body, "tag=prod") || !strings.Contains(body, "load=1") {
+		t.Fatalf("Load all missing scoped URL: %s", body)
+	}
+	if !strings.Contains(body, `class="provider-tag">prod</span>`) {
+		t.Fatalf("missing tag badge: %s", body)
+	}
+	if strings.Contains(body, `class="provider-tag">Untagged</span>`) {
+		t.Fatalf("must not show Untagged badge: %s", body)
+	}
+
+	rr = httptest.NewRecorder()
+	h.usagePage(rr, httptest.NewRequest(http.MethodGet, "/dashboard/usage?tag=__untagged__", nil))
+	body = rr.Body.String()
+	if !strings.Contains(body, "plain") {
+		t.Fatalf("untagged missing match: %s", body)
+	}
+	if strings.Contains(body, "prod-one") || strings.Contains(body, "eu-one") {
+		t.Fatalf("untagged leaked tagged cards: %s", body)
+	}
+}
+
+func TestUsageFilterControlsIgnoreArchivedAndUnsupported(t *testing.T) {
+	h := testHandler(t)
+	ctx := httptest.NewRequest(http.MethodGet, "/", nil).Context()
+	if err := h.store.CreateProvider(ctx, usageCodexProvider("live", []string{"prod"})); err != nil {
+		t.Fatal(err)
+	}
+	archived := usageCodexProvider("old", []string{"secret"})
+	archived.Archived = true
+	if err := h.store.CreateProvider(ctx, archived); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateProvider(ctx, &domain.Provider{
+		Name: "plain", Protocol: domain.ProtocolOpenAI, APIKey: "k", Tags: []string{"hidden"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.usagePage(rr, httptest.NewRequest(http.MethodGet, "/dashboard/usage", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, ">prod</a>") {
+		t.Fatalf("missing supported tag control: %s", body)
+	}
+	if strings.Contains(body, ">secret</a>") || strings.Contains(body, ">hidden</a>") {
+		t.Fatalf("filter must ignore archived/unsupported tags: %s", body)
+	}
+}
+
+func TestUsagePageUnknownTagFallsBackToAll(t *testing.T) {
+	h := testHandler(t)
+	ctx := httptest.NewRequest(http.MethodGet, "/", nil).Context()
+	if err := h.store.CreateProvider(ctx, usageCodexProvider("prod-one", []string{"prod"})); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"missing", usageUntaggedFilter} {
+		rr := httptest.NewRecorder()
+		h.usagePage(rr, httptest.NewRequest(http.MethodGet, "/dashboard/usage?tag="+raw, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("tag %q status = %d", raw, rr.Code)
+		}
+		body := rr.Body.String()
+		if !strings.Contains(body, "prod-one") {
+			t.Fatalf("unknown tag %q should show all: %s", raw, body)
+		}
+		if strings.Contains(body, "No providers match this tag.") {
+			t.Fatalf("unknown tag %q must not error: %s", raw, body)
+		}
+	}
+}
+
+func TestUsageLoadAllRespectsTagFilter(t *testing.T) {
+	h := testHandler(t)
+	ctx := httptest.NewRequest(http.MethodGet, "/", nil).Context()
+	if err := h.store.CreateProvider(ctx, usageCodexProvider("prod-one", []string{"prod"})); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateProvider(ctx, usageCodexProvider("eu-one", []string{"eu"})); err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage?tag=prod&load=1", nil)
+	req.Header.Set("HX-Request", "true")
+	h.usagePage(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "prod-one") || !strings.Contains(body, "hx-trigger=\"load\"") {
+		t.Fatalf("matched card should autoload: %s", body)
+	}
+	if strings.Contains(body, "eu-one") {
+		t.Fatalf("unmatched card must not autoload: %s", body)
 	}
 }
 

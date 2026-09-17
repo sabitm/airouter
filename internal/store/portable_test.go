@@ -360,6 +360,147 @@ func TestImportReasoningDialectAliasesAndInvalid(t *testing.T) {
 	}
 }
 
+func TestExportOmitsEmptyTags(t *testing.T) {
+	src := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{Name: "plain", BaseURL: "http://a", APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := src.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := src.Export(ctx, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), `"tags"`) {
+		t.Fatalf("empty tags should be omitted: %s", buf.String())
+	}
+}
+
+func TestExportImportTags(t *testing.T) {
+	src := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "tagged", BaseURL: "http://a", APIKey: "k", Protocol: domain.ProtocolOpenAI,
+		Tags: []string{"prod", "eu"},
+	}
+	if err := src.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := src.Export(ctx, &buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `"tags"`) || !strings.Contains(out, `"eu"`) || !strings.Contains(out, `"prod"`) {
+		t.Fatalf("export missing tags: %s", out)
+	}
+
+	dst := testStore(t)
+	if _, err := dst.Import(ctx, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.GetProvider(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStringSlice(got.Tags, []string{"eu", "prod"}) {
+		t.Fatalf("imported tags = %v", got.Tags)
+	}
+}
+
+func TestImportMissingTagsBecomeEmptyAndReplace(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	existing := &domain.Provider{
+		Name: "exist-p", BaseURL: "http://old", APIKey: "old", Protocol: domain.ProtocolOpenAI,
+		Tags: []string{"prod"},
+	}
+	if err := st.CreateProvider(ctx, existing); err != nil {
+		t.Fatal(err)
+	}
+	const cfg = `{
+		"version": 1,
+		"providers": [
+			{"name":"exist-p","base_url":"http://new","api_key":"k-new","protocol":"openai"},
+			{"name":"new-p","base_url":"http://b","api_key":"k2","protocol":"openai"}
+		],
+		"combos": []
+	}`
+	if _, err := st.Import(ctx, strings.NewReader(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetProvider(ctx, existing.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("missing tags on upsert should replace, got %v", got.Tags)
+	}
+	list, err := st.ListProviders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]*domain.Provider{}
+	for _, p := range list {
+		by[p.Name] = p
+	}
+	if len(by["new-p"].Tags) != 0 {
+		t.Fatalf("legacy omit tags = %v", by["new-p"].Tags)
+	}
+}
+
+func TestImportTagsReplaceAndInvalidSkip(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	existing := &domain.Provider{
+		Name: "exist-p", BaseURL: "http://old", APIKey: "old", Protocol: domain.ProtocolOpenAI,
+		Tags: []string{"old-tag"},
+	}
+	if err := st.CreateProvider(ctx, existing); err != nil {
+		t.Fatal(err)
+	}
+	const cfg = `{
+		"version": 1,
+		"providers": [
+			{"name":"exist-p","base_url":"http://new","api_key":"k-new","protocol":"openai","tags":[" Beta", "alpha", "alpha"]},
+			{"name":"bad-p","base_url":"http://c","api_key":"k3","protocol":"openai","tags":["foo--bar"]},
+			{"name":"ok-p","base_url":"http://d","api_key":"k4","protocol":"openai","tags":["v2"]}
+		],
+		"combos": []
+	}`
+	sum, err := st.Import(ctx, strings.NewReader(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.ProvidersCreated != 1 || sum.ProvidersUpdated != 1 || len(sum.Failures) != 1 {
+		t.Fatalf("summary = %+v", sum)
+	}
+	if !strings.Contains(sum.Failures[0], `provider "bad-p"`) {
+		t.Fatalf("failure = %q", sum.Failures[0])
+	}
+	got, err := st.GetProvider(ctx, existing.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStringSlice(got.Tags, []string{"alpha", "beta"}) {
+		t.Fatalf("replaced tags = %v", got.Tags)
+	}
+	list, err := st.ListProviders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]*domain.Provider{}
+	for _, p := range list {
+		by[p.Name] = p
+	}
+	if by["bad-p"] != nil {
+		t.Fatal("invalid tags should skip provider")
+	}
+	if !equalStringSlice(by["ok-p"].Tags, []string{"v2"}) {
+		t.Fatalf("ok-p tags = %v", by["ok-p"].Tags)
+	}
+}
+
 func TestImportOmitsReasoningDialect(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

@@ -307,6 +307,9 @@ type Provider struct {
 	// ReasoningDialect may be empty on legacy rows; use Reasoning for the
 	// effective dialect. Explicit none disables the generic reasoning writer.
 	ReasoningDialect ReasoningDialect
+	// Tags are optional free-form labels. Empty means untagged. Values are
+	// always canonical: lowercase, unique, sorted, at most MaxProviderTags.
+	Tags []string
 	// Archived providers are soft-disabled: hidden from the combo builder and
 	// skipped during resolution, but kept so they can be restored or deleted.
 	Archived  bool
