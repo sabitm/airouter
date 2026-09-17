@@ -396,9 +396,6 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 			if err := e.closeBlock(w); err != nil {
 				return err
 			}
-			if err := e.closeOpenTools(w); err != nil {
-				return err
-			}
 			e.openIndex = e.nextIndex
 			e.nextIndex++
 			e.openKind = blockText
@@ -418,9 +415,6 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		}
 		if e.openKind != blockReasoning {
 			if err := e.closeBlock(w); err != nil {
-				return err
-			}
-			if err := e.closeOpenTools(w); err != nil {
 				return err
 			}
 			e.openIndex = e.nextIndex

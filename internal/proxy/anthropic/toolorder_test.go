@@ -197,6 +197,80 @@ func TestEncodeStreamInterleavedParallelCalls(t *testing.T) {
 	}
 }
 
+// Tool blocks stay open across interleaved text or reasoning so later argument
+// fragments are not emitted after content_block_stop.
+func TestEncodeStreamToolArgsSurviveInterleavedDeltas(t *testing.T) {
+	type wantCall struct {
+		id, name, args string
+	}
+	tests := []struct {
+		name   string
+		events []ir.StreamEvent
+		want   []wantCall
+	}{
+		{
+			name: "reasoning between one call fragments",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call_1", ToolName: "get_weather"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `{"ci`},
+				{Kind: ir.EventReasoningDelta, Text: "thinking"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `ty":"SF"}`},
+				{Kind: ir.EventFinish, StopReason: ir.StopToolUse},
+			},
+			want: []wantCall{{id: "call_1", name: "get_weather", args: `{"city":"SF"}`}},
+		},
+		{
+			name: "text between one call fragments",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call_1", ToolName: "get_weather"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `{"ci`},
+				{Kind: ir.EventTextDelta, Text: "hi"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `ty":"SF"}`},
+				{Kind: ir.EventFinish, StopReason: ir.StopToolUse},
+			},
+			want: []wantCall{{id: "call_1", name: "get_weather", args: `{"city":"SF"}`}},
+		},
+		{
+			name: "reasoning between parallel call fragments",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call_a", ToolName: "alpha"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `{"x":`},
+				{Kind: ir.EventToolCallStart, Index: 1, ToolID: "call_b", ToolName: "beta"},
+				{Kind: ir.EventToolCallDelta, Index: 1, ArgsFrag: `{"y":`},
+				{Kind: ir.EventReasoningDelta, Text: "thinking"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `1}`},
+				{Kind: ir.EventToolCallDelta, Index: 1, ArgsFrag: `2}`},
+				{Kind: ir.EventFinish, StopReason: ir.StopToolUse},
+			},
+			want: []wantCall{
+				{id: "call_a", name: "alpha", args: `{"x":1}`},
+				{id: "call_b", name: "beta", args: `{"y":2}`},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := encodeStreamEvents(t, "m", tt.events)
+			frames := parseAnthropicStream(t, body)
+			assertAnthropicWireOrder(t, frames)
+			blocks := reassembleAnthropicToolBlocks(t, frames)
+			if len(blocks) != len(tt.want) {
+				t.Fatalf("want %d tool blocks, got %d: %v", len(tt.want), len(blocks), blocks)
+			}
+			got := map[string]map[string]string{}
+			for _, call := range blocks {
+				got[call["id"]] = call
+			}
+			for _, want := range tt.want {
+				call := got[want.id]
+				if call["name"] != want.name || call["args"] != want.args {
+					t.Errorf("tool %s = name %q args %q, want name %q args %q", want.id, call["name"], call["args"], want.name, want.args)
+				}
+			}
+		})
+	}
+}
+
 // A delta whose Start never arrives has no valid block to live on; the wire
 // must stay protocol-valid (no orphan content_block_delta) and the stream must
 // still terminate cleanly.
