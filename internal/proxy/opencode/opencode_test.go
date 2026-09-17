@@ -45,17 +45,106 @@ func TestDeriveSessionIDStable(t *testing.T) {
 	if a != b {
 		t.Fatalf("session id not stable across calls: %q vs %q", a, b)
 	}
-	if !strings.HasPrefix(a, "ses_") {
-		t.Fatalf("session id %q missing ses_ prefix", a)
-	}
+	assertNativeSessionID(t, a)
 	c := DeriveSessionID("public", "assistant text two")
 	if a == c {
 		t.Fatalf("distinct conversations derived the same session id")
 	}
+	assertNativeSessionID(t, c)
 	// Distinct accounts with identical transcripts stay distinct.
 	d := DeriveSessionID("sk-real-key", "assistant text one")
 	if a == d {
 		t.Fatalf("distinct providers derived the same session id")
+	}
+}
+
+func TestNativeSessionIDPreservesAndMaps(t *testing.T) {
+	native := "ses_0123456789abABCDEFGHIJKLMN"
+	if !IsNativeSessionID(native) {
+		t.Fatalf("fixture is not native: %q", native)
+	}
+	if got := NativeSessionID(native); got != native {
+		t.Fatalf("native session mutated: %q", got)
+	}
+	mapped := NativeSessionID("client-req")
+	assertNativeSessionID(t, mapped)
+	if mapped == "client-req" || mapped == native {
+		t.Fatalf("generic session not mapped: %q", mapped)
+	}
+	if NativeSessionID("client-req") != mapped {
+		t.Fatal("generic session mapping is not stable")
+	}
+	if NativeSessionID("other-client") == mapped {
+		t.Fatal("distinct generic sessions collided")
+	}
+	if NativeSessionID("") != "" {
+		t.Fatal("empty candidate should stay empty")
+	}
+}
+
+func TestNewRequestIDNativeShape(t *testing.T) {
+	a := NewRequestID()
+	b := NewRequestID()
+	assertNativeRequestID(t, a)
+	assertNativeRequestID(t, b)
+	if a == b {
+		t.Fatalf("request ids collided: %q", a)
+	}
+}
+
+func TestIsNativeIDRejectsLegacyHex(t *testing.T) {
+	legacySes := "ses_" + strings.Repeat("ab", 32)
+	if IsNativeSessionID(legacySes) {
+		t.Fatalf("64-hex session accepted: %q", legacySes)
+	}
+	legacyMsg := "msg_" + strings.Repeat("cd", 16)
+	if IsNativeRequestID(legacyMsg) {
+		t.Fatalf("32-hex request accepted: %q", legacyMsg)
+	}
+	if IsNativeSessionID("ses_client") || IsNativeRequestID("msg_client") {
+		t.Fatal("short unofficial ids accepted")
+	}
+}
+
+func TestIsVersionedUserAgent(t *testing.T) {
+	keep := []string{
+		"opencode/1.18.31",
+		"opencode/1.17.7 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+		"opencode/0.16.7",
+		"OpenCode/1.18.31",
+	}
+	for _, ua := range keep {
+		if !IsVersionedUserAgent(ua) {
+			t.Errorf("rejected valid UA %q", ua)
+		}
+	}
+	reject := []string{
+		"",
+		"opencode",
+		"opencode/",
+		"curl/8.0 opencode/1.18.31",
+		"my-opencode-agent/1.0",
+		"opencode/abc",
+		"opencode/1",
+	}
+	for _, ua := range reject {
+		if IsVersionedUserAgent(ua) {
+			t.Errorf("accepted invalid UA %q", ua)
+		}
+	}
+}
+
+func assertNativeSessionID(t *testing.T, id string) {
+	t.Helper()
+	if !IsNativeSessionID(id) {
+		t.Fatalf("session id %q is not native-shaped", id)
+	}
+}
+
+func assertNativeRequestID(t *testing.T, id string) {
+	t.Helper()
+	if !IsNativeRequestID(id) {
+		t.Fatalf("request id %q is not native-shaped", id)
 	}
 }
 
@@ -270,17 +359,33 @@ func TestFingerprintHeaders(t *testing.T) {
 	if got := h.Get("User-Agent"); got != UserAgent {
 		t.Fatalf("UA replaced = %q, want %q", got, UserAgent)
 	}
-	if got := h.Get("x-opencode-session"); got != "ses_test" {
-		t.Fatalf("session = %q", got)
+	assertNativeSessionID(t, h.Get("x-opencode-session"))
+	if h.Get("x-opencode-session") == "ses_test" {
+		t.Fatal("generic session forwarded verbatim")
 	}
-	if got := h.Get("x-opencode-request"); !strings.HasPrefix(got, "msg_") {
-		t.Fatalf("request id = %q", got)
+	assertNativeRequestID(t, h.Get("x-opencode-request"))
+
+	bare := http.Header{}
+	bare.Set("User-Agent", "opencode")
+	FingerprintHeaders(bare, "")
+	if got := bare.Get("User-Agent"); got != UserAgent {
+		t.Fatalf("bare opencode UA kept: %q", got)
 	}
-	// An opencode client UA is preserved; a client-set fingerprint wins.
+
+	generic := http.Header{}
+	generic.Set("x-opencode-session", "ses_client")
+	FingerprintHeaders(generic, "ses_derived")
+	assertNativeSessionID(t, generic.Get("x-opencode-session"))
+	if generic.Get("x-opencode-session") == "ses_client" {
+		t.Fatal("existing generic session forwarded verbatim")
+	}
+
+	// A versioned OpenCode client UA is preserved; a native session wins.
 	h2 := http.Header{}
 	h2.Set("User-Agent", "opencode/0.16.7")
 	h2.Set("x-opencode-client", "my-terminal")
-	h2.Set("x-opencode-session", "ses_client")
+	native := "ses_0123456789abABCDEFGHIJKLMN"
+	h2.Set("x-opencode-session", native)
 	FingerprintHeaders(h2, "ses_derived")
 	if got := h2.Get("User-Agent"); got != "opencode/0.16.7" {
 		t.Fatalf("client UA clobbered: %q", got)
@@ -288,7 +393,7 @@ func TestFingerprintHeaders(t *testing.T) {
 	if got := h2.Get("x-opencode-client"); got != "my-terminal" {
 		t.Fatalf("client header clobbered: %q", got)
 	}
-	if got := h2.Get("x-opencode-session"); got != "ses_client" {
+	if got := h2.Get("x-opencode-session"); got != native {
 		t.Fatalf("client session clobbered: %q", got)
 	}
 }

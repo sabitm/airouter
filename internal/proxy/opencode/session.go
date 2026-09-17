@@ -21,7 +21,8 @@ type Identity struct {
 	Request   string
 	// Session is the first valid client-provided session (explicit OpenCode
 	// header, then generic session headers, then original-body fields). Empty
-	// means the proxy must derive a fallback.
+	// means the proxy must derive a fallback. Native-shaped values are kept;
+	// other candidates are mapped to a native ses_ id in ResolveSession.
 	Session string
 }
 
@@ -45,12 +46,14 @@ var (
 // candidates are ignored; nothing is hashed when a value is valid.
 func CaptureIdentity(h http.Header, body []byte) Identity {
 	var id Identity
-	if ua := headerValue(h, "User-Agent"); ua != "" && strings.Contains(strings.ToLower(ua), UserAgent) {
+	if ua := headerValue(h, "User-Agent"); IsVersionedUserAgent(ua) {
 		id.UserAgent = ua
 	}
 	id.Client = headerValue(h, "x-opencode-client")
 	id.Project = headerValue(h, "x-opencode-project")
-	id.Request = headerValue(h, "x-opencode-request")
+	if req := headerValue(h, "x-opencode-request"); IsNativeRequestID(req) {
+		id.Request = req
+	}
 	id.Session = resolveClientSession(h, body)
 	return id
 }
@@ -130,6 +133,47 @@ func NormalizeIdentity(v string) string {
 	return v
 }
 
+// IsVersionedUserAgent reports whether ua is a syntactically valid versioned
+// OpenCode User-Agent (opencode/<semver> with optional product suffixes).
+// Bare "opencode" and strings that merely contain "opencode" are rejected.
+func IsVersionedUserAgent(ua string) bool {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return false
+	}
+	const prefix = "opencode/"
+	if !strings.HasPrefix(strings.ToLower(ua), prefix) {
+		return false
+	}
+	rest := ua[len(prefix):]
+	if rest == "" {
+		return false
+	}
+	ver, _, _ := strings.Cut(rest, " ")
+	return isOpenCodeVersion(ver)
+}
+
+func isOpenCodeVersion(ver string) bool {
+	if ver == "" || strings.HasPrefix(ver, ".") || strings.HasSuffix(ver, ".") {
+		return false
+	}
+	parts := strings.Split(ver, ".")
+	if len(parts) < 2 || len(parts) > 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+		for i := 0; i < len(p); i++ {
+			if p[i] < '0' || p[i] > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // SanitizeIdentityHeaders drops invalid OpenCode identity values that may have
 // been copied onto an upstream request so they cannot be forwarded.
 func SanitizeIdentityHeaders(h http.Header) {
@@ -141,7 +185,7 @@ func SanitizeIdentityHeaders(h http.Header) {
 			h.Del("User-Agent")
 		} else {
 			n := NormalizeIdentity(values[0])
-			if n == "" || !strings.Contains(strings.ToLower(n), UserAgent) {
+			if !IsVersionedUserAgent(n) {
 				h.Del("User-Agent")
 			} else {
 				h.Set("User-Agent", n)
@@ -157,11 +201,24 @@ func SanitizeIdentityHeaders(h http.Header) {
 			h.Del(key)
 			continue
 		}
-		if n := NormalizeIdentity(values[0]); n == "" {
+		n := NormalizeIdentity(values[0])
+		if n == "" {
 			h.Del(key)
-		} else {
-			h.Set(key, n)
+			continue
 		}
+		switch key {
+		case "x-opencode-request":
+			if !IsNativeRequestID(n) {
+				h.Del(key)
+				continue
+			}
+		case "x-opencode-session":
+			if !IsNativeSessionID(n) {
+				h.Del(key)
+				continue
+			}
+		}
+		h.Set(key, n)
 	}
 }
 
@@ -177,19 +234,20 @@ func ApplyIdentity(h http.Header, id Identity) {
 	if id.Project != "" {
 		h.Set("x-opencode-project", id.Project)
 	}
-	if id.Request != "" {
+	if IsNativeRequestID(id.Request) {
 		h.Set("x-opencode-request", id.Request)
 	}
-	if id.Session != "" {
-		h.Set("x-opencode-session", id.Session)
+	if sid := NativeSessionID(id.Session); sid != "" {
+		h.Set("x-opencode-session", sid)
 	}
 }
 
-// ResolveSession picks x-opencode-session: a valid client session wins;
-// otherwise a namespaced transcript fallback (empty transcript on first turn).
+// ResolveSession picks x-opencode-session: a valid client session wins and is
+// mapped to native shape when needed; otherwise a namespaced transcript
+// fallback (empty transcript on first turn).
 func ResolveSession(id Identity, nonce string, providerID int64, baseURL, apiKey, transcript string) string {
-	if id.Session != "" {
-		return id.Session
+	if sid := NativeSessionID(id.Session); sid != "" {
+		return sid
 	}
 	return FallbackSessionID(nonce, providerID, baseURL, apiKey, transcript)
 }

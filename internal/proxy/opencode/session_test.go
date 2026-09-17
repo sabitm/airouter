@@ -80,16 +80,17 @@ func TestCaptureIdentityPriority(t *testing.T) {
 }
 
 func TestCaptureIdentityOpenCodeFields(t *testing.T) {
+	nativeReq := "msg_0123456789abABCDEFGHIJKLMN"
 	h := http.Header{}
 	h.Set("User-Agent", "opencode/0.16.7")
 	h.Set("x-opencode-client", "my-cli")
 	h.Set("x-opencode-project", "proj-a")
-	h.Set("x-opencode-request", "msg_client")
+	h.Set("x-opencode-request", nativeReq)
 	h.Set("Authorization", "Bearer secret")
 	h.Set("Cookie", "sid=1")
 	h.Set("X-Custom", "nope")
 	id := CaptureIdentity(h, []byte(`{"metadata":{"secret":"x","user_id":{"nested":true}}}`))
-	if id.UserAgent != "opencode/0.16.7" || id.Client != "my-cli" || id.Project != "proj-a" || id.Request != "msg_client" {
+	if id.UserAgent != "opencode/0.16.7" || id.Client != "my-cli" || id.Project != "proj-a" || id.Request != nativeReq {
 		t.Fatalf("identity fields: %+v", id)
 	}
 	if id.Session != "" {
@@ -101,6 +102,20 @@ func TestCaptureIdentityOpenCodeFields(t *testing.T) {
 	id = CaptureIdentity(h, nil)
 	if id.UserAgent != "" {
 		t.Fatalf("non-opencode UA captured: %+v", id)
+	}
+
+	h = http.Header{}
+	h.Set("User-Agent", "opencode")
+	id = CaptureIdentity(h, nil)
+	if id.UserAgent != "" {
+		t.Fatalf("bare opencode UA captured: %+v", id)
+	}
+
+	h = http.Header{}
+	h.Set("x-opencode-request", "msg_client")
+	id = CaptureIdentity(h, nil)
+	if id.Request != "" {
+		t.Fatalf("non-native request id captured: %+v", id)
 	}
 }
 
@@ -123,16 +138,27 @@ func TestCaptureIdentityRejectsInvalid(t *testing.T) {
 }
 
 func TestResolveSessionPriorityAndFallback(t *testing.T) {
-	id := Identity{Session: "ses_client"}
-	if got := ResolveSession(id, "nonce", 1, "https://opencode.ai/zen/v1", "public", "transcript"); got != "ses_client" {
-		t.Fatalf("client session lost: %q", got)
+	native := "ses_0123456789abABCDEFGHIJKLMN"
+	id := Identity{Session: native}
+	if got := ResolveSession(id, "nonce", 1, "https://opencode.ai/zen/v1", "public", "transcript"); got != native {
+		t.Fatalf("native client session lost: %q", got)
+	}
+
+	mapped := ResolveSession(Identity{Session: "ses_client"}, "nonce", 1, "https://opencode.ai/zen/v1", "public", "transcript")
+	assertNativeSessionID(t, mapped)
+	if mapped == "ses_client" {
+		t.Fatal("generic session forwarded verbatim")
+	}
+	if got := ResolveSession(Identity{Session: "ses_client"}, "other-nonce", 9, "https://example", "other", "other-transcript"); got != mapped {
+		t.Fatal("generic session mapping should ignore fallback namespace")
 	}
 
 	a := FallbackSessionID("nonce", 1, "https://opencode.ai/zen/v1", "public", "")
 	b := FallbackSessionID("nonce", 1, "https://opencode.ai/zen/v1", "public", "")
-	if a != b || !strings.HasPrefix(a, "ses_") {
+	if a != b {
 		t.Fatalf("fallback not stable: %q %q", a, b)
 	}
+	assertNativeSessionID(t, a)
 	if ResolveSession(Identity{}, "nonce", 1, "https://opencode.ai/zen/v1", "public", "") != a {
 		t.Fatal("empty identity should use fallback")
 	}
@@ -169,5 +195,56 @@ func TestSanitizeIdentityHeaders(t *testing.T) {
 	}
 	if h.Get("x-opencode-project") != "" {
 		t.Fatalf("ambiguous duplicate project kept: %q", h.Values("x-opencode-project"))
+	}
+
+	h = http.Header{}
+	h.Set("User-Agent", "opencode")
+	h.Set("x-opencode-session", "ses_client")
+	h.Set("x-opencode-request", "msg_client")
+	SanitizeIdentityHeaders(h)
+	if h.Get("User-Agent") != "" {
+		t.Fatalf("bare opencode UA kept: %q", h.Get("User-Agent"))
+	}
+	if h.Get("x-opencode-session") != "" {
+		t.Fatalf("generic session kept: %q", h.Get("x-opencode-session"))
+	}
+	if h.Get("x-opencode-request") != "" {
+		t.Fatalf("generic request kept: %q", h.Get("x-opencode-request"))
+	}
+
+	h = http.Header{}
+	nativeSes := "ses_0123456789abABCDEFGHIJKLMN"
+	nativeReq := "msg_0123456789abABCDEFGHIJKLMN"
+	h.Set("User-Agent", "opencode/1.18.31")
+	h.Set("x-opencode-session", nativeSes)
+	h.Set("x-opencode-request", nativeReq)
+	SanitizeIdentityHeaders(h)
+	if h.Get("User-Agent") != "opencode/1.18.31" {
+		t.Fatalf("versioned UA dropped: %q", h.Get("User-Agent"))
+	}
+	if h.Get("x-opencode-session") != nativeSes {
+		t.Fatalf("native session dropped: %q", h.Get("x-opencode-session"))
+	}
+	if h.Get("x-opencode-request") != nativeReq {
+		t.Fatalf("native request dropped: %q", h.Get("x-opencode-request"))
+	}
+}
+
+func TestApplyIdentityMapsGenericSession(t *testing.T) {
+	h := http.Header{}
+	ApplyIdentity(h, Identity{Session: "client-req", Request: "msg_client"})
+	assertNativeSessionID(t, h.Get("x-opencode-session"))
+	if h.Get("x-opencode-session") == "client-req" {
+		t.Fatal("generic session forwarded verbatim")
+	}
+	if h.Get("x-opencode-request") != "" {
+		t.Fatalf("non-native request id forwarded: %q", h.Get("x-opencode-request"))
+	}
+
+	native := "ses_0123456789abABCDEFGHIJKLMN"
+	h = http.Header{}
+	ApplyIdentity(h, Identity{Session: native})
+	if h.Get("x-opencode-session") != native {
+		t.Fatalf("native session mutated: %q", h.Get("x-opencode-session"))
 	}
 }
