@@ -498,7 +498,7 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid auth scheme")
 		return
 	}
-	dialect, ok := parseReasoningDialectForm(r.FormValue("reasoning_dialect"), proto)
+	dialect, ok := parseProviderReasoningDialectForm(r.FormValue("reasoning_dialect"), proto, cur)
 	if !ok {
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return
@@ -601,7 +601,7 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 			return
 		}
 	}
-	dialect, ok := parseReasoningDialectForm(r.FormValue("reasoning_dialect"), proto)
+	dialect, ok := parseProviderReasoningDialectForm(r.FormValue("reasoning_dialect"), proto, cur)
 	if !ok {
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return

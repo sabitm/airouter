@@ -221,11 +221,14 @@ func ApplyWire(formatID string, body []byte, model string, cfg *Config, protocol
 	}
 	m["model"] = model
 	stripRecognizedReasoning(m)
+	if dialect == domain.ReasoningCline {
+		stripClineControls(m)
+	}
 	if cfg != nil {
 		caps := CapsFor(model, protocol, dialect)
 		eff := Effective(cfg, caps)
 		if eff != nil && (!isClaudeFormat(caps.Format) || lastMessageIsUser(m)) {
-			writeNative(m, eff, caps, formatID, protocol)
+			writeNative(m, model, eff, caps, formatID, protocol)
 		}
 	}
 	return json.Marshal(m)
@@ -364,7 +367,7 @@ func stripRecognizedReasoning(m map[string]any) {
 }
 
 // writeNative applies the effective config in the provider dialect's wire shape.
-func writeNative(m map[string]any, cfg *Config, caps Caps, formatID string, protocol domain.Protocol) {
+func writeNative(m map[string]any, model string, cfg *Config, caps Caps, formatID string, protocol domain.Protocol) {
 	if cfg == nil {
 		return
 	}
@@ -387,6 +390,8 @@ func writeNative(m map[string]any, cfg *Config, caps Caps, formatID string, prot
 		writeZAI(m, cfg, caps)
 	case FormatMiniMax:
 		writeMiniMax(m, cfg, caps)
+	case FormatCline:
+		writeCline(m, cfg, model)
 	case FormatCursor, FormatNone:
 		// Cursor and protocol-managed formats are handled by their codecs.
 	default:

@@ -21,6 +21,7 @@ const (
 	FormatZAI
 	FormatMiniMax
 	FormatGrok
+	FormatCline
 	FormatCursor
 )
 
@@ -84,6 +85,8 @@ func CapsFor(model string, protocol domain.Protocol, dialect domain.ReasoningDia
 		return zaiCaps(m)
 	case domain.ReasoningGrok:
 		return grokCaps(m, protocol)
+	case domain.ReasoningCline:
+		return clineCaps(model)
 	case domain.ReasoningOpencode:
 		return opencodeCaps(m, protocol)
 	default:

@@ -41,8 +41,8 @@ type recipe struct {
 var recipes = []recipe{
 	{ID: "xai", Label: "Grok", Sublabel: "xAI", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "xai", BaseURL: "https://api.x.ai/v1", ReasoningDialect: domain.ReasoningGrok},
 	{ID: "codex", Label: "OpenAI Codex", Sublabel: "ChatGPT", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAICodex, Method: domain.AuthOAuth, Preset: "codex", BaseURL: "https://chatgpt.com/backend-api/codex"},
-	{ID: "cline", Label: "Cline", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "cline", BaseURL: "https://api.cline.bot/api/v1"},
-	{ID: "clinepass", Label: "ClinePass", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "clinepass", BaseURL: "https://api.cline.bot/api/v1"},
+	{ID: "cline", Label: "Cline", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "cline", BaseURL: "https://api.cline.bot/api/v1", ReasoningDialect: domain.ReasoningCline},
+	{ID: "clinepass", Label: "ClinePass", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "clinepass", BaseURL: "https://api.cline.bot/api/v1", ReasoningDialect: domain.ReasoningCline},
 	{ID: "kiro", Label: "Kiro", Sublabel: "AWS CodeWhisperer", Tag: "API key / OAuth", Kind: kindKiro, Protocol: domain.ProtocolKiro, BaseURL: kiro.DefaultBaseURL},
 	{ID: "qoder", Label: "Qoder", Sublabel: "qoder.com", Tag: "OAuth device", Kind: kindQoder, Protocol: domain.ProtocolQoder, Method: domain.AuthOAuth, Preset: "qoder", BaseURL: qoder.DefaultBaseURL},
 	{ID: "antigravity", Label: "Antigravity", Sublabel: "Google Cloud Code (unofficial)", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolAntigravity, Method: domain.AuthOAuth, Preset: "antigravity", BaseURL: antigravity.DefaultBaseURL},
@@ -72,7 +72,8 @@ func genericProtocolEditable(p domain.Protocol) bool {
 
 // reasoningDialectEditable reports whether the dashboard should expose a
 // reasoning-dialect selector. Generic OpenAI/Anthropic-compatible providers can
-// choose; fixed backends lock to their effective dialect.
+// choose; fixed backends lock to their effective dialect. Cline/ClinePass
+// recipes and existing Cline OAuth rows are locked separately.
 func reasoningDialectEditable(p domain.Protocol) bool {
 	return p == domain.ProtocolOpenAI || p == domain.ProtocolOpenAIResponses || p == domain.ProtocolAnthropic
 }
@@ -82,8 +83,70 @@ func lockedReasoningDialect(p domain.Protocol) domain.ReasoningDialect {
 	return domain.DefaultReasoningDialect(p)
 }
 
-// openaiDialectOptions are selectable dialects for OpenAI-compatible transports.
+func recipeReasoningLocked(r recipe) bool {
+	return r.ReasoningDialect == domain.ReasoningCline
+}
+
+func recipeLockedReasoningDialect(r recipe) domain.ReasoningDialect {
+	if r.ReasoningDialect != "" {
+		return r.ReasoningDialect
+	}
+	return domain.DefaultReasoningDialect(r.Protocol)
+}
+
+// providerReasoningLocked locks existing Cline/ClinePass OAuth rows to the
+// effective Cline dialect. Explicit stored non-Cline values stay editable.
+func providerReasoningLocked(p *domain.Provider) bool {
+	if p == nil {
+		return false
+	}
+	if !reasoningDialectEditable(p.Protocol) {
+		return true
+	}
+	if p.ReasoningDialect != "" {
+		d, ok := domain.ParseReasoningDialect(string(p.ReasoningDialect))
+		if !ok || d != domain.ReasoningCline {
+			return false
+		}
+	}
+	return isClineOAuthProvider(p)
+}
+
+func isClineOAuthProvider(p *domain.Provider) bool {
+	if p == nil || p.OAuthCreds == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(p.OAuthCreds.Preset)) {
+	case "cline", "clinepass":
+		return true
+	}
+	return p.OAuthCreds.ClineAuth
+}
+
+func providerLockedReasoningDialect(p *domain.Provider) domain.ReasoningDialect {
+	if p == nil {
+		return domain.ReasoningNone
+	}
+	if d := p.Reasoning(); d != "" {
+		return d
+	}
+	return domain.DefaultReasoningDialect(p.Protocol)
+}
+
+// openaiDialectOptions are selectable dialects for OpenAI Chat Completions.
 var openaiDialectOptions = []domain.ReasoningDialect{
+	domain.ReasoningNone,
+	domain.ReasoningOpenAI,
+	domain.ReasoningKimi,
+	domain.ReasoningQwen,
+	domain.ReasoningDeepSeek,
+	domain.ReasoningZAI,
+	domain.ReasoningGrok,
+	domain.ReasoningCline,
+}
+
+// responsesDialectOptions omit Cline, which is a Chat Completions gateway.
+var responsesDialectOptions = []domain.ReasoningDialect{
 	domain.ReasoningNone,
 	domain.ReasoningOpenAI,
 	domain.ReasoningKimi,
@@ -103,6 +166,8 @@ func dialectOptionsFor(proto domain.Protocol) []domain.ReasoningDialect {
 	switch proto {
 	case domain.ProtocolAnthropic:
 		return anthropicDialectOptions
+	case domain.ProtocolOpenAIResponses:
+		return responsesDialectOptions
 	default:
 		return openaiDialectOptions
 	}
@@ -123,14 +188,31 @@ func parseReasoningDialectForm(raw string, proto domain.Protocol) (domain.Reason
 	if !reasoningDialectEditable(proto) {
 		return domain.DefaultReasoningDialect(proto), true
 	}
-	// For editable providers, store canonical value (including explicit none).
-	// Empty default is represented as "" so Provider.Reasoning resolves by protocol.
+	if d == domain.ReasoningCline && proto != domain.ProtocolOpenAI {
+		return "", false
+	}
+	// For editable providers, store canonical non-default values. Empty remains
+	// the protocol-default sentinel unless an update needs to override Cline compatibility.
 	if d == domain.DefaultReasoningDialect(proto) && raw != "none" && d != domain.ReasoningNone {
-		// Allow storing either "" or the canonical default; prefer "" for defaults
-		// so legacy-equivalent rows stay empty. But if user explicitly selected
-		// the default option value we may receive the canonical string — store it
-		// as empty for openai/claude defaults to match "protocol default" semantics.
 		return "", true
+	}
+	return d, true
+}
+
+// parseProviderReasoningDialectForm preserves an explicit protocol default when
+// it replaces Cline semantics. Empty must not reactivate the legacy Cline fallback.
+func parseProviderReasoningDialectForm(raw string, proto domain.Protocol, current *domain.Provider) (domain.ReasoningDialect, bool) {
+	d, ok := parseReasoningDialectForm(raw, proto)
+	if !ok || d != "" || current == nil || !isClineOAuthProvider(current) {
+		return d, ok
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "default" {
+		return domain.DefaultReasoningDialect(proto), true
+	}
+	explicit, parsed := domain.ParseReasoningDialect(raw)
+	if parsed && explicit == domain.DefaultReasoningDialect(proto) {
+		return explicit, true
 	}
 	return d, true
 }

@@ -360,6 +360,56 @@ func TestImportReasoningDialectAliasesAndInvalid(t *testing.T) {
 	}
 }
 
+func TestExportImportClineReasoningDialect(t *testing.T) {
+	src := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "cline", BaseURL: "http://a", APIKey: "k",
+		Protocol: domain.ProtocolOpenAI, ReasoningDialect: domain.ReasoningCline,
+	}
+	if err := src.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := src.Export(ctx, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `"reasoning_dialect": "cline"`) {
+		t.Fatalf("export missing cline dialect: %s", buf.String())
+	}
+
+	dst := testStore(t)
+	if _, err := dst.Import(ctx, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.GetProvider(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReasoningDialect != domain.ReasoningCline || got.Reasoning() != domain.ReasoningCline {
+		t.Fatalf("imported dialect stored=%q eff=%q", got.ReasoningDialect, got.Reasoning())
+	}
+
+	alias := bytes.NewBufferString(`{
+		"version": 1,
+		"providers": [
+			{"name":"pass","base_url":"http://b","api_key":"k","protocol":"openai","reasoning_dialect":"clinepass"}
+		],
+		"combos": []
+	}`)
+	st := testStore(t)
+	if _, err := st.Import(ctx, alias); err != nil {
+		t.Fatal(err)
+	}
+	list, err := st.ListProviders(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list=%v err=%v", list, err)
+	}
+	if list[0].ReasoningDialect != domain.ReasoningCline {
+		t.Fatalf("clinepass alias stored = %q", list[0].ReasoningDialect)
+	}
+}
+
 func TestExportOmitsEmptyTags(t *testing.T) {
 	src := testStore(t)
 	ctx := context.Background()

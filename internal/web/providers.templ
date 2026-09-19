@@ -133,6 +133,10 @@ templ reasoningDialectField(proto domain.Protocol, current domain.ReasoningDiale
 	}
 }
 
+templ lockedReasoningDialectField(d domain.ReasoningDialect) {
+	<input type="hidden" name="reasoning_dialect" value={ string(d) }/>
+}
+
 // ConnectionPanel shows the router's own ingress URLs for agent clients. The two
 // differ by design: the Anthropic SDK appends /v1/messages to its base URL, so
 // it must omit /v1; OpenAI clients append /chat/completions to a base that
@@ -192,7 +196,11 @@ templ ProviderRecipeForm(r recipe) {
 					<span class="field-name">Base URL</span>
 					<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
 				</label>
-				@reasoningDialectField(r.Protocol, r.ReasoningDialect)
+				if recipeReasoningLocked(r) {
+					@lockedReasoningDialectField(recipeLockedReasoningDialect(r))
+				} else {
+					@reasoningDialectField(r.Protocol, r.ReasoningDialect)
+				}
 				@providerTagsField("")
 				<label class="field">
 					<span class="field-name">Auth mode</span>
@@ -919,7 +927,11 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 			<span class="field-name">Base URL</span>
 			<input name="base_url" value={ p.BaseURL } required/>
 		</label>
-		@reasoningDialectField(p.Protocol, p.ReasoningDialect)
+		if providerReasoningLocked(p) {
+			@lockedReasoningDialectField(providerLockedReasoningDialect(p))
+		} else {
+			@reasoningDialectField(p.Protocol, p.ReasoningDialect)
+		}
 		@providerTagsField(domain.FormatTags(p.Tags))
 		<span class="muted">Connected: { oauthLabel(p.OAuthCreds) }. Reconnect only if the refresh token is revoked.</span>
 		if c.ProjectID != "" {

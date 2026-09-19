@@ -87,7 +87,7 @@ func TestProviderEditRowReasoningDialectSelector(t *testing.T) {
 	if !strings.Contains(html, `name="reasoning_dialect"`) {
 		t.Fatalf("want dialect select; html=%s", html)
 	}
-	for _, opt := range []string{"none", "openai", "kimi", "qwen", "deepseek", "zai", "grok"} {
+	for _, opt := range []string{"none", "openai", "kimi", "qwen", "deepseek", "zai", "grok", "cline"} {
 		if !strings.Contains(html, `value="`+opt+`"`) {
 			t.Fatalf("missing dialect option %q; html=%s", opt, html)
 		}
@@ -175,6 +175,103 @@ func TestProviderEditRowReasoningDialectLocked(t *testing.T) {
 	html := renderComponent(t, providerEditRowInteractiveOAuth(p))
 	if !strings.Contains(html, `type="hidden" name="reasoning_dialect" value="codex"`) {
 		t.Fatalf("want locked codex dialect; html=%s", html)
+	}
+}
+
+func TestClineRecipeLocksDialect(t *testing.T) {
+	for _, id := range []string{"cline", "clinepass"} {
+		r, ok := recipeByID(id)
+		if !ok {
+			t.Fatalf("missing %s recipe", id)
+		}
+		if r.ReasoningDialect != domain.ReasoningCline {
+			t.Fatalf("%s recipe dialect = %q", id, r.ReasoningDialect)
+		}
+		html := renderComponent(t, ProviderRecipeForm(r))
+		if !strings.Contains(html, `type="hidden" name="reasoning_dialect" value="cline"`) {
+			t.Fatalf("%s recipe want locked cline dialect; html=%s", id, html)
+		}
+		if strings.Contains(html, `<select name="reasoning_dialect"`) {
+			t.Fatalf("%s recipe should not expose dialect selector; html=%s", id, html)
+		}
+	}
+}
+
+func TestGenericOpenAISelectorIncludesCline(t *testing.T) {
+	r, ok := recipeByID("openai")
+	if !ok {
+		t.Fatal("missing openai recipe")
+	}
+	html := renderComponent(t, ProviderRecipeForm(r))
+	if !strings.Contains(html, `<select name="reasoning_dialect"`) {
+		t.Fatalf("want dialect select; html=%s", html)
+	}
+	if !strings.Contains(html, `value="cline"`) {
+		t.Fatalf("generic openai should offer cline; html=%s", html)
+	}
+
+	responses, ok := recipeByID("openai-responses")
+	if !ok {
+		t.Fatal("missing openai-responses recipe")
+	}
+	responsesHTML := renderComponent(t, ProviderRecipeForm(responses))
+	if strings.Contains(responsesHTML, `value="cline"`) {
+		t.Fatalf("responses must not offer chat-only cline dialect; html=%s", responsesHTML)
+	}
+}
+
+func TestParseReasoningDialectFormPreservesExplicitOpenAI(t *testing.T) {
+	got, ok := parseReasoningDialectForm("openai", domain.ProtocolOpenAI)
+	if !ok || got != "" {
+		t.Fatalf("generic explicit openai = %q, %v", got, ok)
+	}
+	current := &domain.Provider{
+		Protocol:   domain.ProtocolOpenAI,
+		OAuthCreds: &domain.OAuthCreds{Preset: "cline", ClineAuth: true},
+	}
+	got, ok = parseProviderReasoningDialectForm("openai", domain.ProtocolOpenAI, current)
+	if !ok || got != domain.ReasoningOpenAI {
+		t.Fatalf("cline override openai = %q, %v", got, ok)
+	}
+	current.ReasoningDialect = domain.ReasoningCline
+	got, ok = parseProviderReasoningDialectForm("openai", domain.ProtocolOpenAI, current)
+	if !ok || got != domain.ReasoningOpenAI {
+		t.Fatalf("stored cline override openai = %q, %v", got, ok)
+	}
+	current.ReasoningDialect = domain.ReasoningQwen
+	got, ok = parseProviderReasoningDialectForm("", domain.ProtocolOpenAI, current)
+	if !ok || got != domain.ReasoningOpenAI {
+		t.Fatalf("cline metadata default override = %q, %v", got, ok)
+	}
+	if got, ok := parseReasoningDialectForm("cline", domain.ProtocolOpenAIResponses); ok || got != "" {
+		t.Fatalf("responses cline = %q, %v", got, ok)
+	}
+}
+
+func TestClineOAuthEditLocksEffectiveDialect(t *testing.T) {
+	p := &domain.Provider{
+		ID: 3, Name: "c", BaseURL: "https://api.cline.bot/api/v1", Protocol: domain.ProtocolOpenAI,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{Preset: "cline", ClineAuth: true},
+	}
+	html := renderComponent(t, providerEditRowInteractiveOAuth(p))
+	if !strings.Contains(html, `type="hidden" name="reasoning_dialect" value="cline"`) {
+		t.Fatalf("want locked effective cline dialect; html=%s", html)
+	}
+	if strings.Contains(html, `<select name="reasoning_dialect"`) {
+		t.Fatalf("cline oauth edit should not expose selector; html=%s", html)
+	}
+
+	p.ReasoningDialect = domain.ReasoningQwen
+	html = renderComponent(t, providerEditRowInteractiveOAuth(p))
+	if !strings.Contains(html, `<select name="reasoning_dialect"`) {
+		t.Fatalf("explicit non-cline dialect must stay editable; html=%s", html)
+	}
+	if !strings.Contains(html, `value="qwen" selected`) {
+		t.Fatalf("want qwen selected; html=%s", html)
+	}
+	if strings.Contains(html, `type="hidden" name="reasoning_dialect" value="cline"`) {
+		t.Fatalf("must not override explicit non-cline dialect; html=%s", html)
 	}
 }
 

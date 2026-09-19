@@ -101,6 +101,9 @@ const (
 	ReasoningDeepSeek ReasoningDialect = "deepseek"
 	ReasoningZAI      ReasoningDialect = "zai"
 	ReasoningGrok     ReasoningDialect = "grok"
+	// ReasoningCline is Cline/ClinePass OpenAI-compatible wire semantics.
+	// It is independent of ProtocolOpenAI and of OAuthCreds.ClineAuth.
+	ReasoningCline ReasoningDialect = "cline"
 	// ReasoningOpencode dispatches per model: opencode.ai serves multi-vendor
 	// models behind one endpoint, so the effective native semantics depend on
 	// the model family rather than one wire shape.
@@ -132,6 +135,8 @@ func ParseReasoningDialect(s string) (ReasoningDialect, bool) {
 		return ReasoningZAI, true
 	case "grok", "xai":
 		return ReasoningGrok, true
+	case "cline", "clinepass":
+		return ReasoningCline, true
 	case "opencode", "zen":
 		return ReasoningOpencode, true
 	default:
@@ -143,7 +148,7 @@ func (d ReasoningDialect) Valid() bool {
 	switch d {
 	case "", ReasoningNone, ReasoningOpenAI, ReasoningClaude, ReasoningCodex,
 		ReasoningKimi, ReasoningQwen, ReasoningDeepSeek, ReasoningZAI, ReasoningGrok,
-		ReasoningOpencode:
+		ReasoningCline, ReasoningOpencode:
 		return true
 	default:
 		return false
@@ -345,15 +350,36 @@ func (p *Provider) Auth() AuthScheme {
 
 // Reasoning resolves the effective reasoning dialect. Empty stored value falls
 // back to the protocol default; an explicit none is preserved so callers can
-// disable the generic writer.
+// disable the generic writer. Explicit stored values always win. Empty dialect
+// plus a Cline/ClinePass OAuth preset (or last-resort ClineAuth) resolves to
+// Cline without changing DefaultReasoningDialect(ProtocolOpenAI).
 func (p *Provider) Reasoning() ReasoningDialect {
 	if p.ReasoningDialect == "" {
+		if p.Protocol == ProtocolOpenAI {
+			if d := clineCompatDialect(p.OAuthCreds); d != "" {
+				return d
+			}
+		}
 		return DefaultReasoningDialect(p.Protocol)
 	}
 	if d, ok := ParseReasoningDialect(string(p.ReasoningDialect)); ok {
 		return d
 	}
 	return DefaultReasoningDialect(p.Protocol)
+}
+
+func clineCompatDialect(creds *OAuthCreds) ReasoningDialect {
+	if creds == nil {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(creds.Preset)) {
+	case "cline", "clinepass":
+		return ReasoningCline
+	}
+	if creds.ClineAuth {
+		return ReasoningCline
+	}
+	return ""
 }
 
 // ComboStrategy selects which target a combo resolves to per request.

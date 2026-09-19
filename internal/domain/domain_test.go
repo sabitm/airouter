@@ -162,6 +162,9 @@ func TestParseReasoningDialect(t *testing.T) {
 		{"glm", ReasoningZAI, true},
 		{"grok", ReasoningGrok, true},
 		{"xai", ReasoningGrok, true},
+		{"cline", ReasoningCline, true},
+		{"clinepass", ReasoningCline, true},
+		{"CLINEPASS", ReasoningCline, true},
 		{"  openai  ", ReasoningOpenAI, true},
 		{"bogus", "", false},
 		{"qwen:high", "", false},
@@ -178,6 +181,7 @@ func TestReasoningDialectValid(t *testing.T) {
 	for _, d := range []ReasoningDialect{
 		"", ReasoningNone, ReasoningOpenAI, ReasoningClaude, ReasoningCodex,
 		ReasoningKimi, ReasoningQwen, ReasoningDeepSeek, ReasoningZAI, ReasoningGrok,
+		ReasoningCline, ReasoningOpencode,
 	} {
 		if !d.Valid() {
 			t.Errorf("%q should be valid", d)
@@ -248,5 +252,42 @@ func TestProviderReasoning(t *testing.T) {
 	p = Provider{Protocol: ProtocolOpenAI, ReasoningDialect: "gpt"}
 	if got := p.Reasoning(); got != ReasoningOpenAI {
 		t.Errorf("alias gpt: %q", got)
+	}
+
+	// Explicit stored dialect wins over Cline preset/auth.
+	p = Provider{
+		Protocol: ProtocolOpenAI, ReasoningDialect: ReasoningQwen,
+		OAuthCreds: &OAuthCreds{Preset: "cline", ClineAuth: true},
+	}
+	if got := p.Reasoning(); got != ReasoningQwen {
+		t.Errorf("explicit wins: %q", got)
+	}
+
+	// Empty dialect + preset cline/clinepass resolves Cline.
+	p = Provider{Protocol: ProtocolOpenAI, OAuthCreds: &OAuthCreds{Preset: "cline"}}
+	if got := p.Reasoning(); got != ReasoningCline {
+		t.Errorf("preset cline: %q", got)
+	}
+	p = Provider{Protocol: ProtocolOpenAI, OAuthCreds: &OAuthCreds{Preset: "clinepass"}}
+	if got := p.Reasoning(); got != ReasoningCline {
+		t.Errorf("preset clinepass: %q", got)
+	}
+
+	// Empty dialect + legacy ClineAuth resolves Cline.
+	p = Provider{Protocol: ProtocolOpenAI, OAuthCreds: &OAuthCreds{ClineAuth: true}}
+	if got := p.Reasoning(); got != ReasoningCline {
+		t.Errorf("legacy ClineAuth: %q", got)
+	}
+
+	// Empty dialect + Cline metadata only changes OpenAI Chat providers.
+	p = Provider{Protocol: ProtocolOpenAIResponses, OAuthCreds: &OAuthCreds{Preset: "cline", ClineAuth: true}}
+	if got := p.Reasoning(); got != ReasoningOpenAI {
+		t.Errorf("non-chat cline metadata: %q", got)
+	}
+
+	// Ordinary empty OpenAI remains OpenAI.
+	p = Provider{Protocol: ProtocolOpenAI}
+	if got := p.Reasoning(); got != ReasoningOpenAI {
+		t.Errorf("ordinary empty openai: %q", got)
 	}
 }
