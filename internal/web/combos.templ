@@ -154,6 +154,16 @@ templ ComboList(combos []*domain.Combo) {
 	</div>
 }
 
+templ comboProviderName(p *domain.Provider) {
+	if p == nil {
+		<span>unknown</span>
+	} else if title := domain.TagTooltip(p.Tags); title != "" {
+		<span class="combo-provider-name" tabindex="0" title={ title }>{ p.Name }</span>
+	} else {
+		<span>{ p.Name }</span>
+	}
+}
+
 templ ComboRow(c *domain.Combo) {
 	<tr id={ "combo-" + strconv.FormatInt(c.ID, 10) }>
 		<td class="mono">{ c.Name }</td>
@@ -172,7 +182,7 @@ templ ComboRow(c *domain.Combo) {
 							if len(c.Targets) > 1 {
 								<span class="target-ord">{ strconv.Itoa(i+1) }.</span>
 							}
-							{ t.Provider.Name }
+							@comboProviderName(t.Provider)
 							<span class="tag">{ string(t.Provider.Protocol) }</span>
 							<span class="mono">{ t.UpstreamModel }</span>
 							<button class="link" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/targets/" + strconv.FormatInt(t.ID, 10) + "/toggle" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML" title="temporarily disable this target">Disable</button>
@@ -182,7 +192,7 @@ templ ComboRow(c *domain.Combo) {
 							if len(c.Targets) > 1 {
 								<span class="target-ord">{ strconv.Itoa(i+1) }.</span>
 							}
-							{ t.Provider.Name }
+							@comboProviderName(t.Provider)
 							<span class="tag">{ string(t.Provider.Protocol) }</span>
 							<span class="mono">{ t.UpstreamModel }</span>
 							<button class="link" hx-post={ "/dashboard/combos/" + strconv.FormatInt(c.ID, 10) + "/targets/" + strconv.FormatInt(t.ID, 10) + "/toggle" } hx-target={ "#combo-" + strconv.FormatInt(c.ID, 10) } hx-swap="outerHTML" title="re-enable this target">Enable</button>

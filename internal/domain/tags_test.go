@@ -83,6 +83,18 @@ func TestFormatAndDataValue(t *testing.T) {
 	}
 }
 
+func TestTagTooltip(t *testing.T) {
+	if TagTooltip(nil) != "" || TagTooltip([]string{}) != "" {
+		t.Fatal("empty tags should omit tooltip")
+	}
+	if got := TagTooltip([]string{"prod"}); got != "Tags: prod" {
+		t.Fatalf("one tag = %q", got)
+	}
+	if got := TagTooltip([]string{"prod", "team-a"}); got != "Tags: prod, team-a" {
+		t.Fatalf("multiple tags = %q", got)
+	}
+}
+
 func TestUniqueTagsAndHasUntagged(t *testing.T) {
 	ps := []*Provider{
 		{Name: "a", Tags: []string{"prod", "eu"}},

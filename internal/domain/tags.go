@@ -81,6 +81,15 @@ func FormatTags(tags []string) string {
 	return strings.Join(tags, ", ")
 }
 
+// TagTooltip returns the native tooltip for a tagged provider. Empty tags
+// return "" so callers omit the title attribute.
+func TagTooltip(tags []string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	return "Tags: " + FormatTags(tags)
+}
+
 // TagsDataValue joins canonical tags for a data-tags attribute (no spaces).
 func TagsDataValue(tags []string) string {
 	return strings.Join(tags, ",")
