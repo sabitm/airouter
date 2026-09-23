@@ -342,7 +342,7 @@ td.mono { overflow-wrap: anywhere; }
 .log-col-key { width: 64px; }
 .log-col-route { width: 200px; }
 .log-col-format { width: 84px; }
-.log-col-usage { width: 102px; }
+.log-col-usage { width: 92px; }
 .log-col-latency { width: 82px; }
 .log-col-outcome { width: auto; }
 .log-time-cell { white-space: nowrap; }
@@ -391,7 +391,24 @@ td.mono { overflow-wrap: anywhere; }
 }
 .log-usage-cell span { display: block; white-space: nowrap; }
 .log-usage-cell strong { font-weight: 500; color: var(--text); }
-.log-usage-cell { color: var(--muted); font-size: 12px; }
+.log-usage-cell {
+	color: var(--muted);
+	font-size: 12px;
+	overflow: hidden;
+}
+.log-usage-estimate {
+	display: block;
+	width: fit-content;
+	max-width: 100%;
+	margin: 0 0 2px auto;
+	padding: 0 4px;
+	overflow: hidden;
+	box-sizing: border-box;
+	font-size: 10px;
+	line-height: 1.4;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
 .log-latency-cell { white-space: nowrap; }
 .log-error-row td {
 	padding: 0 8px 12px;

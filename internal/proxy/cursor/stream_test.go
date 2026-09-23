@@ -116,6 +116,48 @@ func collectAgentEventsToolsErr(t *testing.T, tools []ir.Tool, frames ...[]byte)
 	return out, err
 }
 
+func TestDecodeAgentStreamToolUpdateFinishesBeforeLaterFrame(t *testing.T) {
+	var sawFinish bool
+	err := DecodeAgentStreamTools([]ir.Tool{{Name: "read"}}, bytes.NewReader(bytes.Join([][]byte{
+		mcpToolCallStartedFrame(t, "call-read", "read", map[string]any{"path": "prices.py"}),
+		agentTextFrame(t, "this frame must not be required"),
+	}, nil)), nil, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			sawFinish = true
+			if ev.StopReason != ir.StopToolUse {
+				t.Errorf("stop = %q, want tool_use", ev.StopReason)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawFinish {
+		t.Fatal("decoder waited for a later frame after the tool call had arguments")
+	}
+}
+
+func TestDecodeAgentStreamPartialToolDoesNotFinishBeforeArgs(t *testing.T) {
+	var sawFinish bool
+	err := DecodeAgentStreamTools([]ir.Tool{{Name: "read"}}, bytes.NewReader(bytes.Join([][]byte{
+		mcpToolCallStartedFrame(t, "call-read", "read", nil),
+		mcpPartialArgsFrame(t, "call-read", `{"path":"prices.py"}`),
+		agentTextFrame(t, "not read"),
+	}, nil)), nil, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			sawFinish = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawFinish {
+		t.Fatal("decoder did not finish after the argument fragment")
+	}
+}
+
 func TestDecodeAgentStreamTextDeltas(t *testing.T) {
 	events := collectAgentEvents(t,
 		agentTextFrame(t, "Hello"),
@@ -321,6 +363,152 @@ func TestDecodeAgentStreamMCPToolCall(t *testing.T) {
 	}
 }
 
+// TestDecodeAgentStreamMCPExecAcksBeforeFinish writes an empty McpSuccess
+// before the client turn ends. AgentService heartbeats until that ack, and
+// does not send turn_ended while the exec is open.
+func TestDecodeAgentStreamMCPExecAcksBeforeFinish(t *testing.T) {
+	var writes [][]byte
+	var events []ir.StreamEvent
+	err := DecodeAgentStream(bytes.NewReader(mcpExecFrame(t, "call-1", "read", map[string]any{"path": "prices.py"})), func(frame []byte) error {
+		writes = append(writes, frame)
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 1 {
+		t.Fatalf("acks = %d, want 1", len(writes))
+	}
+	_, payload, err := readFrame(bytes.NewReader(writes[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := decodeMessage(payload)
+	ecm, ok := cm[2]
+	if !ok {
+		t.Fatal("ack is not an exec_client_message")
+	}
+	em, _ := decodeMessage(ecm[0].value)
+	if id, _ := varintField(em, ecmID); id != 5 {
+		t.Errorf("exec id = %d, want 5", id)
+	}
+	res, ok := em[ecmMCPResult]
+	if !ok || len(res) == 0 {
+		t.Fatal("mcp_result missing")
+	}
+	mr, _ := decodeMessage(res[0].value)
+	if _, ok := mr[mcpResultSuccess]; !ok {
+		t.Fatal("mcp success missing")
+	}
+	last := events[len(events)-1]
+	if last.Kind != ir.EventFinish || last.StopReason != ir.StopToolUse {
+		t.Fatalf("finish = %+v, want tool_use", last)
+	}
+}
+
+// TestDecodeAgentStreamMCPExecReturnsBeforeTurnEnded does not wait for
+// usage after a client tool call. An empty ack does not make Cursor emit
+// turn_ended, and reading until it arrives holds the chat open.
+func TestDecodeAgentStreamMCPExecReturnsBeforeTurnEnded(t *testing.T) {
+	var sawFinish bool
+	err := DecodeAgentStream(bytes.NewReader(mcpExecFrame(t, "call-1", "read", map[string]any{"path": "prices.py"})), func([]byte) error {
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventFinish {
+			sawFinish = true
+			if ev.StopReason != ir.StopToolUse {
+				t.Errorf("stop = %q, want tool_use", ev.StopReason)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawFinish {
+		t.Fatal("decoder waited for more frames after the tool call")
+	}
+}
+
+// TestDecodeAgentStreamRejectsUnmatchedGrepThenContinues covers the live
+// stall: Cursor asks for files_with_matches after status text. The client
+// has bash, not grep. Rejecting the search must not end the turn, so a
+// later declared tool can still be delivered.
+func TestDecodeAgentStreamRejectsUnmatchedGrepThenContinues(t *testing.T) {
+	var writes [][]byte
+	events := collectAgentEventsTools(t, []ir.Tool{{Name: "bash"}, {Name: "read"}},
+		agentTextFrame(t, "I'll search the remaining sources."),
+		grepExecFrame(t, "call-grep", "/tmp", "**/xai*"),
+		mcpExecFrame(t, "call-bash", "bash", map[string]any{"command": "rg xai"}),
+	)
+	// The collect helper drops writes. Re-run with a writer for the ack.
+	err := DecodeAgentStreamTools([]ir.Tool{{Name: "bash"}}, bytes.NewReader(bytes.Join([][]byte{
+		grepExecFrame(t, "call-grep", "/tmp", "**/xai*"),
+		agentTurnEndedFrame(t, 10, 2),
+	}, nil)), func(frame []byte) error {
+		writes = append(writes, frame)
+		return nil
+	}, func(ir.StreamEvent) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 1 {
+		t.Fatalf("rejects = %d, want 1", len(writes))
+	}
+	_, payload, err := readFrame(bytes.NewReader(writes[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := decodeMessage(payload)
+	ecm, ok := cm[2]
+	if !ok {
+		t.Fatal("reject is not an exec_client_message")
+	}
+	em, _ := decodeMessage(ecm[0].value)
+	res, ok := em[5]
+	if !ok || len(res) == 0 {
+		t.Fatal("grep result missing")
+	}
+	gr, _ := decodeMessage(res[0].value)
+	if _, ok := gr[execResultRejected]; !ok {
+		t.Fatal("grep rejected variant missing")
+	}
+	var names []string
+	var stop ir.StopReason
+	for _, ev := range events {
+		if ev.Kind == ir.EventToolCallStart {
+			names = append(names, ev.ToolName)
+		}
+		if ev.Kind == ir.EventFinish {
+			stop = ev.StopReason
+		}
+	}
+	if len(names) != 1 || names[0] != "bash" {
+		t.Fatalf("tools = %v, want [bash]", names)
+	}
+	if stop != ir.StopToolUse {
+		t.Fatalf("stop = %q, want tool_use", stop)
+	}
+}
+
+func grepExecFrame(t *testing.T, callID, path, pattern string) []byte {
+	t.Helper()
+	args := concatBytes(
+		encodeField(1, wireLen, pattern),
+		encodeField(2, wireLen, path),
+		encodeField(3, wireLen, callID),
+	)
+	ex := concatBytes(
+		encodeField(esmID, wireVarint, uint64(9)),
+		encodeField(esmExecID, wireLen, "exec-grep"),
+		encodeField(5, wireLen, args),
+	)
+	return agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex))
+}
+
 // TestDecodeAgentStreamMCPToolCallEmptyThenDeltas covers incremental args:
 // tool_call_started with an empty McpArgs map ("{}") must not emit a "{}"
 // Delta, or later ptcArgsDelta fragments would concatenate to invalid JSON.
@@ -449,6 +637,77 @@ func TestDecodeAgentStreamUnknownExecOneofStillSurfaces(t *testing.T) {
 	if last.Kind != ir.EventFinish || last.StopReason != ir.StopToolUse {
 		t.Fatalf("finish = %+v, want tool_use", last)
 	}
+}
+
+func TestDecodeAgentStreamUnmatchedUpdateRejectsThenContinues(t *testing.T) {
+	var writes int
+	var names []string
+	err := DecodeAgentStreamTools([]ir.Tool{{Name: "bash"}, {Name: "read"}}, bytes.NewReader(bytes.Join([][]byte{
+		agentTextFrame(t, "Checking what is left to build."),
+		builtinToolUpdateFrame(t, 5, "call-grep", "/tmp", "**/xai*"),
+		mcpToolCallStartedFrame(t, "call-bash", "bash", map[string]any{"command": "rg xai"}),
+	}, nil)), func([]byte) error {
+		writes++
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventToolCallStart {
+			names = append(names, ev.ToolName)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("rejects = %d, want 1", writes)
+	}
+	if len(names) != 1 || names[0] != "bash" {
+		t.Fatalf("tools = %v, want [bash]", names)
+	}
+}
+
+func TestDecodeAgentStreamUnmatchedUpdateWithoutResultCloses(t *testing.T) {
+	var sawFinish bool
+	err := DecodeAgentStreamTools([]ir.Tool{{Name: "bash"}}, bytes.NewReader(bytes.Join([][]byte{
+		agentTextFrame(t, "Checking what is left to build."),
+		builtinToolUpdateFrame(t, 0, "call-grep", "/tmp", "**/xai*"),
+		agentTextFrame(t, "this heartbeat wait must not be read"),
+	}, nil)), nil, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventToolCallStart {
+			t.Fatalf("unmatched tool emitted %s", ev.ToolName)
+		}
+		if ev.Kind == ir.EventFinish {
+			sawFinish = true
+			if ev.StopReason != ir.StopEndTurn {
+				t.Errorf("stop = %q, want end_turn", ev.StopReason)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawFinish {
+		t.Fatal("decoder waited after an unmatched tool update it could not reject")
+	}
+}
+
+func builtinToolUpdateFrame(t *testing.T, resultField int, callID, path, pattern string) []byte {
+	t.Helper()
+	args := concatBytes(
+		encodeField(1, wireLen, pattern),
+		encodeField(2, wireLen, path),
+		encodeField(3, wireLen, callID),
+	)
+	var tc []byte
+	if resultField != 0 {
+		tc = append(tc, encodeField(resultField, wireLen, args)...)
+	}
+	inner := concatBytes(
+		encodeField(tcsCallID, wireLen, callID),
+		encodeField(tcsToolCall, wireLen, tc),
+	)
+	return interactionUpdateFrame(t, iuToolCallStarted, inner)
 }
 
 func TestDecodeAgentStreamReadToolCallStarted(t *testing.T) {
@@ -638,13 +897,12 @@ func TestDecodeAgentStreamWebSearchUnmatchedDropped(t *testing.T) {
 		Name:       "bash",
 		Parameters: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
 	}}
-	events, err := collectAgentEventsToolsErr(t, tools, webSearchQueryFrame(t, "call-ws", "SPUS"))
-	ub, ok := AsUnmatchedBuiltin(err)
-	if !ok || ub.Name != "web_search" {
-		t.Fatalf("err = %v, want unmatched web_search", err)
+	events, err := collectAgentEventsToolsErr(t, tools, webSearchQueryFrame(t, "call-ws", "SPUS"), agentTurnEndedFrame(t, 1, 1))
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, ev := range events {
-		if ev.Kind == ir.EventToolCallStart || ev.Kind == ir.EventFinish {
+		if ev.Kind == ir.EventToolCallStart {
 			t.Fatalf("unmatched built-in emitted %+v", ev)
 		}
 	}
@@ -663,14 +921,21 @@ func TestDecodeAgentStreamShellDoesNotMatchBash(t *testing.T) {
 		encodeField(esmID, wireVarint, uint64(5)),
 		encodeField(2, wireLen, args),
 	)
-	events, err := collectAgentEventsToolsErr(t, tools, agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)))
-	if _, ok := AsUnmatchedBuiltin(err); !ok {
-		t.Fatalf("err = %v, want unmatched builtin", err)
-	}
-	for _, ev := range events {
+	var writes int
+	err := DecodeAgentStreamTools(tools, bytes.NewReader(agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex))), func([]byte) error {
+		writes++
+		return nil
+	}, func(ev ir.StreamEvent) error {
 		if ev.Kind == ir.EventToolCallStart {
 			t.Fatalf("shell remapped to %s", ev.ToolName)
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("rejects = %d, want 1", writes)
 	}
 }
 
@@ -710,13 +975,12 @@ func TestDecodeAgentStreamAskQuestionUnmatched(t *testing.T) {
 	tools := []ir.Tool{{Name: "bash"}}
 	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
 		encodeField(3, wireLen, []byte{})))
-	events, err := collectAgentEventsToolsErr(t, tools, frame)
-	ub, ok := AsUnmatchedBuiltin(err)
-	if !ok || ub.Name != "ask_question" {
-		t.Fatalf("err = %v, want unmatched ask_question", err)
+	events, err := collectAgentEventsToolsErr(t, tools, frame, agentTurnEndedFrame(t, 1, 1))
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, ev := range events {
-		if ev.Kind == ir.EventToolCallStart || ev.Kind == ir.EventFinish {
+		if ev.Kind == ir.EventToolCallStart {
 			t.Fatalf("unmatched interaction emitted %+v", ev)
 		}
 	}

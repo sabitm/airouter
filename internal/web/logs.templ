@@ -178,8 +178,11 @@ templ LogRow(l *domain.RequestLog) {
 		<td class="mono log-format-cell">{ l.Format }</td>
 		<td
 			class="log-number log-usage-cell"
-			title={ "Input: " + formatLogNumber(int64(l.InputTokens)) + " tokens; Output: " + formatLogNumber(int64(l.OutputTokens)) + " tokens" }
+			title={ logUsageTitle(l) }
 		>
+			if l.UsageEstimated {
+				<span class="tag log-usage-estimate">estimated</span>
+			}
 			<span><strong>{ formatLogNumber(int64(l.InputTokens)) }</strong> in</span>
 			<span><strong>{ formatLogNumber(int64(l.OutputTokens)) }</strong> out</span>
 		</td>
@@ -284,6 +287,14 @@ func statusClass(code int) string {
 
 func logErrorID(id int64) string {
 	return "log-error-" + strconv.FormatInt(id, 10)
+}
+
+func logUsageTitle(l *domain.RequestLog) string {
+	title := "Input: " + formatLogNumber(int64(l.InputTokens)) + " tokens; Output: " + formatLogNumber(int64(l.OutputTokens)) + " tokens"
+	if l.UsageEstimated {
+		return title + "; estimated from character length, not upstream usage"
+	}
+	return title
 }
 
 func formatLogNumber(n int64) string {

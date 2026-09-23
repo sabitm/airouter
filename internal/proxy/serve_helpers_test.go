@@ -13,6 +13,65 @@ import (
 	"airouter/internal/proxy/ir"
 )
 
+func TestEstimateUsageUsesCharacterLength(t *testing.T) {
+	req := &ir.Request{
+		System: "abcd",
+		Messages: []ir.Message{{
+			Role: ir.RoleUser,
+			Content: []ir.ContentBlock{{
+				Type:       ir.BlockToolResult,
+				ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "efghijkl"}},
+			}},
+		}},
+		Tools: []ir.Tool{{Name: "read", Description: "mnop", Parameters: json.RawMessage(`{"q":1}`)}},
+	}
+	resp := &ir.Response{Content: []ir.ContentBlock{{
+		Type:      ir.BlockToolUse,
+		ToolName:  "read",
+		ToolInput: json.RawMessage(`{"path":"prices.py"}`),
+	}}}
+	in, out := estimateUsage(req, resp)
+	if in != 7 {
+		t.Errorf("input = %d, want 7", in)
+	}
+	if out != 6 {
+		t.Errorf("output = %d, want 6", out)
+	}
+	if got, gotOut := estimateUsage(nil, nil); got != 0 || gotOut != 0 {
+		t.Errorf("empty = %d/%d, want 0/0", got, gotOut)
+	}
+}
+
+func TestApplyCursorUsageEstimateIgnoresTurnEnded(t *testing.T) {
+	req := &ir.Request{System: strings.Repeat("a", 400)}
+	resp := &ir.Response{
+		Content: []ir.ContentBlock{{Type: ir.BlockText, Text: strings.Repeat("b", 40)}},
+		Usage:   ir.Usage{InputTokens: 2761154, OutputTokens: 11996, CacheReadTokens: 2372032},
+	}
+	applyCursorUsageEstimate(req, resp, 727415)
+	if resp.Usage.InputTokens != 100 {
+		t.Fatalf("input = %d, want 100 from request text", resp.Usage.InputTokens)
+	}
+	if resp.Usage.OutputTokens != 10 {
+		t.Fatalf("output = %d, want 10", resp.Usage.OutputTokens)
+	}
+	if resp.Usage.CacheReadTokens != 0 || resp.Usage.CacheWriteTokens != 0 {
+		t.Fatalf("cache = %d/%d, want 0/0", resp.Usage.CacheReadTokens, resp.Usage.CacheWriteTokens)
+	}
+}
+
+func TestUsageInputPlausibleRejectsImpossibleCount(t *testing.T) {
+	if !usageInputPlausible(727415, 180000) {
+		t.Fatal("180000 tokens fits a 727415 byte request")
+	}
+	if usageInputPlausible(727415, 2761154) {
+		t.Fatal("2761154 tokens cannot fit a 727415 byte request")
+	}
+	if !usageInputPlausible(0, 0) {
+		t.Fatal("missing usage is plausible")
+	}
+}
+
 func TestParseUsage(t *testing.T) {
 	cases := []struct {
 		name    string

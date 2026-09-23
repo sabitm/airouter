@@ -98,6 +98,25 @@ func TestLogRowGroupsRouteUsageLatencyAndError(t *testing.T) {
 	}
 }
 
+func TestLogRowMarksEstimatedUsage(t *testing.T) {
+	log := &domain.RequestLog{
+		ID:             7,
+		CreatedAt:      time.Date(2026, time.August, 25, 2, 59, 2, 0, time.UTC),
+		InputTokens:    12,
+		OutputTokens:   3,
+		UsageEstimated: true,
+	}
+	html := renderComponent(t, LogRow(log))
+	for _, want := range []string{
+		`<span class="tag log-usage-estimate">estimated</span>`,
+		`estimated from character length, not upstream usage`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("rendered log row missing %q; html=%s", want, html)
+		}
+	}
+}
+
 func TestLogFormattingHelpers(t *testing.T) {
 	for _, tc := range []struct {
 		input int64

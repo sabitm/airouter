@@ -450,19 +450,22 @@ const MaxErrorMessageBytes = 1 << 20
 // Provider, combo, and access-key names are denormalized so a log survives
 // deletion of the entities it references. Token counts are 0 when the path did
 // not decode usage (streaming passthrough always; unary passthrough when the
-// upstream body omits a usage object).
+// upstream body omits a usage object). UsageEstimated is true when those
+// counts were derived from character length instead of an upstream usage
+// object. That happens for Cursor tool turns, which finish before turn_ended.
 type RequestLog struct {
-	ID            int64
-	CreatedAt     time.Time
-	AccessKeyName string
-	Combo         string
-	Provider      string
-	UpstreamModel string
-	Format        string // ingress wire format id (oai-chat, anth-msg, oai-responses)
-	Stream        bool
-	Status        int
-	InputTokens   int
-	OutputTokens  int
-	LatencyMS     int64
-	ErrMsg        string
+	ID             int64
+	CreatedAt      time.Time
+	AccessKeyName  string
+	Combo          string
+	Provider       string
+	UpstreamModel  string
+	Format         string // ingress wire format id (oai-chat, anth-msg, oai-responses)
+	Stream         bool
+	Status         int
+	InputTokens    int
+	OutputTokens   int
+	UsageEstimated bool
+	LatencyMS      int64
+	ErrMsg         string
 }

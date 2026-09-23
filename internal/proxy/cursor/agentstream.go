@@ -81,15 +81,22 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, InputTokens: inTok, OutputTokens: outTok, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite})
 	}
 
-	// finishOrRetry ends the turn unless a built-in was dropped. In that
-	// case Finish is withheld so the caller can open one fresh Run that
-	// tells the model to use the declared MCP tools.
-	finishOrRetry := func() error {
-		if unmatched != "" && len(toolOrder) == 0 {
-			_ = emitStart()
-			return &UnmatchedBuiltinError{Name: unmatched}
+	// clientToolsReady is true when every surfaced call has complete JSON
+	// arguments. A name without arguments is not ready: Cursor often sends
+	// the name first and the arguments in later updates. A partial fragment
+	// is not ready either. An unmatched built-in is not in toolOrder, so it
+	// does not make this true.
+	clientToolsReady := func() bool {
+		if len(toolOrder) == 0 {
+			return false
 		}
-		return emitFinish()
+		for _, id := range toolOrder {
+			raw := toolCalls[id].args.String()
+			if raw == "" || !json.Valid([]byte(raw)) {
+				return false
+			}
+		}
+		return true
 	}
 
 	// startToolCall registers (or looks up) a call and emits identity-only
@@ -151,6 +158,41 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		return startToolCall(id, declared, bound)
 	}
 
+	rejectBuiltin := func(server map[int][]field, name string) error {
+		if unmatched == "" {
+			unmatched = name
+		}
+		return rejectUnmatchedExec(server, writeFrame)
+	}
+
+	// answerBuiltin sends a matched built-in to Pi. An unmatched built-in is
+	// a question Cursor asked this stream. Reject it when the message has an
+	// exec result field. If it does not, the proxy cannot write a valid reply,
+	// so the client turn must close instead of waiting for heartbeats.
+	answerBuiltin := func(server map[int][]field, id, name, argsJSON string, mcp bool) (closeTurn bool, err error) {
+		before := len(toolOrder)
+		start := startBuiltin
+		if mcp {
+			start = startToolCall
+		}
+		if err = start(id, name, argsJSON); err != nil {
+			return false, err
+		}
+		if len(toolOrder) != before {
+			return clientToolsReady(), nil
+		}
+		if mcp || len(clientTools) == 0 {
+			return false, nil
+		}
+		if err = rejectBuiltin(server, name); err != nil {
+			return false, err
+		}
+		if execResultField(server) == 0 {
+			return true, nil
+		}
+		return false, nil
+	}
+
 	for {
 		flags, payload, err := readFrame(r)
 		if err != nil {
@@ -175,16 +217,22 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 
 		// interaction_query: the server asks the client to run a built-in.
 		// Every variant is named and resolved; unmatched opens one retry.
-		// Silent ignore stalls the upstream with heartbeats forever.
+		// Silent ignore stalls the upstream with heartbeats forever. A matched
+		// query is the client's tool call, so this turn ends now. Cursor does
+		// not send turn_ended until the query has its real result, and that
+		// result arrives on the next request.
 		if iqs, ok := top[asmInteractionQuery]; ok && len(iqs) > 0 {
 			id, name, args, ok := extractInteractionToolCall(iqs[0].value)
 			if !ok {
 				id, name, args = ir.NewID("call_"), "interaction_query", "{}"
 			}
-			if err := startBuiltin(id, name, args); err != nil {
+			closeTurn, err := answerBuiltin(nil, id, name, args, false)
+			if err != nil {
 				return err
 			}
-			return finishOrRetry()
+			if closeTurn {
+				return emitFinish()
+			}
 		}
 
 		// kv_server_message: reply with empty blob results. Cursor stores
@@ -201,12 +249,25 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		// exec_server_message: request-context queries get an empty context.
 		// MCP and every other exec args oneof are surfaced as IR tool_use
 		// (the client executes or rejects; the result returns with the next
-		// request's history). The abandoned upstream session is by design.
+		// request's history). A client-visible exec ends this turn. Waiting for
+		// turn_ended deadlocks: Cursor heartbeats until the exec is answered,
+		// and the answer is the client's next request, not a frame on this stream.
 		if exs, ok := top[asmExecServerMessage]; ok && len(exs) > 0 {
+			before := len(toolOrder)
 			if done, err := handleExecServerMessage(exs[0].value, writeFrame, startToolCall, startBuiltin); err != nil {
 				return err
+			} else if done && len(toolOrder) == before {
+				server, _ := decodeMessage(exs[0].value)
+				_, name, _, _ := extractExecToolCall(server)
+				if err := rejectBuiltin(server, name); err != nil {
+					return err
+				}
+				continue
 			} else if done {
-				return finishOrRetry()
+				// The empty ack closes a matched MCP exec. It is not the tool
+				// output, so Cursor does not send turn_ended. Reading further only
+				// receives heartbeats and holds the client until timeout.
+				return emitFinish()
 			}
 		}
 
@@ -235,12 +296,13 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 				// (MCP and built-in ToolCall oneofs).
 				if tcss, ok := update[iuToolCallStarted]; ok && len(tcss) > 0 {
 					if id, name, args, mcp, ok := extractAnyToolCall(tcss[0].value); ok {
-						start := startBuiltin
-						if mcp {
-							start = startToolCall
-						}
-						if err := start(id, name, args); err != nil {
+						started, _ := decodeMessage(tcss[0].value)
+						closeTurn, err := answerBuiltin(started, id, name, args, mcp)
+						if err != nil {
 							return err
+						}
+						if closeTurn {
+							return emitFinish()
 						}
 					}
 				}
@@ -257,12 +319,13 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 					}
 					if id == "" || toolCalls[id] == nil {
 						if cid, name, args, mcp, ok := extractAnyToolCall(ptcs[0].value); ok {
-							start := startBuiltin
-							if mcp {
-								start = startToolCall
-							}
-							if err := start(cid, name, args); err != nil {
+							partial, _ := decodeMessage(ptcs[0].value)
+							closeTurn, err := answerBuiltin(partial, cid, name, args, mcp)
+							if err != nil {
 								return err
+							}
+							if closeTurn {
+								return emitFinish()
 							}
 						}
 					}
@@ -284,13 +347,21 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 					if v, ok := varintField(te, teCacheWriteTokens); ok {
 						cacheWrite = usageInt(v)
 					}
-					return finishOrRetry()
+					return emitFinish()
 				}
+			}
+			// A client-visible tool call can arrive as an interaction update
+			// before, or without, the exec message that used to end the turn.
+			// Leaving the stream open after the arguments are complete only
+			// receives heartbeats. The client's real result returns on the next
+			// request, so this turn ends here.
+			if clientToolsReady() {
+				return emitFinish()
 			}
 		}
 	}
 
-	return finishOrRetry()
+	return emitFinish()
 }
 
 func decodeOrEmpty(b []byte) map[int][]field {
@@ -372,13 +443,23 @@ func handleExecServerMessage(server []byte, writeFrame func([]byte) error, start
 			if err := startMCP(callID, decloakToolName(name), argsJSON); err != nil {
 				return false, err
 			}
+			// Empty McpSuccess closes the exec. The client's real result is not
+			// available yet; it is replayed on the next request. A missing ack
+			// leaves AgentService on heartbeats until the stream times out.
+			if writeFrame != nil {
+				if err := writeFrame(encodeMCPAck(id, execID)); err != nil {
+					return false, err
+				}
+			}
 			return true, nil
 		}
 		return false, nil
 	}
 
-	// Any other exec args oneof (shell, read, pi_bash, ...) is a Cursor
-	// built-in. Resolve onto a declared client tool when possible.
+	// Any other exec args oneof (shell, read, grep, ...) is a Cursor
+	// built-in. A declared client tool ends this turn. An unmatched built-in
+	// is rejected on this stream: dropping it makes Cursor end the run after
+	// status text, and the client never sees the search it asked for.
 	if callID, name, argsJSON, ok := extractExecToolCall(m); ok {
 		if err := startBuiltin(callID, name, argsJSON); err != nil {
 			return false, err
@@ -386,6 +467,53 @@ func handleExecServerMessage(server []byte, writeFrame func([]byte) error, start
 		return true, nil
 	}
 	return false, nil
+}
+
+// rejectUnmatchedExec writes ExecClientMessage with the built-in result's
+// rejected variant. Cursor can then call a declared MCP tool instead of
+// waiting, or ending the run, on a tool the client cannot execute.
+func rejectUnmatchedExec(server map[int][]field, writeFrame func([]byte) error) error {
+	if writeFrame == nil {
+		return nil
+	}
+	fieldNum := execResultField(server)
+	if fieldNum == 0 {
+		return nil
+	}
+	id, _ := varintField(server, esmID)
+	execID, _ := stringField(server, esmExecID)
+	rejected := encodeField(execResultRejected, wireLen,
+		encodeField(execRejectedError, wireLen, []byte("not available; use the declared MCP tools")))
+	client := concatBytes(
+		encodeField(ecmID, wireVarint, id),
+		encodeField(ecmExecID, wireLen, execID),
+		encodeField(fieldNum, wireLen, rejected),
+	)
+	return writeFrame(wrapConnectFrame(encodeField(2, wireLen, client), false))
+}
+
+func execResultField(server map[int][]field) int {
+	for num := range server {
+		if execControlFields[num] {
+			continue
+		}
+		return num
+	}
+	return 0
+}
+
+// encodeMCPAck is ExecClientMessage{1: id, 15: exec_id, 11: McpResult{1: McpSuccess{}}}.
+// The empty success tells AgentService the exec was accepted. It is not the
+// tool output; that arrives with the client's next request.
+func encodeMCPAck(id uint64, execID string) []byte {
+	result := encodeField(ecmMCPResult, wireLen,
+		encodeField(mcpResultSuccess, wireLen, []byte{}))
+	client := concatBytes(
+		encodeField(ecmID, wireVarint, id),
+		encodeField(ecmExecID, wireLen, execID),
+		result,
+	)
+	return wrapConnectFrame(encodeField(2, wireLen, client), false)
 }
 
 // interactionQueryName is the IR tool name for each InteractionQuery oneof

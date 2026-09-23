@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
 	status          INTEGER NOT NULL DEFAULT 0,
 	input_tokens    INTEGER NOT NULL DEFAULT 0,
 	output_tokens   INTEGER NOT NULL DEFAULT 0,
+	usage_estimated INTEGER NOT NULL DEFAULT 0,
 	latency_ms      INTEGER NOT NULL DEFAULT 0,
 	err_msg         TEXT NOT NULL DEFAULT ''
 );
@@ -168,6 +169,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateProviderTags(); err != nil {
 		return err
 	}
+	if err := s.migrateRequestLogUsageEstimated(); err != nil {
+		return err
+	}
 	if err := s.migrateComboTargetEnabled(); err != nil {
 		return err
 	}
@@ -187,6 +191,18 @@ func (s *Store) migrateProviderReasoningDialect() error {
 		return err
 	}
 	_, err = s.db.Exec("ALTER TABLE providers ADD COLUMN reasoning_dialect TEXT NOT NULL DEFAULT ''")
+	return err
+}
+
+// migrateRequestLogUsageEstimated adds the usage_estimated column to a
+// request_logs table created before missing usage was estimated. Idempotent;
+// existing rows stay 0, which means the stored counts came from upstream.
+func (s *Store) migrateRequestLogUsageEstimated() error {
+	has, err := s.columnExists("request_logs", "usage_estimated")
+	if err != nil || has {
+		return err
+	}
+	_, err = s.db.Exec("ALTER TABLE request_logs ADD COLUMN usage_estimated INTEGER NOT NULL DEFAULT 0")
 	return err
 }
 

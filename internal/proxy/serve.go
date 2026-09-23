@@ -22,6 +22,10 @@ import (
 
 const maxBodyBytes = 64 << 20 // 64 MiB ceiling on inbound request bodies
 
+// usageEstimateCharsPerToken is the 9router character estimate. It is not a
+// tokenizer and must not replace an upstream usage object.
+const usageEstimateCharsPerToken = 4
+
 const (
 	maxCollectedStreamResponseBytes = maxUnaryUpstreamResponseBytes
 	maxCollectedStreamToolCalls     = 1024
@@ -43,8 +47,12 @@ type reqResult struct {
 	status int
 	inTok  int
 	outTok int
-	errMsg string
-	logErr string
+	// usageEstimated is true when inTok/outTok were derived from character
+	// length because the upstream sent no usage. It must not replace a real
+	// upstream count, and it is not written into the client response.
+	usageEstimated bool
+	errMsg         string
+	logErr         string
 	// anthOrdinary/anthCache* are request-local Anthropic stream partitions for
 	// passthrough sniffing. Written only from committed/relayed events.
 	anthOrdinary   int
@@ -104,12 +112,21 @@ type attemptResult struct {
 	inTok  int
 	outTok int
 	hasTok bool
+	// usageEstimated is true when inTok/outTok came from character length
+	// because the upstream sent no usage. Real upstream counts leave it false.
+	usageEstimated bool
 }
 
 func (ar attemptResult) withTokens(in, out int) attemptResult {
 	ar.inTok = in
 	ar.outTok = out
 	ar.hasTok = true
+	return ar
+}
+
+func (ar attemptResult) withEstimatedTokens(in, out int) attemptResult {
+	ar = ar.withTokens(in, out)
+	ar.usageEstimated = true
 	return ar
 }
 
@@ -217,6 +234,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		rec.Status = res.status
 		rec.InputTokens = res.inTok
 		rec.OutputTokens = res.outTok
+		rec.UsageEstimated = res.usageEstimated
 		rec.ErrMsg = res.errMsg
 		rec.LatencyMS = time.Since(start).Milliseconds()
 		// The final client-facing outcome is distinct from any failed upstream
@@ -400,17 +418,18 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 			// (a later success or the last target's failure) is still covered by the
 			// deferred rec log, so this only fires for intermediate failures.
 			p.recordLog(r.Context(), &domain.RequestLog{
-				AccessKeyName: rec.AccessKeyName,
-				Combo:         rec.Combo,
-				Provider:      provider.Name,
-				UpstreamModel: t.UpstreamModel,
-				Format:        ingress.id,
-				Stream:        meta.Stream,
-				Status:        last.status,
-				InputTokens:   last.inTok,
-				OutputTokens:  last.outTok,
-				ErrMsg:        last.errMsg,
-				LatencyMS:     time.Since(attemptStart).Milliseconds(),
+				AccessKeyName:  rec.AccessKeyName,
+				Combo:          rec.Combo,
+				Provider:       provider.Name,
+				UpstreamModel:  t.UpstreamModel,
+				Format:         ingress.id,
+				Stream:         meta.Stream,
+				Status:         last.status,
+				InputTokens:    last.inTok,
+				OutputTokens:   last.outTok,
+				UsageEstimated: last.usageEstimated,
+				ErrMsg:         last.errMsg,
+				LatencyMS:      time.Since(attemptStart).Milliseconds(),
 			})
 		}
 	}
@@ -440,6 +459,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		if outcome.hasTok {
 			res.inTok = outcome.inTok
 			res.outTok = outcome.outTok
+			res.usageEstimated = outcome.usageEstimated
 		}
 	}
 }
@@ -642,7 +662,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
 	if backend.streamOnly {
-		return p.serveStreamOnlyUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody, req.Tools)
+		return p.serveStreamOnlyUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody, req)
 	}
 
 	status, respBody, err := p.forward(ctx, provider, backend.upstreamPath, upstreamBody, nil)
@@ -677,7 +697,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 // non-streaming client request: it sends the request with the backend's stream
 // Accept, decodes the upstream stream into an IR response, then renders the
 // ingress format's unary response envelope.
-func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, upstreamBody []byte, clientTools []ir.Tool) attemptResult {
+func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, upstreamBody []byte, req *ir.Request) attemptResult {
 	var writeFrame func([]byte) error
 	closeWrite := func() {}
 	var resp *http.Response
@@ -696,7 +716,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
 		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
-	irResp, err := collectStreamResponse(resp.Body, backend, writeFrame, upstreamModel, clientTools)
+	irResp, err := collectStreamResponse(resp.Body, backend, writeFrame, upstreamModel, req.Tools)
 	if err != nil {
 		// Client disconnect: duplex streams surface it as a body-closed read
 		// error (see forwardStreamDuplex). Stop quietly instead of failing
@@ -719,6 +739,20 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	res.status = http.StatusOK
 	res.inTok = irResp.Usage.InputTokens
 	res.outTok = irResp.Usage.OutputTokens
+	if backend.protocol == domain.ProtocolCursor {
+		applyCursorUsageEstimate(req, irResp, len(upstreamBody))
+		res.inTok = irResp.Usage.InputTokens
+		res.outTok = irResp.Usage.OutputTokens
+		res.usageEstimated = true
+	} else if !usageInputPlausible(len(upstreamBody), res.inTok) {
+		res.inTok = 0
+	}
+	if res.inTok == 0 && res.outTok == 0 && !res.usageEstimated {
+		inEst, outEst := estimateUsage(req, irResp)
+		res.inTok = inEst
+		res.outTok = outEst
+		res.usageEstimated = true
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
@@ -1011,6 +1045,84 @@ func (p *Proxy) recordLog(ctx context.Context, l *domain.RequestLog) {
 			)
 		}
 	}()
+}
+
+// estimateUsage approximates tokens from character length when the upstream
+// sent no usage. Input includes the request text, tool schemas, and tool
+// results. Output includes assistant text and tool-call names and arguments.
+// Four characters is one token, matching 9router. The result is an estimate,
+// not Cursor billed usage.
+func estimateUsage(req *ir.Request, resp *ir.Response) (int, int) {
+	if req == nil && resp == nil {
+		return 0, 0
+	}
+	var in, out strings.Builder
+	if req != nil {
+		in.WriteString(req.System)
+		for _, msg := range req.Messages {
+			writeUsageBlocks(&in, msg.Content)
+		}
+		for _, tool := range req.Tools {
+			in.WriteString(tool.Name)
+			in.WriteString(tool.Description)
+			in.Write(tool.Parameters)
+		}
+	}
+	if resp != nil {
+		writeUsageBlocks(&out, resp.Content)
+	}
+	return charsToTokens(in.Len()), charsToTokens(out.Len())
+}
+
+func writeUsageBlocks(b *strings.Builder, blocks []ir.ContentBlock) {
+	for _, block := range blocks {
+		switch block.Type {
+		case ir.BlockText, ir.BlockReasoning:
+			b.WriteString(block.Text)
+		case ir.BlockToolUse:
+			b.WriteString(block.ToolName)
+			b.Write(block.ToolInput)
+		case ir.BlockToolResult:
+			writeUsageBlocks(b, block.ToolResult)
+		}
+	}
+}
+
+// applyCursorUsageEstimate replaces Cursor turn_ended counts. That message
+// is not reliable for a proxy that finishes a tool turn before the server
+// ends the run, and a decoded input count can be far larger than the sent
+// request. The estimate uses the same 4 characters per token as 9router.
+// It does not add 9router's context-guard buffer.
+func applyCursorUsageEstimate(req *ir.Request, resp *ir.Response, requestBytes int) {
+	if resp == nil {
+		return
+	}
+	inEst, outEst := estimateUsage(req, resp)
+	if inEst == 0 && requestBytes > 0 {
+		inEst = charsToTokens(requestBytes)
+	}
+	resp.Usage = ir.Usage{InputTokens: inEst, OutputTokens: outEst}
+}
+
+// usageInputPlausible reports whether an upstream input-token count can
+// fit the request bytes. Zero is plausible: the upstream may omit usage.
+// The bound is one token per two bytes, which leaves room for a hidden
+// prompt without accepting a multi-million count from a sub-megabyte body.
+func usageInputPlausible(requestBytes, inputTokens int) bool {
+	if inputTokens <= 0 {
+		return true
+	}
+	if requestBytes < 0 {
+		requestBytes = 0
+	}
+	return inputTokens <= (requestBytes/2)+4096
+}
+
+func charsToTokens(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return (n + usageEstimateCharsPerToken - 1) / usageEstimateCharsPerToken
 }
 
 func writeErr(w http.ResponseWriter, c codec, status int, message, errType string) {

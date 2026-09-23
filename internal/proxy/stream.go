@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"airouter/internal/domain"
 	"airouter/internal/observability"
@@ -353,17 +354,34 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			return backend.decodeStreamDuplex(r, writeFrame, emit)
 		}
 	}
+	cursorEstimated := backend.protocol == domain.ProtocolCursor
 	emit := func(ev ir.StreamEvent) error {
-		switch ev.Kind {
-		case ir.EventMessageStart:
-			if ev.InputTokens != 0 {
-				inTok = ev.InputTokens
+		if cursorEstimated && ev.Kind == ir.EventFinish {
+			// Estimate before the encoder writes the usage chunk. turn_ended
+			// counts are not Cursor billing for this proxy.
+			inEst, outEst := estimateUsage(req, sink.response())
+			if inEst == 0 && len(upstreamBody) > 0 {
+				inEst = charsToTokens(len(upstreamBody))
 			}
-		case ir.EventFinish:
-			if ev.InputTokens != 0 {
-				inTok = ev.InputTokens
+			ev.InputTokens = inEst
+			ev.OutputTokens = outEst
+			ev.CacheReadTokens = 0
+			ev.CacheWriteTokens = 0
+			inTok = inEst
+			outTok = outEst
+			res.usageEstimated = true
+		} else {
+			switch ev.Kind {
+			case ir.EventMessageStart:
+				if ev.InputTokens != 0 {
+					inTok = ev.InputTokens
+				}
+			case ir.EventFinish:
+				if ev.InputTokens != 0 {
+					inTok = ev.InputTokens
+				}
+				outTok = ev.OutputTokens
 			}
-			outTok = ev.OutputTokens
 		}
 		err := sink.handle(ev)
 		if sink.committed {
@@ -470,6 +488,21 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		)
 	}
 	publishUsage()
+	if cursorEstimated {
+		return committed().withEstimatedTokens(inTok, outTok)
+	}
+	if !usageInputPlausible(len(upstreamBody), inTok) {
+		// A decoded input count that cannot fit the sent request is not usage.
+		inTok = 0
+		res.inTok = 0
+	}
+	if inTok == 0 && outTok == 0 {
+		inEst, outEst := estimateUsage(req, sink.response())
+		res.inTok = inEst
+		res.outTok = outEst
+		res.usageEstimated = true
+		return committed().withEstimatedTokens(inEst, outEst)
+	}
 	return committed().withTokens(inTok, outTok)
 }
 
@@ -477,15 +510,20 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 // then commits SSE headers and replays. Commitment is deferred past
 // EventMessageStart so an upstream error before real output can still fail over.
 type translatedSink struct {
-	w         http.ResponseWriter
-	res       *reqResult
-	enc       streamEncoder
-	sw        *sse.Writer
-	pending   []ir.StreamEvent
-	committed bool
+	w          http.ResponseWriter
+	res        *reqResult
+	enc        streamEncoder
+	sw         *sse.Writer
+	pending    []ir.StreamEvent
+	committed  bool
+	text       strings.Builder
+	toolNames  []string
+	toolArgs   []string
+	stopReason ir.StopReason
 }
 
 func (s *translatedSink) handle(ev ir.StreamEvent) error {
+	s.note(ev)
 	if !s.committed {
 		if ev.Kind == ir.EventMessageStart {
 			s.pending = append(s.pending, ev)
@@ -502,6 +540,37 @@ func (s *translatedSink) handle(ev ir.StreamEvent) error {
 		}
 	}
 	return s.enc.Encode(ev, s.sw)
+}
+
+func (s *translatedSink) note(ev ir.StreamEvent) {
+	switch ev.Kind {
+	case ir.EventTextDelta, ir.EventReasoningDelta:
+		s.text.WriteString(ev.Text)
+	case ir.EventToolCallStart:
+		s.toolNames = append(s.toolNames, ev.ToolName)
+	case ir.EventToolCallDelta:
+		s.toolArgs = append(s.toolArgs, ev.ArgsFrag)
+	case ir.EventFinish:
+		s.stopReason = ev.StopReason
+	}
+}
+
+func (s *translatedSink) response() *ir.Response {
+	if s == nil {
+		return nil
+	}
+	resp := &ir.Response{StopReason: s.stopReason}
+	if s.text.Len() > 0 {
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText, Text: s.text.String()})
+	}
+	for i, name := range s.toolNames {
+		args := ""
+		if i < len(s.toolArgs) {
+			args = s.toolArgs[i]
+		}
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockToolUse, ToolName: name, ToolInput: json.RawMessage(args)})
+	}
+	return resp
 }
 
 func (s *translatedSink) commit() error {

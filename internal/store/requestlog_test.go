@@ -216,6 +216,24 @@ func TestClearRequestLogsWipesAll(t *testing.T) {
 	}
 }
 
+func TestRequestLogUsageEstimatedRoundTrip(t *testing.T) {
+	st := testStore(t)
+	log := seedLog(t, st, "default", "cursor", 200, "")
+	log.InputTokens = 12
+	log.OutputTokens = 3
+	log.UsageEstimated = true
+	if err := st.CreateRequestLog(context.Background(), log); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := st.ListRequestLogs(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !logs[0].UsageEstimated || logs[0].InputTokens != 12 || logs[0].OutputTokens != 3 {
+		t.Fatalf("log = %+v", logs[0])
+	}
+}
+
 func TestRequestLogStatsAggregates(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

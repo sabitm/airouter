@@ -30,10 +30,10 @@ func (s *Store) CreateRequestLog(ctx context.Context, l *domain.RequestLog) erro
 	errMsg := clampRequestLogError(l.ErrMsg)
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO request_logs
-			(access_key_name, combo, provider, upstream_model, format, stream, status, input_tokens, output_tokens, latency_ms, err_msg)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(access_key_name, combo, provider, upstream_model, format, stream, status, input_tokens, output_tokens, usage_estimated, latency_ms, err_msg)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		l.AccessKeyName, l.Combo, l.Provider, l.UpstreamModel, l.Format, l.Stream,
-		l.Status, l.InputTokens, l.OutputTokens, l.LatencyMS, errMsg)
+		l.Status, l.InputTokens, l.OutputTokens, l.UsageEstimated, l.LatencyMS, errMsg)
 	if err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func (s *Store) ListRequestLogsQuery(ctx context.Context, q RequestLogQuery) ([]
 	q.Page = clampLogPage(q.Page)
 	where, args := buildLogWhere(q)
 	offset := (q.Page - 1) * q.Limit
-	sql := `SELECT id, created_at, access_key_name, combo, provider, upstream_model, format, stream, status, input_tokens, output_tokens, latency_ms, err_msg
+	sql := `SELECT id, created_at, access_key_name, combo, provider, upstream_model, format, stream, status, input_tokens, output_tokens, usage_estimated, latency_ms, err_msg
 		 FROM request_logs` + where + ` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
 	args = append(args, q.Limit, offset)
 
@@ -109,7 +109,7 @@ func (s *Store) ListRequestLogsQuery(ctx context.Context, q RequestLogQuery) ([]
 		var l domain.RequestLog
 		if err := rows.Scan(&l.ID, &l.CreatedAt, &l.AccessKeyName, &l.Combo, &l.Provider,
 			&l.UpstreamModel, &l.Format, &l.Stream, &l.Status, &l.InputTokens,
-			&l.OutputTokens, &l.LatencyMS, &l.ErrMsg); err != nil {
+			&l.OutputTokens, &l.UsageEstimated, &l.LatencyMS, &l.ErrMsg); err != nil {
 			return nil, err
 		}
 		out = append(out, &l)

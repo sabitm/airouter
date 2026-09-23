@@ -119,6 +119,21 @@ const (
 	ecmMCPResult         = 11
 )
 
+// Exec result oneofs. Field 2 is the rejected variant on ShellResult,
+// GrepResult, and the other built-in results that share that shape.
+const (
+	execResultRejected = 2
+	execRejectedError  = 2
+)
+
+// McpResult oneof. Field 1 is McpSuccess. The proxy acks with an empty
+// success so AgentService can close the exec. The real tool result returns
+// on the next request's history. An empty success does not produce
+// turn_ended.
+const (
+	mcpResultSuccess = 1
+)
+
 // InteractionUpdate field numbers (oneof message).
 const (
 	iuTextDelta        = 1
