@@ -1,5 +1,7 @@
 package thinking
 
+import "strings"
+
 // LevelToBudget maps discrete effort levels to token budgets (9router thinking.js).
 var LevelToBudget = map[string]int{
 	"none":    0,
@@ -175,6 +177,38 @@ func levelIn(level string, levels []string) bool {
 		}
 	}
 	return false
+}
+
+// NormalizeGrokLevel maps a unified effort level onto Grok's per-model wire set.
+// Returns ("", false) to omit the field (auto, none when cannot disable, unknown).
+func NormalizeGrokLevel(level string, caps Caps) (string, bool) {
+	l := strings.ToLower(strings.TrimSpace(level))
+	if l == "" || l == "auto" {
+		return "", false
+	}
+	if l == "minimal" {
+		l = "low"
+	}
+	if l == "none" {
+		if caps.CanDisable {
+			return "none", true
+		}
+		return "", false
+	}
+	if l == "max" || l == "ultra" {
+		if levelIn("xhigh", caps.Levels) {
+			l = "xhigh"
+		} else {
+			l = "high"
+		}
+	}
+	if l == "xhigh" && !levelIn("xhigh", caps.Levels) {
+		l = "high"
+	}
+	if !levelIn(l, caps.Levels) {
+		return "", false
+	}
+	return l, true
 }
 
 // MinAcceptedLevel returns the lowest non-none level for caps (used when

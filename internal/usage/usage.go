@@ -165,13 +165,12 @@ func Supported(p *domain.Provider) bool {
 	}
 }
 
-// isGrok reports whether a provider is the Grok CLI / Grok Build (xAI) OAuth
-// preset. Grok shares ProtocolOpenAI with generic OpenAI and Cline, so usage is
-// distinguished by the xai OAuth preset rather than the protocol alone.
-// Generic OpenAI, xAI API-key, unrelated OAuth OpenAI, and Grok Web are
-// all excluded. Cursor usage is keyed by ProtocolCursor, not the xAI preset.
+// isGrok identifies xAI OAuth providers (openai or openai-responses + preset "xai").
 func isGrok(p *domain.Provider) bool {
-	if p == nil || p.Protocol != domain.ProtocolOpenAI || p.Method() != domain.AuthOAuth || p.OAuthCreds == nil {
+	if p == nil || p.Method() != domain.AuthOAuth || p.OAuthCreds == nil {
+		return false
+	}
+	if p.Protocol != domain.ProtocolOpenAI && p.Protocol != domain.ProtocolOpenAIResponses {
 		return false
 	}
 	return p.OAuthCreds.Preset == "xai"
@@ -294,6 +293,11 @@ func (s *Service) fetchLive(ctx context.Context, p *domain.Provider) (*Report, e
 			return s.fetchGrok(ctx, p)
 		}
 		return nil, ErrUnsupported
+	case domain.ProtocolOpenAIResponses:
+		if isGrok(p) {
+			return s.fetchGrok(ctx, p)
+		}
+		return &Report{FetchedAt: s.now()}, nil
 	default:
 		return nil, ErrUnsupported
 	}

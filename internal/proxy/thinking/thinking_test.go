@@ -156,8 +156,12 @@ func TestCapsForDialects(t *testing.T) {
 		t.Fatalf("zai format=%v", c.Format)
 	}
 	c = CapsFor("grok-4", domain.ProtocolOpenAI, domain.ReasoningGrok)
-	if c.Format != FormatGrok {
-		t.Fatalf("grok format=%v", c.Format)
+	if c.Format != FormatGrok || !c.Reasoning || c.CanDisable {
+		t.Fatalf("grok-4 fail-open caps=%+v", c)
+	}
+	c = CapsFor("grok-4.7", domain.ProtocolOpenAIResponses, domain.ReasoningGrok)
+	if c.Format != FormatOpenAIResponses {
+		t.Fatalf("grok responses format=%v", c.Format)
 	}
 
 	// Explicit none disables writer.
@@ -507,11 +511,11 @@ func TestApplyWireDialectMatrix(t *testing.T) {
 			},
 		},
 		{
-			name: "grok", dialect: domain.ReasoningGrok, proto: domain.ProtocolOpenAI, formatID: "oai-chat",
-			model: "grok-4", cfg: &Config{Mode: ModeLevel, Level: "max"},
+			name: "grok-max-to-xhigh", dialect: domain.ReasoningGrok, proto: domain.ProtocolOpenAI, formatID: "oai-chat",
+			model: "grok-4.7", cfg: &Config{Mode: ModeLevel, Level: "max"},
 			check: func(t *testing.T, m map[string]any) {
-				if m["reasoning_effort"] != "max" {
-					t.Fatalf("effort=%v", m["reasoning_effort"])
+				if m["reasoning_effort"] != "xhigh" {
+					t.Fatalf("effort=%v want xhigh", m["reasoning_effort"])
 				}
 			},
 		},
@@ -581,11 +585,11 @@ func TestFinalizeBodyBodyWithoutSuffix(t *testing.T) {
 
 func TestResolveIntentNoInjectionFromDialectAlone(t *testing.T) {
 	caps := CapsFor("gpt-5", domain.ProtocolOpenAI, domain.ReasoningOpenAI)
-	if ResolveIntent(nil, nil, caps) != nil {
+	if ResolveIntent(nil, nil, caps, domain.ReasoningOpenAI) != nil {
 		t.Fatal("no required default should stay nil")
 	}
 	caps = CapsFor("gpt-5.3-codex", domain.ProtocolOpenAICodex, domain.ReasoningCodex)
-	cfg := ResolveIntent(nil, nil, caps)
+	cfg := ResolveIntent(nil, nil, caps, domain.ReasoningCodex)
 	if cfg == nil || cfg.Level != "low" {
 		t.Fatalf("codex required default: %+v", cfg)
 	}
@@ -884,4 +888,212 @@ func TestDecodeObjectUseNumberStrict(t *testing.T) {
 			t.Fatalf("n = %T %v", m["n"], m["n"])
 		}
 	})
+}
+
+func TestGrokCapsFamilies(t *testing.T) {
+	tests := []struct {
+		model      string
+		reasoning  bool
+		canDisable bool
+		levels     []string
+	}{
+		{"grok-4.5-latest", true, false, []string{"low", "medium", "high"}},
+		{"grok-build-latest", true, false, []string{"low", "medium", "high"}},
+		{"grok-4.3-latest", true, true, []string{"none", "low", "medium", "high"}},
+		{"grok-4.7", true, false, []string{"low", "medium", "high", "xhigh"}},
+		{"grok-4.6", true, false, []string{"low", "medium", "high", "xhigh"}},
+		{"grok-5", true, false, []string{"low", "medium", "high", "xhigh"}},
+		{"grok-build-0.1", false, false, nil},
+		{"grok-code-fast-1", false, false, nil},
+		{"grok-imagine", false, false, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.model, func(t *testing.T) {
+			caps := CapsFor(tc.model, domain.ProtocolOpenAI, domain.ReasoningGrok)
+			if caps.Reasoning != tc.reasoning {
+				t.Fatalf("Reasoning = %v, want %v", caps.Reasoning, tc.reasoning)
+			}
+			if caps.CanDisable != tc.canDisable {
+				t.Fatalf("CanDisable = %v, want %v", caps.CanDisable, tc.canDisable)
+			}
+			if tc.levels == nil {
+				if caps.Format != FormatNone {
+					t.Fatalf("Format = %v, want FormatNone", caps.Format)
+				}
+				return
+			}
+			if caps.Format != FormatGrok {
+				t.Fatalf("Format = %v, want FormatGrok", caps.Format)
+			}
+			if len(caps.Levels) != len(tc.levels) {
+				t.Fatalf("Levels = %#v, want %#v", caps.Levels, tc.levels)
+			}
+			for i := range tc.levels {
+				if caps.Levels[i] != tc.levels[i] {
+					t.Fatalf("Levels[%d] = %q, want %q", i, caps.Levels[i], tc.levels[i])
+				}
+			}
+		})
+	}
+}
+
+func TestApplyWireGrokNoneOn43WritesNone(t *testing.T) {
+	out, err := ApplyWire("oai-chat", []byte(`{"model":"grok-4.3","messages":[{"role":"user","content":"hi"}]}`), "grok-4.3", &Config{Mode: ModeNone}, domain.ProtocolOpenAI, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["reasoning_effort"] != "none" {
+		t.Fatalf("reasoning_effort = %#v, want none", m["reasoning_effort"])
+	}
+}
+
+func TestApplyWireGrokNoneOn46OmitsField(t *testing.T) {
+	out, err := ApplyWire("oai-chat", []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"hi"}]}`), "grok-4.6", &Config{Mode: ModeNone}, domain.ProtocolOpenAI, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatal("reasoning_effort present, want omitted")
+	}
+}
+
+func TestFinalizeBodyGrokNoIntentDoesNotInjectEffort(t *testing.T) {
+	out, err := FinalizeBody([]byte(`{"model":"combo","messages":[]}`), "grok-4.7", "oai-chat", domain.ProtocolOpenAI, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatal("reasoning_effort present, want omitted")
+	}
+}
+
+func TestApplyWireGrok45ConvertsXHighToHigh(t *testing.T) {
+	out, err := ApplyWire("oai-chat", []byte(`{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}`), "grok-4.5", &Config{Mode: ModeLevel, Level: "xhigh"}, domain.ProtocolOpenAI, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["reasoning_effort"] != "high" {
+		t.Fatalf("reasoning_effort = %#v, want high", m["reasoning_effort"])
+	}
+}
+
+func TestApplyWireGrokUnknownEffortOmitsField(t *testing.T) {
+	out, err := ApplyWire("oai-chat", []byte(`{"model":"grok-4.7","messages":[{"role":"user","content":"hi"}]}`), "grok-4.7", &Config{Mode: ModeLevel, Level: "banana"}, domain.ProtocolOpenAI, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatal("reasoning_effort present, want omitted")
+	}
+}
+
+func TestApplyWireGrokResponsesEffort(t *testing.T) {
+	out, err := ApplyWire("oai-responses", []byte(`{"model":"grok-4.7","input":[]}`), "grok-4.7", &Config{Mode: ModeLevel, Level: "medium"}, domain.ProtocolOpenAIResponses, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, ok := m["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("reasoning = %#v, want object", m["reasoning"])
+	}
+	if reasoning["effort"] != "medium" {
+		t.Fatalf("reasoning.effort = %#v, want medium", reasoning["effort"])
+	}
+	if _, ok := reasoning["summary"]; ok {
+		t.Fatal("reasoning.summary present, want preserved-only (not injected)")
+	}
+	if _, ok := m["include"]; ok {
+		t.Fatal("include present, want absent")
+	}
+}
+
+func TestApplyWireGrokResponsesPreservesSummary(t *testing.T) {
+	body := []byte(`{"model":"grok-4.7","input":[],"reasoning":{"summary":"detailed"}}`)
+	out, err := ApplyWire("oai-responses", body, "grok-4.7", &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpenAIResponses, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, ok := m["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("reasoning = %#v, want object", m["reasoning"])
+	}
+	if reasoning["summary"] != "detailed" {
+		t.Fatalf("reasoning.summary = %#v, want detailed", reasoning["summary"])
+	}
+	if reasoning["effort"] != "high" {
+		t.Fatalf("reasoning.effort = %#v, want high", reasoning["effort"])
+	}
+}
+
+func TestApplyWireGrokStripsNoneWhenUnsupported(t *testing.T) {
+	body := []byte(`{"model":"grok-4.5","reasoning_effort":"none","messages":[{"role":"user","content":"hi"}]}`)
+	out, err := ApplyWire("oai-chat", body, "grok-4.5", &Config{Mode: ModeNone}, domain.ProtocolOpenAI, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort = %#v, want stripped", m["reasoning_effort"])
+	}
+}
+
+func TestApplyWireGrokMediumReplacesAutoReasoningEffort(t *testing.T) {
+	body := []byte(`{"model":"grok-4.6","reasoning_effort":"auto","messages":[{"role":"user","content":"hi"}]}`)
+	out, err := ApplyWire("oai-chat", body, "grok-4.6", &Config{Mode: ModeLevel, Level: "medium"}, domain.ProtocolOpenAI, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["reasoning_effort"] != "medium" {
+		t.Fatalf("reasoning_effort = %#v, want medium", m["reasoning_effort"])
+	}
+}
+
+func TestApplyWireGrokNonEffortStripsIncomingEffort(t *testing.T) {
+	body := []byte(`{"model":"grok-imagine","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`)
+	out, err := ApplyWire("oai-chat", body, "grok-imagine", &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpenAI, domain.ReasoningGrok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort = %#v, want stripped", m["reasoning_effort"])
+	}
 }

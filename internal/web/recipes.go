@@ -39,7 +39,7 @@ type recipe struct {
 }
 
 var recipes = []recipe{
-	{ID: "xai", Label: "Grok", Sublabel: "xAI", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "xai", BaseURL: "https://api.x.ai/v1", ReasoningDialect: domain.ReasoningGrok},
+	{ID: "xai", Label: "Grok", Sublabel: "xAI", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAIResponses, Method: domain.AuthOAuth, Preset: "xai", BaseURL: "https://api.x.ai/v1", ReasoningDialect: domain.ReasoningGrok},
 	{ID: "codex", Label: "OpenAI Codex", Sublabel: "ChatGPT", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAICodex, Method: domain.AuthOAuth, Preset: "codex", BaseURL: "https://chatgpt.com/backend-api/codex"},
 	{ID: "cline", Label: "Cline", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "cline", BaseURL: "https://api.cline.bot/api/v1", ReasoningDialect: domain.ReasoningCline},
 	{ID: "clinepass", Label: "ClinePass", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "clinepass", BaseURL: "https://api.cline.bot/api/v1", ReasoningDialect: domain.ReasoningCline},

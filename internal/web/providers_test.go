@@ -168,6 +168,15 @@ func TestGrokRecipeDefaultsToGrokDialect(t *testing.T) {
 	if !strings.Contains(html, `name="reasoning_dialect"`) || !strings.Contains(html, `value="grok" selected`) {
 		t.Fatalf("grok recipe should preselect grok dialect; html=%s", html)
 	}
+	if !strings.Contains(html, `value="https://api.x.ai/v1"`) {
+		t.Fatalf("recipe HTML missing xai base URL; html=%s", html)
+	}
+	if !strings.Contains(html, `data-protocol="openai-responses"`) {
+		t.Fatalf("recipe HTML missing openai-responses protocol; html=%s", html)
+	}
+	if r.Protocol != domain.ProtocolOpenAIResponses {
+		t.Fatalf("xai recipe protocol = %q, want openai-responses", r.Protocol)
+	}
 }
 
 func TestProviderEditRowReasoningDialectLocked(t *testing.T) {

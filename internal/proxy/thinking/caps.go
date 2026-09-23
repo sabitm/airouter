@@ -248,24 +248,65 @@ func minimaxCaps(m string) Caps {
 }
 
 func grokCaps(m string, protocol domain.Protocol) Caps {
-	fmt := FormatGrok
+	format := FormatGrok
 	if protocol == domain.ProtocolOpenAIResponses {
-		// Grok API on Responses still uses reasoning.effort when supported.
-		fmt = FormatOpenAIResponses
+		format = FormatOpenAIResponses
 	}
-	c := Caps{
+	if grokNonEffortModel(m) {
+		return Caps{Reasoning: false, CanDisable: false, Format: FormatNone, MaxOutput: 128000}
+	}
+	if grokFamily43(m) {
+		return Caps{
+			Reasoning:  true,
+			CanDisable: true,
+			Format:     format,
+			Levels:     []string{"none", "low", "medium", "high"},
+			MaxOutput:  128000,
+		}
+	}
+	if grokFamily45(m) {
+		return Caps{
+			Reasoning:  true,
+			CanDisable: false,
+			Format:     format,
+			Levels:     []string{"low", "medium", "high"},
+			MaxOutput:  128000,
+		}
+	}
+	return Caps{
 		Reasoning:  true,
-		CanDisable: true,
-		Format:     fmt,
-		Levels:     []string{"none", "minimal", "low", "medium", "high", "xhigh"},
+		CanDisable: false,
+		Format:     format,
+		Levels:     []string{"low", "medium", "high", "xhigh"},
 		MaxOutput:  128000,
 	}
-	// Known non-reasoners / image-only.
+}
+
+func grokNonEffortModel(m string) bool {
 	if strings.Contains(m, "image") || strings.Contains(m, "imagine") {
-		c.Reasoning = false
-		c.Format = FormatNone
+		return true
 	}
-	return c
+	if strings.Contains(m, "non-reasoning") {
+		return true
+	}
+	if strings.Contains(m, "composer") {
+		return true
+	}
+	if strings.HasPrefix(m, "grok-code-fast") || strings.HasPrefix(m, "grok-code") {
+		return true
+	}
+	if strings.HasPrefix(m, "grok-build") && m != "grok-build-latest" {
+		return true
+	}
+	return false
+}
+
+func grokFamily45(m string) bool {
+	return strings.HasPrefix(m, "grok-4.5") || m == "grok-build-latest"
+}
+
+func grokFamily43(m string) bool {
+	return strings.HasPrefix(m, "grok-4.3")
 }
 
 // opencodeCaps dispatches per model family: opencode.ai serves multi-vendor

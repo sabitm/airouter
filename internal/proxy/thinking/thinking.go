@@ -186,11 +186,17 @@ func CaptureMap(m map[string]any) *Config {
 // Effective returns cfg after capability clamps. Nil when there is nothing to send.
 // Non-reasoning caps drop intent. !CanDisable turns none into the min accepted level.
 func Effective(cfg *Config, caps Caps) *Config {
+	return EffectiveForDialect(cfg, caps, domain.ReasoningOpenAI)
+}
+
+// EffectiveForDialect applies capability clamps. Grok skips the none-to-min upgrade
+// so writeGrokNative can omit effort instead of forcing low.
+func EffectiveForDialect(cfg *Config, caps Caps, dialect domain.ReasoningDialect) *Config {
 	if cfg == nil || !caps.Reasoning || caps.Format == FormatNone {
 		return nil
 	}
 	out := *cfg
-	if out.Mode == ModeNone && !caps.CanDisable {
+	if out.Mode == ModeNone && !caps.CanDisable && dialect != domain.ReasoningGrok {
 		out = Config{Mode: ModeLevel, Level: MinAcceptedLevel(caps)}
 	}
 	return &out
@@ -199,13 +205,13 @@ func Effective(cfg *Config, caps Caps) *Config {
 // ResolveIntent applies precedence for one failover attempt:
 // suffix override > body/IR intent > required default > absent.
 // Does not inject solely because the provider has a dialect.
-func ResolveIntent(bodyCfg, suffixCfg *Config, caps Caps) *Config {
+func ResolveIntent(bodyCfg, suffixCfg *Config, caps Caps, dialect domain.ReasoningDialect) *Config {
 	cfg := Merge(bodyCfg, suffixCfg)
 	if cfg != nil {
-		return Effective(cfg, caps)
+		return EffectiveForDialect(cfg, caps, dialect)
 	}
 	if caps.RequiredDefault != "" && caps.Reasoning && caps.Format != FormatNone {
-		return Effective(&Config{Mode: ModeLevel, Level: caps.RequiredDefault}, caps)
+		return EffectiveForDialect(&Config{Mode: ModeLevel, Level: caps.RequiredDefault}, caps, dialect)
 	}
 	return nil
 }
@@ -226,9 +232,13 @@ func ApplyWire(formatID string, body []byte, model string, cfg *Config, protocol
 	}
 	if cfg != nil {
 		caps := CapsFor(model, protocol, dialect)
-		eff := Effective(cfg, caps)
+		eff := EffectiveForDialect(cfg, caps, dialect)
 		if eff != nil && (!isClaudeFormat(caps.Format) || lastMessageIsUser(m)) {
-			writeNative(m, model, eff, caps, formatID, protocol)
+			if dialect == domain.ReasoningGrok {
+				writeGrokNative(m, eff, caps)
+			} else {
+				writeNative(m, model, eff, caps, formatID, protocol)
+			}
 		}
 	}
 	return json.Marshal(m)
@@ -290,7 +300,7 @@ func FinalizeBody(body []byte, upstreamModel string, formatID string, protocol d
 	base, suffixCfg := ParseSuffix(upstreamModel)
 	bodyCfg := Capture(body)
 	caps := CapsFor(base, protocol, dialect)
-	cfg := ResolveIntent(bodyCfg, suffixCfg, caps)
+	cfg := ResolveIntent(bodyCfg, suffixCfg, caps, dialect)
 	if cfg == nil && suffixCfg == nil && bodyCfg == nil {
 		// No intent at all: model-only rewrite.
 		return rewriteModelOnly(body, base)
@@ -308,7 +318,7 @@ func FinalizeIR(req *ir.Request, upstreamModel string, protocol domain.Protocol,
 	req.Model = base
 	bodyCfg := FromIR(req.Thinking)
 	caps := CapsFor(base, protocol, dialect)
-	cfg = ResolveIntent(bodyCfg, suffixCfg, caps)
+	cfg = ResolveIntent(bodyCfg, suffixCfg, caps, dialect)
 	req.Thinking = ToIR(cfg)
 	return base, cfg
 }
@@ -364,6 +374,44 @@ func stripRecognizedReasoning(m map[string]any) {
 		delete(gc, "thinkingConfig")
 	}
 	delete(m, "thinkingConfig")
+}
+
+func writeGrokNative(m map[string]any, cfg *Config, caps Caps) {
+	effort, write := grokEffortForWrite(caps, cfg)
+	if !write {
+		return
+	}
+	switch caps.Format {
+	case FormatOpenAIResponses:
+		r, _ := m["reasoning"].(map[string]any)
+		if r == nil {
+			r = map[string]any{}
+		}
+		r["effort"] = effort
+		m["reasoning"] = r
+	default:
+		m["reasoning_effort"] = effort
+	}
+}
+
+func grokEffortForWrite(caps Caps, cfg *Config) (string, bool) {
+	if cfg == nil {
+		return "", false
+	}
+	switch cfg.Mode {
+	case ModeNone:
+		if caps.CanDisable {
+			return "none", true
+		}
+		return "", false
+	case ModeAuto:
+		return "", false
+	case ModeBudget:
+		return NormalizeGrokLevel(BudgetToLevel(cfg.Budget), caps)
+	case ModeLevel:
+		return NormalizeGrokLevel(cfg.Level, caps)
+	}
+	return "", false
 }
 
 // writeNative applies the effective config in the provider dialect's wire shape.

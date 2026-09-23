@@ -76,7 +76,7 @@ var Presets = []Preset{
 		RedirectURI: "http://127.0.0.1:56121/callback",
 		PKCE:        true, // xAI is a public client; no client_secret
 		APIBase:     "https://api.x.ai/v1",
-		Protocol:    domain.ProtocolOpenAI,
+		Protocol:    domain.ProtocolOpenAIResponses,
 	},
 	// Codex is the ChatGPT-subscription-backed coding agent API. The client id is
 	// public (embedded in the official Codex CLI); the ChatGPT token endpoint

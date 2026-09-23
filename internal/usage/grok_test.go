@@ -60,6 +60,14 @@ func TestGrokSupportedDetection(t *testing.T) {
 	if !isGrok(grokProvider("t")) {
 		t.Fatal("xAI OAuth preset must be supported")
 	}
+	p := grokProvider("t")
+	p.Protocol = domain.ProtocolOpenAIResponses
+	if !isGrok(p) {
+		t.Fatal("xAI OAuth openai-responses must match isGrok")
+	}
+	if !Supported(p) {
+		t.Fatal("xAI OAuth openai-responses must be supported")
+	}
 	cases := []struct {
 		name string
 		p    *domain.Provider
@@ -70,6 +78,7 @@ func TestGrokSupportedDetection(t *testing.T) {
 		{"unrelated oauth openai", &domain.Provider{Protocol: domain.ProtocolOpenAI, AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{Preset: "other", AccessToken: "t"}}},
 		{"openai oauth no preset", &domain.Provider{Protocol: domain.ProtocolOpenAI, AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{AccessToken: "t"}}},
 		{"cursor", &domain.Provider{Protocol: domain.ProtocolCursor, AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{Preset: "xai", CursorAuth: true}}},
+		{"openai-responses unrelated oauth", &domain.Provider{Protocol: domain.ProtocolOpenAIResponses, AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{Preset: "openai-codex", AccessToken: "t"}}},
 		{"codex", &domain.Provider{Protocol: domain.ProtocolOpenAICodex, AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{Preset: "xai"}}},
 	}
 	for _, tc := range cases {

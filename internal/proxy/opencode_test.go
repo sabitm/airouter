@@ -819,6 +819,47 @@ func TestOpencodeTranslatedNoIntentDoesNotInjectReasoning(t *testing.T) {
 	}
 }
 
+func TestGrokTranslatedResponsesOmitsRejectedEffort(t *testing.T) {
+	req := &ir.Request{
+		Model: "grok-4.6",
+		Messages: []ir.Message{{
+			Role:    ir.RoleUser,
+			Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}},
+		}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingNone},
+	}
+	encoded, err := responsesCodec.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encodedBody map[string]any
+	if err := json.Unmarshal(encoded, &encodedBody); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := encodedBody["reasoning"].(map[string]any)
+	if reasoning["effort"] != "none" {
+		t.Fatalf("encoder effort = %#v, want none before finalize", reasoning["effort"])
+	}
+
+	provider := &domain.Provider{
+		Protocol:         domain.ProtocolOpenAIResponses,
+		ReasoningDialect: domain.ReasoningGrok,
+	}
+	out, err := finalizeEncodedBody(encoded, req, responsesCodec, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if reasoning, ok := got["reasoning"].(map[string]any); ok {
+		if _, present := reasoning["effort"]; present {
+			t.Fatalf("reasoning.effort = %#v, want omitted", reasoning["effort"])
+		}
+	}
+}
+
 func TestOpencodeTranslatedMiMoUnaryAndStreamStripReasoning(t *testing.T) {
 	upstreamBodies := make(chan []byte, 2)
 	base, token, _ := setupOpencodeTranslatedModel(t, "mimo-v2.5-pro", func(w http.ResponseWriter, r *http.Request) {

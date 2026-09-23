@@ -663,8 +663,10 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	if !caps.Reasoning || caps.Format == thinking.FormatNone {
 		return thinking.ApplyWire(backend.id, body, req.Model, nil, provider.Protocol, dialect)
 	}
-	eff := thinking.ResolveIntent(cfg, nil, caps)
-	if eff == nil && caps.RequiredDefault == "" {
+	eff := thinking.ResolveIntent(cfg, nil, caps, dialect)
+	// Grok omits none/auto instead of upgrading them. The encoder already wrote
+	// a transport-default effort, so ApplyWire must still strip that field.
+	if eff == nil && caps.RequiredDefault == "" && dialect != domain.ReasoningGrok {
 		return body, nil
 	}
 	out, err := thinking.ApplyWire(backend.id, body, req.Model, eff, provider.Protocol, dialect)
