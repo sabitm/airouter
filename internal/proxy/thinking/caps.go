@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/opencode"
 )
 
 // Format selects the native thinking wire shape for a backend.
@@ -309,41 +310,60 @@ func grokFamily43(m string) bool {
 	return strings.HasPrefix(m, "grok-4.3")
 }
 
-// opencodeCaps dispatches per model family: opencode.ai serves multi-vendor
-// models behind one endpoint, so the dialect has no single native shape.
-// muse-spark is the Responses-only exception; the vendor families reuse their
-// own caps on the Chat Completions transport.
+// opencodeCaps reads the Zen catalog snapshot. Go rows can differ, but CapsFor
+// has no provider URL, so wire writing uses opencode.Lookup with the provider tier.
+// An unknown id gets no reasoning control. Google native thinkingConfig is deferred.
 func opencodeCaps(m string, protocol domain.Protocol) Caps {
-	if strings.Contains(m, "muse-spark") {
-		// Upstream rejects reasoning.effort=none and accepts up to xhigh.
-		return Caps{
-			Reasoning:  true,
-			CanDisable: false,
-			Format:     FormatOpenAIResponses,
-			Levels:     []string{"minimal", "low", "medium", "high", "xhigh"},
-			MaxOutput:  131072,
+	_ = protocol
+	spec, ok := opencode.Lookup(opencode.Tier(""), m)
+	return OpencodeCaps(spec, ok)
+}
+
+// OpencodeCaps converts a catalog row into thinking caps. ok false is an unknown model.
+func OpencodeCaps(spec opencode.ModelSpec, ok bool) Caps {
+	if !ok || spec.SDK == "google" || !opencodeWritesReasoning(spec) {
+		// Toggle-only, empty options, and Anthropic rows with no official effort
+		// variant produce no field. Budget on openai-compatible also produces none.
+		if ok && spec.Budget && spec.SDK == "anthropic" && len(spec.Efforts) == 0 {
+			return Caps{
+				Reasoning:  true,
+				CanDisable: false,
+				Format:     FormatClaudeBudget,
+				BudgetMin:  spec.BudgetMin,
+				BudgetMax:  spec.BudgetMax,
+				MaxOutput:  spec.Output,
+				Levels:     []string{"high", "max"},
+			}
+		}
+		out := spec.Output
+		if out == 0 {
+			out = 131072
+		}
+		return Caps{Reasoning: false, CanDisable: true, Format: FormatNone, MaxOutput: out}
+	}
+	format := FormatOpenAI
+	switch spec.SDK {
+	case "openai":
+		format = FormatOpenAIResponses
+	case "anthropic":
+		format = FormatClaudeAdaptive
+	}
+	return Caps{
+		Reasoning:  true,
+		CanDisable: opencodeLevelIn("none", spec.Efforts),
+		Format:     format,
+		Levels:     append([]string(nil), spec.Efforts...),
+		MaxOutput:  spec.Output,
+	}
+}
+
+func opencodeLevelIn(level string, levels []string) bool {
+	for _, item := range levels {
+		if item == level {
+			return true
 		}
 	}
-	switch {
-	case strings.Contains(m, "kimi"):
-		return kimiCaps(m)
-	case strings.Contains(m, "deepseek"):
-		return deepseekCaps(m)
-	case strings.Contains(m, "qwen"):
-		return qwenCaps(m)
-	case strings.Contains(m, "glm"):
-		return zaiCaps(m)
-	case strings.Contains(m, "minimax"):
-		// MiniMax uses thinking.type=adaptive, not Z.ai enabled/enable_thinking.
-		return minimaxCaps(m)
-	case strings.Contains(m, "mimo"):
-		// Xiaomi MiMo is not a reasoning model.
-		return Caps{Reasoning: false, CanDisable: true, Format: FormatNone, MaxOutput: 131072}
-	default:
-		c := openaiCaps(m, protocol)
-		c.MaxOutput = 131072
-		return c
-	}
+	return false
 }
 
 func claudeAdaptiveModel(m string) bool {

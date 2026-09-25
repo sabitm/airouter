@@ -61,19 +61,27 @@ func setupOpencodeTranslatedModel(t *testing.T, upstreamModel string, handler ht
 }
 
 func TestOpencodeBackendCodecPerModel(t *testing.T) {
-	chat := backendCodec(domain.ProtocolOpencode, "big-pickle")
+	chat := backendCodecFor(domain.ProtocolOpencode, opencode.ZenBaseURL, "big-pickle")
 	if chat.id != "opencode-chat" {
 		t.Fatalf("big-pickle codec = %q", chat.id)
 	}
 	if chat.upstreamPath != opencode.ChatPath {
 		t.Fatalf("chat path = %q", chat.upstreamPath)
 	}
-	resp := backendCodec(domain.ProtocolOpencode, "muse-spark-1.2-contributor-free")
+	resp := backendCodecFor(domain.ProtocolOpencode, opencode.ZenBaseURL, "muse-spark-1.2-contributor-free")
 	if resp.id != "opencode-responses" {
 		t.Fatalf("muse-spark codec = %q", resp.id)
 	}
 	if resp.upstreamPath != opencode.ResponsesPath {
 		t.Fatalf("responses path = %q", resp.upstreamPath)
+	}
+	msg := backendCodecFor(domain.ProtocolOpencode, opencode.ZenBaseURL, "qwen3.6-plus")
+	if msg.id != "opencode-messages" || msg.upstreamPath != opencode.MessagesPath {
+		t.Fatalf("qwen codec = %q path %q", msg.id, msg.upstreamPath)
+	}
+	goMini := backendCodecFor(domain.ProtocolOpencode, opencode.GoBaseURL, "minimax-m3")
+	if goMini.id != "opencode-messages" {
+		t.Fatalf("go minimax codec = %q, want messages", goMini.id)
 	}
 }
 
@@ -167,10 +175,12 @@ func TestOpencodeTranslatedDeepseekFinalize(t *testing.T) {
 	if got["model"] != "deepseek-v4-pro" {
 		t.Fatalf("model = %v", got["model"])
 	}
-	// deepseek dialect writes enable_thinking + thinking.type=enabled on chat.
-	th, _ := got["thinking"].(map[string]any)
-	if th == nil || th["type"] != "enabled" {
-		t.Fatalf("deepseek thinking = %+v, want type enabled", th)
+	// Catalog effort is high|max. high stays high. Toggle is not also written.
+	if got["reasoning_effort"] != "high" {
+		t.Fatalf("deepseek effort = %v, want high", got["reasoning_effort"])
+	}
+	if _, ok := got["thinking"]; ok {
+		t.Fatalf("thinking leaked: %v", got["thinking"])
 	}
 }
 
@@ -724,24 +734,16 @@ func assertNoRecognizedReasoningControls(t *testing.T, m map[string]any) {
 
 func TestOpencodeMiniMaxMiMoCaps(t *testing.T) {
 	m3 := thinkingCapsFor(t, "minimax-m3")
-	if !m3.Reasoning || m3.Format != thinking.FormatMiniMax || !m3.CanDisable {
-		t.Fatalf("m3 caps = %+v", m3)
-	}
-	m27 := thinkingCapsFor(t, "minimax-m2.7")
-	if !m27.Reasoning || m27.Format != thinking.FormatMiniMax || m27.CanDisable {
-		t.Fatalf("m2.7 caps = %+v", m27)
-	}
-	m25 := thinkingCapsFor(t, "minimax-m2.5")
-	if !m25.Reasoning || m25.Format != thinking.FormatMiniMax || m25.CanDisable {
-		t.Fatalf("m2.5 caps = %+v", m25)
+	if m3.Reasoning || m3.Format != thinking.FormatNone {
+		t.Fatalf("zen m3 caps = %+v, want no control", m3)
 	}
 	mimo := thinkingCapsFor(t, "mimo-v2.5-pro")
-	if mimo.Reasoning || mimo.Format != thinking.FormatNone || mimo.MaxOutput != 131072 {
+	if mimo.Reasoning || mimo.Format != thinking.FormatNone {
 		t.Fatalf("mimo caps = %+v", mimo)
 	}
-	glm := thinkingCapsFor(t, "glm-4.7")
-	if glm.Format != thinking.FormatZAI {
-		t.Fatalf("glm format = %v", glm.Format)
+	glm := thinkingCapsFor(t, "glm-5.2")
+	if !glm.Reasoning || glm.Format != thinking.FormatOpenAI || glm.CanDisable {
+		t.Fatalf("glm-5.2 caps = %+v", glm)
 	}
 }
 
@@ -756,7 +758,7 @@ func prepareOpencodeTranslated(t *testing.T, ingress codec, ingressBody []byte, 
 		req.Thinking = thinking.ToIR(captured)
 	}
 	applyUpstreamModel(req, upstreamModel)
-	backend := backendCodec(p.Protocol, upstreamModel)
+	backend := backendCodecFor(p.Protocol, p.BaseURL, upstreamModel)
 	upstreamBody, err := backend.encodeRequest(req)
 	if err != nil {
 		t.Fatal(err)
@@ -776,22 +778,115 @@ func prepareOpencodeTranslated(t *testing.T, ingress codec, ingressBody []byte, 
 	return got
 }
 
-func TestOpencodeTranslatedMiniMaxAdaptive(t *testing.T) {
+func TestOpencodeTranslatedMiniMaxStripsControls(t *testing.T) {
 	body := []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
 	got := prepareOpencodeTranslated(t, openaiCodec, body, "minimax-m3")
-	th, _ := got["thinking"].(map[string]any)
-	if th == nil || th["type"] != "adaptive" {
-		t.Fatalf("minimax thinking = %+v, want adaptive", th)
+	assertNoRecognizedReasoningControls(t, got)
+}
+
+func TestOpencodeCatalogEffortWire(t *testing.T) {
+	chat := []byte(`{"model":"combo","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`)
+	glm := prepareOpencodeTranslated(t, openaiCodec, chat, "glm-5.3")
+	if glm["reasoning_effort"] != "low" {
+		t.Fatalf("glm-5.3 low = %v, want low", glm["reasoning_effort"])
 	}
-	if _, ok := got["enable_thinking"]; ok {
-		t.Fatalf("enable_thinking leaked: %v", got)
+	medium := prepareOpencodeTranslated(t, openaiCodec, []byte(`{"model":"combo","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`), "glm-5.3")
+	if medium["reasoning_effort"] != "high" {
+		t.Fatalf("glm-5.3 medium = %v, want high", medium["reasoning_effort"])
 	}
-	if _, ok := got["reasoning_effort"]; ok {
-		t.Fatalf("reasoning_effort leaked: %v", got)
+	kimi := prepareOpencodeTranslated(t, openaiCodec, chat, "kimi-k3")
+	if kimi["reasoning_effort"] != "max" {
+		t.Fatalf("kimi-k3 effort = %v, want max", kimi["reasoning_effort"])
 	}
-	if th["type"] == "enabled" {
-		t.Fatalf("minimax must not emit enabled: %v", got)
+	k25 := prepareOpencodeTranslated(t, openaiCodec, chat, "kimi-k2.5")
+	assertNoRecognizedReasoningControls(t, k25)
+
+	gptBody := []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	gpt := prepareOpencodeTranslated(t, openaiCodec, gptBody, "gpt-5.4")
+	reasoning, _ := gpt["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" || reasoning["summary"] != "auto" {
+		t.Fatalf("gpt reasoning = %+v", reasoning)
 	}
+	if _, ok := gpt["reasoning_effort"]; ok {
+		t.Fatalf("gpt leaked reasoning_effort: %v", gpt["reasoning_effort"])
+	}
+
+	qwenBody := []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	qwen := prepareOpencodeTranslated(t, openaiCodec, qwenBody, "qwen3.6-plus")
+	th, _ := qwen["thinking"].(map[string]any)
+	if th["type"] != "enabled" || th["budget_tokens"] == nil {
+		t.Fatalf("qwen thinking = %+v", th)
+	}
+	if _, ok := qwen["reasoning_effort"]; ok {
+		t.Fatalf("qwen effort leaked: %v", qwen["reasoning_effort"])
+	}
+}
+
+func TestOpencodeAnthropicEffortShapes(t *testing.T) {
+	body := []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	prepare := func(model string) map[string]any {
+		return prepareOpencodeTranslated(t, openaiCodec, body, model)
+	}
+	opus45 := prepare("claude-opus-4-5")
+	th, _ := opus45["thinking"].(map[string]any)
+	if th["type"] != "enabled" || th["budget_tokens"] != float64(16000) {
+		t.Fatalf("opus 4.5 thinking = %+v", th)
+	}
+	if effortOf(t, opus45) != "high" {
+		t.Fatalf("opus 4.5 effort = %v", effortOf(t, opus45))
+	}
+
+	opus46 := prepare("claude-opus-4-6")
+	th, _ = opus46["thinking"].(map[string]any)
+	if th["type"] != "adaptive" || th["display"] != nil || effortOf(t, opus46) != "high" {
+		t.Fatalf("opus 4.6 = thinking:%+v effort:%v", th, effortOf(t, opus46))
+	}
+
+	fable := prepare("claude-fable-5")
+	th, _ = fable["thinking"].(map[string]any)
+	if th["type"] != "adaptive" || th["display"] != "summarized" || effortOf(t, fable) != "high" {
+		t.Fatalf("fable = thinking:%+v effort:%v", th, effortOf(t, fable))
+	}
+
+	flash := prepare("qwen3.8-flash")
+	assertNoRecognizedReasoningControls(t, flash)
+}
+
+func TestOpencodeGoCatalogSelectsGoRow(t *testing.T) {
+	p := opencodeTestProvider()
+	p.BaseURL = opencode.GoBaseURL
+	req, err := openaiCodec.decodeRequest([]byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Thinking = thinking.ToIR(&thinking.Config{Mode: thinking.ModeLevel, Level: "high"})
+	applyUpstreamModel(req, "minimax-m3")
+	backend := backendCodecFor(p.Protocol, p.BaseURL, "minimax-m3")
+	if backend.id != "opencode-messages" {
+		t.Fatalf("go minimax codec = %s, want opencode-messages", backend.id)
+	}
+	body, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err = finalizeEncodedBody(body, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["model"] != "minimax-m3" {
+		t.Fatalf("model = %v", got["model"])
+	}
+	assertNoRecognizedReasoningControls(t, got)
+}
+
+func effortOf(t *testing.T, body map[string]any) any {
+	t.Helper()
+	oc, _ := body["output_config"].(map[string]any)
+	return oc["effort"]
 }
 
 func TestOpencodeTranslatedMiMoStripsReasoningControls(t *testing.T) {

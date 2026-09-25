@@ -234,7 +234,7 @@ var opencodeChatCodec = codec{
 	newStreamEncoder: func(model string) streamEncoder { return openai.NewStreamEncoder(model) },
 }
 
-// opencodeResponsesCodec is the opencode.ai Zen backend for muse-spark models
+// opencodeResponsesCodec is the opencode.ai backend for @ai-sdk/openai models
 // (Responses-only upstream): the standard Responses wire format plus the
 // muse-spark normalization applied in prepareUpstreamRequest. Its id differs
 // from oai-responses so a Responses ingress request still translates.
@@ -251,7 +251,26 @@ var opencodeResponsesCodec = codec{
 	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
 }
 
+// opencodeMessagesCodec is the opencode.ai backend for @ai-sdk/anthropic models.
+// Its id differs from anth-msg so an Anthropic ingress request still translates.
+var opencodeMessagesCodec = codec{
+	id:               "opencode-messages",
+	protocol:         domain.ProtocolOpencode,
+	decodeRequest:    anthropic.DecodeRequest,
+	encodeRequest:    anthropic.EncodeRequest,
+	decodeResponse:   anthropic.DecodeResponse,
+	encodeResponse:   anthropic.EncodeResponse,
+	encodeError:      anthropic.EncodeError,
+	upstreamPath:     opencode.MessagesPath,
+	decodeStream:     anthropic.DecodeStream,
+	newStreamEncoder: func(model string) streamEncoder { return anthropic.NewStreamEncoder(model) },
+}
+
 func backendCodec(p domain.Protocol, model string) codec {
+	return backendCodecFor(p, "", model)
+}
+
+func backendCodecFor(p domain.Protocol, baseURL, model string) codec {
 	switch p {
 	case domain.ProtocolAnthropic:
 		return anthropicCodec
@@ -270,10 +289,14 @@ func backendCodec(p domain.Protocol, model string) codec {
 	case domain.ProtocolClaudeCode:
 		return claudeCodeCodec
 	case domain.ProtocolOpencode:
-		if opencode.IsResponsesModel(model) {
+		switch opencode.Endpoint(opencode.Tier(baseURL), model) {
+		case opencode.EndpointResponses:
 			return opencodeResponsesCodec
+		case opencode.EndpointMessages:
+			return opencodeMessagesCodec
+		default:
+			return opencodeChatCodec
 		}
-		return opencodeChatCodec
 	default:
 		return openaiCodec
 	}

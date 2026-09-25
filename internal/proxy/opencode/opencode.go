@@ -27,6 +27,7 @@ const (
 
 	ChatPath      = "/chat/completions"
 	ResponsesPath = "/responses"
+	MessagesPath  = "/messages"
 
 	sessionPrefix = "ses_"
 	requestPrefix = "msg_"
@@ -47,11 +48,17 @@ var (
 	idCounter     uint64
 )
 
-// IsResponsesModel reports whether the model is served by the Responses
-// endpoint. muse-spark variants 500 on /chat/completions; every other model
-// 500s on /responses, so the split is hard.
+// IsResponsesModel reports whether the Zen catalog serves model on /responses.
+// Tier-specific routing uses Endpoint. Unknown ids stay on chat.
 func IsResponsesModel(model string) bool {
-	return strings.Contains(strings.ToLower(model), "muse-spark")
+	return Endpoint(zenTier, model) == EndpointResponses
+}
+
+// Endpoint reports the upstream family for a tier and model. Unknown models
+// stay on chat. Google rows also stay on chat; native thinkingConfig is deferred.
+func Endpoint(tier, model string) string {
+	spec, ok := Lookup(tier, model)
+	return EndpointFor(spec, ok)
 }
 
 // Tier classifies a provider base URL. Base URLs other than the two known ones

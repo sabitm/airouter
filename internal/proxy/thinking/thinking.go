@@ -221,14 +221,23 @@ func ResolveIntent(bodyCfg, suffixCfg *Config, caps Caps, dialect domain.Reasoni
 // formatID selects the transport wire family (oai-chat, anth-msg, oai-responses)
 // when the dialect alone is ambiguous (e.g. openai vs responses effort field).
 func ApplyWire(formatID string, body []byte, model string, cfg *Config, protocol domain.Protocol, dialect domain.ReasoningDialect) ([]byte, error) {
+	return ApplyWireForTier(formatID, body, model, cfg, protocol, dialect, "")
+}
+
+// ApplyWireForTier is ApplyWire with an OpenCode tier. Other dialects ignore tier.
+func ApplyWireForTier(formatID string, body []byte, model string, cfg *Config, protocol domain.Protocol, dialect domain.ReasoningDialect, tier string) ([]byte, error) {
 	m, err := decodeObjectUseNumber(body)
 	if err != nil {
 		return nil, err
 	}
 	m["model"] = model
-	stripRecognizedReasoning(m)
+	stripRecognizedReasoning(m, dialect)
 	if dialect == domain.ReasoningCline {
 		stripClineControls(m)
+	}
+	if dialect == domain.ReasoningOpencode {
+		writeOpencode(m, model, cfg, tier)
+		return json.Marshal(m)
 	}
 	if cfg != nil {
 		caps := CapsFor(model, protocol, dialect)
@@ -335,7 +344,7 @@ func rewriteModelOnly(body []byte, model string) ([]byte, error) {
 // stripRecognizedReasoning removes only known reasoning members, preserving
 // reasoning.summary, output_config siblings, and unknown fields. Objects emptied
 // by the strip are deleted.
-func stripRecognizedReasoning(m map[string]any) {
+func stripRecognizedReasoning(m map[string]any, dialect domain.ReasoningDialect) {
 	delete(m, "reasoning_effort")
 	delete(m, "enable_thinking")
 	delete(m, "thinking_budget")
@@ -354,6 +363,9 @@ func stripRecognizedReasoning(m map[string]any) {
 		delete(t, "type")
 		delete(t, "budget_tokens")
 		if len(t) == 0 {
+			delete(m, "thinking")
+		} else if dialect == domain.ReasoningOpencode {
+			// OpenCode catalog rows do not preserve vendor thinking siblings.
 			delete(m, "thinking")
 		} else {
 			m["thinking"] = t

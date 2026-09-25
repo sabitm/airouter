@@ -7,6 +7,29 @@ import (
 	"testing"
 )
 
+func TestAnthropicEffortShapes(t *testing.T) {
+	cases := []struct {
+		model string
+		want  AnthropicEffortShape
+	}{
+		{"claude-opus-4-5", AnthropicEffortEnabled},
+		{"claude-opus-4-6", AnthropicEffortAdaptive},
+		{"claude-sonnet-4-6", AnthropicEffortAdaptive},
+		{"claude-opus-4-7", AnthropicEffortSummarized},
+		{"claude-fable-5", AnthropicEffortSummarized},
+		{"claude-opus-4-20250514", AnthropicEffortNone},
+		{"qwen3.8-flash", AnthropicEffortNone},
+	}
+	for _, tc := range cases {
+		if got := AnthropicEffort(tc.model); got != tc.want {
+			t.Errorf("AnthropicEffort(%q) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+	if got := Opus45BudgetTokens(64000); got != 16000 {
+		t.Fatalf("opus budget = %d, want 16000", got)
+	}
+}
+
 func TestIsResponsesModel(t *testing.T) {
 	cases := []struct {
 		model string
@@ -14,9 +37,9 @@ func TestIsResponsesModel(t *testing.T) {
 	}{
 		{"muse-spark-1.2", true},
 		{"muse-spark-1.2-contributor-free", true},
-		{"Muse-Spark-2", true},
+		{"Muse-Spark-2", false},
 		{"big-pickle", false},
-		{"gpt-5.5", false},
+		{"gpt-5.5", true},
 		{"kimi-k3", false},
 		{"deepseek-v4-pro", false},
 	}

@@ -231,7 +231,7 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	}
 	// anthropic-version is a wire-format requirement of the Anthropic Messages
 	// API, tied to protocol rather than auth. Preserve a client-sent value.
-	if provider.Protocol == domain.ProtocolAnthropic && req.Header.Get("anthropic-version") == "" {
+	if (provider.Protocol == domain.ProtocolAnthropic || opencodeMessagesRequest(req, provider)) && req.Header.Get("anthropic-version") == "" {
 		req.Header.Set("anthropic-version", anthropicVersion)
 	}
 	// The Codex backend additionally requires the Codex-CLI identity headers.
@@ -280,6 +280,13 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	if provider.Protocol == domain.ProtocolOpencode {
 		applyOpencodeHeaders(req, ctx)
 	}
+}
+
+func opencodeMessagesRequest(req *http.Request, provider *domain.Provider) bool {
+	if provider == nil || provider.Protocol != domain.ProtocolOpencode || req == nil || req.URL == nil {
+		return false
+	}
+	return strings.HasSuffix(req.URL.Path, opencode.MessagesPath)
 }
 
 // applyQoderHeaders COSY-signs the wire body and sets Qoder identity headers.

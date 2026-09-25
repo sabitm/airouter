@@ -12,6 +12,7 @@ import (
 	"airouter/internal/observability"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/sse"
 	"airouter/internal/proxy/thinking"
@@ -648,7 +649,7 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	// Explicit none: strip any transport-default reasoning the encoder may have
 	// written so the generic writer stays disabled.
 	if dialect == domain.ReasoningNone {
-		return thinking.ApplyWire(backend.id, body, req.Model, nil, provider.Protocol, dialect)
+		return thinking.ApplyWireForTier(backend.id, body, req.Model, nil, provider.Protocol, dialect, opencode.Tier(provider.BaseURL))
 	}
 	// Codex keeps the encoder's required default and native hyphen suffix when no
 	// unified body/suffix intent exists. Explicit intent is selectively patched.
@@ -656,12 +657,23 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	if provider.Protocol == domain.ProtocolOpenAICodex && cfg == nil {
 		return body, nil
 	}
+	tier := ""
+	if provider.Protocol == domain.ProtocolOpencode {
+		tier = opencode.Tier(provider.BaseURL)
+	}
 	caps := thinking.CapsFor(req.Model, provider.Protocol, dialect)
+	if provider.Protocol == domain.ProtocolOpencode {
+		if spec, ok := opencode.Lookup(tier, req.Model); ok {
+			caps = thinking.OpencodeCaps(spec, true)
+		} else {
+			caps = thinking.OpencodeCaps(opencode.ModelSpec{}, false)
+		}
+	}
 	// Chat/Responses encoders write transport-default reasoning fields using
 	// OpenAI caps. Non-reasoning targets must drop those controls even when
 	// IR still carries ingress intent.
 	if !caps.Reasoning || caps.Format == thinking.FormatNone {
-		return thinking.ApplyWire(backend.id, body, req.Model, nil, provider.Protocol, dialect)
+		return thinking.ApplyWireForTier(backend.id, body, req.Model, nil, provider.Protocol, dialect, tier)
 	}
 	eff := thinking.ResolveIntent(cfg, nil, caps, dialect)
 	// Grok omits none/auto instead of upgrading them. The encoder already wrote
@@ -669,7 +681,7 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	if eff == nil && caps.RequiredDefault == "" && dialect != domain.ReasoningGrok {
 		return body, nil
 	}
-	out, err := thinking.ApplyWire(backend.id, body, req.Model, eff, provider.Protocol, dialect)
+	out, err := thinking.ApplyWireForTier(backend.id, body, req.Model, eff, provider.Protocol, dialect, tier)
 	if err != nil {
 		return nil, err
 	}
@@ -695,7 +707,7 @@ func protocolForCodec(c codec) domain.Protocol {
 		return domain.ProtocolOpenAICodex
 	case "claude-code":
 		return domain.ProtocolClaudeCode
-	case "opencode-chat", "opencode-responses":
+	case "opencode-chat", "opencode-responses", "opencode-messages":
 		return domain.ProtocolOpencode
 	case "cursor":
 		return domain.ProtocolCursor
