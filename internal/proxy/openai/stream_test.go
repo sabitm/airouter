@@ -182,6 +182,39 @@ func TestNormalizeErrorScalar(t *testing.T) {
 	}
 }
 
+func TestDecodeStreamUsageOnlyTrailerNoFabrication(t *testing.T) {
+	trailer := "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"up\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}\n\n"
+	var out []ir.StreamEvent
+	err := DecodeStream(strings.NewReader(trailer), func(ev ir.StreamEvent) error {
+		out = append(out, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("events = %+v, want none", out)
+	}
+
+	body := "data: {\"id\":\"chatcmpl-1\",\"model\":\"up\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"up\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n" +
+		"data: [DONE]\n\n"
+	out = nil
+	err = DecodeStream(strings.NewReader(body), func(ev ir.StreamEvent) error {
+		out = append(out, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 3 || out[0].Kind != ir.EventMessageStart || out[1].Kind != ir.EventTextDelta || out[1].Text != "ok" || out[2].Kind != ir.EventFinish {
+		t.Fatalf("events = %+v", out)
+	}
+	if out[2].InputTokens != 10 || out[2].OutputTokens != 2 {
+		t.Fatalf("usage = in %d/out %d, want 10/2", out[2].InputTokens, out[2].OutputTokens)
+	}
+}
+
 func TestDecodeStreamChunkWithChoices(t *testing.T) {
 	body := "data: {\"id\":\"chatcmpl-1\",\"model\":\"up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
 	var out []ir.StreamEvent

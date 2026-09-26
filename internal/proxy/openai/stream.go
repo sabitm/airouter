@@ -143,20 +143,27 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		if json.Unmarshal(ev.Data, &chunk) != nil {
 			continue
 		}
-		// Skip frames that carry neither identity, content, finish, nor usage so
-		// arbitrary empty JSON does not open a fabricated successful stream.
-		hasContent := chunk.ID != "" || chunk.Model != "" || chunk.Usage != nil
-		if !hasContent {
-			for _, c := range chunk.Choices {
-				reasoning := chatReasoningText(c.Delta.ReasoningContent, c.Delta.Reasoning, c.Delta.ReasoningDetails)
-				if c.Delta.Role != "" || c.Delta.Content != "" || reasoning != "" || len(c.Delta.ToolCalls) > 0 ||
-					(c.FinishReason != nil && *c.FinishReason != "") {
-					hasContent = true
-					break
-				}
+		// Only delta content or a finish reason open the stream: evidence the
+		// model produced a turn. A usage-only trailer must update counters without
+		// fabricating a start, so an empty or truncated stream still fails over
+		// (the passthrough classifier treats usage-only frames as lifecycle).
+		hasContent := false
+		for _, c := range chunk.Choices {
+			reasoning := chatReasoningText(c.Delta.ReasoningContent, c.Delta.Reasoning, c.Delta.ReasoningDetails)
+			if c.Delta.Role != "" || c.Delta.Content != "" || reasoning != "" || len(c.Delta.ToolCalls) > 0 ||
+				(c.FinishReason != nil && *c.FinishReason != "") {
+				hasContent = true
+				break
 			}
 		}
 		if !hasContent {
+			if chunk.Usage != nil {
+				u := usageFromWire(chunk.Usage)
+				inputTokens = u.InputTokens
+				outputTokens = u.OutputTokens
+				cacheRead = u.CacheReadTokens
+				cacheWrite = u.CacheWriteTokens
+			}
 			continue
 		}
 		if !started {

@@ -1379,6 +1379,61 @@ func TestStreamOnlyUnaryOversizedResponseFailsOver(t *testing.T) {
 	}
 }
 
+func TestUsageOnlyTrailerStreamFailsOver(t *testing.T) {
+	const usageOnlySSE = "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"up\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}\n\n"
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, usageOnlySSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "real-model", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/messages", key.Token,
+		`{"model":"default","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if hits != 1 {
+		t.Fatalf("hits = %d, want 1", hits)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("decode error envelope: %v body=%s", err, body)
+	}
+	if envelope.Error.Message != "upstream returned an empty stream" {
+		t.Fatalf("message = %q", envelope.Error.Message)
+	}
+	if envelope.Error.Type != "api_error" {
+		t.Fatalf("type = %q", envelope.Error.Type)
+	}
+}
+
 func TestStreamPreCommitOverloadFailover(t *testing.T) {
 	var n1, n2 int
 	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
