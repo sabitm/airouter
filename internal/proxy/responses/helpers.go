@@ -28,13 +28,27 @@ func contentToText(raw json.RawMessage) string {
 	return b.String()
 }
 
-// outputToText flattens a function_call_output value (string or content parts).
-func outputToText(raw json.RawMessage) string {
-	return contentToText(raw)
+// toolResultBlocks decodes a function_call_output value. A string is text;
+// an array uses message-part decoding so nested media reaches InspectRequest.
+func toolResultBlocks(raw json.RawMessage) []ir.ContentBlock {
+	if len(raw) == 0 {
+		return []ir.ContentBlock{{Type: ir.BlockText}}
+	}
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			return []ir.ContentBlock{{Type: ir.BlockText}}
+		}
+		return []ir.ContentBlock{{Type: ir.BlockText, Text: s}}
+	}
+	blocks := decodeParts(raw)
+	if len(blocks) == 0 {
+		return []ir.ContentBlock{{Type: ir.BlockText}}
+	}
+	return blocks
 }
 
-// toolResultText concatenates the text blocks of an IR tool_result for emission
-// as a Responses function_call_output, which carries a plain string output.
+// toolResultText concatenates the text blocks of an IR tool_result.
 func toolResultText(b ir.ContentBlock) string {
 	var sb strings.Builder
 	for _, rb := range b.ToolResult {
@@ -43,6 +57,41 @@ func toolResultText(b ir.ContentBlock) string {
 		}
 	}
 	return sb.String()
+}
+
+// toolResultHasMedia reports whether a tool result carries image or file blocks.
+// Those cannot be flattened into the string form of function_call_output.output.
+func toolResultHasMedia(b ir.ContentBlock) bool {
+	for _, rb := range b.ToolResult {
+		if rb.Type == ir.BlockImage || rb.Type == ir.BlockFile {
+			return true
+		}
+	}
+	return false
+}
+
+// toolResultOutput keeps a text-only result as a string. A result that contains
+// image or file blocks becomes an ordered array of Responses input parts so
+// representable text, image, and file blocks survive encode.
+func toolResultOutput(b ir.ContentBlock) any {
+	if !toolResultHasMedia(b) {
+		return toolResultText(b)
+	}
+	var parts []map[string]any
+	for _, rb := range b.ToolResult {
+		switch rb.Type {
+		case ir.BlockText:
+			parts = append(parts, map[string]any{"type": "input_text", "text": rb.Text})
+		case ir.BlockImage:
+			parts = append(parts, inputImagePart(rb.Image))
+		case ir.BlockFile:
+			parts = append(parts, inputFilePart(rb.File))
+		}
+	}
+	if parts == nil {
+		parts = []map[string]any{}
+	}
+	return parts
 }
 
 func mustJSON(v any) []byte {
@@ -75,6 +124,14 @@ func imageURLString(raw json.RawMessage) string {
 	return obj.URL
 }
 
+// imageFromPart maps a Responses input_image onto IR. file_id is a source
+// even when image_url is absent; both may be set and fail closed later.
+func imageFromPart(p contentPart) *ir.Image {
+	img := imageFromURL(imageURLString(p.ImageURL))
+	img.ID = p.FileID
+	return img
+}
+
 func imageFromURL(url string) *ir.Image {
 	if url == "" {
 		return &ir.Image{}
@@ -101,6 +158,20 @@ func imageToURL(img *ir.Image) string {
 		return media.RenderDataURL(mt, img.Data)
 	}
 	return img.URL
+}
+
+func inputImagePart(img *ir.Image) map[string]any {
+	part := map[string]any{"type": "input_image"}
+	if img == nil {
+		return part
+	}
+	if img.ID != "" {
+		part["file_id"] = img.ID
+	}
+	if url := imageToURL(img); url != "" {
+		part["image_url"] = url
+	}
+	return part
 }
 
 func fileFromPart(p contentPart) *ir.File {

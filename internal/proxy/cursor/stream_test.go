@@ -468,13 +468,24 @@ func TestDecodeAgentStreamRejectsUnmatchedGrepThenContinues(t *testing.T) {
 		t.Fatal("reject is not an exec_client_message")
 	}
 	em, _ := decodeMessage(ecm[0].value)
+	if id, _ := varintField(em, ecmID); id != 9 {
+		t.Fatalf("exec client id = %d, want 9", id)
+	}
+	if eid, _ := stringField(em, ecmExecID); eid != "exec-grep" {
+		t.Fatalf("exec_id = %q, want exec-grep", eid)
+	}
 	res, ok := em[5]
 	if !ok || len(res) == 0 {
-		t.Fatal("grep result missing")
+		t.Fatal("grep result field missing")
 	}
 	gr, _ := decodeMessage(res[0].value)
-	if _, ok := gr[execResultRejected]; !ok {
+	rejected, ok := gr[execResultRejected]
+	if !ok || len(rejected) == 0 {
 		t.Fatal("grep rejected variant missing")
+	}
+	errMsg, _ := decodeMessage(rejected[0].value)
+	if msg, ok := stringField(errMsg, execRejectedError); !ok || msg == "" {
+		t.Fatal("rejected error field missing")
 	}
 	var names []string
 	var stop ir.StopReason
@@ -639,45 +650,26 @@ func TestDecodeAgentStreamUnknownExecOneofStillSurfaces(t *testing.T) {
 	}
 }
 
-func TestDecodeAgentStreamUnmatchedUpdateRejectsThenContinues(t *testing.T) {
+func TestDecodeAgentStreamUnmatchedUpdateClosesWithoutRejection(t *testing.T) {
 	var writes int
-	var names []string
+	var sawTextAfter bool
+	var finished bool
 	err := DecodeAgentStreamTools([]ir.Tool{{Name: "bash"}, {Name: "read"}}, bytes.NewReader(bytes.Join([][]byte{
 		agentTextFrame(t, "Checking what is left to build."),
 		builtinToolUpdateFrame(t, 5, "call-grep", "/tmp", "**/xai*"),
-		mcpToolCallStartedFrame(t, "call-bash", "bash", map[string]any{"command": "rg xai"}),
+		agentTextFrame(t, "this later frame must not be consumed"),
 	}, nil)), func([]byte) error {
 		writes++
 		return nil
 	}, func(ev ir.StreamEvent) error {
 		if ev.Kind == ir.EventToolCallStart {
-			names = append(names, ev.ToolName)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if writes != 1 {
-		t.Fatalf("rejects = %d, want 1", writes)
-	}
-	if len(names) != 1 || names[0] != "bash" {
-		t.Fatalf("tools = %v, want [bash]", names)
-	}
-}
-
-func TestDecodeAgentStreamUnmatchedUpdateWithoutResultCloses(t *testing.T) {
-	var sawFinish bool
-	err := DecodeAgentStreamTools([]ir.Tool{{Name: "bash"}}, bytes.NewReader(bytes.Join([][]byte{
-		agentTextFrame(t, "Checking what is left to build."),
-		builtinToolUpdateFrame(t, 0, "call-grep", "/tmp", "**/xai*"),
-		agentTextFrame(t, "this heartbeat wait must not be read"),
-	}, nil)), nil, func(ev ir.StreamEvent) error {
-		if ev.Kind == ir.EventToolCallStart {
 			t.Fatalf("unmatched tool emitted %s", ev.ToolName)
 		}
+		if ev.Kind == ir.EventTextDelta && ev.Text == "this later frame must not be consumed" {
+			sawTextAfter = true
+		}
 		if ev.Kind == ir.EventFinish {
-			sawFinish = true
+			finished = true
 			if ev.StopReason != ir.StopEndTurn {
 				t.Errorf("stop = %q, want end_turn", ev.StopReason)
 			}
@@ -687,8 +679,54 @@ func TestDecodeAgentStreamUnmatchedUpdateWithoutResultCloses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sawFinish {
-		t.Fatal("decoder waited after an unmatched tool update it could not reject")
+	if writes != 0 {
+		t.Fatalf("rejects = %d, want 0", writes)
+	}
+	if !finished {
+		t.Fatal("unmatched tool update did not finish the turn")
+	}
+	if sawTextAfter {
+		t.Fatal("decoder consumed a frame after the unmatched tool update")
+	}
+}
+
+func TestDecodeAgentStreamUnmatchedPartialUpdateCloses(t *testing.T) {
+	var writes int
+	var sawTextAfter bool
+	var finished bool
+	err := DecodeAgentStreamTools([]ir.Tool{{Name: "bash"}}, bytes.NewReader(bytes.Join([][]byte{
+		agentTextFrame(t, "Checking what is left to build."),
+		builtinPartialToolUpdateFrame(t, "call-grep", "/tmp", "**/xai*"),
+		agentTextFrame(t, "this later frame must not be consumed"),
+	}, nil)), func([]byte) error {
+		writes++
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventToolCallStart {
+			t.Fatalf("unmatched tool emitted %s", ev.ToolName)
+		}
+		if ev.Kind == ir.EventTextDelta && ev.Text == "this later frame must not be consumed" {
+			sawTextAfter = true
+		}
+		if ev.Kind == ir.EventFinish {
+			finished = true
+			if ev.StopReason != ir.StopEndTurn {
+				t.Errorf("stop = %q, want end_turn", ev.StopReason)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writes != 0 {
+		t.Fatalf("rejects = %d, want 0", writes)
+	}
+	if !finished {
+		t.Fatal("unmatched partial update did not finish the turn")
+	}
+	if sawTextAfter {
+		t.Fatal("decoder consumed a frame after the unmatched partial update")
 	}
 }
 
@@ -708,6 +746,20 @@ func builtinToolUpdateFrame(t *testing.T, resultField int, callID, path, pattern
 		encodeField(tcsToolCall, wireLen, tc),
 	)
 	return interactionUpdateFrame(t, iuToolCallStarted, inner)
+}
+
+func builtinPartialToolUpdateFrame(t *testing.T, callID, path, pattern string) []byte {
+	t.Helper()
+	args := concatBytes(
+		encodeField(1, wireLen, pattern),
+		encodeField(2, wireLen, path),
+		encodeField(3, wireLen, callID),
+	)
+	inner := concatBytes(
+		encodeField(ptcCallID, wireLen, callID),
+		encodeField(ptcToolCall, wireLen, encodeField(5, wireLen, args)),
+	)
+	return interactionUpdateFrame(t, iuPartialToolCall, inner)
 }
 
 func TestDecodeAgentStreamReadToolCallStarted(t *testing.T) {
@@ -897,14 +949,41 @@ func TestDecodeAgentStreamWebSearchUnmatchedDropped(t *testing.T) {
 		Name:       "bash",
 		Parameters: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
 	}}
-	events, err := collectAgentEventsToolsErr(t, tools, webSearchQueryFrame(t, "call-ws", "SPUS"), agentTurnEndedFrame(t, 1, 1))
+	var writes int
+	var sawTextAfter bool
+	var finished bool
+	err := DecodeAgentStreamTools(tools, bytes.NewReader(bytes.Join([][]byte{
+		webSearchQueryFrame(t, "call-ws", "SPUS"),
+		agentTextFrame(t, "this later frame must not be consumed"),
+	}, nil)), func([]byte) error {
+		writes++
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EventToolCallStart {
+			t.Fatalf("unmatched interaction emitted %+v", ev)
+		}
+		if ev.Kind == ir.EventTextDelta && ev.Text == "this later frame must not be consumed" {
+			sawTextAfter = true
+		}
+		if ev.Kind == ir.EventFinish {
+			finished = true
+			if ev.StopReason != ir.StopEndTurn {
+				t.Errorf("stop = %q, want end_turn", ev.StopReason)
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, ev := range events {
-		if ev.Kind == ir.EventToolCallStart {
-			t.Fatalf("unmatched built-in emitted %+v", ev)
-		}
+	if writes != 0 {
+		t.Fatalf("rejects = %d, want 0", writes)
+	}
+	if !finished {
+		t.Fatal("unmatched interaction did not finish the turn")
+	}
+	if sawTextAfter {
+		t.Fatal("decoder consumed a frame after the unmatched interaction")
 	}
 }
 
@@ -975,14 +1054,37 @@ func TestDecodeAgentStreamAskQuestionUnmatched(t *testing.T) {
 	tools := []ir.Tool{{Name: "bash"}}
 	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
 		encodeField(3, wireLen, []byte{})))
-	events, err := collectAgentEventsToolsErr(t, tools, frame, agentTurnEndedFrame(t, 1, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, ev := range events {
+	var writes int
+	var finished bool
+	err := DecodeAgentStreamTools(tools, bytes.NewReader(bytes.Join([][]byte{
+		frame,
+		agentTextFrame(t, "this later frame must not be consumed"),
+	}, nil)), func([]byte) error {
+		writes++
+		return nil
+	}, func(ev ir.StreamEvent) error {
 		if ev.Kind == ir.EventToolCallStart {
 			t.Fatalf("unmatched interaction emitted %+v", ev)
 		}
+		if ev.Kind == ir.EventTextDelta && ev.Text == "this later frame must not be consumed" {
+			t.Fatal("decoder consumed a frame after the unmatched interaction")
+		}
+		if ev.Kind == ir.EventFinish {
+			finished = true
+			if ev.StopReason != ir.StopEndTurn {
+				t.Errorf("stop = %q, want end_turn", ev.StopReason)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writes != 0 {
+		t.Fatalf("rejects = %d, want 0", writes)
+	}
+	if !finished {
+		t.Fatal("unmatched interaction did not finish the turn")
 	}
 }
 

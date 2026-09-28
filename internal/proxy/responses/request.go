@@ -106,7 +106,7 @@ func decodeInput(raw json.RawMessage, systemOut *string) []ir.Message {
 			appendBlock(ir.RoleUser, ir.ContentBlock{
 				Type:       ir.BlockToolResult,
 				ToolUseID:  it.CallID,
-				ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: outputToText(it.Output)}},
+				ToolResult: toolResultBlocks(it.Output),
 			})
 		}
 	}
@@ -136,8 +136,8 @@ func decodeParts(raw json.RawMessage) []ir.ContentBlock {
 		case "input_image":
 			// Always emit a recognized image block so missing/empty sources fail
 			// closed at InspectRequest rather than vanishing on passthrough.
-			url := imageURLString(p.ImageURL)
-			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromURL(url)})
+			// file_id is a source; image_url alone is not required.
+			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromPart(p)})
 		case "input_file":
 			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockFile, File: fileFromPart(p)})
 		}
@@ -270,7 +270,7 @@ func encodeInput(req *ir.Request) []map[string]any {
 		for _, b := range m.Content {
 			if b.Type == ir.BlockToolResult {
 				items = append(items, map[string]any{
-					"type": "function_call_output", "call_id": b.ToolUseID, "output": toolResultText(b),
+					"type": "function_call_output", "call_id": b.ToolUseID, "output": toolResultOutput(b),
 				})
 			}
 		}
@@ -280,7 +280,7 @@ func encodeInput(req *ir.Request) []map[string]any {
 			case ir.BlockText:
 				parts = append(parts, map[string]any{"type": "input_text", "text": b.Text})
 			case ir.BlockImage:
-				parts = append(parts, map[string]any{"type": "input_image", "image_url": imageToURL(b.Image)})
+				parts = append(parts, inputImagePart(b.Image))
 			case ir.BlockFile:
 				parts = append(parts, inputFilePart(b.File))
 			}

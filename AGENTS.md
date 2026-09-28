@@ -130,10 +130,9 @@ Qoder, Antigravity, Cursor, and Claude Code are backend-only variants.
   (`interaction_query`, non-MCP exec, ToolCall oneofs) is resolved onto a
   declared ingress tool (exact name, lowercase alphanumeric equality such
   as `web_search`/`websearch`, or Cursor's `pi_` namespace prefix). Unmatched
-  built-ins are not forwarded to the client; the proxy opens one fresh
-  AgentService turn that names the request's declared MCP tools and tells
-  the model to call those. Unknown interaction queries are named and
-  retried the same way; they must not fail the stream.
+  built-ins are not forwarded to the client. The proxy rejects the exec when
+  the message has a result field; otherwise it closes the turn. Unknown
+  interaction queries are not retried and must not fail the stream.
 - **Claude Code:** Keep an ID distinct from Anthropic so requests always pass
   through preparation. Preserve per-request session ID pairing between body and
   headers, OAuth-token-gated cloaking, tool decloaking, and CLI identity headers.

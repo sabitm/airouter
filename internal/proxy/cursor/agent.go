@@ -85,8 +85,9 @@ const (
 	asmExecServerMessage = 2
 	asmKVServerMessage   = 4
 	// asmInteractionQuery (7): the server asks the CLIENT to run a built-in
-	// interaction. Every variant is named and resolved onto a declared MCP
-	// tool (or one retry). Ignoring the query stalls the turn with heartbeats.
+	// interaction. Every variant is named and resolved onto a declared tool.
+	// An unmatched query is not retried or surfaced. Ignoring it stalls the
+	// turn with heartbeats, so the client turn ends instead.
 	asmInteractionQuery = 7
 
 	iqID        = 1
@@ -252,7 +253,7 @@ func EncodeAgentRequest(req *ir.Request) ([]byte, error) {
 	// unknown CLI option, so the system prompt is folded into the current user
 	// message instead, matching the CLI's own prompt layout.
 	sys := strings.TrimSpace(req.System)
-	if note := MCPAvailabilityNote(req.Tools, ""); note != "" {
+	if note := MCPAvailabilityNote(req.Tools); note != "" {
 		if sys != "" {
 			sys = sys + "\n\n" + note
 		} else {

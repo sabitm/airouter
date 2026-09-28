@@ -29,6 +29,13 @@ type BackendCaps struct {
 	ToolResultMedia bool
 }
 
+// imageIDCompatible reports whether a provider-owned image ID can be sent.
+// The ID is scoped to the provider that issued it, so translation across
+// codec IDs is rejected even when both codecs advertise FileID.
+func imageIDCompatible(c BackendCaps, translated bool) bool {
+	return c.FileID && !translated
+}
+
 // CapsForCodecID returns transport attachment capabilities for a backend codec id.
 func CapsForCodecID(id string) BackendCaps {
 	switch id {
@@ -53,14 +60,16 @@ func CapsForCodecID(id string) BackendCaps {
 		}
 	case "oai-responses", "opencode-responses":
 		// input_file carries PDFs via the same inline/URL forms as generic files.
+		// EncodeRequest preserves image/file blocks nested in tool results.
 		return BackendCaps{
-			ImageInline: true,
-			ImageURL:    true,
-			PDFInline:   true,
-			PDFURL:      true,
-			FileInline:  true,
-			FileURL:     true,
-			FileID:      true, // passthrough-only enforced by caller
+			ImageInline:     true,
+			ImageURL:        true,
+			PDFInline:       true,
+			PDFURL:          true,
+			FileInline:      true,
+			FileURL:         true,
+			FileID:          true, // passthrough-only enforced by caller
+			ToolResultMedia: true,
 		}
 	case "oai-codex":
 		// Codex reuses Responses image mapping but rejects PDF/files in v1.
@@ -95,7 +104,7 @@ func CapsForCodecID(id string) BackendCaps {
 // Incompatible reports why the backend cannot represent the attachment set.
 // Empty string means compatible (possibly after materialization). translated
 // is true when the attempt is IR-translated (not same-codec-id passthrough);
-// provider-owned file IDs are rejected on translated attempts.
+// provider-owned file and image IDs are rejected on translated attempts.
 func (c BackendCaps) Incompatible(atts []Attachment, translated bool) string {
 	if len(atts) == 0 {
 		return ""
@@ -105,14 +114,20 @@ func (c BackendCaps) Incompatible(atts []Attachment, translated bool) string {
 			return "backend does not support media inside tool_result blocks"
 		}
 		if a.IsImage || a.Kind == KindImage {
+			if a.HasID && !imageIDCompatible(c, translated) {
+				return "provider image IDs cannot be translated to this backend"
+			}
 			if a.HasData && !c.ImageInline {
 				return "backend does not support inline images"
 			}
 			if a.HasURL && !c.ImageURL && !c.MaterializeImageURL {
 				return "backend does not support image URLs"
 			}
-			if !a.HasData && !a.HasURL {
+			if !a.HasData && !a.HasURL && !a.HasID {
 				return "image attachment is missing a usable source"
+			}
+			if a.HasID {
+				continue
 			}
 			if !c.ImageInline && !c.ImageURL && !c.MaterializeImageURL {
 				return "backend does not support images"

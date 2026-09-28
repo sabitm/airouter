@@ -205,6 +205,49 @@ func TestImportSummaryCounts(t *testing.T) {
 	}
 }
 
+// TestImportDuplicateComboName updates the row created earlier in the same file.
+func TestImportDuplicateComboName(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	const cfg = `{
+		"version": 1,
+		"providers": [
+			{"name":"p1","base_url":"http://a","api_key":"k1","protocol":"openai"}
+		],
+		"combos": [
+			{"name":"same","strategy":"failover","targets":[{"provider":"p1","upstream_model":"m1"}]},
+			{"name":"same","strategy":"roundrobin","targets":[{"provider":"p1","upstream_model":"m2","disabled":true}]}
+		]
+	}`
+	sum, err := st.Import(ctx, strings.NewReader(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.CombosCreated != 1 || sum.CombosUpdated != 1 {
+		t.Fatalf("created=%d updated=%d, want 1/1", sum.CombosCreated, sum.CombosUpdated)
+	}
+	if len(sum.Failures) != 0 {
+		t.Fatalf("failures = %v, want none", sum.Failures)
+	}
+	got, err := st.GetComboByName(ctx, "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Strategy != domain.StrategyRoundRobin {
+		t.Fatalf("strategy = %q, want roundrobin", got.Strategy)
+	}
+	if len(got.Targets) != 1 || got.Targets[0].UpstreamModel != "m2" || got.Targets[0].Enabled {
+		t.Fatalf("stored combo = %+v, want second-row target m2 disabled", got.Targets)
+	}
+	combos, err := st.ListCombos(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combos) != 1 {
+		t.Fatalf("combos = %d, want 1", len(combos))
+	}
+}
+
 // TestImportFailureSkipKeepsOthers confirms validation failures skip only the
 // bad row; good providers and combos that follow still commit.
 func TestImportFailureSkipKeepsOthers(t *testing.T) {

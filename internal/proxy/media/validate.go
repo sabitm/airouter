@@ -17,7 +17,7 @@ type Attachment struct {
 	MediaType string
 	Filename  string
 	// Bytes is the decoded inline payload size. Remote URLs and provider-owned
-	// file IDs are 0; materialized remote bytes are accounted at fetch time.
+	// file or image IDs are 0; materialized remote bytes are accounted at fetch time.
 	Bytes int
 	// InToolResult is true when the block is nested inside a tool_result. Most
 	// backends flatten tool results to plain text and would silently drop nested
@@ -94,12 +94,27 @@ func inspectImage(b *ir.ContentBlock) (*Attachment, error) {
 		img.Data = data
 		img.URL = ""
 	}
-	if img.Data != "" && img.URL != "" {
-		return nil, fmt.Errorf("%w: image has both data and url", ErrMultipleSources)
-	}
 	att := &Attachment{Kind: KindImage, IsImage: true, MediaType: CanonicalImageMIME(img.MediaType)}
+	sources := 0
 	if img.Data != "" {
+		sources++
 		att.HasData = true
+	}
+	if img.URL != "" {
+		sources++
+		att.HasURL = true
+	}
+	if img.ID != "" {
+		sources++
+		att.HasID = true
+	}
+	if sources == 0 {
+		return nil, ErrEmptyAttachment
+	}
+	if sources > 1 {
+		return nil, fmt.Errorf("%w: image has more than one of data/url/id", ErrMultipleSources)
+	}
+	if img.Data != "" {
 		mt, n, err := ValidateInlinePayload(img.Data, img.MediaType, KindImage)
 		if err != nil {
 			return nil, err
@@ -108,7 +123,6 @@ func inspectImage(b *ir.ContentBlock) (*Attachment, error) {
 		att.MediaType = mt
 		att.Bytes = n
 	} else if img.URL != "" {
-		att.HasURL = true
 		if IsDataURL(img.URL) {
 			return nil, ErrInvalidDataURL
 		}
@@ -119,9 +133,9 @@ func inspectImage(b *ir.ContentBlock) (*Attachment, error) {
 		if att.MediaType != "" && !IsSupportedImageMIME(att.MediaType) {
 			return nil, fmt.Errorf("%w: %s", ErrUnsupportedMedia, att.MediaType)
 		}
-	} else {
-		return nil, ErrEmptyAttachment
 	}
+	// A provider-owned image ID has no local bytes. It is portable only on
+	// same-codec passthrough; capability checks reject translated attempts.
 	return att, nil
 }
 

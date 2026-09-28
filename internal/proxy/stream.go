@@ -391,38 +391,6 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		return err
 	}
 	err = decode(resp.Body, emit)
-	if ub, ok := cursor.AsUnmatchedBuiltin(err); ok && len(req.Tools) > 0 {
-		closeWrite()
-		_ = resp.Body.Close()
-		retryReq := cursor.WithBuiltinRejection(req, ub.Name)
-		retryBody, rerr := backend.encodeRequest(retryReq)
-		if rerr == nil {
-			retryBody, rerr = finalizeEncodedBody(retryBody, retryReq, backend, provider)
-		}
-		if rerr == nil {
-			retryBody, rerr = p.prepareUpstreamRequest(ctx, backend, provider, retryBody)
-		}
-		var retryResp *http.Response
-		var retryWrite func([]byte) error
-		var retryClose func()
-		if rerr == nil {
-			retryResp, retryWrite, retryClose, rerr = p.forwardStreamDuplex(ctx, provider, backend.upstreamPath, retryBody, nil, backend.streamAccept)
-		}
-		if rerr == nil {
-			defer retryClose()
-			defer retryResp.Body.Close()
-			if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
-				err = cursor.DecodeAgentStreamTools(req.Tools, retryResp.Body, retryWrite, emit)
-				if _, again := cursor.AsUnmatchedBuiltin(err); again {
-					err = emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: ir.StopEndTurn})
-				}
-			} else {
-				err = emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: ir.StopEndTurn})
-			}
-		} else {
-			err = emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: ir.StopEndTurn})
-		}
-	}
 	if err != nil {
 		// A canceled context means the client disconnected after receiving the
 		// response; that is routine, not a server error, so do not log it as one.

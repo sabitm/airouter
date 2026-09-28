@@ -42,7 +42,6 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 	toolOrder := []string{}
 	var stopReason ir.StopReason = ir.StopEndTurn
 	var inTok, outTok, cacheRead, cacheWrite int
-	var unmatched string
 
 	emitStart := func() error {
 		if started {
@@ -150,26 +149,17 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		}
 		declared, bound, ok := resolveClientTool(clientTools, name, argsJSON)
 		if !ok {
-			if unmatched == "" {
-				unmatched = name
-			}
 			return nil
 		}
 		return startToolCall(id, declared, bound)
 	}
 
-	rejectBuiltin := func(server map[int][]field, name string) error {
-		if unmatched == "" {
-			unmatched = name
-		}
-		return rejectUnmatchedExec(server, writeFrame)
-	}
-
-	// answerBuiltin sends a matched built-in to Pi. An unmatched built-in is
-	// a question Cursor asked this stream. Reject it when the message has an
-	// exec result field. If it does not, the proxy cannot write a valid reply,
-	// so the client turn must close instead of waiting for heartbeats.
-	answerBuiltin := func(server map[int][]field, id, name, argsJSON string, mcp bool) (closeTurn bool, err error) {
+	// answerBuiltin sends a matched built-in to Pi. An unmatched non-MCP tool
+	// update is not an ExecServerMessage, so it cannot carry a valid exec
+	// rejection. Close the client turn instead of writing a fake reply or
+	// waiting for heartbeats. An unmatched interaction query has the same
+	// constraint: it has no ExecServerMessage reply envelope.
+	answerBuiltin := func(id, name, argsJSON string, mcp bool) (closeTurn bool, err error) {
 		before := len(toolOrder)
 		start := startBuiltin
 		if mcp {
@@ -184,13 +174,7 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		if mcp || len(clientTools) == 0 {
 			return false, nil
 		}
-		if err = rejectBuiltin(server, name); err != nil {
-			return false, err
-		}
-		if execResultField(server) == 0 {
-			return true, nil
-		}
-		return false, nil
+		return true, nil
 	}
 
 	for {
@@ -216,8 +200,8 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		}
 
 		// interaction_query: the server asks the client to run a built-in.
-		// Every variant is named and resolved; unmatched opens one retry.
-		// Silent ignore stalls the upstream with heartbeats forever. A matched
+		// Every variant is named and resolved. An unmatched query is not
+		// forwarded. Silent ignore stalls the upstream with heartbeats forever. A matched
 		// query is the client's tool call, so this turn ends now. Cursor does
 		// not send turn_ended until the query has its real result, and that
 		// result arrives on the next request.
@@ -226,7 +210,7 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 			if !ok {
 				id, name, args = ir.NewID("call_"), "interaction_query", "{}"
 			}
-			closeTurn, err := answerBuiltin(nil, id, name, args, false)
+			closeTurn, err := answerBuiltin(id, name, args, false)
 			if err != nil {
 				return err
 			}
@@ -258,8 +242,7 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 				return err
 			} else if done && len(toolOrder) == before {
 				server, _ := decodeMessage(exs[0].value)
-				_, name, _, _ := extractExecToolCall(server)
-				if err := rejectBuiltin(server, name); err != nil {
+				if err := rejectUnmatchedExec(server, writeFrame); err != nil {
 					return err
 				}
 				continue
@@ -296,8 +279,7 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 				// (MCP and built-in ToolCall oneofs).
 				if tcss, ok := update[iuToolCallStarted]; ok && len(tcss) > 0 {
 					if id, name, args, mcp, ok := extractAnyToolCall(tcss[0].value); ok {
-						started, _ := decodeMessage(tcss[0].value)
-						closeTurn, err := answerBuiltin(started, id, name, args, mcp)
+						closeTurn, err := answerBuiltin(id, name, args, mcp)
 						if err != nil {
 							return err
 						}
@@ -319,8 +301,7 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 					}
 					if id == "" || toolCalls[id] == nil {
 						if cid, name, args, mcp, ok := extractAnyToolCall(ptcs[0].value); ok {
-							partial, _ := decodeMessage(ptcs[0].value)
-							closeTurn, err := answerBuiltin(partial, cid, name, args, mcp)
+							closeTurn, err := answerBuiltin(cid, name, args, mcp)
 							if err != nil {
 								return err
 							}

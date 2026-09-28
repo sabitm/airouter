@@ -28,12 +28,14 @@ const (
 	BlockToolResult BlockType = "tool_result"
 )
 
-// Image holds an image either as a remote URL or as inline base64 data. Exactly
-// one form is populated depending on what the source format provided.
+// Image holds an image from exactly one source: inline base64 Data, a remote
+// URL, or a provider-owned ID. Filename is not carried. ID is scoped to the
+// provider that issued it and is not portable across codec IDs.
 type Image struct {
 	URL       string
 	MediaType string
 	Data      string // base64, no data-URI prefix
+	ID        string // provider-owned image/file id; not portable across protocols
 }
 
 // File holds a non-image attachment. Exactly one source is normally present:

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -37,7 +38,11 @@ func newScriptedUpstream(t *testing.T, protocol domain.Protocol) *scriptedUpstre
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(st)
 		if st >= 200 && st < 300 {
-			_, _ = io.WriteString(w, body)
+			reply := body
+			if strings.HasSuffix(r.URL.Path, "/responses") {
+				reply = responsesUpstreamBody
+			}
+			_, _ = io.WriteString(w, reply)
 		} else {
 			_, _ = io.WriteString(w, `{"error":{"message":"scripted failure"}}`)
 		}
@@ -84,7 +89,13 @@ func setupComboProxy(t *testing.T, strategy domain.ComboStrategy, targets []*scr
 		if err := st.CreateProvider(ctx, prov); err != nil {
 			t.Fatal(err)
 		}
-		combo.Targets = append(combo.Targets, domain.ComboTarget{ProviderID: prov.ID, UpstreamModel: "real-model", Enabled: true})
+		model := "real-model"
+		if protocols[i] == domain.ProtocolOpencode {
+			// setupCombo uses an httptest base URL, which Tier treats as zen.
+			// This catalog id selects opencode-responses rather than opencode-chat.
+			model = "gpt-5"
+		}
+		combo.Targets = append(combo.Targets, domain.ComboTarget{ProviderID: prov.ID, UpstreamModel: model, Enabled: true})
 	}
 	if err := st.CreateCombo(ctx, combo); err != nil {
 		t.Fatal(err)

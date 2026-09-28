@@ -158,6 +158,37 @@ func TestInspectRequestFileIDZeroCost(t *testing.T) {
 	}
 }
 
+func TestInspectRequestImageIDZeroCost(t *testing.T) {
+	req := &ir.Request{Messages: []ir.Message{{Role: ir.RoleUser}}}
+	for i := 0; i < 9; i++ {
+		req.Messages[0].Content = append(req.Messages[0].Content, ir.ContentBlock{
+			Type:  ir.BlockImage,
+			Image: &ir.Image{ID: "file-img"},
+		})
+	}
+	atts, err := InspectRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atts) != 9 {
+		t.Fatalf("len=%d want 9", len(atts))
+	}
+	for i, a := range atts {
+		if a.Bytes != 0 || !a.HasID || !a.IsImage {
+			t.Fatalf("att[%d]=%+v want zero-byte image id", i, a)
+		}
+	}
+}
+
+func TestInspectRequestImageIDMultipleSources(t *testing.T) {
+	req := &ir.Request{Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{
+		{Type: ir.BlockImage, Image: &ir.Image{ID: "file-img", URL: "https://example.com/a.png"}},
+	}}}}
+	if _, err := InspectRequest(req); err == nil || !errors.Is(err, ErrMultipleSources) {
+		t.Fatalf("err=%v want ErrMultipleSources", err)
+	}
+}
+
 func TestInspectRequestPDFAndFile(t *testing.T) {
 	req := &ir.Request{Messages: []ir.Message{{
 		Role: ir.RoleUser,
@@ -210,8 +241,30 @@ func TestCapsIncompatible(t *testing.T) {
 	if reason := CapsForCodecID("oai-chat").Incompatible(nestedImg, true); reason == "" {
 		t.Fatal("oai-chat must reject nested tool_result media")
 	}
-	if reason := CapsForCodecID("oai-responses").Incompatible(nestedImg, true); reason == "" {
-		t.Fatal("oai-responses must reject nested tool_result media")
+	if reason := CapsForCodecID("oai-responses").Incompatible(nestedImg, true); reason != "" {
+		t.Fatalf("oai-responses should accept nested tool_result media: %s", reason)
+	}
+	if reason := CapsForCodecID("opencode-responses").Incompatible(nestedImg, true); reason != "" {
+		t.Fatalf("opencode-responses should accept nested tool_result media: %s", reason)
+	}
+	imageID := []Attachment{{Kind: KindImage, IsImage: true, HasID: true}}
+	if reason := CapsForCodecID("oai-responses").Incompatible(imageID, false); reason != "" {
+		t.Fatalf("native responses image id should be ok: %s", reason)
+	}
+	if reason := CapsForCodecID("oai-responses").Incompatible(imageID, true); reason == "" {
+		t.Fatal("translated responses image id should fail")
+	}
+	if reason := CapsForCodecID("opencode-responses").Incompatible(imageID, true); reason == "" {
+		t.Fatal("translated opencode-responses image id should fail")
+	}
+	if reason := CapsForCodecID("anth-msg").Incompatible(imageID, true); reason == "" {
+		t.Fatal("anthropic should reject image ids")
+	}
+	if reason := CapsForCodecID("oai-chat").Incompatible(imageID, true); reason == "" {
+		t.Fatal("translated chat should reject image ids")
+	}
+	if reason := CapsForCodecID("oai-codex").Incompatible(imageID, false); reason == "" {
+		t.Fatal("codex should reject image ids")
 	}
 	if reason := CapsForCodecID("kiro").Incompatible(nestedImg, true); reason == "" {
 		t.Fatal("kiro must reject nested tool_result media")
@@ -275,7 +328,7 @@ func TestOpencodeCapsIncompatible(t *testing.T) {
 		{name: "chat URL PDF", codec: "opencode-chat", att: Attachment{Kind: KindPDF, HasURL: true}},
 		{name: "chat URL file", codec: "opencode-chat", att: Attachment{Kind: KindGeneric, HasURL: true}},
 		{name: "chat nested image", codec: "opencode-chat", att: Attachment{Kind: KindImage, IsImage: true, HasData: true, InToolResult: true}},
-		{name: "responses nested image", codec: "opencode-responses", att: Attachment{Kind: KindImage, IsImage: true, HasData: true, InToolResult: true}},
+		{name: "responses translated image ID", codec: "opencode-responses", att: Attachment{Kind: KindImage, IsImage: true, HasID: true}},
 		{name: "chat translated file ID", codec: "opencode-chat", att: Attachment{Kind: KindGeneric, HasID: true}},
 		{name: "responses translated file ID", codec: "opencode-responses", att: Attachment{Kind: KindGeneric, HasID: true}},
 	}

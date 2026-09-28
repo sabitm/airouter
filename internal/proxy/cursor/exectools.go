@@ -414,29 +414,9 @@ func firstStringArg(src map[string]any) string {
 	return ""
 }
 
-// UnmatchedBuiltinError means Cursor asked for a built-in that is not among
-// the ingress-declared tools. Decode does not emit Finish so the caller can
-// start one fresh AgentService turn that tells the model to use MCP tools.
-type UnmatchedBuiltinError struct {
-	Name string
-}
-
-func (e *UnmatchedBuiltinError) Error() string {
-	if e == nil || e.Name == "" {
-		return "cursor: unmatched built-in tool"
-	}
-	return "cursor: unmatched built-in tool " + e.Name
-}
-
-// AsUnmatchedBuiltin reports whether err is an unmatched built-in.
-func AsUnmatchedBuiltin(err error) (*UnmatchedBuiltinError, bool) {
-	e, ok := err.(*UnmatchedBuiltinError)
-	return e, ok && e != nil
-}
-
 // MCPAvailabilityNote tells the model that only the declared MCP tools exist.
 // Names come from the current request, not a hardcoded catalog.
-func MCPAvailabilityNote(tools []ir.Tool, rejected string) string {
+func MCPAvailabilityNote(tools []ir.Tool) string {
 	if len(tools) == 0 {
 		return ""
 	}
@@ -449,32 +429,8 @@ func MCPAvailabilityNote(tools []ir.Tool, rejected string) string {
 	if len(names) == 0 {
 		return ""
 	}
-	list := strings.Join(names, ", ")
-	if rejected != "" {
-		return "Tool \"" + rejected + "\" is not available. Available MCP tools: " +
-			list + ". Call one of those by name; do not use Cursor built-in tools."
-	}
 	return "You have no Cursor built-in tools in this session. Your only tools are the MCP tools: " +
-		list + ". Always call those by name."
-}
-
-// WithBuiltinRejection returns a shallow copy of req whose last user turn
-// includes the unmatched-tool instruction. Used for the single follow-up
-// AgentService run; the original request is not mutated.
-func WithBuiltinRejection(req *ir.Request, rejected string) *ir.Request {
-	if req == nil {
-		return nil
-	}
-	note := MCPAvailabilityNote(req.Tools, rejected)
-	if note == "" {
-		return req
-	}
-	out := *req
-	out.Messages = append(append([]ir.Message(nil), req.Messages...), ir.Message{
-		Role:    ir.RoleUser,
-		Content: []ir.ContentBlock{{Type: ir.BlockText, Text: note}},
-	})
-	return &out
+		strings.Join(names, ", ") + ". Always call those by name."
 }
 
 func firstRequiredString(schema json.RawMessage) string {

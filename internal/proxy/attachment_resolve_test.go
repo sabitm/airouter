@@ -723,6 +723,103 @@ func TestAttachmentNestedToolResultMedia(t *testing.T) {
 	}
 }
 
+func responsesToolResultImageBody(model string) string {
+	b, _ := json.Marshal(map[string]any{
+		"model": model,
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "look at the shot"},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "call_1",
+				"name":      "screenshot",
+				"arguments": "{}",
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_1",
+				"output": []any{
+					map[string]any{"type": "input_text", "text": "here is the screenshot"},
+					map[string]any{
+						"type":      "input_image",
+						"image_url": "data:image/png;base64," + testPNGB64,
+					},
+				},
+			},
+		},
+	})
+	return string(b)
+}
+
+// Nested function_call_output media must fail closed on OpenAI and survive on Anthropic.
+func TestAttachmentResponsesNestedToolResultMedia(t *testing.T) {
+	oai := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	anth := newScriptedUpstream(t, domain.ProtocolAnthropic)
+	base, token := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{oai, anth},
+		[]domain.Protocol{domain.ProtocolOpenAI, domain.ProtocolAnthropic})
+
+	resp, out := post(t, base+"/v1/responses", token, responsesToolResultImageBody("default"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+	}
+	if oai.hits.Load() != 0 {
+		t.Fatalf("openai hits=%d want 0 (nested tool_result media incompatible)", oai.hits.Load())
+	}
+	if anth.hits.Load() != 1 {
+		t.Fatalf("anthropic hits=%d want 1", anth.hits.Load())
+	}
+	raw, _ := json.Marshal(anth.requestBody(t))
+	if !strings.Contains(string(raw), "tool_result") || !strings.Contains(string(raw), testPNGB64) {
+		t.Fatalf("anthropic lost nested tool_result image: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"type":"image"`) {
+		t.Fatalf("anthropic nested image block missing: %s", raw)
+	}
+
+	// An Anthropic tool result translates to a Responses output content array.
+	responsesBackend := newScriptedUpstream(t, domain.ProtocolOpenAIResponses)
+	base2, token2 := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{responsesBackend}, []domain.Protocol{domain.ProtocolOpenAIResponses})
+	resp2, out2 := post(t, base2+"/v1/messages", token2, anthToolResultImageBody("default"))
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("translated responses status=%d body=%s", resp2.StatusCode, out2)
+	}
+	if responsesBackend.hits.Load() != 1 {
+		t.Fatalf("translated responses hits=%d want 1", responsesBackend.hits.Load())
+	}
+	translatedRaw, _ := json.Marshal(responsesBackend.requestBody(t))
+	if !strings.Contains(string(translatedRaw), `"type":"function_call_output"`) ||
+		!strings.Contains(string(translatedRaw), `"type":"input_image"`) ||
+		!strings.Contains(string(translatedRaw), testPNGB64) {
+		t.Fatalf("responses encoder lost nested tool_result image: %s", translatedRaw)
+	}
+
+	// A native Responses target can carry nested tool-result media unchanged.
+	oaiResp := newScriptedUpstream(t, domain.ProtocolOpenAIResponses)
+	base3, token3 := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{oaiResp}, []domain.Protocol{domain.ProtocolOpenAIResponses})
+	resp3, out3 := post(t, base3+"/v1/responses", token3, responsesToolResultImageBody("default"))
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("responses-only status=%d body=%s, want 200", resp3.StatusCode, out3)
+	}
+	if oaiResp.hits.Load() != 1 {
+		t.Fatalf("responses hits=%d want 1", oaiResp.hits.Load())
+	}
+	raw3, _ := json.Marshal(oaiResp.requestBody(t))
+	if !strings.Contains(string(raw3), "function_call_output") || !strings.Contains(string(raw3), testPNGB64) {
+		t.Fatalf("responses lost nested tool_result image: %s", raw3)
+	}
+	if !strings.Contains(string(raw3), `"type":"input_image"`) || !strings.Contains(string(raw3), "here is the screenshot") {
+		t.Fatalf("responses nested media parts missing: %s", raw3)
+	}
+}
+
 // Missing-source recognized image blocks must 400 with zero upstream calls.
 func TestAttachmentMissingSourceImageClientError(t *testing.T) {
 	// OpenAI chat: {"type":"image_url"} with no nested object.
@@ -761,6 +858,113 @@ func TestAttachmentMissingSourceImageClientError(t *testing.T) {
 	if up2.hits.Load() != 0 {
 		t.Fatal("responses upstream contacted for empty input_image")
 	}
+}
+
+func responsesImageFileIDBody(model, id string, extra map[string]any) string {
+	image := map[string]any{"type": "input_image", "file_id": id}
+	for k, v := range extra {
+		image[k] = v
+	}
+	b, _ := json.Marshal(map[string]any{
+		"model": model,
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					image,
+				},
+			},
+		},
+	})
+	return string(b)
+}
+
+// A provider-owned image file_id passes through unchanged on native Responses
+// and is rejected when the codec ID changes, including oai-responses to
+// opencode-responses.
+func TestAttachmentResponsesImageFileID(t *testing.T) {
+	up := newScriptedUpstream(t, domain.ProtocolOpenAIResponses)
+	base, token := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{up}, []domain.Protocol{domain.ProtocolOpenAIResponses})
+	body := responsesImageFileIDBody("default", "file-img-1", nil)
+	resp, out := post(t, base+"/v1/responses", token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("passthrough status=%d body=%s", resp.StatusCode, out)
+	}
+	if up.hits.Load() != 1 {
+		t.Fatalf("responses hits=%d want 1", up.hits.Load())
+	}
+	raw, _ := json.Marshal(up.requestBody(t))
+	restored := restorePassthroughModel(t, raw, "default")
+	if !jsonEqual(t, restored, []byte(body)) {
+		t.Fatalf("passthrough body changed beyond model rewrite: got %s want %s", restored, body)
+	}
+
+	anth := newScriptedUpstream(t, domain.ProtocolAnthropic)
+	base2, token2 := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{anth}, []domain.Protocol{domain.ProtocolAnthropic})
+	resp2, out2 := post(t, base2+"/v1/responses", token2, body)
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("anthropic status=%d body=%s, want 400", resp2.StatusCode, out2)
+	}
+	if anth.hits.Load() != 0 {
+		t.Fatal("anthropic contacted for image file_id")
+	}
+
+	opencode := newScriptedUpstream(t, domain.ProtocolOpencode)
+	base3, token3 := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{opencode}, []domain.Protocol{domain.ProtocolOpencode})
+	// gpt-5 selects opencode-responses. Codec IDs still differ, so the image ID
+	// is not portable even though both capability records advertise FileID.
+	resp3, out3 := post(t, base3+"/v1/responses", token3, body)
+	if resp3.StatusCode != http.StatusBadRequest {
+		t.Fatalf("opencode status=%d body=%s, want 400", resp3.StatusCode, out3)
+	}
+	if opencode.hits.Load() != 0 {
+		t.Fatal("opencode contacted for translated image file_id")
+	}
+}
+
+func TestAttachmentResponsesImageMultipleSources(t *testing.T) {
+	up := newScriptedUpstream(t, domain.ProtocolOpenAIResponses)
+	base, token := setupCombo(t, domain.StrategyFailover,
+		[]*scriptedUpstream{up}, []domain.Protocol{domain.ProtocolOpenAIResponses})
+	body := responsesImageFileIDBody("default", "file-img-1", map[string]any{
+		"image_url": "https://example.com/a.png",
+	})
+	resp, out := post(t, base+"/v1/responses", token, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", resp.StatusCode, out)
+	}
+	if up.hits.Load() != 0 {
+		t.Fatal("responses upstream contacted for multi-source input_image")
+	}
+}
+
+func restorePassthroughModel(t *testing.T, raw []byte, model string) []byte {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	body["model"] = model
+	out, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func jsonEqual(t *testing.T, a, b []byte) bool {
+	t.Helper()
+	var left, right any
+	if json.Unmarshal(a, &left) != nil || json.Unmarshal(b, &right) != nil {
+		return false
+	}
+	la, _ := json.Marshal(left)
+	rb, _ := json.Marshal(right)
+	return string(la) == string(rb)
 }
 
 // Non-HTTP(S) / credential-bearing / missing-host attachment URLs fail closed.

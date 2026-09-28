@@ -147,30 +147,12 @@ func TestEncodeAgentRequestFoldsMCPAvailabilityNote(t *testing.T) {
 }
 
 func TestMCPAvailabilityNoteUsesRequestTools(t *testing.T) {
-	note := MCPAvailabilityNote([]ir.Tool{{Name: "read"}, {Name: "bash"}}, "shell")
-	if !strings.Contains(note, "shell") || !strings.Contains(note, "read, bash") {
+	note := MCPAvailabilityNote([]ir.Tool{{Name: "read"}, {Name: "bash"}})
+	if !strings.Contains(note, "read, bash") || !strings.Contains(note, "MCP tools") {
 		t.Errorf("note = %q", note)
 	}
-	if MCPAvailabilityNote(nil, "shell") != "" {
+	if MCPAvailabilityNote(nil) != "" {
 		t.Error("empty tools should produce no note")
-	}
-}
-
-func TestWithBuiltinRejectionAppendsUserTurn(t *testing.T) {
-	req := &ir.Request{
-		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "run it"}}}},
-		Tools:    []ir.Tool{{Name: "bash"}},
-	}
-	out := WithBuiltinRejection(req, "shell")
-	if len(out.Messages) != 2 {
-		t.Fatalf("messages = %d, want 2", len(out.Messages))
-	}
-	if len(req.Messages) != 1 {
-		t.Fatal("original request mutated")
-	}
-	got := out.Messages[1].Content[0].Text
-	if !strings.Contains(got, "shell") || !strings.Contains(got, "bash") {
-		t.Errorf("retry text = %q", got)
 	}
 }
 

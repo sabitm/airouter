@@ -276,11 +276,11 @@ func (s *Store) importCombo(ctx context.Context, ex executor, pc portableCombo, 
 		sum.CombosUpdated++
 		return ""
 	}
-	if err := s.createCombo(ctx, ex, &domain.Combo{
-		Name: pc.Name, Strategy: strategy, Targets: targets,
-	}); err != nil {
+	nc := &domain.Combo{Name: pc.Name, Strategy: strategy, Targets: targets}
+	if err := s.createCombo(ctx, ex, nc); err != nil {
 		return fmt.Sprintf("combo %q: %v", pc.Name, err)
 	}
+	comboByName[nc.Name] = nc
 	sum.CombosCreated++
 	return ""
 }

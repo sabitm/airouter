@@ -449,24 +449,96 @@ func TestSyncCodexReasoningInclude(t *testing.T) {
 	})
 }
 
-func TestOutputToText(t *testing.T) {
+func TestToolResultBlocks(t *testing.T) {
+	png := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
 	cases := []struct {
 		name string
 		raw  json.RawMessage
-		want string
+		check func(*testing.T, []ir.ContentBlock)
 	}{
-		{"empty", json.RawMessage(``), ""},
-		{"null", json.RawMessage(`null`), ""},
-		{"string", json.RawMessage(`"hello"`), "hello"},
-		{"array of text parts", json.RawMessage(`[{"type":"text","text":"hi "},{"type":"text","text":"there"}]`), "hi there"},
-		{"array with non-text parts skipped", json.RawMessage(`[{"type":"image_url"},{"type":"text","text":"keep"}]`), "keep"},
-		{"invalid json", json.RawMessage(`{bad`), ""},
+		{
+			name: "empty",
+			raw:  json.RawMessage(``),
+			check: func(t *testing.T, got []ir.ContentBlock) {
+				assertSingleEmptyText(t, got)
+			},
+		},
+		{
+			name: "null",
+			raw:  json.RawMessage(`null`),
+			check: func(t *testing.T, got []ir.ContentBlock) {
+				assertSingleEmptyText(t, got)
+			},
+		},
+		{
+			name: "string",
+			raw:  json.RawMessage(`"hello"`),
+			check: func(t *testing.T, got []ir.ContentBlock) {
+				if len(got) != 1 || got[0].Type != ir.BlockText || got[0].Text != "hello" {
+					t.Fatalf("got %+v", got)
+				}
+			},
+		},
+		{
+			name: "text array",
+			raw:  json.RawMessage(`[{"type":"input_text","text":"hi "},{"type":"text","text":"there"}]`),
+			check: func(t *testing.T, got []ir.ContentBlock) {
+				if len(got) != 2 || got[0].Text != "hi " || got[1].Text != "there" {
+					t.Fatalf("got %+v", got)
+				}
+			},
+		},
+		{
+			name: "image data URL",
+			raw:  json.RawMessage(`[{"type":"input_image","image_url":"data:image/png;base64,` + png + `"}]`),
+			check: func(t *testing.T, got []ir.ContentBlock) {
+				if len(got) != 1 || got[0].Type != ir.BlockImage || got[0].Image == nil {
+					t.Fatalf("got %+v", got)
+				}
+				if got[0].Image.MediaType != "image/png" || got[0].Image.Data != png {
+					t.Fatalf("image = %+v", got[0].Image)
+				}
+			},
+		},
+		{
+			name: "file part",
+			raw:  json.RawMessage(`[{"type":"input_file","filename":"note.txt","file_data":"data:text/plain;base64,aGVsbG8="}]`),
+			check: func(t *testing.T, got []ir.ContentBlock) {
+				if len(got) != 1 || got[0].Type != ir.BlockFile || got[0].File == nil {
+					t.Fatalf("got %+v", got)
+				}
+				if got[0].File.Filename != "note.txt" || got[0].File.MediaType != "text/plain" || got[0].File.Data != "aGVsbG8=" {
+					t.Fatalf("file = %+v", got[0].File)
+				}
+			},
+		},
+		{
+			name: "unknown type ignored",
+			raw:  json.RawMessage(`[{"type":"image_url"},{"type":"input_text","text":"keep"}]`),
+			check: func(t *testing.T, got []ir.ContentBlock) {
+				if len(got) != 1 || got[0].Type != ir.BlockText || got[0].Text != "keep" {
+					t.Fatalf("got %+v", got)
+				}
+			},
+		},
+		{
+			name: "invalid json",
+			raw:  json.RawMessage(`{bad`),
+			check: func(t *testing.T, got []ir.ContentBlock) {
+				assertSingleEmptyText(t, got)
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := outputToText(tc.raw); got != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
-			}
+			tc.check(t, toolResultBlocks(tc.raw))
 		})
+	}
+}
+
+func assertSingleEmptyText(t *testing.T, got []ir.ContentBlock) {
+	t.Helper()
+	if len(got) != 1 || got[0].Type != ir.BlockText || got[0].Text != "" {
+		t.Fatalf("got %+v, want one empty text block", got)
 	}
 }

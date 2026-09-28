@@ -60,7 +60,9 @@ type contentPart struct {
 	Type     string          `json:"type"` // input_text | output_text | text | input_image | input_file
 	Text     string          `json:"text"`
 	ImageURL json.RawMessage `json:"image_url"` // string or {url}
-	// input_file fields (flat on the part in the public Responses shape)
+	// input_file fields (flat on the part in the public Responses shape).
+	// FileID is also input_image.file_id. The two part types are exclusive, so
+	// one JSON field is safe; a second file_id tag would drop the value.
 	FileData string `json:"file_data,omitempty"`
 	FileURL  string `json:"file_url,omitempty"`
 	Filename string `json:"filename,omitempty"`

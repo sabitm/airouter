@@ -896,15 +896,6 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		}
 		return nil
 	})
-	if _, ok := cursor.AsUnmatchedBuiltin(err); ok {
-		// Unary collection cannot open a follow-up Run here; surface the
-		// text that already arrived and end the turn.
-		err = nil
-		if resp.StopReason == "" {
-			resp.StopReason = ir.StopEndTurn
-		}
-		sawEvent = true
-	}
 	if err != nil {
 		return nil, err
 	}
