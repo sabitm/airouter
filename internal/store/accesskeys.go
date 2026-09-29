@@ -24,17 +24,24 @@ func (s *Store) NewAccessKey(ctx context.Context, name string) (*domain.AccessKe
 	hash := hashToken(token)
 	display := token[:len(tokenPrefix)+6] + "..."
 
+	// Hold the cache lock across the INSERT and presence update. A cache-miss
+	// count also holds this lock, so it cannot publish a pre-insert zero after
+	// this returns. Token material is generated before the lock so rand does not
+	// stall overlapping counts.
+	s.hasKeysMu.Lock()
+	defer s.hasKeysMu.Unlock()
 	res, err := s.db.ExecContext(ctx,
 		"INSERT INTO access_keys (name, prefix, hash) VALUES (?, ?, ?)",
 		name, display, hash)
 	if err != nil {
 		return nil, err
 	}
+	present := true
+	s.hasKeys = &present
 	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
-	s.invalidateHasKeys()
 	return &domain.AccessKey{ID: id, Name: name, Prefix: display, Hash: hash, Token: token}, nil
 }
 
@@ -58,8 +65,8 @@ func (s *Store) ListAccessKeys(ctx context.Context) ([]*domain.AccessKey, error)
 
 // CountAccessKeys returns the number of access keys. When zero, the proxy
 // runs in open mode and accepts unauthenticated requests. It is a DB hot path
-// on every unauthenticated request, so the result is cached and only recomputed
-// when the cache is unknown or after a create/delete invalidates it.
+// on every unauthenticated request, so the result is cached and updated after
+// successful access-key mutations.
 func (s *Store) CountAccessKeys(ctx context.Context) (int, error) {
 	s.hasKeysMu.RLock()
 	p := s.hasKeys
@@ -70,14 +77,23 @@ func (s *Store) CountAccessKeys(ctx context.Context) (int, error) {
 		}
 		return 0, nil
 	}
+	// Recheck under the exclusive lock. The count and publish stay inside the
+	// same hold as NewAccessKey/DeleteAccessKey, so a mutation cannot land
+	// between the query and the cache write.
+	s.hasKeysMu.Lock()
+	defer s.hasKeysMu.Unlock()
+	if s.hasKeys != nil {
+		if *s.hasKeys {
+			return 1, nil
+		}
+		return 0, nil
+	}
 	n, err := s.countKeys(ctx)
 	if err != nil {
 		return 0, err
 	}
 	present := n > 0
-	s.hasKeysMu.Lock()
 	s.hasKeys = &present
-	s.hasKeysMu.Unlock()
 	return n, nil
 }
 
@@ -96,14 +112,6 @@ func (s *Store) countAccessKeysDB(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// invalidateHasKeys clears the cached key-presence flag so the next
-// CountAccessKeys recomputes it. Called after a create or delete.
-func (s *Store) invalidateHasKeys() {
-	s.hasKeysMu.Lock()
-	s.hasKeys = nil
-	s.hasKeysMu.Unlock()
-}
-
 // VerifyToken returns the matching access key for a raw bearer token, or
 // ErrNotFound. Used by the proxy auth middleware.
 func (s *Store) VerifyToken(ctx context.Context, token string) (*domain.AccessKey, error) {
@@ -118,11 +126,16 @@ func (s *Store) VerifyToken(ctx context.Context, token string) (*domain.AccessKe
 }
 
 func (s *Store) DeleteAccessKey(ctx context.Context, id int64) error {
+	// Same lock as a cache-miss count: the DELETE and invalidation are one
+	// critical section, and a failed DELETE leaves the cache unchanged.
+	s.hasKeysMu.Lock()
+	defer s.hasKeysMu.Unlock()
 	_, err := s.db.ExecContext(ctx, "DELETE FROM access_keys WHERE id = ?", id)
-	if err == nil {
-		s.invalidateHasKeys()
+	if err != nil {
+		return err
 	}
-	return err
+	s.hasKeys = nil
+	return nil
 }
 
 func hashToken(token string) string {

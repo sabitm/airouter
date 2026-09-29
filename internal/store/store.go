@@ -26,8 +26,10 @@ type Store struct {
 	cipher *crypto.Cipher
 
 	// hasKeys caches whether any access keys exist, so the proxy's per-request
-	// open-mode check need not hit the DB on every unauthenticated request. The
-	// count changes only via NewAccessKey/DeleteAccessKey, which invalidate it.
+	// open-mode check need not hit the DB on every unauthenticated request.
+	// hasKeysMu protects cache access and orders a cache-miss count and its
+	// publication with NewAccessKey/DeleteAccessKey database mutations, so an
+	// older count cannot overwrite a later mutation.
 	hasKeysMu sync.RWMutex
 	hasKeys   *bool // nil = unknown; non-nil = last known presence
 
