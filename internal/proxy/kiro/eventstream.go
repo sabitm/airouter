@@ -23,6 +23,10 @@ type esMessage struct {
 
 const esPreludeLen = 12 // totalLen(4) + headersLen(4) + preludeCRC(4)
 
+// esMaxFrameLen is a local proxy survival limit, not Smithy service
+// enforcement. It prevents a multi-GB make from an upstream-controlled uint32.
+const esMaxFrameLen = 32 << 20 // 32 MiB total frame ceiling
+
 // esHeaderStringType is the header value type for a UTF-8 string (type 7), the
 // only type CodeWhisperer uses for the Smithy system headers we read.
 const esHeaderStringType = 7
@@ -52,6 +56,9 @@ func readEventStreamMessage(r io.Reader) (*esMessage, error) {
 	}
 	if totalLen < esPreludeLen+4 || headersLen > totalLen-esPreludeLen-4 {
 		return nil, fmt.Errorf("kiro: eventstream frame length invalid (total=%d headers=%d)", totalLen, headersLen)
+	}
+	if totalLen > esMaxFrameLen {
+		return nil, fmt.Errorf("kiro: eventstream frame too large (total=%d)", totalLen)
 	}
 
 	// Read the remainder of the frame (everything after the prelude).

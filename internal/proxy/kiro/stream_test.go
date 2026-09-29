@@ -319,6 +319,17 @@ func TestReadEventStreamMessage(t *testing.T) {
 			t.Errorf("got %v, want short read error", err)
 		}
 	})
+
+	t.Run("frame too large rejected before allocation", func(t *testing.T) {
+		// Prelude only. A check after make would report short read instead.
+		_, err := readEventStreamMessage(bytes.NewReader(buildPrelude(esMaxFrameLen+1, 0)))
+		if err == nil || !bytes.Contains([]byte(err.Error()), []byte("frame too large")) {
+			t.Errorf("got %v, want frame too large error", err)
+		}
+		if err != nil && bytes.Contains([]byte(err.Error()), []byte("short read")) {
+			t.Errorf("got %v, size check ran after allocation", err)
+		}
+	})
 }
 
 // encodeHeader builds a single string-typed (type 7) header entry.
