@@ -2,6 +2,8 @@ package cursor
 
 import (
 	"bytes"
+	"compress/gzip"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -813,6 +815,84 @@ func TestDecodeAgentStreamTruncatedHeader(t *testing.T) {
 	if sawFinish {
 		t.Error("DecodeAgentStreamTools fabricated a Finish event on a truncated stream")
 	}
+}
+
+func TestDecodeAgentStreamOversizedFrame(t *testing.T) {
+	valid := agentTextFrame(t, "visible")
+	for _, tc := range []struct {
+		name  string
+		input []byte
+	}{
+		{name: "before output", input: oversizedConnectHeader()},
+		{name: "after text", input: append(append([]byte{}, valid...), oversizedConnectHeader()...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []ir.StreamEvent
+			err := DecodeAgentStreamTools(nil, bytes.NewReader(tc.input), nil, func(ev ir.StreamEvent) error {
+				events = append(events, ev)
+				return nil
+			})
+			if !errors.Is(err, errFrameTooLarge) {
+				t.Fatalf("got %v, want frame size error", err)
+			}
+			for _, ev := range events {
+				if ev.Kind == ir.EventFinish {
+					t.Fatal("oversized frame fabricated EventFinish")
+				}
+			}
+			if tc.name == "before output" && len(events) != 0 {
+				t.Fatalf("events = %+v, want none before output", events)
+			}
+		})
+	}
+}
+
+func TestDecodeAgentStreamDecompressedPayloadTooLarge(t *testing.T) {
+	frame := gzipConnectFrame(t, maxDecompressedPayloadBytes+1)
+	var events []ir.StreamEvent
+	err := DecodeAgentStreamTools(nil, bytes.NewReader(frame), nil, func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if !errors.Is(err, errDecompressedPayloadTooLarge) {
+		t.Fatalf("got %v, want decompressed size error", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events = %+v, want none from the oversized frame", events)
+	}
+}
+
+func oversizedConnectHeader() []byte {
+	hdr := make([]byte, 5)
+	hdr[0] = flagNone
+	binary.BigEndian.PutUint32(hdr[1:5], ^uint32(0))
+	return hdr
+}
+
+func gzipConnectFrame(t *testing.T, n int64) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	chunk := bytes.Repeat([]byte{'a'}, 64<<10)
+	var written int64
+	for written < n {
+		step := int64(len(chunk))
+		if remain := n - written; remain < step {
+			step = remain
+		}
+		if _, err := w.Write(chunk[:step]); err != nil {
+			t.Fatal(err)
+		}
+		written += step
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	frame := make([]byte, 5+buf.Len())
+	frame[0] = flagGzip
+	binary.BigEndian.PutUint32(frame[1:5], uint32(buf.Len()))
+	copy(frame[5:], buf.Bytes())
+	return frame
 }
 
 func TestDecodeAgentStreamEmptyStreamFinishes(t *testing.T) {

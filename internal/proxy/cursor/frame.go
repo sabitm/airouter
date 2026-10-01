@@ -5,8 +5,21 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+)
+
+// These are local proxy survival limits, not Cursor protocol limits. The
+// Connect length field counts payload bytes, excluding the five-byte header.
+const (
+	maxConnectPayloadBytes      = 32 << 20
+	maxDecompressedPayloadBytes = 32 << 20
+)
+
+var (
+	errFrameTooLarge               = errors.New("cursor: frame too large")
+	errDecompressedPayloadTooLarge = errors.New("cursor: decompressed payload too large")
 )
 
 // wrapConnectFrame wraps a protobuf payload in a Connect-RPC 5-byte envelope.
@@ -48,6 +61,9 @@ func readFrame(r io.Reader) (byte, []byte, error) {
 	}
 	flags := header[0]
 	length := binary.BigEndian.Uint32(header[1:5])
+	if length > maxConnectPayloadBytes {
+		return 0, nil, fmt.Errorf("%w (payload=%d limit=%d)", errFrameTooLarge, length, maxConnectPayloadBytes)
+	}
 	if length == 0 {
 		return flags, nil, nil
 	}
@@ -62,42 +78,60 @@ func readFrame(r io.Reader) (byte, []byte, error) {
 // responses may use gzip, raw zlib, or (rarely) raw deflate; try each in turn.
 // JSON error frames (payload starts with '{') are returned unchanged so the
 // caller can parse them as errors.
-func decompressPayload(payload []byte, flags byte) []byte {
+func decompressPayload(payload []byte, flags byte) ([]byte, error) {
+	return decompressPayloadWithLimit(payload, flags, maxDecompressedPayloadBytes)
+}
+
+func decompressPayloadWithLimit(payload []byte, flags byte, limit int64) ([]byte, error) {
 	if len(payload) > 0 && payload[0] == 0x7b { // '{' — JSON error frame
-		return payload
+		return payload, nil
 	}
 	if flags&(flagGzip|flagGzipTrailer) == 0 && flags&flagTrailer == 0 {
-		return payload
+		return payload, nil
 	}
 	// gzip first (standard gzip header 1f 8b).
 	if gz, err := gzip.NewReader(bytes.NewReader(payload)); err == nil {
-		if out, derr := io.ReadAll(gz); derr == nil {
-			return out
+		out, err := readDecompressedPayload(gz, limit)
+		if err == nil || errors.Is(err, errDecompressedPayloadTooLarge) {
+			return out, err
 		}
-		_ = gz.Close()
 	}
 	// zlib (RFC 1950) then raw deflate (RFC 1951) fallbacks: some Cursor frames
 	// use the raw deflate stream without a zlib wrapper.
 	if zr, err := zlib.NewReader(bytes.NewReader(payload)); err == nil {
-		if out, derr := io.ReadAll(zr); derr == nil {
-			return out
+		out, err := readDecompressedPayload(zr, limit)
+		if err == nil || errors.Is(err, errDecompressedPayloadTooLarge) {
+			return out, err
 		}
 	}
-	if out, err := inflateRaw(payload); err == nil {
-		return out
+	if out, err := inflateRaw(payload, limit); err == nil || errors.Is(err, errDecompressedPayloadTooLarge) {
+		return out, err
 	}
 	// Last resort: return as-is so decode attempts a best-effort parse.
-	return payload
+	return payload, nil
+}
+
+func readDecompressedPayload(r io.ReadCloser, limit int64) ([]byte, error) {
+	defer r.Close()
+	out, err := io.ReadAll(io.LimitReader(r, limit+1))
+	// Excess output is terminal even if the same read reports a checksum or
+	// truncation error; falling back would hide the violated size budget.
+	if int64(len(out)) > limit {
+		return nil, fmt.Errorf("%w (limit=%d)", errDecompressedPayloadTooLarge, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // inflateRaw decompresses a raw deflate stream (no zlib header) via zlib's
 // flush-mode reader seeded with a synthetic zlib header.
-func inflateRaw(payload []byte) ([]byte, error) {
+func inflateRaw(payload []byte, limit int64) ([]byte, error) {
 	r := bytes.NewReader(payload)
 	zr, err := zlib.NewReader(io.MultiReader(bytes.NewReader([]byte{0x78, 0x01}), r))
 	if err != nil {
 		return nil, err
 	}
-	defer zr.Close()
-	return io.ReadAll(zr)
+	return readDecompressedPayload(zr, limit)
 }

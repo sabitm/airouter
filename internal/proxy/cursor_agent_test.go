@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -345,6 +347,191 @@ func TestCursorTruncatedStreamFailover(t *testing.T) {
 	if !finished {
 		t.Error("stream did not finish cleanly on second target")
 	}
+}
+
+func TestCursorOversizedFrameLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ingress   string
+		body      string
+		unary     bool
+		committed bool
+	}{
+		{
+			name:    "unary discards primary partial",
+			ingress: "/v1/chat/completions",
+			body:    `{"model":"default","messages":[{"role":"user","content":"hi"}]}`,
+			unary:   true,
+		},
+		{
+			name:    "pre-commit stream fails over",
+			ingress: "/v1/messages",
+			body:    `{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+		{
+			name:      "post-commit stream does not fail over",
+			ingress:   "/v1/chat/completions",
+			body:      `{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			committed: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var badHits atomic.Int64
+			badDone := make(chan struct{})
+			bad := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				badHits.Add(1)
+				// Handler return RSTs the duplex stream. Stay alive until the proxy
+				// closes the request so queued response frames can arrive.
+				go func() {
+					_, _ = io.Copy(io.Discard, r.Body)
+					close(badDone)
+				}()
+				w.Header().Set("Content-Type", cursor.ConnectContentType)
+				w.WriteHeader(http.StatusOK)
+				fl := w.(http.Flusher)
+				if tc.unary || tc.committed {
+					writeTextDelta(w, "partial")
+				} else {
+					hb := teField(13, teBytes, nil)
+					_, _ = w.Write(wrapFrameForTest(teField(1, teBytes, teField(1, teBytes, hb))))
+					fl.Flush()
+				}
+				_, _ = w.Write(oversizedConnectHeaderForTest())
+				fl.Flush()
+				select {
+				case <-r.Context().Done():
+				case <-badDone:
+				case <-time.After(5 * time.Second):
+				}
+			}))
+			bad.EnableHTTP2 = true
+			bad.StartTLS()
+			t.Cleanup(bad.Close)
+
+			goodCap := &cursorAgentCapture{}
+			var goodKV sync.WaitGroup
+			goodKV.Add(1)
+			good := httptest.NewUnstartedServer(serveAgentRun(goodCap, &goodKV))
+			good.EnableHTTP2 = true
+			good.StartTLS()
+			t.Cleanup(good.Close)
+
+			base, token := setupCursorFailoverProxy(t, bad.URL, good.URL)
+			var resp *http.Response
+			var body []byte
+			if tc.unary {
+				resp, body = post(t, base+tc.ingress, token, tc.body)
+			} else {
+				var text string
+				resp, text = postStream(t, base+tc.ingress, token, tc.body)
+				body = []byte(text)
+			}
+			if badHits.Load() != 1 {
+				t.Fatalf("primary hits = %d, want 1", badHits.Load())
+			}
+			select {
+			case <-badDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("primary request was not closed")
+			}
+			goodCap.mu.Lock()
+			hitGood := goodCap.runPayload != nil
+			goodCap.mu.Unlock()
+
+			if tc.committed {
+				if hitGood {
+					t.Fatal("post-commit failure used the second target")
+				}
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+				}
+				if !strings.Contains(string(body), "partial") || !strings.Contains(string(body), "frame too large") {
+					t.Fatalf("body = %s, want partial text and ingress size error", body)
+				}
+				if strings.Contains(string(body), "[DONE]") || strings.Contains(string(body), `"finish_reason":"stop"`) ||
+					strings.Contains(string(body), "message_stop") {
+					t.Fatalf("successful finish after post-commit error: %s", body)
+				}
+				return
+			}
+
+			if !hitGood {
+				t.Fatal("pre-commit failure did not use the second target")
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			if strings.Contains(string(body), "partial") || strings.Contains(string(body), "frame too large") {
+				t.Fatalf("primary failure leaked into response: %s", body)
+			}
+			if tc.unary {
+				var got struct {
+					Choices []struct {
+						Message struct {
+							Content string `json:"content"`
+						} `json:"message"`
+					} `json:"choices"`
+				}
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatal(err)
+				}
+				if len(got.Choices) != 1 || got.Choices[0].Message.Content != "Hello world" {
+					t.Fatalf("choices = %+v, want fallback text only", got.Choices)
+				}
+				return
+			}
+			text, finished := collectStreamText(t, tc.ingress, string(body))
+			if text != "Hello world" || !finished {
+				t.Fatalf("text=%q finished=%v, want fallback success", text, finished)
+			}
+		})
+	}
+}
+
+func setupCursorFailoverProxy(t *testing.T, badURL, goodURL string) (string, string) {
+	t.Helper()
+	st := newTestStore(t)
+	ctx := context.Background()
+	providers := []*domain.Provider{
+		{Name: "cursor-bad", BaseURL: badURL, Protocol: domain.ProtocolCursor,
+			AuthMethod: domain.AuthAPIKey, APIKey: "agent-tok",
+			OAuthCreds: &domain.OAuthCreds{CursorAuth: true, MachineID: "m-1"}},
+		{Name: "cursor-good", BaseURL: goodURL, Protocol: domain.ProtocolCursor,
+			AuthMethod: domain.AuthAPIKey, APIKey: "agent-tok",
+			OAuthCreds: &domain.OAuthCreds{CursorAuth: true, MachineID: "m-1"}},
+	}
+	for _, prov := range providers {
+		if err := st.CreateProvider(ctx, prov); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: providers[0].ID, UpstreamModel: "default", Enabled: true},
+		{ProviderID: providers[1].ID, UpstreamModel: "default", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	p := New(st, nil)
+	p.streamClient = &http.Client{Transport: &http.Transport{
+		ForceAttemptHTTP2:   true,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		TLSHandshakeTimeout: 10 * time.Second,
+	}}
+	p.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL, key.Token
+}
+
+func oversizedConnectHeaderForTest() []byte {
+	hdr := make([]byte, 5)
+	binary.BigEndian.PutUint32(hdr[1:5], ^uint32(0))
+	return hdr
 }
 
 // readConnectFrameForTest reads one 5-byte-prefixed Connect frame.

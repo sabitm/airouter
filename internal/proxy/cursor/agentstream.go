@@ -188,7 +188,10 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		if payload == nil {
 			continue
 		}
-		data := decompressPayload(payload, flags)
+		data, err := decompressPayload(payload, flags)
+		if err != nil {
+			return err
+		}
 
 		if len(data) > 0 && data[0] == 0x7b && isCursorError(data) {
 			return parseCursorError(data)
