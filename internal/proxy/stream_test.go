@@ -2839,6 +2839,502 @@ func TestTranslatedStreamCommittedFailureKeepsAttemptUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAIMetadataOnlyTranslatedFailover(t *testing.T) {
+	const roleOnly = "data: {\"id\":\"chatcmpl-primary\",\"object\":\"chat.completion.chunk\",\"model\":\"primary-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n"
+	const roleUsage = roleOnly +
+		"data: {\"id\":\"chatcmpl-primary\",\"object\":\"chat.completion.chunk\",\"model\":\"primary-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":7,\"total_tokens\":106}}\n\n"
+	const fallback = "data: {\"id\":\"chatcmpl-fallback\",\"object\":\"chat.completion.chunk\",\"model\":\"fallback-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-fallback\",\"object\":\"chat.completion.chunk\",\"model\":\"fallback-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fallback answer\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-fallback\",\"object\":\"chat.completion.chunk\",\"model\":\"fallback-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-fallback\",\"object\":\"chat.completion.chunk\",\"model\":\"fallback-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n" +
+		"data: [DONE]\n\n"
+
+	cases := []struct {
+		name    string
+		ingress string
+		body    string
+		primary string
+		wantIn  int
+		wantOut int
+	}{
+		{
+			name:    "anthropic role only",
+			ingress: "/v1/messages",
+			body:    `{"model":"default","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			primary: roleOnly,
+			wantIn:  4,
+			wantOut: 2,
+		},
+		{
+			name:    "responses role only",
+			ingress: "/v1/responses",
+			body:    `{"model":"default","input":"hi","stream":true}`,
+			primary: roleOnly,
+			wantIn:  4,
+			wantOut: 2,
+		},
+		{
+			name:    "anthropic role plus usage",
+			ingress: "/v1/messages",
+			body:    `{"model":"default","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			primary: roleUsage,
+			wantIn:  4,
+			wantOut: 2,
+		},
+		{
+			name:    "responses role plus usage",
+			ingress: "/v1/responses",
+			body:    `{"model":"default","input":"hi","stream":true}`,
+			primary: roleUsage,
+			wantIn:  4,
+			wantOut: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var n1, n2 int
+			up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n1++
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, tc.primary)
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(up1.Close)
+			up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n2++
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, fallback)
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(up2.Close)
+
+			st := newTestStore(t)
+			ctx := context.Background()
+			p1 := &domain.Provider{Name: "oai-primary", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+			p2 := &domain.Provider{Name: "oai-fallback", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+			if err := st.CreateProvider(ctx, p1); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateProvider(ctx, p2); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+				{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+				{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			key, err := st.NewAccessKey(ctx, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			px := New(st, nil)
+			px.Mount(mux)
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+
+			resp, body := postStream(t, ts.URL+tc.ingress, key.Token, tc.body)
+			if n1 != 1 || n2 != 1 {
+				t.Fatalf("hits primary=%d fallback=%d, want 1/1; status=%d body=%s", n1, n2, resp.StatusCode, body)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+			}
+			if strings.Contains(body, "chatcmpl-primary") || strings.Contains(body, "primary-model") {
+				t.Fatalf("primary identity leaked: %s", body)
+			}
+			if strings.Contains(body, "data: {\"id\"") || strings.Contains(body, "data: [DONE]") {
+				t.Fatalf("openai wire leaked into translated ingress: %s", body)
+			}
+			switch tc.ingress {
+			case "/v1/messages":
+				text, finished := collectStreamText(t, tc.ingress, body)
+				if text != "fallback answer" || !finished {
+					t.Fatalf("text=%q finished=%v body=%s", text, finished, body)
+				}
+				if !strings.Contains(body, `"id":"chatcmpl-fallback"`) || !strings.Contains(body, `"model":"fallback-model"`) {
+					t.Fatalf("anthropic stream missing fallback identity: %s", body)
+				}
+			case "/v1/responses":
+				if !strings.Contains(body, `"delta":"fallback answer"`) || !strings.Contains(body, "response.completed") {
+					t.Fatalf("responses fallback missing completion: %s", body)
+				}
+				if !strings.Contains(body, `"id":"chatcmpl-fallback"`) || !strings.Contains(body, `"model":"fallback-model"`) {
+					t.Fatalf("responses stream missing fallback identity: %s", body)
+				}
+			default:
+				t.Fatalf("unexpected ingress %s", tc.ingress)
+			}
+			if got := backoffSkips(px, p1.ID); got == 0 {
+				t.Fatal("primary was not penalized")
+			}
+			if got := backoffSkips(px, p2.ID); got != 0 {
+				t.Fatalf("fallback penalized skips=%d", got)
+			}
+			logs := waitForLogs(t, st, 2)
+			failed := findLogByProvider(t, logs, "oai-primary")
+			if failed.ErrMsg == "" || failed.Status == http.StatusOK {
+				t.Fatalf("primary log = %+v", failed)
+			}
+			winner := findLogByProvider(t, logs, "oai-fallback")
+			if winner.ErrMsg != "" || winner.Status != http.StatusOK {
+				t.Fatalf("winner log = %+v", winner)
+			}
+			if winner.InputTokens != tc.wantIn || winner.OutputTokens != tc.wantOut {
+				t.Fatalf("winner tokens = %d/%d, want %d/%d", winner.InputTokens, winner.OutputTokens, tc.wantIn, tc.wantOut)
+			}
+			if strings.Contains(tc.primary, "prompt_tokens\":99") && (failed.InputTokens == 99 || winner.InputTokens == 99 || winner.OutputTokens == 7) {
+				t.Fatalf("primary usage leaked: failed=%+v winner=%+v", failed, winner)
+			}
+		})
+	}
+}
+
+func TestOpenAIMetadataOnlyAllTargetsUnaryError(t *testing.T) {
+	const roleOnly = "data: {\"id\":\"chatcmpl-empty\",\"model\":\"up\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+	cases := []struct {
+		name    string
+		ingress string
+		body    string
+		wantTop string
+	}{
+		{
+			name:    "anthropic",
+			ingress: "/v1/messages",
+			body:    `{"model":"default","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			wantTop: "type",
+		},
+		{
+			name:    "responses",
+			ingress: "/v1/responses",
+			body:    `{"model":"default","input":"hi","stream":true}`,
+			wantTop: "error",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var n1, n2 int
+			handler := func(hits *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					*hits++
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(w, roleOnly)
+					w.(http.Flusher).Flush()
+				}
+			}
+			up1 := httptest.NewServer(handler(&n1))
+			t.Cleanup(up1.Close)
+			up2 := httptest.NewServer(handler(&n2))
+			t.Cleanup(up2.Close)
+
+			st := newTestStore(t)
+			ctx := context.Background()
+			p1 := &domain.Provider{Name: "oai-a", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+			p2 := &domain.Provider{Name: "oai-b", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+			if err := st.CreateProvider(ctx, p1); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateProvider(ctx, p2); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+				{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+				{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			key, err := st.NewAccessKey(ctx, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			New(st, nil).Mount(mux)
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+
+			resp, body := postStream(t, ts.URL+tc.ingress, key.Token, tc.body)
+			if n1 != 1 || n2 != 1 {
+				t.Fatalf("hits = %d/%d, want 1/1", n1, n2)
+			}
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+			}
+			if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+				t.Fatalf("content-type = %q", resp.Header.Get("Content-Type"))
+			}
+			if strings.Contains(body, "data:") || strings.Contains(body, "event:") || strings.Contains(body, "chatcmpl-empty") {
+				t.Fatalf("stream preamble leaked: %s", body)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(body), &got); err != nil {
+				t.Fatalf("body not JSON: %s", body)
+			}
+			if _, ok := got[tc.wantTop]; !ok {
+				t.Fatalf("missing %s envelope: %s", tc.wantTop, body)
+			}
+			errObj := got["error"]
+			if tc.ingress == "/v1/messages" {
+				if string(got["type"]) != `"error"` {
+					t.Fatalf("anthropic type = %s", got["type"])
+				}
+			}
+			var envelope struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+			}
+			if err := json.Unmarshal(errObj, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Message != "upstream returned an empty stream" || envelope.Type != "api_error" {
+				t.Fatalf("error = %+v", envelope)
+			}
+		})
+	}
+}
+
+func TestOpenAIExplicitEmptyFinishDoesNotFailOver(t *testing.T) {
+	const emptyFinish = "data: {\"id\":\"chatcmpl-empty\",\"object\":\"chat.completion.chunk\",\"model\":\"primary-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_write_tokens\":1}}}\n\n" +
+		"data: [DONE]\n\n"
+	cases := []struct {
+		name    string
+		ingress string
+		body    string
+	}{
+		{
+			name:    "anthropic",
+			ingress: "/v1/messages",
+			body:    `{"model":"default","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+		{
+			name:    "responses",
+			ingress: "/v1/responses",
+			body:    `{"model":"default","input":"hi","stream":true}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var n1, n2 int
+			up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n1++
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, emptyFinish)
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(up1.Close)
+			up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n2++
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(up2.Close)
+
+			st := newTestStore(t)
+			ctx := context.Background()
+			p1 := &domain.Provider{Name: "oai-primary", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+			p2 := &domain.Provider{Name: "oai-unused", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+			if err := st.CreateProvider(ctx, p1); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateProvider(ctx, p2); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+				{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+				{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			key, err := st.NewAccessKey(ctx, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			px := New(st, nil)
+			px.Mount(mux)
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+
+			resp, body := postStream(t, ts.URL+tc.ingress, key.Token, tc.body)
+			if n1 != 1 || n2 != 0 {
+				t.Fatalf("hits primary=%d fallback=%d, want 1/0", n1, n2)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+			}
+			if got := backoffSkips(px, p1.ID); got != 0 {
+				t.Fatalf("successful empty completion penalized skips=%d", got)
+			}
+			switch tc.ingress {
+			case "/v1/messages":
+				if !strings.Contains(body, `"model":"primary-model"`) || !strings.Contains(body, `"stop_reason":"max_tokens"`) || !strings.Contains(body, "message_stop") {
+					t.Fatalf("anthropic empty completion missing metadata: %s", body)
+				}
+				if !strings.Contains(body, `"input_tokens":4`) || !strings.Contains(body, `"output_tokens":0`) || !strings.Contains(body, `"cache_read_input_tokens":3`) || !strings.Contains(body, `"cache_creation_input_tokens":1`) {
+					t.Fatalf("anthropic usage missing: %s", body)
+				}
+			case "/v1/responses":
+				if !strings.Contains(body, `"model":"primary-model"`) || !strings.Contains(body, "response.completed") || !strings.Contains(body, `"status":"incomplete"`) {
+					t.Fatalf("responses empty completion missing metadata: %s", body)
+				}
+				if !strings.Contains(body, `"input_tokens":8`) || !strings.Contains(body, `"output_tokens":0`) {
+					t.Fatalf("responses usage missing: %s", body)
+				}
+			}
+			if strings.Count(body, "event: message_stop") > 1 || strings.Count(body, "event: response.completed") > 1 {
+				t.Fatalf("duplicate terminal event: %s", body)
+			}
+			logs := waitForLogs(t, st, 1)
+			if logs[0].Provider != "oai-primary" || logs[0].InputTokens != 8 || logs[0].OutputTokens != 0 || logs[0].ErrMsg != "" {
+				t.Fatalf("log = %+v", logs[0])
+			}
+		})
+	}
+}
+
+func TestOpenAIPassthroughRoleOnlyEOFFailsOver(t *testing.T) {
+	const roleOnly = "data: {\"id\":\"chatcmpl-primary\",\"object\":\"chat.completion.chunk\",\"model\":\"primary-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n"
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, roleOnly)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "oai-bad", BaseURL: up1.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	p2 := &domain.Provider{Name: "oai-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m1", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d", n1, n2)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "chatcmpl-primary") || strings.Contains(body, "primary-model") {
+		t.Fatalf("primary bytes leaked: %s", body)
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" || !finished {
+		t.Fatalf("text=%q finished=%v body=%s", text, finished, body)
+	}
+	if got := backoffSkips(px, p1.ID); got == 0 {
+		t.Fatal("failed provider was not penalized")
+	}
+}
+
+func TestOpenCodeChatRoleOnlyEOFFailsOver(t *testing.T) {
+	const roleOnly = "data: {\"id\":\"chatcmpl-zen\",\"object\":\"chat.completion.chunk\",\"model\":\"big-pickle\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n"
+	var n1, n2 int
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n1++
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			t.Errorf("opencode path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, roleOnly)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n2++
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			t.Errorf("fallback path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(up2.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "zen-bad", BaseURL: up1.URL, APIKey: "public", Protocol: domain.ProtocolOpencode}
+	p2 := &domain.Provider{Name: "oai-good", BaseURL: up2.URL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "big-pickle", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m2", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token,
+		`{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if n1 != 1 || n2 != 1 {
+		t.Fatalf("hits n1=%d n2=%d body=%s", n1, n2, body)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "chatcmpl-zen") || strings.Contains(body, "big-pickle") {
+		t.Fatalf("opencode identity leaked: %s", body)
+	}
+	text, finished := collectStreamText(t, "/v1/chat/completions", body)
+	if text != "Hello world" || !finished {
+		t.Fatalf("text=%q finished=%v body=%s", text, finished, body)
+	}
+	if got := backoffSkips(px, p1.ID); got == 0 {
+		t.Fatal("opencode provider was not penalized")
+	}
+}
+
 func TestResponsesTranslatedNumericErrorFailover(t *testing.T) {
 	const numericFailedSSE = `event: response.created
 data: {"type":"response.created","response":{"id":"resp_bad","model":"up","status":"in_progress"}}

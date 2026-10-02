@@ -106,6 +106,10 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	var stopReason ir.StopReason = ir.StopEndTurn
 	inputTokens, outputTokens := 0, 0
 	cacheRead, cacheWrite := 0, 0
+	// Latest non-empty identity seen before the first response-bearing event.
+	// Role-only preambles often carry id/model that later chunks omit; empty
+	// fields must not clear a value already saved.
+	var startID, startModel string
 
 	for {
 		ev, err := reader.Next()
@@ -115,6 +119,8 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		if err != nil {
 			return err
 		}
+		// [DONE] ends the stream. It is not response evidence: a role-only or
+		// usage-only stream that ends here emits no IR events.
 		if string(ev.Data) == "[DONE]" {
 			break
 		}
@@ -143,34 +149,26 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		if json.Unmarshal(ev.Data, &chunk) != nil {
 			continue
 		}
-		// Only delta content or a finish reason open the stream: evidence the
-		// model produced a turn. A usage-only trailer must update counters without
-		// fabricating a start, so an empty or truncated stream still fails over
-		// (the passthrough classifier treats usage-only frames as lifecycle).
+		if !started {
+			if chunk.ID != "" {
+				startID = chunk.ID
+			}
+			if chunk.Model != "" {
+				startModel = chunk.Model
+			}
+		}
+		// Role and usage are not a turn. Only text, reasoning, tool activity, or
+		// an explicit finish reason opens the stream. Whitespace is content.
+		// Usage is captured on every valid chunk, including skipped metadata, but
+		// it is reported only if a later event actually starts the turn.
 		hasContent := false
 		for _, c := range chunk.Choices {
 			reasoning := chatReasoningText(c.Delta.ReasoningContent, c.Delta.Reasoning, c.Delta.ReasoningDetails)
-			if c.Delta.Role != "" || c.Delta.Content != "" || reasoning != "" || len(c.Delta.ToolCalls) > 0 ||
+			if c.Delta.Content != "" || reasoning != "" || len(c.Delta.ToolCalls) > 0 ||
 				(c.FinishReason != nil && *c.FinishReason != "") {
 				hasContent = true
 				break
 			}
-		}
-		if !hasContent {
-			if chunk.Usage != nil {
-				u := usageFromWire(chunk.Usage)
-				inputTokens = u.InputTokens
-				outputTokens = u.OutputTokens
-				cacheRead = u.CacheReadTokens
-				cacheWrite = u.CacheWriteTokens
-			}
-			continue
-		}
-		if !started {
-			if err := emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: chunk.ID, Model: chunk.Model}); err != nil {
-				return err
-			}
-			started = true
 		}
 		if chunk.Usage != nil {
 			u := usageFromWire(chunk.Usage)
@@ -178,6 +176,15 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			outputTokens = u.OutputTokens
 			cacheRead = u.CacheReadTokens
 			cacheWrite = u.CacheWriteTokens
+		}
+		if !hasContent {
+			continue
+		}
+		if !started {
+			if err := emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: startID, Model: startModel}); err != nil {
+				return err
+			}
+			started = true
 		}
 		for _, c := range chunk.Choices {
 			if reasoning := chatReasoningText(c.Delta.ReasoningContent, c.Delta.Reasoning, c.Delta.ReasoningDetails); reasoning != "" {

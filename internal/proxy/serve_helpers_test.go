@@ -10,6 +10,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"airouter/internal/domain"
 	"airouter/internal/proxy/ir"
 )
 
@@ -476,6 +477,53 @@ func TestCollectStreamResponseLimits(t *testing.T) {
 		}), nil, fallback, nil, limit, 10)
 		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
 			t.Fatalf("error = %v, want response-too-large", err)
+		}
+	})
+}
+
+func TestCollectStreamResponseQoderMetadata(t *testing.T) {
+	envelope := func(inner string) string {
+		raw, err := json.Marshal(map[string]any{"statusCodeValue": 200, "body": inner})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "data: " + string(raw) + "\n\n"
+	}
+	qoder := backendCodec(domain.ProtocolQoder, "")
+
+	t.Run("role only is empty stream", func(t *testing.T) {
+		body := envelope(`{"id":"chatcmpl-role","model":"auto","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`)
+		resp, err := collectStreamResponse(strings.NewReader(body), qoder, nil, "fallback-model", nil)
+		if resp != nil {
+			t.Fatalf("response = %+v, want nil", resp)
+		}
+		sf, ok := ir.AsStreamFailure(err)
+		if !ok {
+			t.Fatalf("error = %v, want StreamFailure", err)
+		}
+		if sf.Message != "upstream returned an empty stream" {
+			t.Fatalf("message = %q", sf.Message)
+		}
+	})
+
+	t.Run("explicit finish is empty completion", func(t *testing.T) {
+		body := envelope(`{"id":"chatcmpl-empty","model":"auto","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`) +
+			envelope(`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":6,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1}}}`)
+		resp, err := collectStreamResponse(strings.NewReader(body), qoder, nil, "fallback-model", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.ID != "chatcmpl-empty" || resp.Model != "auto" {
+			t.Fatalf("identity = %q/%q", resp.ID, resp.Model)
+		}
+		if resp.StopReason != ir.StopMaxTokens {
+			t.Fatalf("stop = %q", resp.StopReason)
+		}
+		if len(resp.Content) != 0 {
+			t.Fatalf("content = %+v, want empty", resp.Content)
+		}
+		if resp.Usage.InputTokens != 6 || resp.Usage.OutputTokens != 0 || resp.Usage.CacheReadTokens != 2 || resp.Usage.CacheWriteTokens != 1 {
+			t.Fatalf("usage = %+v", resp.Usage)
 		}
 	})
 }

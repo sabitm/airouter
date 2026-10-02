@@ -35,6 +35,54 @@ func TestDecodeStreamUnwrapsEnvelope(t *testing.T) {
 	}
 }
 
+func TestDecodeStreamRoleOnlyEnvelopeEmitsNothing(t *testing.T) {
+	inner := `{"id":"chatcmpl-role","model":"auto","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`
+	env, _ := json.Marshal(map[string]any{"statusCodeValue": 200, "body": inner})
+	// EOF without an explicit DONE still reaches the shared decoder as [DONE].
+	sse := "data: " + string(env) + "\n\n"
+	var out []ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		out = append(out, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("events = %+v, want none", out)
+	}
+}
+
+func TestDecodeStreamExplicitEmptyFinishKeepsMetadata(t *testing.T) {
+	role := `{"id":"chatcmpl-empty","model":"auto","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`
+	finish := `{"choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":6,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1}}}`
+	var frames []string
+	for _, inner := range []string{role, finish} {
+		env, err := json.Marshal(map[string]any{"statusCodeValue": 200, "body": inner})
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames = append(frames, "data: "+string(env))
+	}
+	sse := strings.Join(frames, "\n\n") + "\n\n"
+	var out []ir.StreamEvent
+	err := DecodeStream(strings.NewReader(sse), func(ev ir.StreamEvent) error {
+		out = append(out, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 || out[0].Kind != ir.EventMessageStart || out[1].Kind != ir.EventFinish {
+		t.Fatalf("events = %+v", out)
+	}
+	if out[0].ID != "chatcmpl-empty" || out[0].Model != "auto" {
+		t.Fatalf("metadata = %q/%q", out[0].ID, out[0].Model)
+	}
+	if out[1].StopReason != ir.StopMaxTokens || out[1].InputTokens != 6 || out[1].CacheReadTokens != 2 || out[1].CacheWriteTokens != 1 {
+		t.Fatalf("finish = %+v", out[1])
+	}
+}
 
 func TestTruncate(t *testing.T) {
 	t.Run("short unchanged", func(t *testing.T) {
