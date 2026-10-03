@@ -10,8 +10,8 @@ import (
 )
 
 // DecodeStream reads a Kiro binary AWS EventStream and emits IR stream events.
-// Kiro is stream-only, so this is the sole response direction (a unary client
-// request is collected from these same events upstream in the proxy).
+// It does not restore cloaked tool names. Production response paths use
+// DecodeStreamTools with the original client declarations.
 //
 // Event mapping (see KIRO.md 5.4):
 //   - assistantResponseEvent / codeEvent -> text delta (<thinking> tags stripped)
@@ -21,6 +21,22 @@ import (
 //
 // The IR has no reasoning field, so reasoningContentEvent folds into text.
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
+	return decodeStream(nil, r, emit, false)
+}
+
+// DecodeStreamTools reads a Kiro EventStream and restores wire tool names to
+// the exact client names from clientTools. A nil or empty list is authoritative:
+// decoy and unknown tool calls fail the stream instead of being forwarded.
+// The catalog is rebuilt from the same declarations used at encode time.
+func DecodeStreamTools(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) error) error {
+	return decodeStream(clientTools, r, emit, true)
+}
+
+func decodeStream(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) error, cloak bool) error {
+	var catalog toolCatalog
+	if cloak {
+		catalog = buildToolCatalog(clientTools)
+	}
 	started := false
 	sawTool := false
 	stop := ir.StopEndTurn
@@ -29,8 +45,10 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 
 	// Tool calls are keyed by toolUseId. Each distinct id gets a monotonic index
 	// so argument fragments attribute to the right call; a start event is emitted
-	// the first time an id is seen.
+	// the first time an id is seen. Request-aware decoding binds each id to its
+	// validated wire name before accepting nameless continuation fragments.
 	toolIndex := map[string]int{}
+	toolWireNames := map[string]string{}
 	nextIndex := 0
 
 	ensureStarted := func() error {
@@ -107,6 +125,24 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if json.Unmarshal(msg.payload, &p) != nil {
 				continue
 			}
+			name := p.Name
+			// Kiro must declare the tool name on the first frame for an id. Later
+			// frames may omit or repeat that name, but cannot change it. Validate
+			// before emitting identity or arguments; failures carry no wire data.
+			if cloak {
+				wireName, bound := toolWireNames[p.ToolUseID]
+				if p.ToolUseID == "" || (!bound && name == "") || (bound && name != "" && name != wireName) {
+					return &ir.StreamFailure{Type: "invalid_request_error", Message: "upstream tool call is not available"}
+				}
+				if !bound {
+					restored, ok := catalog.resolveWireName(name)
+					if !ok {
+						return &ir.StreamFailure{Type: "invalid_request_error", Message: "upstream tool call is not available"}
+					}
+					toolWireNames[p.ToolUseID] = name
+					name = restored
+				}
+			}
 			if err := ensureStarted(); err != nil {
 				return err
 			}
@@ -117,7 +153,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				nextIndex++
 				toolIndex[p.ToolUseID] = idx
 				if err := emit(ir.StreamEvent{
-					Kind: ir.EventToolCallStart, Index: idx, ToolID: p.ToolUseID, ToolName: p.Name,
+					Kind: ir.EventToolCallStart, Index: idx, ToolID: p.ToolUseID, ToolName: name,
 				}); err != nil {
 					return err
 				}

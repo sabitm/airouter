@@ -177,6 +177,227 @@ func TestDecodeStreamStripsThinkingTags(t *testing.T) {
 	}
 }
 
+func TestDecodeStreamToolsRestoresAndRejects(t *testing.T) {
+	tools := []ir.Tool{
+		{Name: "get_weather"},
+		{Name: "fs_read"},
+		{Name: "already_ide"},
+		{Name: "bad name"},
+	}
+	cat := buildToolCatalog(tools)
+
+	t.Run("fragmented interleaved calls restore exact names", func(t *testing.T) {
+		var buf bytes.Buffer
+		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_b", cat.toWire["bad name"], `{"q":`)))
+		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_a", cat.toWire["fs_read"], `{"path":`)))
+		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_b", "", "1}")))
+		buf.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"note"}`)))
+		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_a", "", `"a.txt"}`)))
+		buf.Write(buildFrame("metricsEvent", []byte(`{"inputTokens":9,"outputTokens":4}`)))
+		buf.Write(buildFrame("messageStopEvent", []byte(`{}`)))
+
+		events := collectTools(t, tools, buf.Bytes())
+		var text string
+		starts := map[string]ir.StreamEvent{}
+		args := map[int]string{}
+		var finish *ir.StreamEvent
+		for _, ev := range events {
+			switch ev.Kind {
+			case ir.EventTextDelta:
+				text += ev.Text
+			case ir.EventToolCallStart:
+				starts[ev.ToolID] = ev
+			case ir.EventToolCallDelta:
+				args[ev.Index] += ev.ArgsFrag
+			case ir.EventFinish:
+				finish = &ev
+			}
+		}
+		if starts["call_b"].ToolName != "bad name" || starts["call_a"].ToolName != "fs_read" {
+			t.Fatalf("starts = %+v", starts)
+		}
+		if starts["call_b"].Index != 0 || starts["call_a"].Index != 1 {
+			t.Fatalf("indices = %d %d", starts["call_b"].Index, starts["call_a"].Index)
+		}
+		if args[0] != `{"q":1}` || args[1] != `{"path":"a.txt"}` {
+			t.Fatalf("args = %+v", args)
+		}
+		if text != "note" {
+			t.Errorf("text = %q", text)
+		}
+		if finish == nil || finish.StopReason != ir.StopToolUse || finish.InputTokens != 9 || finish.OutputTokens != 4 {
+			t.Fatalf("finish = %+v", finish)
+		}
+	})
+
+	t.Run("decoy and unknown fail before tool events", func(t *testing.T) {
+		for _, name := range []string{"fs_read", "execute_bash", "not_declared", cat.toWire["get_weather"] + "_extra"} {
+			var buf bytes.Buffer
+			buf.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"before"}`)))
+			buf.Write(buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_x","name":"`+name+`","input":"{\"secret\":\"hidden\"}"}`)))
+			buf.Write(buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_ok","name":"`+cat.toWire["get_weather"]+`","input":"{}"}`)))
+			var sawTool bool
+			var events []ir.StreamEvent
+			err := DecodeStreamTools(tools, bytes.NewReader(buf.Bytes()), func(ev ir.StreamEvent) error {
+				events = append(events, ev)
+				if ev.Kind == ir.EventToolCallStart || ev.Kind == ir.EventToolCallDelta {
+					sawTool = true
+				}
+				return nil
+			})
+			sf, ok := ir.AsStreamFailure(err)
+			if !ok {
+				t.Fatalf("%s: got %v, want StreamFailure", name, err)
+			}
+			if sf.Message != "upstream tool call is not available" || strings.Contains(sf.Message, name) || strings.Contains(sf.Error(), "secret") {
+				t.Fatalf("%s failure = %+v", name, sf)
+			}
+			if sawTool {
+				t.Fatalf("%s emitted a tool event before rejection: %+v", name, events)
+			}
+		}
+		var buf bytes.Buffer
+		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_hidden", "fs_read", "")))
+		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_hidden", "", `{"secret":"hidden"}`)))
+		err := DecodeStreamTools(tools, bytes.NewReader(buf.Bytes()), func(ev ir.StreamEvent) error {
+			if ev.Kind == ir.EventToolCallDelta && strings.Contains(ev.ArgsFrag, "hidden") {
+				t.Fatalf("decoy continuation leaked args: %+v", ev)
+			}
+			return nil
+		})
+		if _, ok := ir.AsStreamFailure(err); !ok {
+			t.Fatalf("decoy continuation got %v", err)
+		}
+	})
+
+	t.Run("empty declarations reject every tool name", func(t *testing.T) {
+		frame := buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_1","name":"get_weather_ide","input":"{}"}`))
+		err := DecodeStreamTools(nil, bytes.NewReader(frame), func(ev ir.StreamEvent) error {
+			if ev.Kind == ir.EventToolCallStart || ev.Kind == ir.EventToolCallDelta {
+				t.Fatalf("empty tools forwarded %+v", ev)
+			}
+			return nil
+		})
+		if _, ok := ir.AsStreamFailure(err); !ok {
+			t.Fatalf("got %v, want StreamFailure", err)
+		}
+	})
+}
+
+func TestDecodeStreamToolsRejectsUnboundAndChangedIdentity(t *testing.T) {
+	tools := []ir.Tool{{Name: "lookup"}, {Name: "other"}}
+	first := toolEventJSON("call_1", "lookup_ide", `{"allowed":1}`)
+	cases := []struct {
+		name       string
+		tools      []ir.Tool
+		first      []byte
+		invalid    []byte
+		wantStarts int
+	}{
+		{name: "nameless start without declarations", invalid: toolEventJSON("call_hidden", "", `{"secret":"hidden"}`)},
+		{name: "nameless start with declarations", tools: tools, invalid: toolEventJSON("call_hidden", "", `{"secret":"hidden"}`)},
+		{name: "explicit empty name", tools: tools, invalid: []byte(`{"toolUseId":"call_hidden","name":"","input":"hidden"}`)},
+		{name: "null name", tools: tools, invalid: []byte(`{"toolUseId":"call_hidden","name":null,"input":"hidden"}`)},
+		{name: "missing tool ID", tools: tools, invalid: []byte(`{"name":"lookup_ide","input":"hidden"}`)},
+		{name: "new nameless ID after valid call", tools: tools, first: first, invalid: toolEventJSON("call_hidden", "", "hidden"), wantStarts: 1},
+		{name: "changed to declared tool", tools: tools, first: first, invalid: toolEventJSON("call_1", "other_ide", "hidden"), wantStarts: 1},
+		{name: "changed to decoy", tools: tools, first: first, invalid: toolEventJSON("call_1", "fs_read", "hidden"), wantStarts: 1},
+		{name: "changed to unknown", tools: tools, first: first, invalid: toolEventJSON("call_1", "unknown", "hidden"), wantStarts: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if len(tc.first) > 0 {
+				buf.Write(buildFrame("toolUseEvent", tc.first))
+			}
+			buf.Write(buildFrame("toolUseEvent", tc.invalid))
+			buf.Write(buildFrame("messageStopEvent", []byte(`{}`)))
+			var starts, deltas int
+			err := DecodeStreamTools(tc.tools, &buf, func(ev ir.StreamEvent) error {
+				switch ev.Kind {
+				case ir.EventToolCallStart:
+					starts++
+					if ev.ToolID != "call_1" || ev.ToolName != "lookup" {
+						t.Fatalf("unvalidated identity emitted: %+v", ev)
+					}
+				case ir.EventToolCallDelta:
+					deltas++
+					if ev.ArgsFrag != `{"allowed":1}` {
+						t.Fatalf("unvalidated arguments emitted: %+v", ev)
+					}
+				case ir.EventFinish:
+					t.Fatal("invalid identity produced a successful finish")
+				}
+				return nil
+			})
+			sf, ok := ir.AsStreamFailure(err)
+			if !ok || sf.Type != "invalid_request_error" || sf.Message != "upstream tool call is not available" {
+				t.Fatalf("failure = %v, want generic tool StreamFailure", err)
+			}
+			if starts != tc.wantStarts || deltas != tc.wantStarts {
+				t.Fatalf("starts/deltas = %d/%d, want %d/%d", starts, deltas, tc.wantStarts, tc.wantStarts)
+			}
+		})
+	}
+}
+
+func TestDecodeStreamToolsAllowsValidatedContinuations(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_1", "lookup_ide", `{"value":`)))
+	buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_1", "lookup_ide", "1")))
+	buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_1", "", "}")))
+	buf.Write(buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_1","stop":true}`)))
+	buf.Write(buildFrame("messageStopEvent", []byte(`{}`)))
+	var starts int
+	var args string
+	for _, ev := range collectTools(t, []ir.Tool{{Name: "lookup"}}, buf.Bytes()) {
+		switch ev.Kind {
+		case ir.EventToolCallStart:
+			starts++
+			if ev.ToolID != "call_1" || ev.ToolName != "lookup" {
+				t.Fatalf("tool start = %+v", ev)
+			}
+		case ir.EventToolCallDelta:
+			args += ev.ArgsFrag
+		case ir.EventFinish:
+			if ev.StopReason != ir.StopToolUse {
+				t.Fatalf("stop reason = %q", ev.StopReason)
+			}
+		}
+	}
+	if starts != 1 || args != `{"value":1}` {
+		t.Fatalf("starts/args = %d/%q", starts, args)
+	}
+}
+
+func toolEventJSON(id, name, input string) []byte {
+	p := map[string]any{"toolUseId": id}
+	if name != "" {
+		p["name"] = name
+	}
+	if input != "" {
+		p["input"] = input
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func collectTools(t *testing.T, tools []ir.Tool, frames []byte) []ir.StreamEvent {
+	t.Helper()
+	var events []ir.StreamEvent
+	err := DecodeStreamTools(tools, bytes.NewReader(frames), func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("DecodeStreamTools: %v", err)
+	}
+	return events
+}
+
 func TestDecodeStreamToolUse(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write(buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_1","name":"get_weather","input":"{\"ci"}`)))

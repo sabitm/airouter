@@ -51,6 +51,9 @@ func EncodeRequestWithProfile(req *ir.Request, profileArn string) ([]byte, error
 	}
 
 	turns := buildTurns(msgs, req.System)
+	// Built after the tool-state guards. The catalog is local to this encode and
+	// is not written back onto req, so repeated encodes cannot accumulate suffixes.
+	catalog := buildToolCatalog(req.Tools)
 	state := cwConversationState{
 		ChatTriggerType: "MANUAL",
 		ConversationID:  ir.NewID("conv_"),
@@ -58,12 +61,13 @@ func EncodeRequestWithProfile(req *ir.Request, profileArn string) ([]byte, error
 
 	// The last user turn is the current message; everything before it is history.
 	// A trailing assistant turn (prefill) has no place in the CodeWhisperer shape
-	// and is dropped.
+	// and is dropped. A request with no user turn still carries declared tools on
+	// the synthesized current message.
 	curIdx := lastUserTurn(turns)
 	if curIdx < 0 {
-		// No user turn at all: synthesize an empty current message so the request
-		// is still well-formed.
-		state.CurrentMessage = cwMessage{UserInputMessage: &cwUserInputMessage{Content: "", Origin: "AI_EDITOR"}}
+		cur := &cwUserInputMessage{Content: "", Origin: "AI_EDITOR"}
+		applyToolCatalog(cur, catalog)
+		state.CurrentMessage = cwMessage{UserInputMessage: cur}
 	} else {
 		for i := 0; i < curIdx; i++ {
 			state.History = append(state.History, turns[i].history())
@@ -71,16 +75,10 @@ func EncodeRequestWithProfile(req *ir.Request, profileArn string) ([]byte, error
 		cur := turns[curIdx].user
 		cur.Origin = "AI_EDITOR"
 		cur.ModelID = req.Model
-		if len(req.Tools) > 0 {
-			ctx := cur.UserInputMessageContext
-			if ctx == nil {
-				ctx = &cwUserInputMessageContext{}
-			}
-			ctx.Tools = encodeTools(req.Tools)
-			cur.UserInputMessageContext = ctx
-		}
+		applyToolCatalog(cur, catalog)
 		state.CurrentMessage = cwMessage{UserInputMessage: cur}
 	}
+	rewriteHistoryToolNames(state.History, catalog)
 
 	out := cwRequest{
 		ConversationState: state,
@@ -218,20 +216,36 @@ func buildAssistant(blocks []ir.ContentBlock) (content string, toolUses []cwTool
 	return strings.Join(text, "\n"), toolUses
 }
 
-func encodeTools(tools []ir.Tool) []cwTool {
-	out := make([]cwTool, 0, len(tools))
-	for _, t := range tools {
-		schema := json.RawMessage(t.Parameters)
-		if len(schema) == 0 {
-			schema = json.RawMessage(`{"type":"object","properties":{}}`)
-		}
-		out = append(out, cwTool{ToolSpecification: cwToolSpecification{
-			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: cwInputSchema{JSON: schema},
-		}})
+func applyToolCatalog(cur *cwUserInputMessage, catalog toolCatalog) {
+	if cur == nil || catalog.empty() {
+		return
 	}
-	return out
+	ctx := cur.UserInputMessageContext
+	if ctx == nil {
+		ctx = &cwUserInputMessageContext{}
+	}
+	ctx.Tools = catalog.tools
+	cur.UserInputMessageContext = ctx
+}
+
+// rewriteHistoryToolNames cloaks assistant toolUses whose name matches a
+// declaration in this request. Unmatched historical calls stay unchanged.
+// Tool results are ID-only and are not rewritten.
+func rewriteHistoryToolNames(history []cwHistory, catalog toolCatalog) {
+	if catalog.empty() {
+		return
+	}
+	for i := range history {
+		assistant := history[i].AssistantResponseMessage
+		if assistant == nil {
+			continue
+		}
+		for j := range assistant.ToolUses {
+			if wire, ok := catalog.toWire[assistant.ToolUses[j].Name]; ok {
+				assistant.ToolUses[j].Name = wire
+			}
+		}
+	}
 }
 
 // toolResultText collapses a tool_result's block content into plain text, the

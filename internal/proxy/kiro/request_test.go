@@ -71,10 +71,10 @@ func TestEncodeRequestToolsOnCurrentMessage(t *testing.T) {
 	}
 	got := decodeReq(t, body)
 	cur := got.ConversationState.CurrentMessage.UserInputMessage
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.Tools) != 1 {
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.Tools) != 1+len(decoyNames) {
 		t.Fatalf("tools not attached to current message: %s", body)
 	}
-	if cur.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather" {
+	if cur.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather_ide" {
 		t.Errorf("tool name = %q", cur.UserInputMessageContext.Tools[0].ToolSpecification.Name)
 	}
 }
@@ -106,7 +106,7 @@ func TestEncodeRequestToolResultAndToolUse(t *testing.T) {
 	for _, h := range got.ConversationState.History {
 		if h.AssistantResponseMessage != nil {
 			for _, tu := range h.AssistantResponseMessage.ToolUses {
-				if tu.ToolUseID == "call_1" && tu.Name == "get_weather" {
+				if tu.ToolUseID == "call_1" && tu.Name == "get_weather_ide" {
 					sawToolUse = true
 				}
 			}
@@ -728,9 +728,181 @@ func TestInjectProfileArnErrorPaths(t *testing.T) {
 	})
 }
 
+func TestEncodeRequestCloakAndHistory(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"id":{"maximum":9223372036854775807},"n":{"maximum":1e400}}}`)
+	input := json.RawMessage(`{"id":9050000000000000001,"n":1e400}`)
+	req := &ir.Request{
+		Model:  "claude-sonnet-4.5",
+		System: "be brief",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "weather?"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolUse, ToolID: "call_match", ToolName: "get_weather", ToolInput: input},
+				{Type: ir.BlockToolUse, ToolID: "call_old", ToolName: "retired_tool", ToolInput: json.RawMessage(`{"keep":true}`)},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "call_match", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "sunny"}}},
+				{Type: ir.BlockImage, Image: &ir.Image{MediaType: "image/png", Data: "abc"}},
+				{Type: ir.BlockText, Text: "thanks"},
+			}},
+		},
+		Tools: []ir.Tool{
+			{Name: "get_weather", Description: "weather", Parameters: schema},
+			{Name: "fs_read", Description: "client read"},
+		},
+	}
+	originalTools := append([]ir.Tool(nil), req.Tools...)
+	originalInput := append(json.RawMessage(nil), input...)
+
+	body, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeReq(t, body)
+	cur := got.ConversationState.CurrentMessage.UserInputMessage
+	if cur.ModelID != req.Model || cur.Origin != "AI_EDITOR" {
+		t.Fatalf("model/origin = %q/%q", cur.ModelID, cur.Origin)
+	}
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.Tools) != 2+len(decoyNames) {
+		t.Fatalf("tools = %+v", cur.UserInputMessageContext)
+	}
+	specs := cur.UserInputMessageContext.Tools
+	if specs[0].ToolSpecification.Name != "get_weather_ide" || specs[1].ToolSpecification.Name != "fs_read_ide" {
+		t.Fatalf("client wire names = %s %s", specs[0].ToolSpecification.Name, specs[1].ToolSpecification.Name)
+	}
+	if string(specs[0].ToolSpecification.InputSchema.JSON) != string(schema) {
+		t.Errorf("schema = %s", specs[0].ToolSpecification.InputSchema.JSON)
+	}
+	if specs[2].ToolSpecification.Name != decoyNames[0] || specs[2].ToolSpecification.Description != decoyDescription {
+		t.Errorf("first decoy = %+v", specs[2].ToolSpecification)
+	}
+	if len(cur.Images) != 1 || cur.Images[0].Source.Bytes != "abc" {
+		t.Errorf("images = %+v", cur.Images)
+	}
+	if len(cur.UserInputMessageContext.ToolResults) != 1 || cur.UserInputMessageContext.ToolResults[0].ToolUseID != "call_match" {
+		t.Errorf("tool result = %+v", cur.UserInputMessageContext.ToolResults)
+	}
+
+	var matched, unmatched *cwToolUse
+	for _, h := range got.ConversationState.History {
+		if h.AssistantResponseMessage == nil {
+			continue
+		}
+		for i := range h.AssistantResponseMessage.ToolUses {
+			tu := &h.AssistantResponseMessage.ToolUses[i]
+			switch tu.ToolUseID {
+			case "call_match":
+				matched = tu
+			case "call_old":
+				unmatched = tu
+			}
+		}
+	}
+	if matched == nil || matched.Name != "get_weather_ide" || string(matched.Input) != string(input) {
+		t.Fatalf("matched history = %+v", matched)
+	}
+	if unmatched == nil || unmatched.Name != "retired_tool" || string(unmatched.Input) != `{"keep":true}` {
+		t.Fatalf("unmatched history = %+v", unmatched)
+	}
+	if !strings.Contains(string(body), "9223372036854775807") || !strings.Contains(string(body), "1e400") || !strings.Contains(string(body), "9050000000000000001") {
+		t.Fatalf("raw number tokens lost:\n%s", body)
+	}
+
+	if req.Tools[0].Name != originalTools[0].Name || req.Tools[1].Name != originalTools[1].Name {
+		t.Fatalf("caller tool names mutated: %+v", req.Tools)
+	}
+	if req.Messages[1].Content[0].ToolName != "get_weather" || req.Messages[1].Content[1].ToolName != "retired_tool" {
+		t.Fatalf("caller history mutated: %+v", req.Messages[1].Content)
+	}
+	if string(req.Tools[0].Parameters) != string(schema) || string(req.Messages[1].Content[0].ToolInput) != string(originalInput) {
+		t.Fatal("caller raw schema or input mutated")
+	}
+
+	again, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(again), "get_weather_ide_ide") || strings.Contains(string(again), "fs_read_ide_ide") {
+		t.Fatalf("repeat encode accumulated a suffix:\n%s", again)
+	}
+	if decodeReq(t, again).ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather_ide" {
+		t.Fatal("repeat encode changed the wire name")
+	}
+}
+
+func TestEncodeRequestNoToolsOmitsDecoys(t *testing.T) {
+	req := &ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+	}
+	got := decodeReq(t, mustEncode(t, req))
+	cur := got.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext != nil {
+		t.Fatalf("no-tools request emitted context: %+v", cur.UserInputMessageContext)
+	}
+}
+
+func TestEncodeRequestUnusableToolsOmitDecoys(t *testing.T) {
+	req := &ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+		Tools: []ir.Tool{{Name: ""}, {Name: " "}},
+	}
+	got := decodeReq(t, mustEncode(t, req))
+	cur := got.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.Tools) != 0 {
+		t.Fatalf("unusable tools emitted declarations: %+v", cur.UserInputMessageContext.Tools)
+	}
+}
+
+func TestEncodeRequestSynthesizedCurrentCarriesTools(t *testing.T) {
+	req := &ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolUse, ToolID: "call_1", ToolName: "get_weather", ToolInput: json.RawMessage(`{"city":"NYC"}`)},
+			}},
+		},
+		Tools: []ir.Tool{{Name: "get_weather", Parameters: json.RawMessage(`{"type":"object"}`)}},
+	}
+	got := decodeReq(t, mustEncode(t, req))
+	cur := got.ConversationState.CurrentMessage.UserInputMessage
+	if cur == nil || cur.Content != "" || cur.Origin != "AI_EDITOR" {
+		t.Fatalf("synthesized current = %+v", cur)
+	}
+	if cur.UserInputMessageContext == nil || cur.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather_ide" {
+		t.Fatalf("declared tools skipped on synthesized current: %+v", cur.UserInputMessageContext)
+	}
+	if len(got.ConversationState.History) != 0 {
+		t.Fatalf("assistant-only history = %+v, want dropped prefill", got.ConversationState.History)
+	}
+}
+
+func mustEncode(t *testing.T, req *ir.Request) []byte {
+	t.Helper()
+	body, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
 func TestEncodeTools(t *testing.T) {
+	clientSpecs := func(tools []ir.Tool) []cwTool {
+		t.Helper()
+		cat := buildToolCatalog(tools)
+		if len(cat.tools) < len(decoyNames) {
+			t.Fatalf("catalog tools = %d", len(cat.tools))
+		}
+		return cat.tools[:len(cat.tools)-len(decoyNames)]
+	}
+
 	t.Run("nil parameters uses default schema", func(t *testing.T) {
-		tools := encodeTools([]ir.Tool{{Name: "f", Description: "do f"}})
+		tools := clientSpecs([]ir.Tool{{Name: "f", Description: "do f"}})
 		if len(tools) != 1 {
 			t.Fatalf("len = %d, want 1", len(tools))
 		}
@@ -741,7 +913,7 @@ func TestEncodeTools(t *testing.T) {
 	})
 
 	t.Run("empty parameters uses default schema", func(t *testing.T) {
-		tools := encodeTools([]ir.Tool{{Name: "f", Parameters: json.RawMessage("")}})
+		tools := clientSpecs([]ir.Tool{{Name: "f", Parameters: json.RawMessage("")}})
 		got := string(tools[0].ToolSpecification.InputSchema.JSON)
 		if got != `{"type":"object","properties":{}}` {
 			t.Errorf("schema = %s, want default empty object schema", got)
@@ -750,7 +922,7 @@ func TestEncodeTools(t *testing.T) {
 
 	t.Run("non-empty parameters passthrough verbatim", func(t *testing.T) {
 		schema := json.RawMessage(`{"type":"object","properties":{"x":{"type":"string"}}}`)
-		tools := encodeTools([]ir.Tool{{Name: "f", Parameters: schema}})
+		tools := clientSpecs([]ir.Tool{{Name: "f", Parameters: schema}})
 		got := tools[0].ToolSpecification.InputSchema.JSON
 		if string(got) != string(schema) {
 			t.Errorf("schema = %s, want verbatim passthrough", got)
@@ -758,10 +930,10 @@ func TestEncodeTools(t *testing.T) {
 	})
 
 	t.Run("name and description propagated", func(t *testing.T) {
-		tools := encodeTools([]ir.Tool{{Name: "search", Description: "search the web"}})
+		tools := clientSpecs([]ir.Tool{{Name: "search", Description: "search the web"}})
 		ts := tools[0].ToolSpecification
-		if ts.Name != "search" {
-			t.Errorf("Name = %q, want search", ts.Name)
+		if ts.Name != "search_ide" {
+			t.Errorf("Name = %q, want search_ide", ts.Name)
 		}
 		if ts.Description != "search the web" {
 			t.Errorf("Description = %q, want search the web", ts.Description)
@@ -769,7 +941,7 @@ func TestEncodeTools(t *testing.T) {
 	})
 
 	t.Run("multiple tools preserve order", func(t *testing.T) {
-		tools := encodeTools([]ir.Tool{
+		tools := clientSpecs([]ir.Tool{
 			{Name: "a", Parameters: json.RawMessage(`{}`)},
 			{Name: "b", Parameters: json.RawMessage(`{}`)},
 			{Name: "c", Parameters: json.RawMessage(`{}`)},
@@ -777,7 +949,7 @@ func TestEncodeTools(t *testing.T) {
 		if len(tools) != 3 {
 			t.Fatalf("len = %d, want 3", len(tools))
 		}
-		if tools[0].ToolSpecification.Name != "a" || tools[1].ToolSpecification.Name != "b" || tools[2].ToolSpecification.Name != "c" {
+		if tools[0].ToolSpecification.Name != "a_ide" || tools[1].ToolSpecification.Name != "b_ide" || tools[2].ToolSpecification.Name != "c_ide" {
 			t.Errorf("order = %s %s %s",
 				tools[0].ToolSpecification.Name,
 				tools[1].ToolSpecification.Name,
@@ -786,18 +958,14 @@ func TestEncodeTools(t *testing.T) {
 	})
 
 	t.Run("empty tools slice returns empty result", func(t *testing.T) {
-		tools := encodeTools(nil)
-		if len(tools) != 0 {
-			t.Errorf("len = %d, want 0", len(tools))
-		}
-		// make([]cwTool, 0, 0) returns non-nil empty slice.
-		if tools == nil {
-			t.Error("got nil, want non-nil empty slice")
+		cat := buildToolCatalog(nil)
+		if len(cat.tools) != 0 {
+			t.Errorf("len = %d, want 0", len(cat.tools))
 		}
 	})
 
 	t.Run("description omitted propagates as empty", func(t *testing.T) {
-		tools := encodeTools([]ir.Tool{{Name: "f", Parameters: json.RawMessage(`{}`)}})
+		tools := clientSpecs([]ir.Tool{{Name: "f", Parameters: json.RawMessage(`{}`)}})
 		if tools[0].ToolSpecification.Description != "" {
 			t.Errorf("Description = %q, want empty when omitted", tools[0].ToolSpecification.Description)
 		}

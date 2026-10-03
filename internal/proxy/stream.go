@@ -12,6 +12,7 @@ import (
 	"airouter/internal/observability"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/sse"
@@ -347,12 +348,17 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		res.outTok = outTok
 	}
 	decode := backend.decodeStream
-	if backend.decodeStreamDuplex != nil {
+	switch {
+	case backend.decodeStreamDuplex != nil:
 		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if backend.protocol == domain.ProtocolCursor {
 				return cursor.DecodeAgentStreamTools(req.Tools, r, writeFrame, emit)
 			}
 			return backend.decodeStreamDuplex(r, writeFrame, emit)
+		}
+	case backend.protocol == domain.ProtocolKiro:
+		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			return kiro.DecodeStreamTools(req.Tools, r, emit)
 		}
 	}
 	cursorEstimated := backend.protocol == domain.ProtocolCursor
