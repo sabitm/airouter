@@ -3,13 +3,16 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"airouter/internal/domain"
 	"airouter/internal/observability"
@@ -57,6 +60,130 @@ func TestProviderModelsOAuth(t *testing.T) {
 		if !strings.Contains(body, `value="`+id+`"`) {
 			t.Errorf("datalist missing option %q: %s", id, body)
 		}
+	}
+}
+
+func TestFetchKiroModelsUsesLiveCatalog(t *testing.T) {
+	var gotURL string
+	withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+		gotURL = req.URL.String()
+		return kiroJSONResponse(http.StatusOK, `{"models":[{"modelId":"Claude-Sonnet-4.5"},{"modelId":"claude-sonnet-4.5"},{"modelId":"Claude-Sonnet-4.5"}]}`), nil
+	})
+	models, err := fetchUpstreamModels(context.Background(), nil, &domain.Provider{
+		BaseURL: "https://kiro-models.example/root/", APIKey: "key", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthAPIKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(models, ",") != "Claude-Sonnet-4.5,claude-sonnet-4.5" {
+		t.Fatalf("models = %v", models)
+	}
+	if gotURL != "https://kiro-models.example/root/" {
+		t.Fatalf("url = %s", gotURL)
+	}
+	for _, stale := range []string{"deepseek-3.2", "qwen3-coder-next", "MiniMax-M2.5"} {
+		for _, got := range models {
+			if got == stale {
+				t.Fatalf("static fallback model %q returned", stale)
+			}
+		}
+	}
+}
+
+func TestKiroModelAutocompleteRefreshesSavedOAuth(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		for _, outcome := range []string{"success", "catalog rejected", "refresh rejected"} {
+			t.Run(http.StatusText(status)+"/"+outcome, func(t *testing.T) {
+				h := testHandler(t)
+				var tokenHits atomic.Int32
+				tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					tokenHits.Add(1)
+					var payload map[string]string
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Error(err)
+					}
+					if payload["refreshToken"] != "stored-refresh" || payload["grantType"] != "refresh_token" {
+						t.Errorf("unexpected token payload: %v", payload)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if outcome == "refresh rejected" {
+						w.WriteHeader(http.StatusUnauthorized)
+						_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+						return
+					}
+					_, _ = w.Write([]byte(`{"accessToken":"fresh-token","refreshToken":"fresh-refresh","expiresIn":3600}`))
+				}))
+				t.Cleanup(tokenSrv.Close)
+				withKiroTokenTransport(t, tokenSrv)
+				var auth []string
+				withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+					auth = append(auth, req.Header.Get("Authorization"))
+					if len(auth) == 1 || outcome == "catalog rejected" {
+						return kiroJSONResponse(status, `{}`), nil
+					}
+					return kiroJSONResponse(http.StatusOK, `{"models":[{"modelId":"  Fresh-Model  "},{"modelId":"Fresh-Model"}]}`), nil
+				})
+				p := &domain.Provider{
+					Name: "kiro-models", BaseURL: "https://catalog.example", Protocol: domain.ProtocolKiro,
+					AuthMethod: domain.AuthOAuth,
+					OAuthCreds: &domain.OAuthCreds{
+						KiroAuth: "builder-id", Region: "us-east-1", ClientID: "cid", ClientSecret: "secret",
+						AccessToken: "stored-token", RefreshToken: "stored-refresh", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+					},
+				}
+				if err := h.store.CreateProvider(context.Background(), p); err != nil {
+					t.Fatal(err)
+				}
+				req := httptest.NewRequest(http.MethodGet, "/dashboard/providers/models?provider_id="+strconv.FormatInt(p.ID, 10), nil)
+				rec := httptest.NewRecorder()
+				h.providerModels(rec, req)
+				body := rec.Body.String()
+				wantAuth := "Bearer stored-token,Bearer fresh-token"
+				wantToken := "fresh-token"
+				if outcome == "refresh rejected" {
+					wantAuth, wantToken = "Bearer stored-token", "stored-token"
+				}
+				if tokenHits.Load() != 1 || strings.Join(auth, ",") != wantAuth {
+					t.Fatalf("token hits=%d catalog auth=%v", tokenHits.Load(), auth)
+				}
+				if outcome == "success" {
+					if !strings.Contains(body, `value="  Fresh-Model  "`) || !strings.Contains(body, `value="Fresh-Model"`) || strings.Contains(body, "enter id manually") {
+						t.Fatalf("catalog options=%s", body)
+					}
+				} else if !strings.Contains(body, "enter id manually") || strings.Contains(body, "Fresh-Model") {
+					t.Fatalf("failed catalog returned options: %s", body)
+				}
+				saved, err := h.store.GetProvider(context.Background(), p.ID)
+				if err != nil || saved.OAuthCreds.AccessToken != wantToken {
+					t.Fatalf("saved token did not match refresh outcome: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestKiroCatalogRefreshEligibility(t *testing.T) {
+	h := testHandler(t)
+	for _, tc := range []struct {
+		name      string
+		method    domain.AuthMethod
+		id        int64
+		fromStore bool
+		want      bool
+	}{
+		{name: "saved OAuth", method: domain.AuthOAuth, id: 1, fromStore: true, want: true},
+		{name: "saved API key", method: domain.AuthAPIKey, id: 1, fromStore: true},
+		{name: "unsaved session", method: domain.AuthOAuth},
+		{name: "manual tokens over saved provider", method: domain.AuthOAuth, id: 1},
+		{name: "missing provider ID", method: domain.AuthOAuth, fromStore: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &domain.Provider{Protocol: domain.ProtocolKiro, AuthMethod: tc.method, ID: tc.id}
+			if got := h.kiroCatalogRefresh(p, tc.fromStore) != nil; got != tc.want {
+				t.Fatalf("refresh enabled=%t, want %t", got, tc.want)
+			}
+		})
 	}
 }
 

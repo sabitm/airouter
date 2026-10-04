@@ -1246,6 +1246,241 @@ func TestRefreshAllOAuth(t *testing.T) {
 	}
 }
 
+type fakeConnector struct {
+	state string
+	creds *domain.OAuthCreds
+}
+
+func (f fakeConnector) State() string { return f.state }
+func (f fakeConnector) Result() (*domain.OAuthCreds, error, bool) {
+	return f.creds, nil, true
+}
+func (f fakeConnector) Close() error { return nil }
+
+func putKiroSession(h *Handler, creds *domain.OAuthCreds) string {
+	const state = "kiro-session"
+	h.sessions.put(state, &connectSession{conn: fakeConnector{state: state, creds: creds}, created: time.Now()}, time.Now())
+	return state
+}
+
+func TestKiroCheckFormCredentialSources(t *testing.T) {
+	h := testHandler(t)
+	type captured struct {
+		auth      string
+		apiKey    string
+		tokenType string
+		body      string
+		url       string
+	}
+	var got captured
+	withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(req.Body)
+		got = captured{
+			auth: req.Header.Get("Authorization"), apiKey: req.Header.Get("x-api-key"),
+			tokenType: req.Header.Get("tokentype"), body: string(raw), url: req.URL.String(),
+		}
+		return kiroJSONResponse(http.StatusOK, `{"models":[{"modelId":"Live-Model"}]}`), nil
+	})
+
+	t.Run("stored api key uses stored config", func(t *testing.T) {
+		stored := &domain.OAuthCreds{ProfileArn: "arn:stored", Region: "eu-central-1", KiroAuth: "idc"}
+		p := &domain.Provider{
+			Name: "kiro-key", BaseURL: "https://stored.example", Protocol: domain.ProtocolKiro,
+			AuthMethod: domain.AuthAPIKey, AuthScheme: domain.AuthXAPIKey, APIKey: "stored-key",
+			OAuthCreds: stored,
+		}
+		if err := h.store.CreateProvider(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+		form := url.Values{
+			"protocol": {"kiro"}, "auth_method": {"apikey"}, "auth_scheme": {"x-api-key"},
+			"base_url": {"https://form.example/root"}, "id": {strconv.FormatInt(p.ID, 10)},
+		}
+		rec := httptest.NewRecorder()
+		h.checkProvider(rec, reqWithForm(form))
+		if !strings.Contains(rec.Body.String(), "1 models") || got.apiKey != "stored-key" || got.tokenType != "API_KEY" {
+			t.Fatalf("result=%s captured=%+v", rec.Body.String(), got)
+		}
+		if got.url != "https://form.example/root/" || !strings.Contains(got.body, "arn:stored") || strings.Contains(got.body, "eu-central-1") {
+			t.Fatalf("request url=%s body=%s", got.url, got.body)
+		}
+		saved, err := h.store.GetProvider(context.Background(), p.ID)
+		if err != nil || saved.OAuthCreds.ProfileArn != "arn:stored" || saved.APIKey != "stored-key" {
+			t.Fatalf("stored provider mutated: %+v %v", saved, err)
+		}
+	})
+
+	t.Run("new api key uses form config", func(t *testing.T) {
+		form := url.Values{
+			"protocol": {"kiro"}, "auth_method": {"apikey"}, "auth_scheme": {"bearer"},
+			"base_url": {"https://new.example"}, "api_key": {"typed-key"},
+			"profile_arn": {"arn:form"}, "region": {"us-west-2"}, "kiro_auth": {"social"},
+		}
+		rec := httptest.NewRecorder()
+		h.checkProvider(rec, reqWithForm(form))
+		if got.auth != "Bearer typed-key" || got.tokenType != "API_KEY" || !strings.Contains(got.body, "arn:form") {
+			t.Fatalf("captured=%+v result=%s", got, rec.Body.String())
+		}
+		if strings.Contains(got.url, "us-west-2") || strings.Contains(got.body, "us-west-2") {
+			t.Fatalf("region leaked into request: %+v", got)
+		}
+	})
+
+	t.Run("session is not refreshed and form overlays copy", func(t *testing.T) {
+		sessionCreds := &domain.OAuthCreds{
+			AccessToken: "session-token", RefreshToken: "session-refresh", KiroAuth: "idc",
+			ProfileArn: "arn:session", Region: "ap-southeast-2", ClientID: "cid", ClientSecret: "secret",
+		}
+		state := putKiroSession(h, sessionCreds)
+		form := url.Values{
+			"protocol": {"kiro"}, "auth_method": {"oauth"}, "base_url": {"https://session.example"},
+			"oauth_session": {state}, "profile_arn": {"arn:overlay"},
+		}
+		rec := httptest.NewRecorder()
+		h.checkProvider(rec, reqWithForm(form))
+		if got.auth != "Bearer session-token" || got.tokenType != "" || !strings.Contains(got.body, "arn:overlay") {
+			t.Fatalf("captured=%+v result=%s", got, rec.Body.String())
+		}
+		if sessionCreds.ProfileArn != "arn:session" || sessionCreds.Region != "ap-southeast-2" {
+			t.Fatalf("session creds mutated: %+v", sessionCreds)
+		}
+	})
+
+	t.Run("manual tokens are not refreshed", func(t *testing.T) {
+		form := url.Values{
+			"protocol": {"kiro"}, "auth_method": {"oauth"}, "base_url": {"https://manual.example"},
+			"preset": {"kiro"}, "kiro_auth": {"Builder-ID"}, "access_token": {"pasted-token"},
+			"refresh_token": {"pasted-refresh"}, "client_id": {"cid"}, "client_secret": {"secret"},
+			"profile_arn": {"arn:manual-must-not-send"}, "region": {"eu-west-1"},
+		}
+		rec := httptest.NewRecorder()
+		h.checkProvider(rec, reqWithForm(form))
+		if got.auth != "Bearer pasted-token" || got.url != "https://manual.example/" || got.body != `{"origin":"AI_EDITOR"}` {
+			t.Fatalf("captured=%+v result=%s", got, rec.Body.String())
+		}
+	})
+}
+
+func TestKiroCheckSavedOAuthRefreshOnce(t *testing.T) {
+	h := testHandler(t)
+	var tokenHits int
+	var tokenBody string
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenHits++
+		raw, _ := io.ReadAll(r.Body)
+		tokenBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accessToken":"rotated-token","refreshToken":"rotated-refresh","expiresIn":3600}`))
+	}))
+	t.Cleanup(tokenSrv.Close)
+	withKiroTokenTransport(t, tokenSrv)
+
+	var auth []string
+	var bodies []string
+	withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(req.Body)
+		auth = append(auth, req.Header.Get("Authorization"))
+		bodies = append(bodies, string(raw))
+		if len(auth) == 1 {
+			return kiroJSONResponse(http.StatusUnauthorized, `{}`), nil
+		}
+		return kiroJSONResponse(http.StatusOK, `{"models":[{"modelId":"after-refresh"}]}`), nil
+	})
+	p := &domain.Provider{
+		Name: "saved-kiro", BaseURL: "https://saved.example", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			KiroAuth: "idc", AccessToken: "stored-token", RefreshToken: "stored-refresh",
+			ClientID: "cid", ClientSecret: "secret", ProfileArn: "arn:saved", Region: "us-east-1",
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"protocol": {"kiro"}, "auth_method": {"oauth"}, "base_url": {"https://saved-form.example"},
+		"id": {strconv.FormatInt(p.ID, 10)}, "profile_arn": {"arn:form"},
+	}
+	rec := httptest.NewRecorder()
+	h.checkProvider(rec, reqWithForm(form))
+	if tokenHits != 1 || !strings.Contains(tokenBody, "stored-refresh") {
+		t.Fatalf("token hits=%d body=%s", tokenHits, tokenBody)
+	}
+	if strings.Join(auth, ",") != "Bearer stored-token,Bearer rotated-token" || !strings.Contains(rec.Body.String(), "1 models") {
+		t.Fatalf("auth=%v result=%s", auth, rec.Body.String())
+	}
+	for _, body := range bodies {
+		if !strings.Contains(body, "arn:form") || strings.Contains(body, "us-east-1") {
+			t.Fatalf("catalog body=%s", body)
+		}
+	}
+	saved, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil || saved.OAuthCreds.AccessToken != "rotated-token" || saved.OAuthCreds.ProfileArn != "arn:saved" {
+		t.Fatalf("persisted creds=%+v err=%v", saved.OAuthCreds, err)
+	}
+}
+
+func TestKiroCheckSavedOAuthRefreshFailure(t *testing.T) {
+	h := testHandler(t)
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	t.Cleanup(tokenSrv.Close)
+	withKiroTokenTransport(t, tokenSrv)
+	hits := 0
+	withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+		hits++
+		return kiroJSONResponse(http.StatusForbidden, `{}`), nil
+	})
+	p := &domain.Provider{
+		Name: "saved-kiro-fail", BaseURL: "https://saved.example", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{
+			KiroAuth: "builder-id", AccessToken: "stored-token", RefreshToken: "stored-refresh",
+			ClientID: "cid", ClientSecret: "secret", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"protocol": {"kiro"}, "auth_method": {"oauth"}, "base_url": {"https://saved-form.example"},
+		"id": {strconv.FormatInt(p.ID, 10)},
+	}
+	rec := httptest.NewRecorder()
+	h.checkProvider(rec, reqWithForm(form))
+	if hits != 1 || !strings.Contains(rec.Body.String(), "reconnect required") {
+		t.Fatalf("hits=%d result=%s", hits, rec.Body.String())
+	}
+	saved, _ := h.store.GetProvider(context.Background(), p.ID)
+	if saved.OAuthCreds.AccessToken != "stored-token" {
+		t.Fatalf("token changed after failed refresh: %+v", saved.OAuthCreds)
+	}
+}
+
+func TestKiroModelsFailureKeepsManualEntry(t *testing.T) {
+	h := testHandler(t)
+	withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+		return kiroJSONResponse(http.StatusUnauthorized, `{}`), nil
+	})
+	p := &domain.Provider{
+		Name: "kiro-models", BaseURL: "https://models.example", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthAPIKey, APIKey: "stored-key",
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/providers/models?provider_id="+strconv.FormatInt(p.ID, 10), nil)
+	rec := httptest.NewRecorder()
+	h.providerModels(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "enter id manually") || strings.Contains(body, "claude-sonnet") {
+		t.Fatalf("model options=%s", body)
+	}
+}
+
 // exchangeConnect completes a connect session via the manual-paste path.
 func exchangeConnect(t *testing.T, h *Handler, state, code string) {
 	t.Helper()

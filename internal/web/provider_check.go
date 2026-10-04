@@ -78,7 +78,12 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, msg := checkUpstream(r.Context(), h.logger, &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth})
+	probe := &domain.Provider{BaseURL: baseURL, APIKey: apiKey, Protocol: proto, AuthScheme: auth}
+	if proto == domain.ProtocolKiro {
+		probe.AuthMethod = domain.AuthAPIKey
+		probe.OAuthCreds = kiroProbeCreds(r, existing)
+	}
+	ok, msg := checkUpstream(r.Context(), h.logger, probe)
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -92,6 +97,9 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	if creds == nil {
 		render(w, r, CheckResult(false, "not connected yet - run Connect first"))
 		return
+	}
+	if proto == domain.ProtocolKiro {
+		creds = kiroProbeCreds(r, &domain.Provider{OAuthCreds: creds})
 	}
 	probe := &domain.Provider{
 		BaseURL: baseURL, Protocol: proto,
@@ -121,8 +129,27 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	} else {
 		probe.APIKey = creds.AccessToken
 	}
-	ok, msg := checkUpstream(r.Context(), h.logger, probe)
+	ok, msg := h.checkUpstreamResolved(r.Context(), probe, fromStore)
 	render(w, r, CheckResult(ok, msg))
+}
+
+// checkUpstreamResolved probes a fully resolved provider. A saved Kiro OAuth
+// provider may force-refresh once after an auth rejection. Other providers and
+// unsaved Kiro sessions keep the generic one-shot probe.
+func (h *Handler) checkUpstreamResolved(ctx context.Context, probe *domain.Provider, fromStore bool) (bool, string) {
+	if probe.Protocol == domain.ProtocolKiro {
+		return checkKiroUpstream(ctx, h.logger, probe, h.kiroCatalogRefresh(probe, fromStore))
+	}
+	return checkUpstream(ctx, h.logger, probe)
+}
+
+func (h *Handler) kiroCatalogRefresh(probe *domain.Provider, fromStore bool) func(context.Context) (string, error) {
+	if !fromStore || probe.Method() != domain.AuthOAuth || probe.ID == 0 || h.oauth == nil {
+		return nil
+	}
+	return func(ctx context.Context) (string, error) {
+		return h.oauth.Resolve(ctx, probe, true)
+	}
 }
 
 // oauthCheckCreds finds the credentials to probe for an oauth Check, in the same
@@ -156,7 +183,7 @@ func checkUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider)
 		return checkCodexUpstream(ctx, logger, p)
 	}
 	if p.Protocol == domain.ProtocolKiro {
-		return checkKiroUpstream(ctx, logger, p)
+		return checkKiroUpstream(ctx, logger, p, nil)
 	}
 	if p.Protocol == domain.ProtocolQoder {
 		return checkQoderUpstream(ctx, logger, p)
@@ -357,6 +384,35 @@ func checkCodexUpstream(ctx context.Context, logger *slog.Logger, p *domain.Prov
 		}
 	}
 	return true, fmt.Sprintf("OK - Codex models reachable, token accepted (%d models)", len(models))
+}
+
+// kiroProbeCreds returns a request-local Kiro config. A blank form field
+// keeps the saved or session value. The source credentials are never mutated.
+func kiroProbeCreds(r *http.Request, existing *domain.Provider) *domain.OAuthCreds {
+	var base *domain.OAuthCreds
+	if existing != nil {
+		base = existing.OAuthCreds
+	}
+	out := cloneOAuthCreds(base)
+	if out == nil {
+		out = &domain.OAuthCreds{}
+	}
+	applyKiroConfig(out, r)
+	return out
+}
+
+func cloneOAuthCreds(c *domain.OAuthCreds) *domain.OAuthCreds {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	if c.ExtraAuthParams != nil {
+		cp.ExtraAuthParams = make(map[string]string, len(c.ExtraAuthParams))
+		for k, v := range c.ExtraAuthParams {
+			cp.ExtraAuthParams[k] = v
+		}
+	}
+	return &cp
 }
 
 func newCheckSessionID() string {

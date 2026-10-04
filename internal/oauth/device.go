@@ -16,13 +16,13 @@ import (
 )
 
 const (
-	kiroDeviceClientName   = "kiro-oauth-client"
-	kiroDeviceClientType   = "public"
-	kiroDeviceStartURL     = "https://view.awsapps.com/start"
-	kiroDeviceIssuerURL    = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
-	kiroDeviceGrantType    = "urn:ietf:params:oauth:grant-type:device_code"
-	kiroBuilderIDPreset    = "kiro"
-	kiroBuilderIDAuth      = "builder-id"
+	kiroDeviceClientName = "kiro-oauth-client"
+	kiroDeviceClientType = "public"
+	kiroDeviceStartURL   = "https://view.awsapps.com/start"
+	kiroDeviceIssuerURL  = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
+	kiroDeviceGrantType  = "urn:ietf:params:oauth:grant-type:device_code"
+	kiroBuilderIDPreset  = "kiro"
+	kiroBuilderIDAuth    = "builder-id"
 )
 
 var kiroDeviceScopes = []string{
@@ -51,12 +51,6 @@ var (
 			region = "us-east-1"
 		}
 		return fmt.Sprintf("https://oidc.%s.amazonaws.com/device_authorization", region)
-	}
-	kiroListProfilesURL = func(region string) string {
-		if region == "" {
-			region = "us-east-1"
-		}
-		return fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/", region)
 	}
 )
 
@@ -92,9 +86,9 @@ type DeviceConnect struct {
 	region string
 	state  string
 
-	mu     sync.Mutex
-	done   chan struct{}
-	result exchangeResult
+	mu      sync.Mutex
+	done    chan struct{}
+	result  exchangeResult
 	started bool
 
 	cancel context.CancelFunc
@@ -293,7 +287,7 @@ func (d *DeviceConnect) pollLoop(ctx context.Context) {
 			return
 		}
 		if tr.AccessToken != "" {
-			creds, err := d.buildCreds(ctx, tr)
+			creds, err := d.buildCreds(tr)
 			if err != nil {
 				d.finishWithErr(err)
 				return
@@ -351,7 +345,7 @@ func (d *DeviceConnect) pollOnce(ctx context.Context) (tr kiroTokenResponse, pen
 	}
 }
 
-func (d *DeviceConnect) buildCreds(ctx context.Context, tr kiroTokenResponse) (*domain.OAuthCreds, error) {
+func (d *DeviceConnect) buildCreds(tr kiroTokenResponse) (*domain.OAuthCreds, error) {
 	d.mu.Lock()
 	clientID, clientSecret, region := d.clientID, d.clientSecret, d.region
 	d.mu.Unlock()
@@ -374,51 +368,9 @@ func (d *DeviceConnect) buildCreds(ctx context.Context, tr kiroTokenResponse) (*
 	if email, _, ok := ClaimsFromToken(tr.AccessToken); ok && email != "" {
 		c.Email = email
 	}
-	if c.ProfileArn == "" {
-		if arn, err := resolveKiroProfileArn(ctx, region, tr.AccessToken); err == nil && arn != "" {
-			c.ProfileArn = arn
-		}
-	}
+	// Builder ID does not support ListAvailableProfiles. Keep an ARN only
+	// when the token response already supplied one; do not synthesize one.
 	return c, nil
-}
-
-func resolveKiroProfileArn(ctx context.Context, region, accessToken string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, kiroListProfilesURL(region), bytes.NewReader([]byte(`{"maxResults":10}`)))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-	req.Header.Set("x-amz-target", "AmazonCodeWhispererService.ListAvailableProfiles")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	raw, _ := readLimited(resp.Body)
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("ListAvailableProfiles HTTP %d", resp.StatusCode)
-	}
-
-	var parsed struct {
-		Profiles []struct {
-			Arn        string `json:"arn"`
-			ProfileArn string `json:"profileArn"`
-		} `json:"profiles"`
-	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return "", err
-	}
-	for _, p := range parsed.Profiles {
-		if p.ProfileArn != "" {
-			return p.ProfileArn, nil
-		}
-		if p.Arn != "" {
-			return p.Arn, nil
-		}
-	}
-	return "", nil
 }
 
 func (d *DeviceConnect) finishWithCreds(creds *domain.OAuthCreds) {

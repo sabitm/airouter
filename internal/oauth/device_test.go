@@ -40,12 +40,8 @@ func TestDeviceConnectHappyPath(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"accessToken":"at","refreshToken":"rt","expiresIn":3600}`))
 		default:
-			// ListAvailableProfiles (POST to codewhisperer host root)
 			body, _ := io.ReadAll(r.Body)
-			if r.Header.Get("x-amz-target") != "AmazonCodeWhispererService.ListAvailableProfiles" {
-				t.Errorf("unexpected path %s body %s", r.URL.Path, body)
-			}
-			_, _ = w.Write([]byte(`{"profiles":[{"profileArn":"arn:aws:codewhisperer:us-east-1:1:profile/p1"}]}`))
+			t.Errorf("unexpected request %s %s body %s", r.Method, r.URL.String(), body)
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -54,16 +50,13 @@ func TestDeviceConnectHappyPath(t *testing.T) {
 	origReg := kiroRegisterURL
 	origDev := kiroDeviceAuthURL
 	origTok := kiroOIDCTokenURL
-	origProf := kiroListProfilesURL
 	kiroRegisterURL = func(string) string { return base + "/client/register" }
 	kiroDeviceAuthURL = func(string) string { return base + "/device_authorization" }
 	kiroOIDCTokenURL = func(string) string { return base + "/token" }
-	kiroListProfilesURL = func(string) string { return base + "/" }
 	t.Cleanup(func() {
 		kiroRegisterURL = origReg
 		kiroDeviceAuthURL = origDev
 		kiroOIDCTokenURL = origTok
-		kiroListProfilesURL = origProf
 	})
 
 	dc, err := NewDeviceConnect("")
@@ -91,8 +84,65 @@ func TestDeviceConnectHappyPath(t *testing.T) {
 			if creds.KiroAuth != "builder-id" || creds.Region != "us-east-1" || creds.Preset != "kiro" {
 				t.Fatalf("kiro metadata: %+v", creds)
 			}
-			if creds.ProfileArn != "arn:aws:codewhisperer:us-east-1:1:profile/p1" {
-				t.Fatalf("profileArn = %q", creds.ProfileArn)
+			if creds.ProfileArn != "" {
+				t.Fatalf("profileArn = %q, want empty without token profileArn", creds.ProfileArn)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for device connect")
+}
+
+func TestDeviceConnectKeepsTokenProfileArn(t *testing.T) {
+	origMin := devicePollMin
+	devicePollMin = time.Millisecond
+	t.Cleanup(func() { devicePollMin = origMin })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/client/register"):
+			_, _ = w.Write([]byte(`{"clientId":"dyn-cid","clientSecret":"dyn-secret"}`))
+		case strings.HasSuffix(r.URL.Path, "/device_authorization"):
+			_, _ = w.Write([]byte(`{"deviceCode":"dc","userCode":"ABCD","verificationUriComplete":"https://example.com/v","expiresIn":600,"interval":1}`))
+		default:
+			if r.Header.Get("x-amz-target") != "" {
+				t.Errorf("profile lookup target = %q", r.Header.Get("x-amz-target"))
+			}
+			_, _ = w.Write([]byte(`{"accessToken":"at","refreshToken":"rt","expiresIn":3600,"profileArn":"arn:from-token"}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	base := srv.URL
+	origReg, origDev, origTok := kiroRegisterURL, kiroDeviceAuthURL, kiroOIDCTokenURL
+	kiroRegisterURL = func(string) string { return base + "/client/register" }
+	kiroDeviceAuthURL = func(string) string { return base + "/device_authorization" }
+	kiroOIDCTokenURL = func(string) string { return base + "/token" }
+	t.Cleanup(func() {
+		kiroRegisterURL = origReg
+		kiroDeviceAuthURL = origDev
+		kiroOIDCTokenURL = origTok
+	})
+
+	dc, err := NewDeviceConnect("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dc.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dc.Close() })
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		creds, err, done := dc.Result()
+		if done {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if creds.ProfileArn != "arn:from-token" || creds.Region != "us-east-1" || creds.ExpiresAt == 0 {
+				t.Fatalf("creds = %+v", creds)
 			}
 			return
 		}

@@ -58,7 +58,12 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 		}
 		provider.APIKey = tok
 	}
-	models, err := fetchUpstreamModels(r.Context(), h.logger, provider)
+	var models []string
+	if provider.Protocol == domain.ProtocolKiro {
+		models, err = queryKiroModelsWithRefresh(r.Context(), h.logger, provider, h.kiroCatalogRefresh(provider, true))
+	} else {
+		models, err = fetchUpstreamModels(r.Context(), h.logger, provider)
+	}
 	failed := err != nil
 	if failed {
 		models = nil
@@ -83,10 +88,10 @@ func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 	if p.Protocol == domain.ProtocolOpencode {
 		return fetchOpencodeModels(ctx, logger, p)
 	}
-	// Kiro has no /models endpoint; live discovery is out of scope. Serve the
-	// static catalog so combo autocomplete still offers the known model ids.
+	// Kiro discovery uses the same CodeWhisperer catalog query as Check.
+	// Failure stays an error so the dashboard keeps manual model entry.
 	if p.Protocol == domain.ProtocolKiro {
-		return kiroModels(), nil
+		return queryKiroModels(ctx, logger, p)
 	}
 	if p.Protocol == domain.ProtocolQoder {
 		ids, err := qoder.ListModelIDs(ctx, p)
