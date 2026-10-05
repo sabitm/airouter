@@ -71,10 +71,10 @@ func TestEncodeRequestToolsOnCurrentMessage(t *testing.T) {
 	}
 	got := decodeReq(t, body)
 	cur := got.ConversationState.CurrentMessage.UserInputMessage
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.Tools) != 1+len(decoyNames) {
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.Tools) != 1 {
 		t.Fatalf("tools not attached to current message: %s", body)
 	}
-	if cur.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather_ide" {
+	if cur.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather" {
 		t.Errorf("tool name = %q", cur.UserInputMessageContext.Tools[0].ToolSpecification.Name)
 	}
 }
@@ -106,7 +106,7 @@ func TestEncodeRequestToolResultAndToolUse(t *testing.T) {
 	for _, h := range got.ConversationState.History {
 		if h.AssistantResponseMessage != nil {
 			for _, tu := range h.AssistantResponseMessage.ToolUses {
-				if tu.ToolUseID == "call_1" && tu.Name == "get_weather_ide" {
+				if tu.ToolUseID == "call_1" && tu.Name == "get_weather" {
 					sawToolUse = true
 				}
 			}
@@ -555,8 +555,8 @@ func TestBuildTurns(t *testing.T) {
 		if len(turns) != 2 {
 			t.Fatalf("turns = %d, want 2 (assistant + lone system user)", len(turns))
 		}
-		if turns[1].user == nil || turns[1].user.Content != "sys" {
-			t.Errorf("second turn = %+v, want lone system user turn", turns[1])
+		if turns[0].user == nil || turns[0].user.Content != "sys" || turns[1].assistant == nil {
+			t.Errorf("turns = %+v, want leading system user turn", turns)
 		}
 	})
 
@@ -763,18 +763,20 @@ func TestEncodeRequestCloakAndHistory(t *testing.T) {
 	if cur.ModelID != req.Model || cur.Origin != "AI_EDITOR" {
 		t.Fatalf("model/origin = %q/%q", cur.ModelID, cur.Origin)
 	}
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.Tools) != 2+len(decoyNames) {
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.Tools) != 2 {
 		t.Fatalf("tools = %+v", cur.UserInputMessageContext)
 	}
 	specs := cur.UserInputMessageContext.Tools
-	if specs[0].ToolSpecification.Name != "get_weather_ide" || specs[1].ToolSpecification.Name != "fs_read_ide" {
+	if specs[0].ToolSpecification.Name != "get_weather" || specs[1].ToolSpecification.Name != "fs_read" {
 		t.Fatalf("client wire names = %s %s", specs[0].ToolSpecification.Name, specs[1].ToolSpecification.Name)
 	}
-	if string(specs[0].ToolSpecification.InputSchema.JSON) != string(schema) {
+	if !strings.Contains(string(specs[0].ToolSpecification.InputSchema.JSON), "9223372036854775807") {
 		t.Errorf("schema = %s", specs[0].ToolSpecification.InputSchema.JSON)
 	}
-	if specs[2].ToolSpecification.Name != decoyNames[0] || specs[2].ToolSpecification.Description != decoyDescription {
-		t.Errorf("first decoy = %+v", specs[2].ToolSpecification)
+	for _, spec := range specs {
+		if spec.ToolSpecification.Name == "execute_bash" {
+			t.Fatal("decoy advertised")
+		}
 	}
 	if len(cur.Images) != 1 || cur.Images[0].Source.Bytes != "abc" {
 		t.Errorf("images = %+v", cur.Images)
@@ -798,11 +800,20 @@ func TestEncodeRequestCloakAndHistory(t *testing.T) {
 			}
 		}
 	}
-	if matched == nil || matched.Name != "get_weather_ide" || string(matched.Input) != string(input) {
+	if matched == nil || matched.Name != "get_weather" || !strings.Contains(string(matched.Input), "9050000000000000001") {
 		t.Fatalf("matched history = %+v", matched)
 	}
-	if unmatched == nil || unmatched.Name != "retired_tool" || string(unmatched.Input) != `{"keep":true}` {
-		t.Fatalf("unmatched history = %+v", unmatched)
+	if unmatched != nil {
+		t.Fatalf("undeclared history stayed executable: %+v", unmatched)
+	}
+	var historyText string
+	for _, h := range got.ConversationState.History {
+		if h.AssistantResponseMessage != nil {
+			historyText += h.AssistantResponseMessage.Content
+		}
+	}
+	if !strings.Contains(historyText, "retired_tool") {
+		t.Fatalf("undeclared call was not flattened: %s", historyText)
 	}
 	if !strings.Contains(string(body), "9223372036854775807") || !strings.Contains(string(body), "1e400") || !strings.Contains(string(body), "9050000000000000001") {
 		t.Fatalf("raw number tokens lost:\n%s", body)
@@ -822,10 +833,10 @@ func TestEncodeRequestCloakAndHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(again), "get_weather_ide_ide") || strings.Contains(string(again), "fs_read_ide_ide") {
+	if strings.Contains(string(again), "get_weather_ide") || strings.Contains(string(again), "fs_read_ide") {
 		t.Fatalf("repeat encode accumulated a suffix:\n%s", again)
 	}
-	if decodeReq(t, again).ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather_ide" {
+	if decodeReq(t, again).ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather" {
 		t.Fatal("repeat encode changed the wire name")
 	}
 }
@@ -871,14 +882,14 @@ func TestEncodeRequestSynthesizedCurrentCarriesTools(t *testing.T) {
 	}
 	got := decodeReq(t, mustEncode(t, req))
 	cur := got.ConversationState.CurrentMessage.UserInputMessage
-	if cur == nil || cur.Content != "" || cur.Origin != "AI_EDITOR" {
+	if cur == nil || strings.TrimSpace(cur.Content) == "" || cur.Origin != "AI_EDITOR" {
 		t.Fatalf("synthesized current = %+v", cur)
 	}
-	if cur.UserInputMessageContext == nil || cur.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather_ide" {
+	if cur.UserInputMessageContext == nil || cur.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather" {
 		t.Fatalf("declared tools skipped on synthesized current: %+v", cur.UserInputMessageContext)
 	}
-	if len(got.ConversationState.History) != 0 {
-		t.Fatalf("assistant-only history = %+v, want dropped prefill", got.ConversationState.History)
+	if len(got.ConversationState.History) == 0 || got.ConversationState.History[0].UserInputMessage == nil {
+		t.Fatalf("assistant-first history was not repaired: %+v", got.ConversationState.History)
 	}
 }
 
@@ -894,11 +905,7 @@ func mustEncode(t *testing.T, req *ir.Request) []byte {
 func TestEncodeTools(t *testing.T) {
 	clientSpecs := func(tools []ir.Tool) []cwTool {
 		t.Helper()
-		cat := buildToolCatalog(tools)
-		if len(cat.tools) < len(decoyNames) {
-			t.Fatalf("catalog tools = %d", len(cat.tools))
-		}
-		return cat.tools[:len(cat.tools)-len(decoyNames)]
+		return buildToolCatalog(tools).tools
 	}
 
 	t.Run("nil parameters uses default schema", func(t *testing.T) {
@@ -924,16 +931,16 @@ func TestEncodeTools(t *testing.T) {
 		schema := json.RawMessage(`{"type":"object","properties":{"x":{"type":"string"}}}`)
 		tools := clientSpecs([]ir.Tool{{Name: "f", Parameters: schema}})
 		got := tools[0].ToolSpecification.InputSchema.JSON
-		if string(got) != string(schema) {
-			t.Errorf("schema = %s, want verbatim passthrough", got)
+		if !strings.Contains(string(got), `"x"`) || !strings.Contains(string(got), `"type":"object"`) {
+			t.Errorf("schema = %s, want repaired object schema", got)
 		}
 	})
 
 	t.Run("name and description propagated", func(t *testing.T) {
 		tools := clientSpecs([]ir.Tool{{Name: "search", Description: "search the web"}})
 		ts := tools[0].ToolSpecification
-		if ts.Name != "search_ide" {
-			t.Errorf("Name = %q, want search_ide", ts.Name)
+		if ts.Name != "search" {
+			t.Errorf("Name = %q, want search", ts.Name)
 		}
 		if ts.Description != "search the web" {
 			t.Errorf("Description = %q, want search the web", ts.Description)
@@ -949,7 +956,7 @@ func TestEncodeTools(t *testing.T) {
 		if len(tools) != 3 {
 			t.Fatalf("len = %d, want 3", len(tools))
 		}
-		if tools[0].ToolSpecification.Name != "a_ide" || tools[1].ToolSpecification.Name != "b_ide" || tools[2].ToolSpecification.Name != "c_ide" {
+		if tools[0].ToolSpecification.Name != "a" || tools[1].ToolSpecification.Name != "b" || tools[2].ToolSpecification.Name != "c" {
 			t.Errorf("order = %s %s %s",
 				tools[0].ToolSpecification.Name,
 				tools[1].ToolSpecification.Name,
@@ -966,8 +973,109 @@ func TestEncodeTools(t *testing.T) {
 
 	t.Run("description omitted propagates as empty", func(t *testing.T) {
 		tools := clientSpecs([]ir.Tool{{Name: "f", Parameters: json.RawMessage(`{}`)}})
-		if tools[0].ToolSpecification.Description != "" {
-			t.Errorf("Description = %q, want empty when omitted", tools[0].ToolSpecification.Description)
+		if tools[0].ToolSpecification.Description != "Tool: f" {
+			t.Errorf("Description = %q, want fallback", tools[0].ToolSpecification.Description)
 		}
 	})
+}
+
+func TestEncodeRequestConversationCanonicalization(t *testing.T) {
+	tool := ir.Tool{Name: "lookup", Description: "", Parameters: json.RawMessage(`{"properties":{"q":{"type":"string"}},"required":["q","missing",1]}`)}
+	req := &ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "starts assistant"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolUse, ToolID: "call/1", ToolName: "lookup", ToolInput: json.RawMessage(`{"q":"a"}`)},
+				{Type: ir.BlockToolUse, ToolID: "call/1", ToolName: "lookup", ToolInput: json.RawMessage(`{"q":"b"}`)},
+				{Type: ir.BlockToolUse, ToolID: "missing", ToolName: "lookup", ToolInput: json.RawMessage(`{"q":"c"}`)},
+				{Type: ir.BlockToolUse, ToolID: "gone", ToolName: "undeclared", ToolInput: json.RawMessage(`{"q":"d"}`)},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "call/1", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "ra"}}},
+				{Type: ir.BlockToolResult, ToolUseID: "call/1", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "rb"}}},
+				{Type: ir.BlockToolResult, ToolUseID: "orphan", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "orphan"}}},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "next"}}},
+		},
+		Tools: []ir.Tool{tool},
+	}
+	got := decodeReq(t, mustEncode(t, req))
+	history := got.ConversationState.History
+	cur := got.ConversationState.CurrentMessage.UserInputMessage
+	if len(history) != 2 || history[0].UserInputMessage == nil || history[1].AssistantResponseMessage == nil || cur == nil {
+		t.Fatalf("history roles = %#v current=%+v", history, cur)
+	}
+	assistant := history[1].AssistantResponseMessage
+	if len(assistant.ToolUses) != 2 {
+		t.Fatalf("kept calls = %+v text=%q", assistant.ToolUses, assistant.Content)
+	}
+	if !strings.Contains(assistant.Content, "undeclared") || !strings.Contains(assistant.Content, "\"q\":\"c\"") {
+		t.Fatalf("unsafe calls not flattened: %q", assistant.Content)
+	}
+	ids := map[string]bool{}
+	for _, call := range assistant.ToolUses {
+		if ids[call.ToolUseID] || call.Name != "lookup" {
+			t.Fatalf("call = %+v", call)
+		}
+		ids[call.ToolUseID] = true
+	}
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 2 {
+		t.Fatalf("results = %+v", cur.UserInputMessageContext)
+	}
+	for _, result := range cur.UserInputMessageContext.ToolResults {
+		if !ids[result.ToolUseID] {
+			t.Fatalf("result id %q not paired", result.ToolUseID)
+		}
+	}
+	if !strings.Contains(cur.Content, "orphan") || !strings.Contains(cur.Content, "next") {
+		t.Fatalf("current text = %q", cur.Content)
+	}
+	spec := cur.UserInputMessageContext.Tools[0].ToolSpecification
+	if spec.Description != "Tool: lookup" || !strings.Contains(string(spec.InputSchema.JSON), `"q"`) || strings.Contains(string(spec.InputSchema.JSON), "missing") {
+		t.Fatalf("spec = %+v", spec)
+	}
+	for _, name := range []string{"execute_bash", "fs_read", "fs_write", "web_search"} {
+		if strings.Contains(string(mustEncode(t, req)), `"name":"`+name+`"`) {
+			t.Fatalf("decoy %s advertised", name)
+		}
+	}
+}
+
+func TestEncodeRequestNoToolsStillRepairsUserFirst(t *testing.T) {
+	req := &ir.Request{
+		Model:  "m",
+		System: "system rules",
+		Messages: []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "old"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockToolUse, ToolID: "c1", ToolName: "lookup", ToolInput: json.RawMessage(`{"n":9050000000000000001,"f":1e400}`)}}},
+		},
+	}
+	got := decodeReq(t, mustEncode(t, req))
+	history := got.ConversationState.History
+	cur := got.ConversationState.CurrentMessage.UserInputMessage
+	if len(history) < 1 || history[0].UserInputMessage == nil || !strings.Contains(history[0].UserInputMessage.Content, "system rules") {
+		t.Fatalf("system was not placed in a leading user turn: %+v", history)
+	}
+	if cur == nil || strings.TrimSpace(cur.Content) == "" {
+		t.Fatalf("current content empty: %+v", cur)
+	}
+	body := string(mustEncode(t, req))
+	if !strings.Contains(body, "9050000000000000001") || !strings.Contains(body, "1e400") {
+		t.Fatalf("flattened tool input changed number tokens: %s", body)
+	}
+	prev := ""
+	for _, h := range append(history, cwHistory{UserInputMessage: cur}) {
+		role := "assistant"
+		if h.UserInputMessage != nil {
+			role = "user"
+			if strings.TrimSpace(h.UserInputMessage.Content) == "" {
+				t.Fatal("empty user content survived")
+			}
+		}
+		if role == prev {
+			t.Fatalf("roles did not alternate: %s", body)
+		}
+		prev = role
+	}
 }

@@ -1,10 +1,12 @@
 package kiro
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"airouter/internal/proxy/ir"
 )
@@ -13,15 +15,17 @@ import (
 // It does not restore cloaked tool names. Production response paths use
 // DecodeStreamTools with the original client declarations.
 //
-// Event mapping (see KIRO.md 5.4):
+// Event mapping:
 //   - assistantResponseEvent / codeEvent -> text delta (<thinking> tags stripped)
+//   - reasoningContentEvent              -> reasoning delta
 //   - toolUseEvent                       -> tool call start + argument delta
-//   - metricsEvent                       -> usage, carried onto the finish event
-//   - messageStopEvent / end-of-stream   -> finish
+//   - metricsEvent / metadataEvent       -> usage, carried onto the finish event
+//   - messageStopEvent / metadataEvent   -> terminal stop
 //
-// The IR has no reasoning field, so reasoningContentEvent folds into text.
+// A selected transport must provide a terminal event. Clean EOF without one is
+// an incomplete stream, not a successful end turn.
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
-	return decodeStream(nil, r, emit, false)
+	return decodeStream(nil, r, emit, false, false)
 }
 
 // DecodeStreamTools reads a Kiro EventStream and restores wire tool names to
@@ -29,19 +33,28 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 // decoy and unknown tool calls fail the stream instead of being forwarded.
 // The catalog is rebuilt from the same declarations used at encode time.
 func DecodeStreamTools(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) error) error {
-	return decodeStream(clientTools, r, emit, true)
+	return decodeStream(clientTools, r, emit, true, true)
 }
 
-func decodeStream(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) error, cloak bool) error {
+// DecodeStreamToolsTransport is DecodeStreamTools with an explicit terminal
+// requirement. Legacy CodeWhisperer keeps requireTerminal false so an older
+// stream that ends at EOF still finishes. Runtime sets it true.
+func DecodeStreamToolsTransport(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) error, requireTerminal bool) error {
+	return decodeStream(clientTools, r, emit, true, requireTerminal)
+}
+
+func decodeStream(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) error, cloak, requireTerminal bool) error {
 	var catalog toolCatalog
 	if cloak {
 		catalog = buildToolCatalog(clientTools)
 	}
 	started := false
 	sawTool := false
+	sawTerminal := false
 	stop := ir.StopEndTurn
 	inputTokens, outputTokens := 0, 0
 	cacheRead, cacheWrite := 0, 0
+	sawUsage := false
 
 	// Tool calls are keyed by toolUseId. Each distinct id gets a monotonic index
 	// so argument fragments attribute to the right call; a start event is emitted
@@ -74,7 +87,14 @@ func decodeStream(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) 
 			return kiroStreamFailure(msg)
 		}
 		eventType := msg.headers[":event-type"]
+		if failure, ok := typedEventFailure(eventType, msg.payload); ok {
+			return failure
+		}
 		switch eventType {
+		case "contextUsageEvent", "meteringEvent":
+			// Context percentage and credit metering are not token usage.
+			continue
+
 		case "assistantResponseEvent", "codeEvent":
 			var p struct {
 				Content string `json:"content"`
@@ -111,7 +131,7 @@ func decodeStream(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) 
 			if err := ensureStarted(); err != nil {
 				return err
 			}
-			if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: text}); err != nil {
+			if err := emit(ir.StreamEvent{Kind: ir.EventReasoningDelta, Text: text}); err != nil {
 				return err
 			}
 
@@ -168,31 +188,46 @@ func decodeStream(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) 
 			// Base input excludes separately reported cache fields; fold cache-read
 			// and cache-creation into the input total. Accept camelCase and snake_case
 			// aliases; camel takes precedence when both are present. Missing fields stay 0.
-			var p struct {
-				InputTokens                   int `json:"inputTokens"`
-				OutputTokens                  int `json:"outputTokens"`
-				CacheReadInputTokens          int `json:"cacheReadInputTokens"`
-				CacheReadInputTokensSnake     int `json:"cache_read_input_tokens"`
-				CacheCreationInputTokens      int `json:"cacheCreationInputTokens"`
-				CacheCreationInputTokensSnake int `json:"cache_creation_input_tokens"`
-			}
-			if json.Unmarshal(msg.payload, &p) == nil {
+			if applyUsage(&inputTokens, &outputTokens, &cacheRead, &cacheWrite, msg.payload) {
+				sawUsage = true
 				if err := ensureStarted(); err != nil {
 					return err
 				}
-				cacheRead = p.CacheReadInputTokens
-				if cacheRead == 0 {
-					cacheRead = p.CacheReadInputTokensSnake
+			}
+
+		case "metadataEvent", "MetadataEvent":
+			meta, ok := parseMetadataEvent(msg.payload)
+			if !ok {
+				return &ir.StreamFailure{Type: "api_error", Code: "invalid_metadata", Message: "upstream metadata is malformed"}
+			}
+			if applyUsage(&inputTokens, &outputTokens, &cacheRead, &cacheWrite, meta.usage) {
+				sawUsage = true
+			}
+			if meta.stopPresent {
+				mapped, known := mapStopReason(meta.stopReason)
+				if !known {
+					return unknownStopFailure()
+				} else {
+					stop = mapped
+					sawTerminal = true
 				}
-				cacheWrite = p.CacheCreationInputTokens
-				if cacheWrite == 0 {
-					cacheWrite = p.CacheCreationInputTokensSnake
+				if err := ensureStarted(); err != nil {
+					return err
 				}
-				inputTokens = p.InputTokens + cacheRead + cacheWrite
-				outputTokens = p.OutputTokens
+			} else if sawUsage {
+				if err := ensureStarted(); err != nil {
+					return err
+				}
 			}
 
 		case "messageStopEvent":
+			mapped, terminal, malformed := messageStop(msg.payload)
+			if malformed {
+				return unknownStopFailure()
+			} else if terminal {
+				stop = mapped
+				sawTerminal = true
+			}
 			// A valid empty response may contain only a stop marker. Start a minimal
 			// response so callers still receive the terminal event.
 			if err := ensureStarted(); err != nil {
@@ -202,12 +237,263 @@ func decodeStream(clientTools []ir.Tool, r io.Reader, emit func(ir.StreamEvent) 
 	}
 
 	if !started {
+		if requireTerminal {
+			return &ir.StreamFailure{Type: "api_error", Message: "upstream stream ended without a terminal event"}
+		}
 		return nil
 	}
-	if sawTool {
+	if requireTerminal && !sawTerminal {
+		return &ir.StreamFailure{Type: "api_error", Message: "upstream stream ended without a terminal event"}
+	}
+	if sawTool && stop == ir.StopEndTurn {
 		stop = ir.StopToolUse
 	}
 	return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stop, InputTokens: inputTokens, OutputTokens: outputTokens, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite})
+}
+
+func applyUsage(input, output, cacheRead, cacheWrite *int, raw json.RawMessage) bool {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var p struct {
+		InputTokens                   int `json:"inputTokens"`
+		OutputTokens                  int `json:"outputTokens"`
+		UncachedInputTokens           int `json:"uncachedInputTokens"`
+		CacheReadInputTokens          int `json:"cacheReadInputTokens"`
+		CacheReadInputTokensSnake     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens      int `json:"cacheCreationInputTokens"`
+		CacheCreationInputTokensSnake int `json:"cache_creation_input_tokens"`
+		CacheWriteInputTokens         int `json:"cacheWriteInputTokens"`
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return false
+	}
+	read := p.CacheReadInputTokens
+	if read == 0 {
+		read = p.CacheReadInputTokensSnake
+	}
+	write := p.CacheCreationInputTokens
+	if write == 0 {
+		write = p.CacheCreationInputTokensSnake
+	}
+	if write == 0 {
+		write = p.CacheWriteInputTokens
+	}
+	base := p.InputTokens
+	if base == 0 && p.UncachedInputTokens > 0 {
+		base = p.UncachedInputTokens
+	}
+	*cacheRead = read
+	*cacheWrite = write
+	*input = base + read + write
+	*output = p.OutputTokens
+	return true
+}
+
+type metadataEvent struct {
+	usage       json.RawMessage
+	stopReason  string
+	stopPresent bool
+}
+
+// parseMetadataEvent keeps stopReason and token usage when stopDetails is an
+// object, null, missing, or an unknown nested shape. stopDetails is not a stop
+// reason and does not replace an explicit stop reason. An explicit unknown stop
+// stays present so the caller can fail instead of treating the frame as success.
+func parseMetadataEvent(payload []byte) (metadataEvent, bool) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil || raw == nil {
+		return metadataEvent{}, false
+	}
+	out := metadataEvent{usage: firstRaw(raw, "tokenUsage", "usage")}
+	if stopRaw, ok := firstPresent(raw, "stopReason", "stop_reason"); ok {
+		out.stopPresent = true
+		out.stopReason = jsonString(stopRaw)
+		if out.stopReason == "" && !isJSONNull(stopRaw) {
+			// A non-string explicit stop is not a recognized terminal.
+			out.stopReason = "unrecognized_stop"
+		}
+	}
+	return out, true
+}
+
+func firstPresent(raw map[string]json.RawMessage, keys ...string) (json.RawMessage, bool) {
+	for _, key := range keys {
+		if v, ok := raw[key]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
+// messageStop accepts the legacy empty stop marker. An explicit stop must be a
+// recognized value. Malformed JSON and unknown nonempty values are unsafe and
+// must not become a successful finish, including when a later empty marker or
+// EOF follows.
+func messageStop(payload []byte) (ir.StopReason, bool, bool) {
+	trimmed := bytes.TrimSpace(payload)
+	if string(trimmed) == "{}" {
+		return ir.StopEndTurn, true, false
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil || raw == nil {
+		return "", false, true
+	}
+	stopRaw, present := firstPresent(raw, "stopReason", "stop_reason")
+	if !present {
+		return ir.StopEndTurn, true, false
+	}
+	if isJSONNull(stopRaw) {
+		return "", false, true
+	}
+	reason := jsonString(stopRaw)
+	if reason == "" {
+		return "", false, true
+	}
+	mapped, known := mapStopReason(reason)
+	if !known {
+		return "", false, true
+	}
+	return mapped, true, false
+}
+
+func unknownStopFailure() *ir.StreamFailure {
+	return &ir.StreamFailure{Type: "api_error", Code: "unknown_stop", Message: "upstream stop reason is not recognized"}
+}
+
+// typedEventFailure maps the Runtime event types that the official parser
+// throws. The payload is reduced to a known message; the raw body is not
+// forwarded. Header exceptions are handled before this path.
+func typedEventFailure(eventType string, payload []byte) (*ir.StreamFailure, bool) {
+	var kind, code, fallback string
+	switch eventType {
+	case "error", "InternalServerException":
+		kind, code, fallback = "api_error", "internal_server_error", "Internal server error"
+	case "throttlingError", "ThrottlingException":
+		kind, code, fallback = "rate_limit_error", "throttling", "Too many requests"
+	case "validationError", "ValidationException":
+		kind, code, fallback = "invalid_request_error", "validation", "Invalid request"
+	case "serviceUnavailableError", "ServiceUnavailableException":
+		kind, code, fallback = "service_unavailable_error", "service_unavailable", "Service unavailable"
+	default:
+		return nil, false
+	}
+	msg := jsonMessage(payload)
+	if msg == "" {
+		msg = fallback
+	}
+	return &ir.StreamFailure{Type: kind, Code: code, Message: msg}, true
+}
+
+func jsonMessage(payload []byte) string {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(payload, &raw) != nil {
+		return ""
+	}
+	msg := jsonString(firstRaw(raw, "message", "Message"))
+	if msg == "" {
+		return ""
+	}
+	return truncateUTF8Bytes(msg, 240)
+}
+
+// truncateUTF8Bytes keeps the 240-byte message budget and moves the cut to a
+// UTF-8 boundary. A 240-rune cut would expand that budget.
+func truncateUTF8Bytes(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+func firstRaw(raw map[string]json.RawMessage, keys ...string) json.RawMessage {
+	for _, key := range keys {
+		if v, ok := raw[key]; ok && len(bytes.TrimSpace(v)) > 0 && string(bytes.TrimSpace(v)) != "null" {
+			return v
+		}
+	}
+	return nil
+}
+
+func jsonString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+// mapStopReason maps a known Kiro stop value. Camel-case and compact forms are
+// normalized before matching. Unknown values and unsafe terminal states are not
+// treated as a successful completion.
+func mapStopReason(reason string) (ir.StopReason, bool) {
+	switch normalizeStopReason(reason) {
+	case "":
+		return "", false
+	case "end_turn", "stop", "complete":
+		return ir.StopEndTurn, true
+	case "tool_use", "tool_calls":
+		return ir.StopToolUse, true
+	case "max_tokens", "max_output_tokens", "length":
+		return ir.StopMaxTokens, true
+	case "stop_sequence":
+		return ir.StopStopSequence, true
+	case "content_filtered", "refusal", "guardrail_intervened":
+		// IR has no refusal stop. Max tokens is the existing non-success terminal
+		// that does not claim a clean end turn or a completed tool call. The
+		// refusal category, explanation, and recommended model are not forwarded.
+		return ir.StopMaxTokens, true
+	default:
+		return "", false
+	}
+}
+
+func normalizeStopReason(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return ""
+	}
+	var b strings.Builder
+	var prev rune
+	for i, r := range reason {
+		if r == '-' || r == ' ' || r == '\t' {
+			if b.Len() > 0 && !strings.HasSuffix(b.String(), "_") {
+				b.WriteByte('_')
+			}
+			prev = r
+			continue
+		}
+		if r >= 'A' && r <= 'Z' {
+			if i > 0 && prev >= 'a' && prev <= 'z' && !strings.HasSuffix(b.String(), "_") {
+				b.WriteByte('_')
+			}
+			b.WriteRune(r + ('a' - 'A'))
+		} else {
+			b.WriteRune(r)
+		}
+		prev = r
+	}
+	return b.String()
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // kiroStreamFailure parses known safe fields from an EventStream exception frame.

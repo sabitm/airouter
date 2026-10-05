@@ -99,7 +99,24 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 		return
 	}
 	if proto == domain.ProtocolKiro {
-		creds = kiroProbeCreds(r, &domain.Provider{OAuthCreds: creds})
+		if fromStore {
+			creds = kiroProbeCreds(r, &domain.Provider{OAuthCreds: creds})
+		} else {
+			creds = cloneOAuthCreds(creds)
+			var prev *domain.OAuthCreds
+			if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
+				if saved, err := h.store.GetProvider(r.Context(), id); err == nil && saved.Protocol == domain.ProtocolKiro {
+					prev = saved.OAuthCreds
+				}
+			}
+			if _, connected := h.connectedCreds(r.FormValue("oauth_session")); connected {
+				preserveKiroConfig(creds, prev, r)
+				applyKiroConnectionConfig(creds, r)
+			} else {
+				configureKiroImport(creds, prev, r)
+			}
+			creds.KiroContentOptOutSet = false
+		}
 	}
 	probe := &domain.Provider{
 		BaseURL: baseURL, Protocol: proto,
@@ -386,8 +403,9 @@ func checkCodexUpstream(ctx context.Context, logger *slog.Logger, p *domain.Prov
 	return true, fmt.Sprintf("OK - Codex models reachable, token accepted (%d models)", len(models))
 }
 
-// kiroProbeCreds returns a request-local Kiro config. A blank form field
-// keeps the saved or session value. The source credentials are never mutated.
+// kiroProbeCreds returns a request-local Kiro config. Omitted form fields
+// keep the saved or session value. An explicit empty, legacy, or false value
+// clears that field for the probe. The source credentials are never mutated.
 func kiroProbeCreds(r *http.Request, existing *domain.Provider) *domain.OAuthCreds {
 	var base *domain.OAuthCreds
 	if existing != nil {
@@ -398,6 +416,7 @@ func kiroProbeCreds(r *http.Request, existing *domain.Provider) *domain.OAuthCre
 		out = &domain.OAuthCreds{}
 	}
 	applyKiroConfig(out, r)
+	out.KiroContentOptOutSet = false
 	return out
 }
 

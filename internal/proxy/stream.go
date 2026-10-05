@@ -358,7 +358,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		}
 	case backend.protocol == domain.ProtocolKiro:
 		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
-			return kiro.DecodeStreamTools(req.Tools, r, emit)
+			return kiro.DecodeStreamToolsTransport(req.Tools, r, emit, backend.id == "kiro-runtime")
 		}
 	}
 	cursorEstimated := backend.protocol == domain.ProtocolCursor

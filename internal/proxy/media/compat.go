@@ -79,7 +79,7 @@ func CapsForCodecID(id string) BackendCaps {
 			ImageURL:            false,
 			MaterializeImageURL: true,
 		}
-	case "kiro":
+	case "kiro", "kiro-runtime":
 		return BackendCaps{
 			ImageInline:         true,
 			ImageURL:            false,

@@ -238,6 +238,9 @@ func TestCapsIncompatible(t *testing.T) {
 	if reason := CapsForCodecID("kiro").Incompatible([]Attachment{{Kind: KindImage, IsImage: true, HasURL: true}}, true); reason != "" {
 		t.Fatalf("kiro should accept URL images via materialize: %s", reason)
 	}
+	if reason := CapsForCodecID("kiro-runtime").Incompatible([]Attachment{{Kind: KindImage, IsImage: true, HasURL: true}}, true); reason != "" {
+		t.Fatalf("kiro-runtime should accept URL images via materialize: %s", reason)
+	}
 	if reason := CapsForCodecID("oai-chat").Incompatible(nestedImg, true); reason == "" {
 		t.Fatal("oai-chat must reject nested tool_result media")
 	}

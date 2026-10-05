@@ -14,11 +14,20 @@ import "encoding/json"
 // UpstreamPath is appended to it.
 const DefaultBaseURL = "https://codewhisperer.us-east-1.amazonaws.com"
 
-// UpstreamPath is appended to the provider base URL for the chat endpoint.
+// UpstreamPath is appended to the provider base URL for the legacy chat endpoint.
 const UpstreamPath = "/generateAssistantResponse"
+
+// RuntimeUpstreamPath marks the runtime codec. ChatURL replaces it with the
+// regional runtime host root, or with an explicit non-public BaseURL root.
+// The active serializer posts to "/", not the unused HTTP operation path.
+const RuntimeUpstreamPath = "kiro-runtime:/"
 
 // XAmzTarget identifies the CodeWhisperer streaming operation.
 const XAmzTarget = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+
+// RuntimeTarget identifies the Kiro Runtime RPC operation. The active AWS JSON
+// 1.0 serializer sends this target; it does not apply the HTTP path trait.
+const RuntimeTarget = RuntimeServiceTarget
 
 // EventStreamAccept is the upstream Accept value: Kiro returns a binary AWS
 // EventStream rather than text/event-stream.
@@ -121,4 +130,26 @@ type cwInferenceConfig struct {
 	MaxTokens   int      `json:"maxTokens"`
 	Temperature *float64 `json:"temperature,omitempty"`
 	TopP        *float64 `json:"topP,omitempty"`
+}
+
+const runtimeOrigin = "AI_EDITOR"
+
+// rtRequest is the official Runtime GenerateAssistantResponse input. The active
+// schema writer omits unknown fields, and inferenceConfig is not a member.
+// systemPrompt and additionalModelRequestFields stay omitted in this pass.
+type rtRequest struct {
+	ConversationState rtConversationState `json:"conversationState"`
+	ProfileArn        string              `json:"profileArn,omitempty"`
+	AgentMode         string              `json:"agentMode,omitempty"`
+}
+
+// rtConversationState follows the official conversationState members. Current
+// message and chat trigger are required. Continuation and task identity are
+// optional and are not fabricated from IR.
+type rtConversationState struct {
+	CurrentMessage     cwMessage   `json:"currentMessage"`
+	ChatTriggerType    string      `json:"chatTriggerType"`
+	ConversationID     string      `json:"conversationId,omitempty"`
+	History            []cwHistory `json:"history,omitempty"`
+	RootConversationID string      `json:"rootConversationId,omitempty"`
 }

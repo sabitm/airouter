@@ -144,6 +144,7 @@ var codexCodec = codec{
 // IR. The upstream returns a binary AWS EventStream, so it is stream-only and
 // its streaming Accept differs from the SSE default. There is no unary response
 // decoder; unary client requests are collected from the stream.
+// kiro-runtime is a distinct opt-in transport. It is not selected by BaseURL.
 var kiroCodec = codec{
 	id:            "kiro",
 	protocol:      domain.ProtocolKiro,
@@ -152,6 +153,23 @@ var kiroCodec = codec{
 	decodeStream:  kiro.DecodeStream,
 	streamOnly:    true,
 	streamAccept:  kiro.EventStreamAccept,
+}
+
+var kiroRuntimeCodec = codec{
+	id:            "kiro-runtime",
+	protocol:      domain.ProtocolKiro,
+	encodeRequest: kiro.EncodeRuntimeRequest,
+	upstreamPath:  kiro.RuntimeUpstreamPath,
+	decodeStream:  kiro.DecodeStream,
+	streamOnly:    true,
+	streamAccept:  kiro.EventStreamAccept,
+}
+
+func kiroBackendCodec(provider *domain.Provider) codec {
+	if kiro.UseRuntime(kiro.IdentityFromProvider(provider)) {
+		return kiroRuntimeCodec
+	}
+	return kiroCodec
 }
 
 // qoderCodec is the Qoder backend: COSY-signed WAF-encoded chat, SSE-only.
@@ -267,10 +285,18 @@ var opencodeMessagesCodec = codec{
 }
 
 func backendCodec(p domain.Protocol, model string) codec {
-	return backendCodecFor(p, "", model)
+	return backendCodecForProvider(p, nil, model)
 }
 
 func backendCodecFor(p domain.Protocol, baseURL, model string) codec {
+	return backendCodecForProvider(p, &domain.Provider{BaseURL: baseURL, Protocol: p}, model)
+}
+
+func backendCodecForProvider(p domain.Protocol, provider *domain.Provider, model string) codec {
+	baseURL := ""
+	if provider != nil {
+		baseURL = provider.BaseURL
+	}
 	switch p {
 	case domain.ProtocolAnthropic:
 		return anthropicCodec
@@ -279,7 +305,7 @@ func backendCodecFor(p domain.Protocol, baseURL, model string) codec {
 	case domain.ProtocolOpenAICodex:
 		return codexCodec
 	case domain.ProtocolKiro:
-		return kiroCodec
+		return kiroBackendCodec(provider)
 	case domain.ProtocolQoder:
 		return qoderCodec
 	case domain.ProtocolAntigravity:

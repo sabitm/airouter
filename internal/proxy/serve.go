@@ -353,7 +353,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		provider := t.Provider
 		rec.Provider = provider.Name
 		rec.UpstreamModel = t.UpstreamModel
-		backend := backendCodecFor(provider.Protocol, provider.BaseURL, t.UpstreamModel)
+		backend := backendCodecForProvider(provider.Protocol, provider, t.UpstreamModel)
 
 		attemptStart := time.Now()
 		if ingress.id == backend.id {
@@ -532,7 +532,7 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 		for _, t := range enabled {
 			backend := openaiCodec
 			if t.Provider != nil {
-				backend = backendCodecFor(t.Provider.Protocol, t.Provider.BaseURL, t.UpstreamModel)
+				backend = backendCodecForProvider(t.Provider.Protocol, t.Provider, t.UpstreamModel)
 			}
 			translated := ingress.id != backend.id
 			if reason := prep.checkCompatible(backend, translated); reason != "" {
@@ -839,7 +839,7 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		}
 	case backend.protocol == domain.ProtocolKiro:
 		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
-			return kiro.DecodeStreamTools(clientTools, r, emit)
+			return kiro.DecodeStreamToolsTransport(clientTools, r, emit, backend.id == "kiro-runtime")
 		}
 	}
 	err := decode(r, func(ev ir.StreamEvent) error {

@@ -65,16 +65,189 @@ func (e fieldError) Error() string { return string(e) }
 // config from one place. kiro_auth is only meaningful for oauth Kiro; on an
 // apikey provider it is stored but unused.
 func applyKiroConfig(c *domain.OAuthCreds, r *http.Request) {
-	// Only overwrite when the form supplies a value so device-resolved ARN/region survive web-auth save.
-	if v := strings.TrimSpace(r.FormValue("profile_arn")); v != "" {
-		c.ProfileArn = v
+	if r.Form.Has("profile_arn") {
+		c.ProfileArn = strings.TrimSpace(r.FormValue("profile_arn"))
 	}
-	if v := strings.TrimSpace(r.FormValue("region")); v != "" {
-		c.Region = v
+	if r.Form.Has("region") {
+		c.Region = strings.TrimSpace(r.FormValue("region"))
 	}
-	if v := strings.TrimSpace(r.FormValue("kiro_auth")); v != "" {
-		c.KiroAuth = v
+	if r.Form.Has("kiro_auth") {
+		c.KiroAuth = strings.TrimSpace(r.FormValue("kiro_auth"))
 	}
+	if r.Form.Has("kiro_idp") {
+		c.KiroIDP = normalizeKiroIDP(r.FormValue("kiro_idp"))
+	}
+	applyKiroConnectionConfig(c, r)
+}
+
+// applyKiroConnectionConfig applies only connection preferences. It does not
+// copy profile, region, auth flavor, or IDP from a stale edit form onto a
+// newly connected account. Omitted preferences are left unchanged.
+func applyKiroConnectionConfig(c *domain.OAuthCreds, r *http.Request) {
+	if c == nil || r == nil {
+		return
+	}
+	if r.Form.Has("kiro_agent_mode") {
+		c.KiroAgentMode = normalizeKiroAgentMode(r.FormValue("kiro_agent_mode"))
+	}
+	if r.Form.Has("kiro_transport") {
+		c.KiroTransport = normalizeKiroTransport(r.FormValue("kiro_transport"))
+	}
+	if r.Form.Has("kiro_discovery") {
+		c.KiroDiscovery = normalizeKiroDiscovery(r.FormValue("kiro_discovery"))
+	}
+	if r.Form.Has("kiro_content_opt_out") {
+		c.KiroContentOptOut = formBool(r.FormValue("kiro_content_opt_out"))
+		c.KiroContentOptOutSet = true
+	}
+}
+
+func normalizeKiroIDP(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "google":
+		return "Google"
+	case "github":
+		return "Github"
+	case "builderid", "builder-id", "builder_id":
+		return "BuilderId"
+	case "awsidc", "aws-idc", "enterprise", "internal":
+		return "AWSIdC"
+	case "externaloidc", "external-oidc", "externalidp", "external_idp":
+		return "ExternalOIDC"
+	default:
+		return ""
+	}
+}
+
+func normalizeKiroAgentMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "vibe", "spec", "autopilot":
+		return strings.ToLower(strings.TrimSpace(v))
+	default:
+		return ""
+	}
+}
+
+func normalizeKiroTransport(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "codewhisperer":
+		return ""
+	case "runtime":
+		return "runtime"
+	default:
+		return ""
+	}
+}
+
+func normalizeKiroDiscovery(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "legacy":
+		return ""
+	case "management":
+		return "management"
+	default:
+		return ""
+	}
+}
+
+func formBool(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// preserveKiroConfig keeps connection preferences when the form omits them.
+// An explicitly submitted empty, legacy, or false value stays cleared. Account
+// identity is not copied: a missing profile, IDP, auth flavor, or region on
+// next stays missing rather than inheriting another account.
+func preserveKiroConfig(next, prev *domain.OAuthCreds, r *http.Request) {
+	if next == nil || prev == nil || r == nil {
+		return
+	}
+	if !r.Form.Has("kiro_agent_mode") {
+		next.KiroAgentMode = prev.KiroAgentMode
+	}
+	if !r.Form.Has("kiro_transport") {
+		next.KiroTransport = prev.KiroTransport
+	}
+	if !r.Form.Has("kiro_discovery") {
+		next.KiroDiscovery = prev.KiroDiscovery
+	}
+	if !r.Form.Has("kiro_content_opt_out") {
+		next.KiroContentOptOut = prev.KiroContentOptOut
+	}
+}
+
+// mergeKiroAccount keeps same-account profile, region, and auth flavor when
+// the form omits them. A reconnect must not call this: a new account's missing
+// identity stays missing, and an explicit empty field clears the old value.
+func mergeKiroAccount(next, prev *domain.OAuthCreds, r *http.Request) {
+	if next == nil || prev == nil || r == nil {
+		return
+	}
+	if !r.Form.Has("profile_arn") {
+		next.ProfileArn = prev.ProfileArn
+	}
+	if !r.Form.Has("region") {
+		next.Region = prev.Region
+	}
+	if !r.Form.Has("kiro_auth") {
+		next.KiroAuth = prev.KiroAuth
+	}
+	if !r.Form.Has("kiro_idp") {
+		next.KiroIDP = prev.KiroIDP
+	}
+}
+
+// kiroSameAccount permits stored identity reuse only when no tokens were pasted
+// or a pasted credential matches the stored credential. An ARN or auth flavor
+// alone cannot establish that two opaque tokens belong to the same account.
+func kiroSameAccount(prev *domain.OAuthCreds, r *http.Request) bool {
+	if prev == nil {
+		return false
+	}
+	access := strings.TrimSpace(r.FormValue("access_token"))
+	refresh := strings.TrimSpace(r.FormValue("refresh_token"))
+	if access == "" && refresh == "" {
+		return true
+	}
+	if refresh != "" {
+		return prev.RefreshToken != "" && refresh == prev.RefreshToken
+	}
+	return prev.AccessToken != "" && access == prev.AccessToken
+}
+
+func configureKiroImport(next, prev *domain.OAuthCreds, r *http.Request) {
+	if kiroSameAccount(prev, r) {
+		mergeKiroAccount(next, prev, r)
+		if next.AccessToken == "" {
+			next.AccessToken = prev.AccessToken
+			next.ExpiresAt = prev.ExpiresAt
+		}
+		if next.RefreshToken == "" {
+			next.RefreshToken = prev.RefreshToken
+		}
+		if next.Email == "" {
+			next.Email = prev.Email
+		}
+		if next.AccountID == "" {
+			next.AccountID = prev.AccountID
+		}
+		if next.ClientID == "" {
+			next.ClientID = prev.ClientID
+		}
+		if next.ClientSecret == "" {
+			next.ClientSecret = prev.ClientSecret
+		}
+		if next.TokenURL == "" {
+			next.TokenURL = prev.TokenURL
+		}
+	}
+	preserveKiroConfig(next, prev, r)
+	applyKiroConfig(next, r)
 }
 
 // applyQoderConfig overlays Qoder identity fields from the form (manual import)
@@ -388,87 +561,99 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 			savedID = true
 			id = parsed
 			stored := p.OAuthCreds
-			if creds.RefreshToken == "" {
-				creds.RefreshToken = stored.RefreshToken
+			// A pasted Kiro refresh token may belong to another account. Never
+			// combine it with stored tokens or the old client registration.
+			if p.Protocol != domain.ProtocolKiro || kiroSameAccount(stored, r) {
+				if creds.RefreshToken == "" {
+					creds.RefreshToken = stored.RefreshToken
+				}
+				if creds.AccessToken == "" {
+					creds.AccessToken = stored.AccessToken
+				}
+				if creds.ExpiresAt == 0 {
+					creds.ExpiresAt = stored.ExpiresAt
+				}
+				if creds.Email == "" {
+					creds.Email = stored.Email
+				}
+				if creds.AccountID == "" {
+					creds.AccountID = stored.AccountID
+				}
+				if creds.TokenURL == "" {
+					creds.TokenURL = stored.TokenURL
+				}
+				if creds.ClientID == "" {
+					creds.ClientID = stored.ClientID
+				}
+				if creds.ClientSecret == "" {
+					creds.ClientSecret = stored.ClientSecret
+				}
+				if creds.Scopes == "" {
+					creds.Scopes = stored.Scopes
+				}
+				if creds.RedirectURI == "" {
+					creds.RedirectURI = stored.RedirectURI
+				}
+				if !creds.PKCE {
+					creds.PKCE = stored.PKCE
+				}
+				if p.Protocol == domain.ProtocolKiro {
+					mergeKiroAccount(creds, stored, r)
+				} else {
+					if creds.Region == "" {
+						creds.Region = stored.Region
+					}
+					if creds.KiroAuth == "" {
+						creds.KiroAuth = stored.KiroAuth
+					}
+					if creds.ProfileArn == "" {
+						creds.ProfileArn = stored.ProfileArn
+					}
+				}
+				if !creds.RefreshJSON {
+					creds.RefreshJSON = stored.RefreshJSON
+				}
+				if creds.RefreshURL == "" {
+					creds.RefreshURL = stored.RefreshURL
+				}
+				if !creds.ClineAuth {
+					creds.ClineAuth = stored.ClineAuth
+				}
+				if !creds.QoderAuth {
+					creds.QoderAuth = stored.QoderAuth
+				}
+				if !creds.AntigravityAuth {
+					creds.AntigravityAuth = stored.AntigravityAuth
+				}
+				if !creds.CursorAuth {
+					creds.CursorAuth = stored.CursorAuth
+				}
+				if creds.ProjectID == "" {
+					creds.ProjectID = stored.ProjectID
+				}
+				if creds.UserID == "" {
+					creds.UserID = stored.UserID
+				}
+				if creds.MachineID == "" {
+					creds.MachineID = stored.MachineID
+				}
+				if creds.DisplayName == "" {
+					creds.DisplayName = stored.DisplayName
+				}
+				if creds.OrganizationID == "" {
+					creds.OrganizationID = stored.OrganizationID
+				}
+				if creds.IDToken == "" {
+					creds.IDToken = stored.IDToken
+				}
+				if creds.Preset == "" {
+					creds.Preset = stored.Preset
+				}
 			}
-			if creds.AccessToken == "" {
-				creds.AccessToken = stored.AccessToken
+			if p.Protocol == domain.ProtocolKiro {
+				preserveKiroConfig(creds, stored, r)
 			}
-			if creds.ExpiresAt == 0 {
-				creds.ExpiresAt = stored.ExpiresAt
-			}
-			if creds.Email == "" {
-				creds.Email = stored.Email
-			}
-			if creds.AccountID == "" {
-				creds.AccountID = stored.AccountID
-			}
-			if creds.TokenURL == "" {
-				creds.TokenURL = stored.TokenURL
-			}
-			if creds.ClientID == "" {
-				creds.ClientID = stored.ClientID
-			}
-			if creds.ClientSecret == "" {
-				creds.ClientSecret = stored.ClientSecret
-			}
-			if creds.Scopes == "" {
-				creds.Scopes = stored.Scopes
-			}
-			if creds.RedirectURI == "" {
-				creds.RedirectURI = stored.RedirectURI
-			}
-			if !creds.PKCE {
-				creds.PKCE = stored.PKCE
-			}
-			if creds.Region == "" {
-				creds.Region = stored.Region
-			}
-			if creds.KiroAuth == "" {
-				creds.KiroAuth = stored.KiroAuth
-			}
-			if creds.ProfileArn == "" {
-				creds.ProfileArn = stored.ProfileArn
-			}
-			if !creds.RefreshJSON {
-				creds.RefreshJSON = stored.RefreshJSON
-			}
-			if creds.RefreshURL == "" {
-				creds.RefreshURL = stored.RefreshURL
-			}
-			if !creds.ClineAuth {
-				creds.ClineAuth = stored.ClineAuth
-			}
-			if !creds.QoderAuth {
-				creds.QoderAuth = stored.QoderAuth
-			}
-			if !creds.AntigravityAuth {
-				creds.AntigravityAuth = stored.AntigravityAuth
-			}
-			if !creds.CursorAuth {
-				creds.CursorAuth = stored.CursorAuth
-			}
-			if creds.ProjectID == "" {
-				creds.ProjectID = stored.ProjectID
-			}
-			if creds.UserID == "" {
-				creds.UserID = stored.UserID
-			}
-			if creds.MachineID == "" {
-				creds.MachineID = stored.MachineID
-			}
-			if creds.DisplayName == "" {
-				creds.DisplayName = stored.DisplayName
-			}
-			if creds.OrganizationID == "" {
-				creds.OrganizationID = stored.OrganizationID
-			}
-			if creds.IDToken == "" {
-				creds.IDToken = stored.IDToken
-			}
-			if creds.Preset == "" {
-				creds.Preset = stored.Preset
-			}
+			creds.KiroContentOptOutSet = false
 		}
 	}
 

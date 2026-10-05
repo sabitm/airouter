@@ -253,6 +253,26 @@ type OAuthCreds struct {
 	// does not. "external_idp" is left to the generic form refresh (it targets a
 	// standard Microsoft token endpoint).
 	KiroAuth string `json:"kiro_auth,omitempty"`
+	// KiroIDP is an explicit identity-provider label recorded by the connection.
+	// It is not inferred from protocol or KiroAuth. Known values become
+	// X-Kiro-Idp; unknown values are omitted.
+	KiroIDP string `json:"kiro_idp,omitempty"`
+	// KiroContentOptOut, when true, sends x-amzn-codewhisperer-optout: true.
+	// False omits the header rather than claiming an opt-in.
+	KiroContentOptOut bool `json:"kiro_content_opt_out,omitempty"`
+	// KiroContentOptOutSet is request-local. It distinguishes a submitted false
+	// from an omitted form field. It is not persisted.
+	KiroContentOptOutSet bool `json:"-"`
+	// KiroAgentMode is an explicit agent mode (vibe, spec, autopilot). Empty
+	// omits x-amzn-kiro-agent-mode.
+	KiroAgentMode string `json:"kiro_agent_mode,omitempty"`
+	// KiroTransport selects the chat transport. Empty and "codewhisperer" keep
+	// the legacy CodeWhisperer endpoint. "runtime" selects Kiro Runtime.
+	KiroTransport string `json:"kiro_transport,omitempty"`
+	// KiroDiscovery selects model discovery. Empty and "legacy" use the
+	// configured CodeWhisperer catalog. "management" tries the regional
+	// management control plane and falls back to legacy on failure.
+	KiroDiscovery string `json:"kiro_discovery,omitempty"`
 
 	// QoderAuth marks a Qoder device-flow OAuth connection. When true, proactive
 	// and reactive refresh are no-ops that surface reconnect (device tokens cannot

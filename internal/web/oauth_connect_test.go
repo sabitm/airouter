@@ -758,6 +758,172 @@ func TestCreateCursorProviderMissingAccessTokenRejected(t *testing.T) {
 	}
 }
 
+func TestKiroConfigSurvivesAPIKeyEditAndOptOutFalse(t *testing.T) {
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "kiro-key", BaseURL: "https://stored.example", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthAPIKey, AuthScheme: domain.AuthBearer, APIKey: "stored-key",
+		OAuthCreds: &domain.OAuthCreds{
+			ProfileArn: "arn:stored", Region: "eu-central-1", KiroIDP: "Google",
+			KiroTransport: "runtime", KiroDiscovery: "management", KiroAgentMode: "spec",
+			KiroContentOptOut: true,
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"auth_method": {"apikey"}, "name": {"kiro-key"}, "protocol": {"kiro"},
+		"base_url": {"https://stored.example"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/"+strconv.FormatInt(p.ID, 10), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	got, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil || got.OAuthCreds == nil || got.OAuthCreds.KiroTransport != "runtime" || !got.OAuthCreds.KiroContentOptOut || got.OAuthCreds.ProfileArn != "arn:stored" {
+		t.Fatalf("omitted config lost: %+v %v", got.OAuthCreds, err)
+	}
+	form.Set("kiro_content_opt_out", "false")
+	form.Set("kiro_transport", "not-a-transport")
+	req = httptest.NewRequest(http.MethodPost, "/dashboard/providers/"+strconv.FormatInt(p.ID, 10), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec = httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	got, err = h.store.GetProvider(context.Background(), p.ID)
+	if err != nil || got.OAuthCreds.KiroContentOptOut || got.OAuthCreds.KiroTransport != "" || got.OAuthCreds.KiroDiscovery != "management" {
+		t.Fatalf("submitted false/unknown not applied: %+v %v", got.OAuthCreds, err)
+	}
+}
+
+func TestKiroReconnectKeepsTransportButNotOldProfile(t *testing.T) {
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "kiro", BaseURL: "https://codewhisperer.us-east-1.amazonaws.com", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{
+			KiroAuth: "builder-id", KiroIDP: "BuilderId", ProfileArn: "arn:old-account",
+			AccessToken: "old", RefreshToken: "old-refresh", KiroTransport: "runtime",
+			KiroContentOptOut: true,
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	conn := &stubCursorConn{state: "kiro-reconn", creds: &domain.OAuthCreds{
+		KiroAuth: "idc", KiroIDP: "AWSIdC", ProfileArn: "arn:new-account",
+		AccessToken: "new", RefreshToken: "new-refresh",
+	}}
+	h.sessions.put(conn.state, &connectSession{conn: conn, created: time.Now()}, time.Now())
+	form := url.Values{
+		"auth_method": {"oauth"}, "name": {"kiro"}, "protocol": {"kiro"},
+		"preset": {"kiro"}, "oauth_session": {conn.state},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/"+strconv.FormatInt(p.ID, 10), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	got, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.ProfileArn != "arn:new-account" || got.OAuthCreds.KiroIDP != "AWSIdC" || got.OAuthCreds.AccessToken != "new" {
+		t.Fatalf("new account did not win: %+v", got.OAuthCreds)
+	}
+	if got.OAuthCreds.KiroTransport != "runtime" || !got.OAuthCreds.KiroContentOptOut {
+		t.Fatalf("connection config lost: %+v", got.OAuthCreds)
+	}
+	if got.OAuthCreds.RefreshToken == "old-refresh" {
+		t.Fatal("old credential copied")
+	}
+}
+
+func TestKiroReconnectStaleFormDoesNotOverwriteNewAccount(t *testing.T) {
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "kiro", BaseURL: "https://codewhisperer.us-east-1.amazonaws.com", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{
+			KiroAuth: "builder-id", KiroIDP: "BuilderId", ProfileArn: "arn:old-account",
+			Region: "us-east-1", AccessToken: "old", RefreshToken: "old-refresh",
+			KiroTransport: "runtime", KiroDiscovery: "management", KiroAgentMode: "spec",
+			KiroContentOptOut: true,
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	conn := &stubCursorConn{state: "kiro-stale", creds: &domain.OAuthCreds{
+		KiroAuth: "idc", AccessToken: "new", RefreshToken: "new-refresh",
+	}}
+	h.sessions.put(conn.state, &connectSession{conn: conn, created: time.Now()}, time.Now())
+	form := url.Values{
+		"auth_method": {"oauth"}, "name": {"kiro"}, "protocol": {"kiro"},
+		"preset": {"kiro"}, "oauth_session": {conn.state},
+		"profile_arn": {"arn:old-account"}, "region": {"us-east-1"},
+		"kiro_auth": {"builder-id"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/"+strconv.FormatInt(p.ID, 10), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	got, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.ProfileArn != "" || got.OAuthCreds.KiroIDP != "" || got.OAuthCreds.Region != "" || got.OAuthCreds.KiroAuth != "idc" {
+		t.Fatalf("stale account fields won: %+v", got.OAuthCreds)
+	}
+	if got.OAuthCreds.AccessToken != "new" || got.OAuthCreds.RefreshToken != "new-refresh" {
+		t.Fatalf("new credentials lost: %+v", got.OAuthCreds)
+	}
+	if got.OAuthCreds.KiroTransport != "runtime" || got.OAuthCreds.KiroDiscovery != "management" || got.OAuthCreds.KiroAgentMode != "spec" || !got.OAuthCreds.KiroContentOptOut {
+		t.Fatalf("omitted connection preferences lost: %+v", got.OAuthCreds)
+	}
+}
+
+func TestKiroExplicitConfigResetClearsStoredFields(t *testing.T) {
+	h := testHandler(t)
+	p := &domain.Provider{
+		Name: "kiro", BaseURL: "https://stored.example", Protocol: domain.ProtocolKiro,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{
+			KiroAuth: "idc", KiroIDP: "AWSIdC", ProfileArn: "arn:same", Region: "eu-central-1",
+			AccessToken: "tok", RefreshToken: "refresh", KiroTransport: "runtime",
+			KiroDiscovery: "management", KiroAgentMode: "spec", KiroContentOptOut: true,
+		},
+	}
+	if err := h.store.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"auth_method": {"oauth"}, "name": {"kiro"}, "protocol": {"kiro"},
+		"preset": {"kiro"}, "kiro_auth": {"idc"}, "profile_arn": {"arn:same"},
+		"region":         {"eu-central-1"},
+		"kiro_transport": {"codewhisperer"}, "kiro_discovery": {"legacy"},
+		"kiro_idp": {""}, "kiro_agent_mode": {""}, "kiro_content_opt_out": {"false"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/providers/"+strconv.FormatInt(p.ID, 10), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+	rec := httptest.NewRecorder()
+	h.updateProvider(rec, req)
+	got, err := h.store.GetProvider(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.KiroTransport != "" || got.OAuthCreds.KiroDiscovery != "" || got.OAuthCreds.KiroIDP != "" || got.OAuthCreds.KiroAgentMode != "" || got.OAuthCreds.KiroContentOptOut {
+		t.Fatalf("explicit reset ignored: %+v", got.OAuthCreds)
+	}
+	if got.OAuthCreds.ProfileArn != "arn:same" || got.OAuthCreds.KiroAuth != "idc" || got.OAuthCreds.AccessToken != "tok" {
+		t.Fatalf("same-account identity lost: %+v", got.OAuthCreds)
+	}
+}
+
 func reqWithForm(form url.Values) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -1326,7 +1492,7 @@ func TestKiroCheckFormCredentialSources(t *testing.T) {
 		}
 	})
 
-	t.Run("session is not refreshed and form overlays copy", func(t *testing.T) {
+	t.Run("session identity wins over stale form", func(t *testing.T) {
 		sessionCreds := &domain.OAuthCreds{
 			AccessToken: "session-token", RefreshToken: "session-refresh", KiroAuth: "idc",
 			ProfileArn: "arn:session", Region: "ap-southeast-2", ClientID: "cid", ClientSecret: "secret",
@@ -1338,7 +1504,7 @@ func TestKiroCheckFormCredentialSources(t *testing.T) {
 		}
 		rec := httptest.NewRecorder()
 		h.checkProvider(rec, reqWithForm(form))
-		if got.auth != "Bearer session-token" || got.tokenType != "" || !strings.Contains(got.body, "arn:overlay") {
+		if got.auth != "Bearer session-token" || got.tokenType != "SSO_OIDC" || !strings.Contains(got.body, "arn:session") || strings.Contains(got.body, "arn:overlay") {
 			t.Fatalf("captured=%+v result=%s", got, rec.Body.String())
 		}
 		if sessionCreds.ProfileArn != "arn:session" || sessionCreds.Region != "ap-southeast-2" {
@@ -1351,11 +1517,11 @@ func TestKiroCheckFormCredentialSources(t *testing.T) {
 			"protocol": {"kiro"}, "auth_method": {"oauth"}, "base_url": {"https://manual.example"},
 			"preset": {"kiro"}, "kiro_auth": {"Builder-ID"}, "access_token": {"pasted-token"},
 			"refresh_token": {"pasted-refresh"}, "client_id": {"cid"}, "client_secret": {"secret"},
-			"profile_arn": {"arn:manual-must-not-send"}, "region": {"eu-west-1"},
+			"profile_arn": {"arn:manual-kept"}, "region": {"eu-west-1"},
 		}
 		rec := httptest.NewRecorder()
 		h.checkProvider(rec, reqWithForm(form))
-		if got.auth != "Bearer pasted-token" || got.url != "https://manual.example/" || got.body != `{"origin":"AI_EDITOR"}` {
+		if got.auth != "Bearer pasted-token" || got.url != "https://manual.example/" || !strings.Contains(got.body, "arn:manual-kept") {
 			t.Fatalf("captured=%+v result=%s", got, rec.Body.String())
 		}
 	})

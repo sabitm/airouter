@@ -25,6 +25,27 @@ type probeResult struct {
 	Duration   time.Duration
 }
 
+// probeTransportError marks a failure to reach the probe target or to read
+// its response body. Request construction and response interpretation are not
+// transport failures.
+type probeTransportError struct {
+	Err error
+}
+
+func (e *probeTransportError) Error() string {
+	if e == nil || e.Err == nil {
+		return "probe transport failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *probeTransportError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // executeProbe runs req, captures a bounded body, and emits metadata-only TRACE
 // probe_request / probe_response events. Transport and body-read errors are
 // logged once here (DEBUG) so callers must not re-log them. Auth headers and
@@ -61,7 +82,7 @@ func executeProbe(ctx context.Context, logger *slog.Logger, client *http.Client,
 			"url", req.URL.String(),
 			"error", err,
 		)
-		return probeResult{Duration: time.Since(start)}, err
+		return probeResult{Duration: time.Since(start)}, &probeTransportError{Err: err}
 	}
 	defer resp.Body.Close()
 
@@ -83,7 +104,7 @@ func executeProbe(ctx context.Context, logger *slog.Logger, client *http.Client,
 			"status", resp.StatusCode,
 			"error", rerr,
 		)
-		return pr, rerr
+		return pr, &probeTransportError{Err: rerr}
 	}
 
 	if log.Enabled(ctx, observability.LevelTrace) {

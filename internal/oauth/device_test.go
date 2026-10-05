@@ -141,7 +141,7 @@ func TestDeviceConnectKeepsTokenProfileArn(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if creds.ProfileArn != "arn:from-token" || creds.Region != "us-east-1" || creds.ExpiresAt == 0 {
+			if creds.ProfileArn != "arn:from-token" || creds.Region != "us-east-1" || creds.ExpiresAt == 0 || creds.KiroIDP != "BuilderId" {
 				t.Fatalf("creds = %+v", creds)
 			}
 			return

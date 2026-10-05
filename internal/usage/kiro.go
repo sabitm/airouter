@@ -37,6 +37,9 @@ func (s *Service) fetchKiro(ctx context.Context, p *domain.Provider) (*Report, e
 					"origin":          {"AI_EDITOR"},
 					"resourceType":    {"AGENTIC_REQUEST"},
 				}
+				if profileArn != "" {
+					q.Set("profileArn", profileArn)
+				}
 				return s.doJSON(ctx, http.MethodGet, cwHost+"/getUsageLimits?"+q.Encode(), tok, headers, nil)
 			},
 		},
@@ -116,19 +119,18 @@ func kiroUsageHeaders(p *domain.Provider) map[string]string {
 		"user-agent":       kiro.UserAgent,
 		"x-amz-user-agent": kiro.XAmzUserAgent,
 	}
-	if p.Method() == domain.AuthAPIKey {
-		h["tokentype"] = "API_KEY"
-	} else if p.OAuthCreds != nil && strings.EqualFold(p.OAuthCreds.KiroAuth, "external_idp") {
-		h["TokenType"] = "EXTERNAL_IDP"
+	id := kiro.IdentityFromProvider(p)
+	if tokenType := kiro.TokenType(id); tokenType != "" {
+		h[kiro.HeaderTokenType] = tokenType
+	}
+	if id.ContentOptOut {
+		h[kiro.HeaderOptOut] = "true"
 	}
 	return h
 }
 
 func kiroProfileArn(p *domain.Provider) string {
-	if p.OAuthCreds == nil {
-		return ""
-	}
-	return strings.TrimSpace(p.OAuthCreds.ProfileArn)
+	return kiro.ProfileArnForBody(kiro.IdentityFromProvider(p))
 }
 
 func kiroHostFromBase(base string) string {

@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -304,6 +306,87 @@ func TestRefreshKiroOIDCUnauthorized(t *testing.T) {
 		t.Errorf("access changed on failure: %q", c.AccessToken)
 	}
 }
+
+func TestRefreshKiroOIDCRegionValidatedBeforeTransport(t *testing.T) {
+	origClient := httpClient
+	origURL := kiroOIDCTokenURL
+	t.Cleanup(func() {
+		httpClient = origClient
+		kiroOIDCTokenURL = origURL
+	})
+
+	valid := []string{"", "  ", "us-east-1", "eu-central-1", "ap-southeast-2"}
+	for _, region := range valid {
+		t.Run("valid/"+region, func(t *testing.T) {
+			httpClient = origClient
+			t.Cleanup(func() { httpClient = origClient })
+			srv, _ := kiroJSONServer(t, 200, `{"accessToken":"tok","expiresIn":60}`)
+			built := 0
+			kiroOIDCTokenURL = func(got string) string {
+				built++
+				if got == "" || strings.ContainsAny(got, "/#?@") || strings.Contains(got, ".") {
+					t.Errorf("URL builder received invalid region %q", got)
+				}
+				want := strings.TrimSpace(region)
+				if want == "" {
+					want = "us-east-1"
+				}
+				if got != want {
+					t.Errorf("normalized region = %q, want %q", got, want)
+				}
+				return srv.URL
+			}
+			t.Cleanup(func() { kiroOIDCTokenURL = origURL })
+			c := &domain.OAuthCreds{KiroAuth: "idc", ClientID: "cid", ClientSecret: "secret", RefreshToken: "rt", Region: region, AccessToken: "old"}
+			if err := refreshKiro(context.Background(), c, time.Unix(1000, 0)); err != nil {
+				t.Fatal(err)
+			}
+			if built != 1 {
+				t.Fatalf("URL builder calls = %d, want 1", built)
+			}
+			if c.AccessToken != "tok" {
+				t.Fatalf("access = %q", c.AccessToken)
+			}
+		})
+	}
+
+	for _, region := range []string{"us-east-1.example.test/path#", "us-east-1/path", "us-east-1?x=1", "evil@us-east-1", "us.east.1", "US-EAST-1", "localhost"} {
+		t.Run("invalid/"+region, func(t *testing.T) {
+			calls := 0
+			httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				t.Errorf("rejected region reached transport for %s", r.URL)
+				return nil, errors.New("transport must not run")
+			})}
+			t.Cleanup(func() { httpClient = origClient })
+			built := 0
+			kiroOIDCTokenURL = func(got string) string {
+				built++
+				t.Errorf("URL builder called for rejected region %q with %q", region, got)
+				return "http://127.0.0.1/invalid-region-must-not-build"
+			}
+			t.Cleanup(func() { kiroOIDCTokenURL = origURL })
+			before := &domain.OAuthCreds{
+				KiroAuth: "builder-id", ClientID: "cid", ClientSecret: "secret", RefreshToken: "rt",
+				Region: region, AccessToken: "old", ProfileArn: "arn:kept",
+				ExtraAuthParams: map[string]string{"scope": "kept"},
+			}
+			c := *before
+			c.ExtraAuthParams = map[string]string{"scope": "kept"}
+			err := refreshKiro(context.Background(), &c, time.Unix(1000, 0))
+			if err == nil || calls != 0 || built != 0 {
+				t.Fatalf("err=%v calls=%d built=%d", err, calls, built)
+			}
+			if !reflect.DeepEqual(&c, before) {
+				t.Fatalf("rejected region mutated creds: got=%+v want=%+v", &c, before)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // TestRefreshKiroSocial covers the social branch: no client secret, fixed social
 // endpoint, camelCase response. A configured profileArn is not overwritten.

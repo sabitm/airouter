@@ -7,8 +7,10 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"airouter/internal/proxy/ir"
 )
@@ -231,7 +233,7 @@ func TestDecodeStreamToolsRestoresAndRejects(t *testing.T) {
 	})
 
 	t.Run("decoy and unknown fail before tool events", func(t *testing.T) {
-		for _, name := range []string{"fs_read", "execute_bash", "not_declared", cat.toWire["get_weather"] + "_extra"} {
+		for _, name := range []string{"execute_bash", "not_declared", cat.toWire["get_weather"] + "_extra"} {
 			var buf bytes.Buffer
 			buf.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"before"}`)))
 			buf.Write(buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_x","name":"`+name+`","input":"{\"secret\":\"hidden\"}"}`)))
@@ -257,7 +259,7 @@ func TestDecodeStreamToolsRestoresAndRejects(t *testing.T) {
 			}
 		}
 		var buf bytes.Buffer
-		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_hidden", "fs_read", "")))
+		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_hidden", "execute_bash", "")))
 		buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_hidden", "", `{"secret":"hidden"}`)))
 		err := DecodeStreamTools(tools, bytes.NewReader(buf.Bytes()), func(ev ir.StreamEvent) error {
 			if ev.Kind == ir.EventToolCallDelta && strings.Contains(ev.ArgsFrag, "hidden") {
@@ -271,7 +273,7 @@ func TestDecodeStreamToolsRestoresAndRejects(t *testing.T) {
 	})
 
 	t.Run("empty declarations reject every tool name", func(t *testing.T) {
-		frame := buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_1","name":"get_weather_ide","input":"{}"}`))
+		frame := buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_1","name":"get_weather","input":"{}"}`))
 		err := DecodeStreamTools(nil, bytes.NewReader(frame), func(ev ir.StreamEvent) error {
 			if ev.Kind == ir.EventToolCallStart || ev.Kind == ir.EventToolCallDelta {
 				t.Fatalf("empty tools forwarded %+v", ev)
@@ -286,7 +288,7 @@ func TestDecodeStreamToolsRestoresAndRejects(t *testing.T) {
 
 func TestDecodeStreamToolsRejectsUnboundAndChangedIdentity(t *testing.T) {
 	tools := []ir.Tool{{Name: "lookup"}, {Name: "other"}}
-	first := toolEventJSON("call_1", "lookup_ide", `{"allowed":1}`)
+	first := toolEventJSON("call_1", "lookup", `{"allowed":1}`)
 	cases := []struct {
 		name       string
 		tools      []ir.Tool
@@ -298,10 +300,10 @@ func TestDecodeStreamToolsRejectsUnboundAndChangedIdentity(t *testing.T) {
 		{name: "nameless start with declarations", tools: tools, invalid: toolEventJSON("call_hidden", "", `{"secret":"hidden"}`)},
 		{name: "explicit empty name", tools: tools, invalid: []byte(`{"toolUseId":"call_hidden","name":"","input":"hidden"}`)},
 		{name: "null name", tools: tools, invalid: []byte(`{"toolUseId":"call_hidden","name":null,"input":"hidden"}`)},
-		{name: "missing tool ID", tools: tools, invalid: []byte(`{"name":"lookup_ide","input":"hidden"}`)},
+		{name: "missing tool ID", tools: tools, invalid: []byte(`{"name":"lookup","input":"hidden"}`)},
 		{name: "new nameless ID after valid call", tools: tools, first: first, invalid: toolEventJSON("call_hidden", "", "hidden"), wantStarts: 1},
-		{name: "changed to declared tool", tools: tools, first: first, invalid: toolEventJSON("call_1", "other_ide", "hidden"), wantStarts: 1},
-		{name: "changed to decoy", tools: tools, first: first, invalid: toolEventJSON("call_1", "fs_read", "hidden"), wantStarts: 1},
+		{name: "changed to declared tool", tools: tools, first: first, invalid: toolEventJSON("call_1", "other", "hidden"), wantStarts: 1},
+		{name: "changed to unknown", tools: tools, first: first, invalid: toolEventJSON("call_1", "execute_bash", "hidden"), wantStarts: 1},
 		{name: "changed to unknown", tools: tools, first: first, invalid: toolEventJSON("call_1", "unknown", "hidden"), wantStarts: 1},
 	}
 	for _, tc := range cases {
@@ -343,8 +345,8 @@ func TestDecodeStreamToolsRejectsUnboundAndChangedIdentity(t *testing.T) {
 
 func TestDecodeStreamToolsAllowsValidatedContinuations(t *testing.T) {
 	var buf bytes.Buffer
-	buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_1", "lookup_ide", `{"value":`)))
-	buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_1", "lookup_ide", "1")))
+	buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_1", "lookup", `{"value":`)))
+	buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_1", "lookup", "1")))
 	buf.Write(buildFrame("toolUseEvent", toolEventJSON("call_1", "", "}")))
 	buf.Write(buildFrame("toolUseEvent", []byte(`{"toolUseId":"call_1","stop":true}`)))
 	buf.Write(buildFrame("messageStopEvent", []byte(`{}`)))
@@ -732,5 +734,236 @@ func TestDecodeStreamExceptionFrame(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("want no events, got %+v", events)
+	}
+}
+
+func TestDecodeStreamReasoningAndMetadata(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(buildFrame("reasoningContentEvent", []byte(`{"text":"think"}`)))
+	buf.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"answer"}`)))
+	buf.Write(buildFrame("contextUsageEvent", []byte(`{"contextUsagePercentage":12.5}`)))
+	buf.Write(buildFrame("meteringEvent", []byte(`{"usage":99}`)))
+	buf.Write(buildFrame("metadataEvent", []byte(`{"tokenUsage":{"uncachedInputTokens":5,"cacheReadInputTokens":2,"cacheWriteInputTokens":3,"outputTokens":4},"stopReason":"max_tokens"}`)))
+	events := collect(t, buf.Bytes())
+	var reasoning, text string
+	var finish *ir.StreamEvent
+	for i := range events {
+		switch events[i].Kind {
+		case ir.EventReasoningDelta:
+			reasoning += events[i].Text
+		case ir.EventTextDelta:
+			text += events[i].Text
+		case ir.EventFinish:
+			finish = &events[i]
+		}
+	}
+	if reasoning != "think" || text != "answer" {
+		t.Fatalf("reasoning=%q text=%q", reasoning, text)
+	}
+	if finish == nil || finish.InputTokens != 10 || finish.OutputTokens != 4 || finish.CacheReadTokens != 2 || finish.CacheWriteTokens != 3 {
+		t.Fatalf("finish = %+v", finish)
+	}
+	if finish.StopReason != ir.StopMaxTokens {
+		t.Fatalf("stop = %q", finish.StopReason)
+	}
+}
+
+func TestDecodeStreamLegacyEOFStillFinishes(t *testing.T) {
+	frame := buildFrame("assistantResponseEvent", []byte(`{"content":"done"}`))
+	events := collect(t, frame)
+	if len(events) == 0 || events[len(events)-1].Kind != ir.EventFinish {
+		t.Fatalf("legacy EOF did not finish: %+v", events)
+	}
+}
+
+func TestDecodeStreamRuntimeRequiresTerminal(t *testing.T) {
+	frame := buildFrame("assistantResponseEvent", []byte(`{"content":"done"}`))
+	err := DecodeStreamToolsTransport(nil, bytes.NewReader(frame), func(ir.StreamEvent) error { return nil }, true)
+	if _, ok := ir.AsStreamFailure(err); !ok {
+		t.Fatalf("got %v, want terminal failure", err)
+	}
+}
+
+func TestDecodeStreamTypedErrorEventsFail(t *testing.T) {
+	cases := []struct {
+		event string
+		typ   string
+		code  string
+	}{
+		{event: "error", typ: "api_error", code: "internal_server_error"},
+		{event: "throttlingError", typ: "rate_limit_error", code: "throttling"},
+		{event: "validationError", typ: "invalid_request_error", code: "validation"},
+		{event: "serviceUnavailableError", typ: "service_unavailable_error", code: "service_unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.event, func(t *testing.T) {
+			var buf bytes.Buffer
+			buf.Write(buildFrame(tc.event, []byte(`{"message":"safe detail","reason":"raw-secret","extra":{"token":"hidden"}}`)))
+			buf.Write(buildFrame("metadataEvent", []byte(`{"stopReason":"END_TURN"}`)))
+			var events []ir.StreamEvent
+			err := DecodeStreamToolsTransport(nil, bytes.NewReader(buf.Bytes()), func(ev ir.StreamEvent) error {
+				events = append(events, ev)
+				return nil
+			}, true)
+			sf, ok := ir.AsStreamFailure(err)
+			if !ok {
+				t.Fatalf("got %v, want StreamFailure", err)
+			}
+			if sf.Type != tc.typ || sf.Code != tc.code || sf.Message != "safe detail" {
+				t.Fatalf("failure = %+v", sf)
+			}
+			if strings.Contains(sf.Error(), "raw-secret") || strings.Contains(sf.Error(), "hidden") {
+				t.Fatalf("raw payload leaked: %s", sf.Error())
+			}
+			for _, ev := range events {
+				if ev.Kind == ir.EventFinish {
+					t.Fatal("typed error emitted finish")
+				}
+			}
+		})
+	}
+}
+
+func TestDecodeStreamUnknownStopDoesNotSucceed(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"partial"}`)))
+	buf.Write(buildFrame("messageStopEvent", []byte(`{"stopReason":"unrecognized_failure"}`)))
+	err := DecodeStreamToolsTransport(nil, bytes.NewReader(buf.Bytes()), func(ir.StreamEvent) error { return nil }, true)
+	sf, ok := ir.AsStreamFailure(err)
+	if !ok || sf.Code != "unknown_stop" {
+		t.Fatalf("got %v, want unknown stop failure", err)
+	}
+	if strings.Contains(err.Error(), "unrecognized_failure") {
+		t.Fatalf("raw stop leaked: %s", err)
+	}
+
+	var masked bytes.Buffer
+	masked.Write(buildFrame("metadataEvent", []byte(`{"tokenUsage":{"outputTokens":2},"stopReason":"unrecognized_failure"}`)))
+	masked.Write(buildFrame("messageStopEvent", []byte(`{}`)))
+	err = DecodeStream(bytes.NewReader(masked.Bytes()), func(ir.StreamEvent) error { return nil })
+	if _, ok := ir.AsStreamFailure(err); !ok {
+		t.Fatalf("legacy empty stop masked unknown metadata stop: %v", err)
+	}
+
+	empty := buildFrame("messageStopEvent", []byte(`{}`))
+	events := collect(t, empty)
+	if len(events) == 0 || events[len(events)-1].Kind != ir.EventFinish || events[len(events)-1].StopReason != ir.StopEndTurn {
+		t.Fatalf("empty legacy stop = %+v", events)
+	}
+}
+
+func TestDecodeStreamMalformedTerminalFrames(t *testing.T) {
+	cases := []struct {
+		event   string
+		payload string
+	}{
+		{"metadataEvent", `{"stopReason":`},
+		{"metadataEvent", `[]`},
+		{"metadataEvent", `null`},
+		{"messageStopEvent", ``},
+		{"messageStopEvent", `null`},
+		{"messageStopEvent", `[]`},
+		{"messageStopEvent", `{"stopReason":null}`},
+		{"messageStopEvent", `{"stopReason":23}`},
+	}
+	for _, tc := range cases {
+		for _, strict := range []bool{false, true} {
+			for _, priorStop := range []bool{false, true} {
+				t.Run(tc.event+"/"+tc.payload+"/strict="+strconv.FormatBool(strict)+"/prior="+strconv.FormatBool(priorStop), func(t *testing.T) {
+					var frames bytes.Buffer
+					if priorStop {
+						frames.Write(buildFrame("metadataEvent", []byte(`{"stopReason":"END_TURN"}`)))
+					}
+					frames.Write(buildFrame(tc.event, []byte(tc.payload)))
+					frames.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"must not be emitted"}`)))
+					frames.Write(buildFrame("messageStopEvent", []byte(`{}`)))
+					err := DecodeStreamToolsTransport(nil, &frames, func(ev ir.StreamEvent) error {
+						if ev.Kind == ir.EventFinish || ev.Kind == ir.EventTextDelta {
+							t.Fatalf("malformed terminal emitted %+v", ev)
+						}
+						return nil
+					}, strict)
+					if _, ok := ir.AsStreamFailure(err); !ok {
+						t.Fatalf("malformed terminal succeeded: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestJSONMessageTruncatesOnUTF8Boundary(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "short", text: "ok", want: "ok"},
+		{name: "ascii exact", text: strings.Repeat("a", 240), want: strings.Repeat("a", 240)},
+		{name: "ascii over", text: strings.Repeat("b", 241), want: strings.Repeat("b", 240)},
+		{name: "multibyte crossing", text: strings.Repeat("a", 239) + "é", want: strings.Repeat("a", 239)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(map[string]string{"message": tc.text})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := jsonMessage(payload)
+			if got != tc.want || !utf8.ValidString(got) || len(got) > 240 {
+				t.Fatalf("got %q len=%d", got, len(got))
+			}
+		})
+	}
+}
+
+func TestDecodeStreamTypedErrorAliasesAfterText(t *testing.T) {
+	for _, event := range []string{"error", "InternalServerException", "throttlingError", "ThrottlingException", "validationError", "ValidationException", "serviceUnavailableError", "ServiceUnavailableException"} {
+		t.Run(event, func(t *testing.T) {
+			var frames bytes.Buffer
+			frames.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"partial"}`)))
+			frames.Write(buildFrame(event, []byte(`{"Message":"failure","unknown":{"secret":"hidden"}}`)))
+			frames.Write(buildFrame("metadataEvent", []byte(`{"stopReason":"END_TURN"}`)))
+			var text string
+			err := DecodeStreamToolsTransport(nil, &frames, func(ev ir.StreamEvent) error {
+				if ev.Kind == ir.EventFinish {
+					t.Fatal("typed error produced success")
+				}
+				if ev.Kind == ir.EventTextDelta {
+					text += ev.Text
+				}
+				return nil
+			}, true)
+			failure, ok := ir.AsStreamFailure(err)
+			if !ok || failure.Message != "failure" || text != "partial" || strings.Contains(err.Error(), "hidden") {
+				t.Fatalf("text=%q failure=%v", text, err)
+			}
+		})
+	}
+}
+
+func TestDecodeStreamMetadataObjectDoesNotDropUsage(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		stop ir.StopReason
+	}{
+		{name: "end turn object", body: `{"tokenUsage":{"inputTokens":1,"cacheReadInputTokens":2,"cacheWriteInputTokens":3,"outputTokens":4},"stopReason":"END_TURN","stopDetails":{"ignored":true}}`, stop: ir.StopEndTurn},
+		{name: "camel max tokens", body: `{"tokenUsage":{"uncachedInputTokens":5,"cacheReadInputTokens":1,"outputTokens":6},"stopReason":"maxTokens","stopDetails":null}`, stop: ir.StopMaxTokens},
+		{name: "compact tool use", body: `{"usage":{"inputTokens":2,"outputTokens":3},"stop_reason":"toolUse","stop_details":{"extra":"kept"}}`, stop: ir.StopToolUse},
+		{name: "max output tokens", body: `{"tokenUsage":{"inputTokens":8,"outputTokens":1},"stopReason":"max_output_tokens"}`, stop: ir.StopMaxTokens},
+		{name: "refusal object", body: `{"tokenUsage":{"inputTokens":9,"outputTokens":1},"stopReason":"refusal","stopDetails":{"refusal":{"category":"safety","explanation":"blocked","recommendedModel":"other"}}}`, stop: ir.StopMaxTokens},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			buf.Write(buildFrame("assistantResponseEvent", []byte(`{"content":"ok"}`)))
+			buf.Write(buildFrame("metadataEvent", []byte(tc.body)))
+			events := collect(t, buf.Bytes())
+			finish := events[len(events)-1]
+			if finish.Kind != ir.EventFinish || finish.StopReason != tc.stop || finish.OutputTokens == 0 {
+				t.Fatalf("finish = %+v", finish)
+			}
+		})
 	}
 }

@@ -355,6 +355,7 @@ func (d *DeviceConnect) buildCreds(tr kiroTokenResponse) (*domain.OAuthCreds, er
 		Mode:         domain.OAuthAuto,
 		Preset:       kiroBuilderIDPreset,
 		KiroAuth:     kiroBuilderIDAuth,
+		KiroIDP:      "BuilderId",
 		Region:       region,
 		ClientID:     clientID,
 		ClientSecret: clientSecret,

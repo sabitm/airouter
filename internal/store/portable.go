@@ -89,6 +89,8 @@ func (s *Store) Export(ctx context.Context, w io.Writer) error {
 		}
 		if p.Method() == domain.AuthOAuth {
 			pp.OAuth = p.OAuthCreds
+		} else if cfg := portableKiroAPIKeyConfig(p); cfg != nil {
+			pp.OAuth = cfg
 		}
 		cfg.Providers = append(cfg.Providers, pp)
 	}
@@ -104,6 +106,32 @@ func (s *Store) Export(ctx context.Context, w io.Writer) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(cfg)
+}
+
+// portableKiroAPIKeyConfig copies only the token-less Kiro settings that an
+// API-key provider stores in the OAuth credential container. Tokens, client
+// registration, and unrelated OAuth settings are dropped even if a stale import
+// left them in that container. Other protocols do not export this container.
+func portableKiroAPIKeyConfig(p *domain.Provider) *domain.OAuthCreds {
+	if p == nil || p.Protocol != domain.ProtocolKiro || p.OAuthCreds == nil {
+		return nil
+	}
+	c := p.OAuthCreds
+	out := &domain.OAuthCreds{
+		ProfileArn:        c.ProfileArn,
+		Region:            c.Region,
+		KiroAuth:          c.KiroAuth,
+		KiroIDP:           c.KiroIDP,
+		KiroContentOptOut: c.KiroContentOptOut,
+		KiroAgentMode:     c.KiroAgentMode,
+		KiroTransport:     c.KiroTransport,
+		KiroDiscovery:     c.KiroDiscovery,
+	}
+	if out.ProfileArn == "" && out.Region == "" && out.KiroAuth == "" && out.KiroIDP == "" &&
+		!out.KiroContentOptOut && out.KiroAgentMode == "" && out.KiroTransport == "" && out.KiroDiscovery == "" {
+		return nil
+	}
+	return out
 }
 
 // ImportSummary reports the outcome of an Import: per-entity counts plus one

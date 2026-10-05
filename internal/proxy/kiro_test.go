@@ -258,6 +258,133 @@ func TestKiroTruncatedStreamFailover(t *testing.T) {
 	}
 }
 
+func runtimeProvider(name, base string) *domain.Provider {
+	return &domain.Provider{
+		Name: name, BaseURL: base, Protocol: domain.ProtocolKiro, AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{
+			KiroAuth: "idc", KiroIDP: "AWSIdC", KiroTransport: "runtime",
+			ProfileArn:  "arn:aws:codewhisperer:eu-central-1:1:profile/A",
+			AccessToken: "oauth-token", ExpiresAt: 4102444800,
+		},
+	}
+}
+
+func TestKiroRuntimeTransportHeadersAndFailover(t *testing.T) {
+	var hits []string
+	var headers []http.Header
+	var bodies [][]byte
+	handler := func(name string, body []byte, failAfter bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			hits = append(hits, name+" "+r.URL.Path)
+			headers = append(headers, r.Header.Clone())
+			bodies = append(bodies, raw)
+			if r.URL.Path != "/" || r.URL.RawQuery != "" {
+				t.Errorf("runtime path = %q query = %q", r.URL.Path, r.URL.RawQuery)
+			}
+			if r.Header.Get("X-Amz-Target") != "KiroRuntimeService.GenerateAssistantResponse" {
+				t.Errorf("runtime target = %q", r.Header.Get("X-Amz-Target"))
+			}
+			if r.Header.Get("Content-Type") != "application/x-amz-json-1.0" {
+				t.Errorf("content-type = %q", r.Header.Get("Content-Type"))
+			}
+			if values := r.Header.Values("TokenType"); len(values) != 1 || values[0] != "SSO_OIDC" {
+				t.Errorf("TokenType = %#v", values)
+			}
+			if r.Header.Get("X-Kiro-Idp") != "AWSIdC" || r.Header.Get("x-amzn-kiro-profile-arn") != "" {
+				t.Errorf("identity headers = %v", r.Header)
+			}
+			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			if failAfter {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+	}
+	up1 := httptest.NewServer(handler("bad", []byte{0, 0, 0, 0, 0, 0, 0}, true))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(handler("good", kiroTextStream(), false))
+	t.Cleanup(up2.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := runtimeProvider("bad", up1.URL)
+	p2 := runtimeProvider("good", up2.URL)
+	if err := st.CreateProvider(ctx, p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "m", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "m", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	resp, body := postStream(t, ts.URL+"/v1/chat/completions", key.Token, `{"model":"default","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQI12P4z8AAAAMBAQAY3Y20AAAAAElFTkSuQmCC"}}]}]}`)
+	if resp.StatusCode != http.StatusOK || len(hits) != 2 {
+		t.Fatalf("status=%d hits=%v body=%s", resp.StatusCode, hits, body)
+	}
+	for _, raw := range bodies {
+		if !bytes.Contains(raw, []byte(`"profileArn":"arn:aws:codewhisperer:eu-central-1:1:profile/A"`)) || !bytes.Contains(raw, []byte(`"bytes":"iVBORw0KGgo`)) {
+			t.Fatalf("runtime body missing profile or image: %s", raw)
+		}
+	}
+	if !strings.Contains(body, "Hello") {
+		t.Fatalf("client stream = %s", body)
+	}
+	_ = headers
+
+	var committedHits int
+	committed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		committedHits++
+		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(buildKiroFrame("assistantResponseEvent", `{"content":"visible"}`))
+		_, _ = w.Write([]byte{0, 0, 0, 0, 0, 0, 0})
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(committed.Close)
+	next := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("failover after commitment")
+	}))
+	t.Cleanup(next.Close)
+	st2 := newTestStore(t)
+	bad := runtimeProvider("committed", committed.URL)
+	good := runtimeProvider("unused", next.URL)
+	if err := st2.CreateProvider(ctx, bad); err != nil || st2.CreateProvider(ctx, good) != nil {
+		t.Fatal(err)
+	}
+	if err := st2.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: bad.ID, UpstreamModel: "m", Enabled: true},
+		{ProviderID: good.ID, UpstreamModel: "m", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key2, err := st2.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux2 := http.NewServeMux()
+	New(st2, nil).Mount(mux2)
+	ts2 := httptest.NewServer(mux2)
+	t.Cleanup(ts2.Close)
+	resp, body = postStream(t, ts2.URL+"/v1/chat/completions", key2.Token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if committedHits != 1 || strings.Contains(body, "unused") {
+		t.Fatalf("hits=%d body=%s status=%d", committedHits, body, resp.StatusCode)
+	}
+}
+
 // TestKiroUnaryCollected verifies a non-streaming client request to the
 // stream-only Kiro backend is collected from the EventStream into a unary
 // response and usage is recorded.
@@ -353,7 +480,7 @@ func TestKiroUpstreamPreservesToolSchemaInteger(t *testing.T) {
 // OpenAI tool_call with concatenated arguments and a tool_calls finish reason.
 func TestKiroToolStream(t *testing.T) {
 	var buf bytes.Buffer
-	buf.Write(buildKiroFrame("toolUseEvent", `{"toolUseId":"call_1","name":"get_weather_ide","input":"{\"city\":"}`))
+	buf.Write(buildKiroFrame("toolUseEvent", `{"toolUseId":"call_1","name":"get_weather","input":"{\"city\":"}`))
 	buf.Write(buildKiroFrame("toolUseEvent", `{"toolUseId":"call_1","input":"\"paris\"}"}`))
 	buf.Write(buildKiroFrame("metricsEvent", `{"inputTokens":11,"outputTokens":3}`))
 	buf.Write(buildKiroFrame("messageStopEvent", `{}`))
@@ -378,8 +505,8 @@ func TestKiroToolStream(t *testing.T) {
 	if finish != "tool_calls" {
 		t.Errorf("finish_reason = %q", finish)
 	}
-	if !bytes.Contains(cap.body, []byte(`"name":"get_weather_ide"`)) || bytes.Contains(cap.body, []byte(`"name":"get_weather"`)) {
-		t.Errorf("upstream declarations not cloaked:\n%s", cap.body)
+	if !bytes.Contains(cap.body, []byte(`"name":"get_weather"`)) || bytes.Contains(cap.body, []byte(`"name":"get_weather_ide"`)) {
+		t.Errorf("upstream declaration not normalized:\n%s", cap.body)
 	}
 	if !bytes.Contains(cap.body, []byte("9223372036854775807")) {
 		t.Errorf("schema number lost:\n%s", cap.body)
@@ -394,7 +521,7 @@ func TestKiroToolStream(t *testing.T) {
 }
 
 func TestKiroToolCloakMatrix(t *testing.T) {
-	stream := kiroToolStream("call_9", "lookup_ide", `{"id":9050000000000000001}`)
+	stream := kiroToolStream("call_9", "lookup", `{"id":9050000000000000001}`)
 	cases := []struct {
 		name    string
 		ingress string
@@ -447,7 +574,7 @@ func TestKiroToolCloakMatrix(t *testing.T) {
 
 func TestKiroToolCloakFailover(t *testing.T) {
 	bad := buildKiroFrame("toolUseEvent", `{"toolUseId":"call_bad","name":"fs_read","input":"{\"secret\":\"hidden\"}"}`)
-	good := kiroToolStream("call_9", "lookup_ide", `{"id":1}`)
+	good := kiroToolStream("call_9", "lookup", `{"id":1}`)
 	var n1, n2 int
 	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n1++
@@ -634,7 +761,7 @@ func TestKiroToolCloakRejectsUnboundAndChangedIdentity(t *testing.T) {
 	}{
 		{name: "nameless without declarations", invalid: `{"toolUseId":"call_hidden","input":"hidden"}`},
 		{name: "nameless with declarations", withTools: true, invalid: `{"toolUseId":"call_hidden","input":"hidden"}`},
-		{name: "changed declared identity", withTools: true, validStart: true, invalid: `{"toolUseId":"call_valid","name":"other_ide","input":"hidden"}`},
+		{name: "changed declared identity", withTools: true, validStart: true, invalid: `{"toolUseId":"call_valid","name":"other","input":"hidden"}`},
 	}
 	ingresses := []struct {
 		path  string
@@ -664,7 +791,7 @@ func TestKiroToolCloakRejectsUnboundAndChangedIdentity(t *testing.T) {
 					var frames bytes.Buffer
 					frames.Write(buildKiroFrame("assistantResponseEvent", `{"content":"visible"}`))
 					if tc.validStart {
-						frames.Write(buildKiroFrame("toolUseEvent", `{"toolUseId":"call_valid","name":"lookup_ide"}`))
+						frames.Write(buildKiroFrame("toolUseEvent", `{"toolUseId":"call_valid","name":"lookup"}`))
 					}
 					frames.Write(buildKiroFrame("toolUseEvent", tc.invalid))
 					frames.Write(buildKiroFrame("messageStopEvent", `{}`))
@@ -685,7 +812,7 @@ func TestKiroToolCloakRejectsUnboundAndChangedIdentity(t *testing.T) {
 					if !strings.Contains(body, "upstream tool call is not available") {
 						t.Fatalf("generic tool failure missing: %s", body)
 					}
-					for _, leaked := range []string{"hidden", "other_ide", "lookup_ide"} {
+					for _, leaked := range []string{"hidden", "other"} {
 						if strings.Contains(body, leaked) {
 							t.Fatalf("rejected data %q leaked: %s", leaked, body)
 						}
@@ -767,21 +894,21 @@ func boolString(v bool) string {
 
 func assertKiroCloakedRequest(t *testing.T, cap *kiroCapture, method domain.AuthMethod) {
 	t.Helper()
-	if !bytes.Contains(cap.body, []byte(`"name":"lookup_ide"`)) {
-		t.Fatalf("cloaked declaration missing:\n%s", cap.body)
+	if !bytes.Contains(cap.body, []byte(`"name":"lookup"`)) {
+		t.Fatalf("normalized declaration missing:\n%s", cap.body)
 	}
-	if bytes.Contains(cap.body, []byte(`"name":"lookup"`)) {
-		t.Fatalf("original client name leaked:\n%s", cap.body)
+	if bytes.Contains(cap.body, []byte(`"name":"lookup_ide"`)) {
+		t.Fatalf("unexpected alias leaked:\n%s", cap.body)
 	}
-	for _, name := range []string{"execute_bash", "fs_read", "fs_write", "glob", "grep", "web_search", "web_fetch"} {
-		if !bytes.Contains(cap.body, []byte(`"name":"`+name+`"`)) {
-			t.Errorf("decoy %s missing", name)
+	for _, name := range []string{"execute_bash", "fs_write", "glob", "grep", "web_search", "web_fetch"} {
+		if bytes.Contains(cap.body, []byte(`"name":"`+name+`"`)) {
+			t.Errorf("decoy %s advertised", name)
 		}
 	}
 	if !bytes.Contains(cap.body, []byte("9223372036854775807")) {
 		t.Errorf("schema number lost:\n%s", cap.body)
 	}
-	if !bytes.Contains(cap.body, []byte(`"toolUseId":"call_old"`)) || !bytes.Contains(cap.body, []byte(`"name":"lookup_ide"`)) {
+	if !bytes.Contains(cap.body, []byte(`"toolUseId":"call_old"`)) || !bytes.Contains(cap.body, []byte(`"name":"lookup"`)) {
 		t.Errorf("history id/name not preserved:\n%s", cap.body)
 	}
 	if !bytes.Contains(cap.body, []byte(`"profileArn":"arn:aws:codewhisperer:us-east-1:123:profile/ABC"`)) {

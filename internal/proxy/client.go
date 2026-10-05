@@ -91,7 +91,11 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 		}
 		return body, nil
 	case "kiro":
-		return kiro.InjectProfileArn(body, kiroProfileArn(provider)), nil
+		return kiro.InjectProfileArn(body, kiro.ProfileArnForBody(kiro.IdentityFromProvider(provider))), nil
+	case "kiro-runtime":
+		id := kiro.IdentityFromProvider(provider)
+		body = kiro.InjectProfileArn(body, kiro.ProfileArnForBody(id))
+		return kiro.InjectRuntimeAgentMode(body, id.AgentMode), nil
 	case "qoder":
 		wire, err := qoder.PrepareWireBody(ctx, provider, body)
 		if err != nil {
@@ -165,16 +169,6 @@ func claudeCodeSeed(provider *domain.Provider) string {
 	return provider.OAuthCreds.AccessToken
 }
 
-// kiroProfileArn returns the CodeWhisperer profile ARN configured for a Kiro
-// provider, from its OAuthCreds (which carries the field for both apikey and
-// oauth Kiro providers). Empty when unset.
-func kiroProfileArn(provider *domain.Provider) string {
-	if provider != nil && provider.OAuthCreds != nil {
-		return provider.OAuthCreds.ProfileArn
-	}
-	return ""
-}
-
 // reqModelFromBody reads the model field of an encoded upstream body; empty
 // when absent (the echo patch then stays a no-op).
 func reqModelFromBody(body []byte) string {
@@ -198,6 +192,10 @@ var hopByHopOrControlled = map[string]bool{
 	"Keep-Alive":        true,
 	"Proxy-Connection":  true,
 	"Transfer-Encoding": true,
+	// Kiro owns its operation target. A client-supplied value must not select a
+	// different RPC. Content-Type stays copyable for other protocols; Kiro
+	// overwrites it after the copy.
+	"X-Amz-Target": true,
 }
 
 // applyUpstreamHeaders copies the client's request headers onto the upstream
@@ -347,19 +345,40 @@ func applyCursorHeaders(req *http.Request, provider *domain.Provider) {
 	}
 }
 
-// applyKiroHeaders sets the CodeWhisperer identity headers and, for an apikey
-// provider, the tokentype marker the upstream keys host acceptance on. The
-// Amz-Sdk-Invocation-Id is a fresh uuid per request. Authorization is already
-// set to the bearer credential by the auth-scheme switch above.
+// applyKiroHeaders sets the CodeWhisperer identity headers and the verified
+// Kiro auth markers. Authorization is already set by the auth-scheme switch,
+// then ApplyAuthHeaders replaces it with the same credential plus identity
+// headers that this connection can prove. The invocation id is fresh per request.
 func applyKiroHeaders(req *http.Request, provider *domain.Provider) {
-	req.Header.Set("X-Amz-Target", kiro.XAmzTarget)
+	id := kiro.IdentityFromProvider(provider)
+	// Drop client-supplied Kiro identity and profile markers before writing the
+	// values this connection can prove. The active Runtime serializer does not
+	// emit the unused profile HTTP header trait.
+	for _, name := range []string{
+		"X-Amz-Target",
+		"x-amzn-kiro-profile-arn",
+		"X-Kiro-Profile-Arn",
+		"X-Kiro-Idp",
+		"TokenType",
+		"x-amzn-kiro-agent-mode",
+		"x-amzn-codewhisperer-optout",
+	} {
+		req.Header.Del(name)
+	}
+	if kiro.UseRuntime(id) {
+		// The active Runtime serializer is AWS JSON 1.0. It writes the Runtime
+		// target and does not apply the unused profile HTTP header trait.
+		req.Header.Set("Content-Type", kiro.JSONContentType)
+		req.Header.Set("X-Amz-Target", kiro.RuntimeTarget)
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Amz-Target", kiro.XAmzTarget)
+	}
 	req.Header.Set("User-Agent", kiro.UserAgent)
 	req.Header.Set("X-Amz-User-Agent", kiro.XAmzUserAgent)
 	req.Header.Set("Amz-Sdk-Request", kiro.AmzSdkRequest)
 	req.Header.Set("Amz-Sdk-Invocation-Id", newUUID())
-	if provider.Method() == domain.AuthAPIKey {
-		req.Header.Set("tokentype", "API_KEY")
-	}
+	kiro.ApplyAuthHeaders(req.Header, id)
 }
 
 // applyOpencodeHeaders sets the opencode client fingerprint. Sanitized ingress
@@ -559,6 +578,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 // carries a non-Cursor base URL, which then overrides the absolute host
 // (self-hosted mirrors and tests).
 func upstreamURL(provider *domain.Provider, path string) string {
+	if provider != nil && provider.Protocol == domain.ProtocolKiro && kiro.UseRuntime(kiro.IdentityFromProvider(provider)) {
+		return kiro.ChatURL(provider.BaseURL, kiro.IdentityFromProvider(provider))
+	}
 	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
 		if b := strings.TrimSpace(provider.BaseURL); b != "" && !strings.Contains(b, "cursor.sh") {
 			if u, err := url.Parse(path); err == nil {

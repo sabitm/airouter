@@ -369,7 +369,13 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 	// Kiro oauth providers carry the profile ARN/region and the auth-flavor marker
 	// that routes token refresh to Kiro's flow.
 	if proto == domain.ProtocolKiro {
-		applyKiroConfig(creds, r)
+		creds = cloneOAuthCreds(creds)
+		if ok {
+			applyKiroConnectionConfig(creds, r)
+		} else {
+			applyKiroConfig(creds, r)
+		}
+		creds.KiroContentOptOutSet = false
 	}
 	if proto == domain.ProtocolQoder {
 		applyQoderConfig(creds, r)
@@ -530,12 +536,24 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	// Switching an oauth provider back to apikey: drop the stored credentials so
 	// the row no longer resolves a bearer token.
 	cur.AuthMethod = domain.AuthAPIKey
-	cur.OAuthCreds = nil
 	// A Kiro apikey provider keeps a token-less OAuthCreds for its profile config.
+	// Fields the form does not submit stay on the existing connection. Copy before
+	// clearing the stored credentials.
 	if proto == domain.ProtocolKiro {
 		creds := &domain.OAuthCreds{}
+		if cur.OAuthCreds != nil {
+			prev := *cur.OAuthCreds
+			mergeKiroAccount(creds, &prev, r)
+			preserveKiroConfig(creds, &prev, r)
+		}
 		applyKiroConfig(creds, r)
+		creds.AccessToken = ""
+		creds.RefreshToken = ""
+		creds.IDToken = ""
+		creds.KiroContentOptOutSet = false
 		cur.OAuthCreds = creds
+	} else {
+		cur.OAuthCreds = nil
 	}
 	cur.APIKey = apiKey
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
@@ -552,11 +570,21 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 // provider without reconnecting or pasting never requires re-auth.
 func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cur *domain.Provider, proto domain.Protocol) {
 	var prevCursorMachineID string
+	var prevKiro *domain.OAuthCreds
 	if cur.OAuthCreds != nil {
 		prevCursorMachineID = cur.OAuthCreds.MachineID
+		copied := *cur.OAuthCreds
+		prevKiro = &copied
 	}
+	reconnected := false
+	imported := false
 	if creds, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
+		if proto == domain.ProtocolKiro {
+			creds = cloneOAuthCreds(creds)
+			preserveKiroConfig(creds, prevKiro, r)
+		}
 		cur.OAuthCreds = creds
+		reconnected = true
 	} else if c, err := credsFromConnectForm(r); err == nil && applyManualTokens(c, r) {
 		if proto == domain.ProtocolCursor && c.AccessToken == "" && cur.OAuthCreds != nil {
 			c.AccessToken = cur.OAuthCreds.AccessToken
@@ -564,14 +592,23 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 			c.Email = cur.OAuthCreds.Email
 			c.AccountID = cur.OAuthCreds.AccountID
 		}
+		if proto == domain.ProtocolKiro {
+			configureKiroImport(c, prevKiro, r)
+		}
 		cur.OAuthCreds = c
+		imported = true
 	}
 	if cur.OAuthCreds == nil {
 		htmxBadRequest(w, r, "provider-flash", "connect this provider or paste an access/refresh token before saving")
 		return
 	}
 	if proto == domain.ProtocolKiro {
-		applyKiroConfig(cur.OAuthCreds, r)
+		if reconnected {
+			applyKiroConnectionConfig(cur.OAuthCreds, r)
+		} else if !imported {
+			applyKiroConfig(cur.OAuthCreds, r)
+		}
+		cur.OAuthCreds.KiroContentOptOutSet = false
 	}
 	if proto == domain.ProtocolQoder {
 		applyQoderConfig(cur.OAuthCreds, r)

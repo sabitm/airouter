@@ -114,7 +114,7 @@ func TestKiroCatalogQuerySharedByCheckAndDiscovery(t *testing.T) {
 			if !isUUID(got.Header.Get("Amz-Sdk-Invocation-Id")) {
 				t.Fatalf("invocation id = %q", got.Header.Get("Amz-Sdk-Invocation-Id"))
 			}
-			if got.Header.Get("Authorization") != "Bearer catalog-token" || got.Header.Get("tokentype") != "" || got.Header.Get("TokenType") != "" {
+			if got.Header.Get("Authorization") != "Bearer catalog-token" || len(got.Header.Values("TokenType")) != 1 || got.Header.Get("TokenType") != "SSO_OIDC" {
 				t.Fatalf("auth headers = %v", got.Header)
 			}
 			if string(raw) != `{"origin":"AI_EDITOR","profileArn":"arn:configured"}` {
@@ -127,7 +127,7 @@ func TestKiroCatalogQuerySharedByCheckAndDiscovery(t *testing.T) {
 	}
 }
 
-func TestKiroCatalogBuilderIDOmitsProfile(t *testing.T) {
+func TestKiroCatalogBuilderIDKeepsAuthProfile(t *testing.T) {
 	for _, auth := range []string{"builder-id", "Builder_ID", "Builder ID", "builderid"} {
 		t.Run(auth, func(t *testing.T) {
 			var raw []byte
@@ -140,7 +140,7 @@ func TestKiroCatalogBuilderIDOmitsProfile(t *testing.T) {
 			p := &domain.Provider{
 				BaseURL: "https://custom.example", APIKey: "tok", Protocol: domain.ProtocolKiro,
 				AuthMethod: domain.AuthOAuth,
-				OAuthCreds: &domain.OAuthCreds{KiroAuth: auth, ProfileArn: "arn:must-not-send"},
+				OAuthCreds: &domain.OAuthCreds{KiroAuth: auth, ProfileArn: "arn:from-auth"},
 			}
 			if _, err := queryKiroModels(context.Background(), nil, p); err != nil {
 				t.Fatal(err)
@@ -148,7 +148,7 @@ func TestKiroCatalogBuilderIDOmitsProfile(t *testing.T) {
 			if target != kiroCatalogTarget || strings.Contains(target, "ListAvailableProfiles") {
 				t.Fatalf("target = %q", target)
 			}
-			if string(raw) != `{"origin":"AI_EDITOR"}` || strings.Contains(string(raw), "arn:") || strings.Contains(string(raw), "placeholder") {
+			if !strings.Contains(string(raw), "arn:from-auth") || strings.Contains(string(raw), "placeholder") {
 				t.Fatalf("body = %s", raw)
 			}
 		})
@@ -162,7 +162,6 @@ func TestKiroCatalogCredentialHeaders(t *testing.T) {
 		authHeader string
 		authValue  string
 		tokenType  string
-		tokenKey   string
 	}{
 		{
 			name: "api key bearer",
@@ -170,14 +169,14 @@ func TestKiroCatalogCredentialHeaders(t *testing.T) {
 				APIKey: "key-1", AuthMethod: domain.AuthAPIKey, AuthScheme: domain.AuthBearer,
 				OAuthCreds: &domain.OAuthCreds{ProfileArn: "arn:api"},
 			},
-			authHeader: "Authorization", authValue: "Bearer key-1", tokenKey: "tokentype", tokenType: "API_KEY",
+			authHeader: "Authorization", authValue: "Bearer key-1", tokenType: "API_KEY",
 		},
 		{
 			name: "api key x-api-key",
 			provider: domain.Provider{
 				APIKey: "key-2", AuthMethod: domain.AuthAPIKey, AuthScheme: domain.AuthXAPIKey,
 			},
-			authHeader: "x-api-key", authValue: "key-2", tokenKey: "tokentype", tokenType: "API_KEY",
+			authHeader: "x-api-key", authValue: "key-2", tokenType: "API_KEY",
 		},
 		{
 			name: "external idp",
@@ -185,7 +184,7 @@ func TestKiroCatalogCredentialHeaders(t *testing.T) {
 				APIKey: "idp-tok", AuthMethod: domain.AuthOAuth,
 				OAuthCreds: &domain.OAuthCreds{KiroAuth: "external_idp", ProfileArn: "arn:idp"},
 			},
-			authHeader: "Authorization", authValue: "Bearer idp-tok", tokenKey: "TokenType", tokenType: "EXTERNAL_IDP",
+			authHeader: "Authorization", authValue: "Bearer idp-tok", tokenType: "EXTERNAL_IDP",
 		},
 		{
 			name: "social keeps profile",
@@ -213,12 +212,12 @@ func TestKiroCatalogCredentialHeaders(t *testing.T) {
 			if got.URL.String() != "https://configured.example/root/" || got.Header.Get(tc.authHeader) != tc.authValue {
 				t.Fatalf("url=%s headers=%v", got.URL, got.Header)
 			}
-			if tc.tokenKey == "" {
-				if got.Header.Get("tokentype") != "" || got.Header.Get("TokenType") != "" {
+			if tc.tokenType == "" {
+				if got.Header.Get("TokenType") != "" || len(got.Header.Values("TokenType")) != 0 {
 					t.Fatalf("unexpected token marker: %v", got.Header)
 				}
-			} else if got.Header.Get(tc.tokenKey) != tc.tokenType {
-				t.Fatalf("%s = %q", tc.tokenKey, got.Header.Get(tc.tokenKey))
+			} else if len(got.Header.Values("TokenType")) != 1 || got.Header.Get("TokenType") != tc.tokenType {
+				t.Fatalf("TokenType = %#v", got.Header.Values("TokenType"))
 			}
 			if tc.provider.OAuthCreds != nil && tc.provider.OAuthCreds.ProfileArn != "" && !strings.Contains(string(raw), tc.provider.OAuthCreds.ProfileArn) {
 				t.Fatalf("profile missing from body %s", raw)
@@ -643,6 +642,63 @@ func TestKiroCatalogCanceledRefreshHasNoRetry(t *testing.T) {
 	})
 	if models != nil || !errors.Is(err, context.Canceled) || calls != 1 {
 		t.Fatalf("models=%v calls=%d err=%v", models, calls, err)
+	}
+}
+
+func TestKiroManagementDiscoveryFallback(t *testing.T) {
+	var urls []string
+	withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+		urls = append(urls, req.URL.String())
+		raw, _ := io.ReadAll(req.Body)
+		if strings.Contains(req.URL.Host, "management.") {
+			if req.Method != http.MethodPost || req.URL.Path != "/" || req.URL.RawQuery != "" {
+				t.Fatalf("management method/path/query = %s %s %q", req.Method, req.URL.Path, req.URL.RawQuery)
+			}
+			if !strings.Contains(string(raw), `"origin":"AI_EDITOR"`) || !strings.Contains(string(raw), `"profileArn":"arn:from-auth"`) {
+				t.Fatalf("management body = %s", raw)
+			}
+			if req.Header.Get("X-Amz-Target") != kiroManagementTarget || req.Header.Get("Content-Type") != kiroCatalogJSONType {
+				t.Fatalf("management headers = %v", req.Header)
+			}
+			if req.Header.Get("TokenType") != "SSO_OIDC" || len(req.Header.Values("TokenType")) != 1 {
+				t.Fatalf("token type = %#v", req.Header.Values("TokenType"))
+			}
+			return kiroJSONResponse(http.StatusNotFound, `{}`), nil
+		}
+		if req.Method != http.MethodPost || req.URL.String() != "https://catalog.example/" || !strings.Contains(string(raw), "arn:from-auth") {
+			t.Fatalf("legacy fallback = %s %s body=%s", req.Method, req.URL, raw)
+		}
+		return kiroJSONResponse(http.StatusOK, `{"models":[{"modelId":"legacy-model"}]}`), nil
+	})
+	p := kiroProbeProvider()
+	p.OAuthCreds = &domain.OAuthCreds{KiroAuth: "builder-id", KiroIDP: "BuilderId", KiroDiscovery: "management", ProfileArn: "arn:from-auth", Region: "eu-central-1"}
+	models, err := queryKiroModels(context.Background(), nil, p)
+	if err != nil || len(models) != 1 || models[0] != "legacy-model" {
+		t.Fatalf("models=%v err=%v urls=%v", models, err, urls)
+	}
+	if len(urls) != 2 || urls[0] != "https://management.eu-central-1.kiro.dev/" {
+		t.Fatalf("urls = %v", urls)
+	}
+}
+
+func TestKiroManagementAuthDoesNotFallBack(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusBadRequest} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			hits := 0
+			withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+				hits++
+				return kiroJSONResponse(status, `{}`), nil
+			})
+			p := kiroProbeProvider()
+			p.OAuthCreds = &domain.OAuthCreds{KiroDiscovery: "management", Region: "us-east-1"}
+			_, err := queryKiroModels(context.Background(), nil, p)
+			if hits != 1 || kiroCatalogAuthStatus(err) == 0 && status != http.StatusBadRequest {
+				t.Fatalf("hits=%d err=%v", hits, err)
+			}
+			if status == http.StatusBadRequest && !errors.As(err, new(*kiroCatalogStatusError)) {
+				t.Fatalf("400 was swallowed: %v", err)
+			}
+		})
 	}
 }
 

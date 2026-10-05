@@ -63,7 +63,14 @@ func refreshKiro(ctx context.Context, c *domain.OAuthCreds, now time.Time) error
 	headers := map[string]string{"Content-Type": "application/json", "Accept": "application/json"}
 
 	if c.ClientID != "" && c.ClientSecret != "" {
-		url = kiroOIDCTokenURL(c.Region)
+		// Validate before URL construction and before any transport call. A
+		// malformed region must not silently fall back or carry the client secret
+		// to another host. Blank still resolves to us-east-1.
+		region, err := validateKiroRegion(strings.TrimSpace(c.Region))
+		if err != nil {
+			return err
+		}
+		url = kiroOIDCTokenURL(region)
 		body, _ = json.Marshal(map[string]string{
 			"clientId":     c.ClientID,
 			"clientSecret": c.ClientSecret,

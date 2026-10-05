@@ -257,8 +257,8 @@ func TestFetchKiroGETAndPOSTFallback(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "getUsageLimits") {
 			sawGET.Store(true)
-			if r.Header.Get("tokentype") != "API_KEY" {
-				t.Errorf("missing tokentype on GET")
+			if r.Header.Get("TokenType") != "API_KEY" || len(r.Header.Values("TokenType")) != 1 {
+				t.Errorf("token type = %#v", r.Header.Values("TokenType"))
 			}
 			http.Error(w, "nope", http.StatusNotFound)
 			return
@@ -358,6 +358,45 @@ func TestFetchKiroGETSuccess(t *testing.T) {
 	}
 	if len(rep.Quotas) != 1 || rep.Quotas[0].Remaining != 8 {
 		t.Fatalf("quotas = %+v", rep.Quotas)
+	}
+}
+
+func TestFetchKiroPrimaryQueryProfileArn(t *testing.T) {
+	arn := "arn:aws:codewhisperer:eu-central-1:1:profile/A B&C"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s", r.Method)
+		}
+		if got := r.URL.Query().Get("profileArn"); got != arn {
+			t.Fatalf("profileArn = %q query=%s", got, r.URL.RawQuery)
+		}
+		if strings.Count(r.URL.RawQuery, "profileArn=") != 1 || !strings.Contains(r.URL.RawQuery, "profile%2FA+B%26C") {
+			t.Fatalf("query escaped more than once: %s", r.URL.RawQuery)
+		}
+		_, _ = io.WriteString(w, `{"usageBreakdownList":[{"resourceType":"CREDIT","currentUsageWithPrecision":1,"usageLimitWithPrecision":2}]}`)
+	}))
+	t.Cleanup(up.Close)
+	prev, prevQ := KiroUsageBase, KiroQUsageBase
+	KiroUsageBase, KiroQUsageBase = up.URL, "http://127.0.0.1:1"
+	t.Cleanup(func() { KiroUsageBase, KiroQUsageBase = prev, prevQ })
+	p := oauthProvider(11, domain.ProtocolKiro, "tok")
+	p.OAuthCreds.ProfileArn = arn
+	svc := testSvc(t, &stubResolver{token: "tok"})
+	if _, err := svc.Fetch(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.URL.Query()["profileArn"]; ok {
+			t.Fatalf("empty profile sent: %s", r.URL.RawQuery)
+		}
+		_, _ = io.WriteString(w, `{"usageBreakdownList":[]}`)
+	}))
+	t.Cleanup(empty.Close)
+	KiroUsageBase = empty.URL
+	api := &domain.Provider{ID: 12, Protocol: domain.ProtocolKiro, AuthMethod: domain.AuthAPIKey, APIKey: "key", OAuthCreds: &domain.OAuthCreds{}}
+	if _, err := testSvc(t, nil).Fetch(context.Background(), api); err != nil {
+		t.Fatal(err)
 	}
 }
 

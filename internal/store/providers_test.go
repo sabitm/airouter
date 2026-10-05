@@ -209,6 +209,83 @@ func TestExportImportOAuthRoundTrip(t *testing.T) {
 	}
 }
 
+func TestExportImportKiroAPIKeyConfigRoundTrip(t *testing.T) {
+	src := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "kiro-key", BaseURL: "https://codewhisperer.example", APIKey: "key-1",
+		Protocol: domain.ProtocolKiro, AuthMethod: domain.AuthAPIKey, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{
+			AccessToken: "stale-access", RefreshToken: "stale-refresh", IDToken: "stale-id",
+			ClientSecret: "stale-secret", ClientID: "stale-client", TokenURL: "https://evil.example/token",
+			ProfileArn: "arn:aws:codewhisperer:eu-central-1:1:profile/A", Region: "eu-central-1",
+			KiroAuth: "builder-id", KiroIDP: "BuilderId", KiroContentOptOut: true,
+			KiroAgentMode: "spec", KiroTransport: "runtime", KiroDiscovery: "management",
+		},
+	}
+	if err := src.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := src.Export(ctx, &buf); err != nil {
+		t.Fatal(err)
+	}
+	exported := buf.String()
+	for _, secret := range []string{"stale-access", "stale-refresh", "stale-id", "stale-secret", "stale-client", "evil.example"} {
+		if strings.Contains(exported, secret) {
+			t.Fatalf("export leaked %s: %s", secret, exported)
+		}
+	}
+	dst := testStore(t)
+	if _, err := dst.Import(ctx, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.GetProvider(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Method() != domain.AuthAPIKey || got.APIKey != "key-1" || got.OAuthCreds == nil {
+		t.Fatalf("imported = %+v creds=%+v", got, got.OAuthCreds)
+	}
+	c := got.OAuthCreds
+	if c.ProfileArn != p.OAuthCreds.ProfileArn || c.Region != "eu-central-1" || c.KiroAuth != "builder-id" ||
+		c.KiroIDP != "BuilderId" || !c.KiroContentOptOut || c.KiroAgentMode != "spec" ||
+		c.KiroTransport != "runtime" || c.KiroDiscovery != "management" {
+		t.Fatalf("config = %+v", c)
+	}
+	if c.AccessToken != "" || c.RefreshToken != "" || c.IDToken != "" || c.ClientSecret != "" || c.ClientID != "" || c.TokenURL != "" {
+		t.Fatalf("sanitized config kept credentials: %+v", c)
+	}
+
+	var again bytes.Buffer
+	if err := dst.Export(ctx, &again); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(again.String(), "stale-") {
+		t.Fatalf("second export leaked stale credentials: %s", again.String())
+	}
+}
+
+func TestImportLegacyAPIKeyKiroWithoutConfig(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	const cfg = `{
+		"version": 1,
+		"providers": [{"name":"old","base_url":"https://codewhisperer.example","api_key":"key-1","protocol":"kiro","auth_method":"apikey"}],
+		"combos": []
+	}`
+	if _, err := st.Import(ctx, bytes.NewReader([]byte(cfg))); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetProvider(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Method() != domain.AuthAPIKey || got.APIKey != "key-1" || got.OAuthCreds != nil {
+		t.Fatalf("legacy import = %+v creds=%+v", got, got.OAuthCreds)
+	}
+}
+
 // TestImportOAuthMissingCreds skips an oauth method with no oauth block and
 // records the row in ImportSummary.Failures without aborting the import.
 func TestImportOAuthMissingCreds(t *testing.T) {

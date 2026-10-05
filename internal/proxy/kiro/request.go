@@ -15,6 +15,46 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	return EncodeRequestWithProfile(req, "")
 }
 
+// EncodeRuntimeRequest renders the IR as a Kiro Runtime
+// GenerateAssistantResponse body. It does not emit inferenceConfig: that field
+// is absent from the official request schema. Profile and agent mode stay absent
+// here and are injected only from explicit provider config at preparation.
+//
+// systemPrompt is optional and is not used. Official extraction is gated by
+// system_field_injection, whose default is false, so the system text is folded
+// into the first user turn. Temperature, max tokens, and thinking are not mapped
+// into additionalModelRequestFields because this pass has no live model schema.
+// Continuation IDs and reasoningContent need trusted binding this IR does not
+// carry, so they stay omitted.
+func EncodeRuntimeRequest(req *ir.Request) ([]byte, error) {
+	return encodeRuntimeRequest(req, "", "")
+}
+
+// InjectRuntimeAgentMode sets agentMode on an already-encoded Runtime body when
+// mode is one of the explicit IDE values. A blank or unknown mode stays absent.
+// The same value is sent as the agent-mode header. Legacy bodies are not passed
+// here.
+func InjectRuntimeAgentMode(body []byte, mode string) []byte {
+	mode = agentMode(mode)
+	if mode == "" {
+		return body
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil || m == nil {
+		return body
+	}
+	raw, err := json.Marshal(mode)
+	if err != nil {
+		return body
+	}
+	m["agentMode"] = raw
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // InjectProfileArn sets profileArn on an already-encoded Kiro request body. A
 // blank arn is left absent (never a shared default: a wrong-account default ARN
 // yields a 403). Returns the body unchanged if it is not a JSON object.
@@ -43,31 +83,27 @@ func InjectProfileArn(body []byte, arn string) []byte {
 // field, which is correct for the auth methods this MVP supports (no shared
 // default ARN is ever substituted, since a wrong-account default yields 403).
 func EncodeRequestWithProfile(req *ir.Request, profileArn string) ([]byte, error) {
-	// Guards must run before conversion: they rewrite tool blocks into plain text
-	// to avoid Kiro's HTTP 400 on inconsistent tool state.
-	msgs := reconcileOrphanedToolResults(req.Messages)
-	if len(req.Tools) == 0 {
-		msgs = flattenToolInteractions(msgs)
-	}
-
-	turns := buildTurns(msgs, req.System)
-	// Built after the tool-state guards. The catalog is local to this encode and
-	// is not written back onto req, so repeated encodes cannot accumulate suffixes.
+	// The catalog is local to this encode and is not written back onto req.
+	// History uses the same map, so repeated encodes cannot accumulate suffixes.
 	catalog := buildToolCatalog(req.Tools)
+	msgs := prepareMessages(req.Messages, catalog)
+	turns := buildTurns(msgs, req.System)
 	state := cwConversationState{
 		ChatTriggerType: "MANUAL",
 		ConversationID:  ir.NewID("conv_"),
 	}
 
 	// The last user turn is the current message; everything before it is history.
-	// A trailing assistant turn (prefill) has no place in the CodeWhisperer shape
-	// and is dropped. A request with no user turn still carries declared tools on
-	// the synthesized current message.
+	// A trailing assistant turn has no place in the CodeWhisperer shape, so a
+	// non-empty current user turn is synthesized instead of dropping the history.
 	curIdx := lastUserTurn(turns)
-	if curIdx < 0 {
-		cur := &cwUserInputMessage{Content: "", Origin: "AI_EDITOR"}
+	if curIdx < 0 || curIdx != len(turns)-1 {
+		cur := &cwUserInputMessage{Content: emptyUserContent, Origin: "AI_EDITOR", ModelID: req.Model}
 		applyToolCatalog(cur, catalog)
 		state.CurrentMessage = cwMessage{UserInputMessage: cur}
+		for i := 0; i < len(turns); i++ {
+			state.History = append(state.History, turns[i].history())
+		}
 	} else {
 		for i := 0; i < curIdx; i++ {
 			state.History = append(state.History, turns[i].history())
@@ -78,7 +114,7 @@ func EncodeRequestWithProfile(req *ir.Request, profileArn string) ([]byte, error
 		applyToolCatalog(cur, catalog)
 		state.CurrentMessage = cwMessage{UserInputMessage: cur}
 	}
-	rewriteHistoryToolNames(state.History, catalog)
+	ensureCurrentContent(state.CurrentMessage.UserInputMessage)
 
 	out := cwRequest{
 		ConversationState: state,
@@ -90,6 +126,56 @@ func EncodeRequestWithProfile(req *ir.Request, profileArn string) ([]byte, error
 		},
 	}
 	return json.Marshal(out)
+}
+
+// encodeRuntimeRequest shares the legacy turn construction, then stamps model
+// and origin on every user turn. A fresh conversation id is also used as
+// rootConversationId, matching the observed fresh-conversation builder. No
+// cross-request identity is stored.
+func encodeRuntimeRequest(req *ir.Request, profileArn, agentModeValue string) ([]byte, error) {
+	catalog := buildToolCatalog(req.Tools)
+	msgs := prepareMessages(req.Messages, catalog)
+	turns := buildTurns(msgs, req.System)
+	conversationID := ir.NewID("conv_")
+	state := rtConversationState{
+		ChatTriggerType:    "MANUAL",
+		ConversationID:     conversationID,
+		RootConversationID: conversationID,
+	}
+	curIdx := lastUserTurn(turns)
+	if curIdx < 0 || curIdx != len(turns)-1 {
+		cur := &cwUserInputMessage{Content: emptyUserContent, Origin: runtimeOrigin, ModelID: req.Model}
+		applyToolCatalog(cur, catalog)
+		state.CurrentMessage = cwMessage{UserInputMessage: cur}
+		for i := 0; i < len(turns); i++ {
+			state.History = append(state.History, stampRuntimeHistory(turns[i], req.Model))
+		}
+	} else {
+		for i := 0; i < curIdx; i++ {
+			state.History = append(state.History, stampRuntimeHistory(turns[i], req.Model))
+		}
+		cur := turns[curIdx].user
+		cur.Origin = runtimeOrigin
+		cur.ModelID = req.Model
+		applyToolCatalog(cur, catalog)
+		state.CurrentMessage = cwMessage{UserInputMessage: cur}
+	}
+	ensureCurrentContent(state.CurrentMessage.UserInputMessage)
+	out := rtRequest{
+		ConversationState: state,
+		ProfileArn:        profileArn,
+		AgentMode:         agentMode(agentModeValue),
+	}
+	return json.Marshal(out)
+}
+
+func stampRuntimeHistory(t turn, model string) cwHistory {
+	h := t.history()
+	if h.UserInputMessage != nil {
+		h.UserInputMessage.ModelID = model
+		h.UserInputMessage.Origin = runtimeOrigin
+	}
+	return h
 }
 
 // turn is one merged conversation turn in the IR order, already converted to the
@@ -150,9 +236,18 @@ func buildTurns(msgs []ir.Message, system string) []turn {
 	}
 
 	// System prompt with no user turn to attach to: emit a lone user turn so it is
-	// not lost.
+	// not lost. An assistant-only history therefore starts with that user turn.
 	if systemPending != "" {
-		turns = append(turns, turn{user: &cwUserInputMessage{Content: systemPending}})
+		if len(turns) == 0 || turns[0].user == nil {
+			turns = append([]turn{{user: &cwUserInputMessage{Content: systemPending}}}, turns...)
+		} else {
+			turns[0].user.Content = joinContent(systemPending, turns[0].user.Content)
+		}
+	}
+	for i := range turns {
+		if turns[i].user != nil {
+			ensureUserContent(turns[i].user)
+		}
 	}
 	return turns
 }
@@ -213,7 +308,11 @@ func buildAssistant(blocks []ir.ContentBlock) (content string, toolUses []cwTool
 			toolUses = append(toolUses, cwToolUse{ToolUseID: b.ToolID, Name: b.ToolName, Input: input})
 		}
 	}
-	return strings.Join(text, "\n"), toolUses
+	content = strings.Join(text, "\n")
+	if strings.TrimSpace(content) == "" {
+		content = emptyAssistantContent
+	}
+	return content, toolUses
 }
 
 func applyToolCatalog(cur *cwUserInputMessage, catalog toolCatalog) {
@@ -228,24 +327,19 @@ func applyToolCatalog(cur *cwUserInputMessage, catalog toolCatalog) {
 	cur.UserInputMessageContext = ctx
 }
 
-// rewriteHistoryToolNames cloaks assistant toolUses whose name matches a
-// declaration in this request. Unmatched historical calls stay unchanged.
-// Tool results are ID-only and are not rewritten.
-func rewriteHistoryToolNames(history []cwHistory, catalog toolCatalog) {
-	if catalog.empty() {
+func ensureUserContent(msg *cwUserInputMessage) {
+	if msg == nil || strings.TrimSpace(msg.Content) != "" {
 		return
 	}
-	for i := range history {
-		assistant := history[i].AssistantResponseMessage
-		if assistant == nil {
-			continue
-		}
-		for j := range assistant.ToolUses {
-			if wire, ok := catalog.toWire[assistant.ToolUses[j].Name]; ok {
-				assistant.ToolUses[j].Name = wire
-			}
-		}
+	if msg.UserInputMessageContext != nil && len(msg.UserInputMessageContext.ToolResults) > 0 {
+		msg.Content = toolResultsPlaceholder
+		return
 	}
+	msg.Content = emptyUserContent
+}
+
+func ensureCurrentContent(cur *cwUserInputMessage) {
+	ensureUserContent(cur)
 }
 
 // toolResultText collapses a tool_result's block content into plain text, the
