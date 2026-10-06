@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/harlog"
+	"airouter/internal/kirocatalog"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
@@ -39,6 +40,8 @@ type Handler struct {
 	logger *slog.Logger
 	// har is the process-wide capture controller shared with server middleware.
 	har *harlog.Controller
+	// kiroCatalog is the shared Kiro discovery service. Nil builds an isolated one.
+	kiroCatalog *kirocatalog.Service
 }
 
 // NewHandler builds the dashboard handler with its own oauth.Service. logger may
@@ -53,19 +56,30 @@ func NewHandler(s *store.Store, logger *slog.Logger, har *harlog.Controller) *Ha
 // matching NewHandler. Production injects the process-wide service so dashboard
 // probes coalesce with proxy refreshes.
 func NewHandlerWithOAuth(s *store.Store, logger *slog.Logger, har *harlog.Controller, oauthSvc *oauth.Service) *Handler {
+	return NewHandlerWithDeps(s, logger, har, oauthSvc, nil)
+}
+
+// NewHandlerWithDeps builds the dashboard handler with optional shared services.
+// A nil oauthSvc or catalog constructs an isolated service. Production injects
+// the process-wide services so dashboard and proxy share discovery and refresh.
+func NewHandlerWithDeps(s *store.Store, logger *slog.Logger, har *harlog.Controller, oauthSvc *oauth.Service, catalog *kirocatalog.Service) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if oauthSvc == nil {
 		oauthSvc = oauth.New(s)
 	}
+	if catalog == nil {
+		catalog = kirocatalog.New(nil)
+	}
 	return &Handler{
-		store:    s,
-		oauth:    oauthSvc,
-		usage:    usage.NewService(oauthSvc, logger.With("component", "usage"), nil),
-		sessions: newConnectSessions(),
-		logger:   logger,
-		har:      har,
+		store:       s,
+		oauth:       oauthSvc,
+		usage:       usage.NewService(oauthSvc, logger.With("component", "usage"), nil),
+		sessions:    newConnectSessions(),
+		logger:      logger,
+		har:         har,
+		kiroCatalog: catalog,
 	}
 }
 

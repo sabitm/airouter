@@ -321,8 +321,11 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
 	}
-	upstreamBody, err = p.prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
+	upstreamBody, err = p.prepareUpstreamRequestFor(ctx, backend, provider, req, upstreamBody)
 	if err != nil {
+		if kiroPrepareCanceled(ctx, backend, err) {
+			return callerCanceledResult()
+		}
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
 	var writeFrame func([]byte) error

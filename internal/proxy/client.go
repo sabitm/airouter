@@ -16,15 +16,18 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/harlog"
+	"airouter/internal/kirocatalog"
 	"airouter/internal/oauth"
 	"airouter/internal/observability"
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
+	"airouter/internal/proxy/thinking"
 )
 
 const (
@@ -72,13 +75,17 @@ func applyCodexHeaders(req *http.Request, provider *domain.Provider, ctx context
 // Other backends return the body unchanged. A non-nil error is terminal for the
 // attempt (e.g. Qoder model_config unknown).
 func (p *Proxy) prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain.Provider, body []byte) ([]byte, error) {
+	return p.prepareUpstreamRequestFor(ctx, backend, provider, nil, body)
+}
+
+func (p *Proxy) prepareUpstreamRequestFor(ctx context.Context, backend codec, provider *domain.Provider, req *ir.Request, body []byte) ([]byte, error) {
 	if p != nil && (backend.id == "opencode-chat" || backend.id == "opencode-responses") {
 		ctx = withOpencodeNonce(ctx, p.opencodeNonce)
 	}
-	return prepareUpstreamRequest(ctx, backend, provider, body)
+	return prepareUpstreamRequest(ctx, p, backend, provider, req, body)
 }
 
-func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain.Provider, body []byte) ([]byte, error) {
+func prepareUpstreamRequest(ctx context.Context, p *Proxy, backend codec, provider *domain.Provider, req *ir.Request, body []byte) ([]byte, error) {
 	switch backend.id {
 	case "oai-codex":
 		id := resolveCodexCacheKey(ctx, provider)
@@ -91,8 +98,16 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 		}
 		return body, nil
 	case "kiro":
+		body, err := p.applyKiroCapability(ctx, provider, req, body)
+		if err != nil {
+			return nil, err
+		}
 		return kiro.InjectProfileArn(body, kiro.ProfileArnForBody(kiro.IdentityFromProvider(provider))), nil
 	case "kiro-runtime":
+		body, err := p.applyKiroCapability(ctx, provider, req, body)
+		if err != nil {
+			return nil, err
+		}
 		id := kiro.IdentityFromProvider(provider)
 		body = kiro.InjectProfileArn(body, kiro.ProfileArnForBody(id))
 		return kiro.InjectRuntimeAgentMode(body, id.AgentMode), nil
@@ -133,6 +148,136 @@ func prepareUpstreamRequest(ctx context.Context, backend codec, provider *domain
 		return body, nil
 	default:
 		return body, nil
+	}
+}
+
+// applyKiroCapability resolves the live model schema and patches the encoded
+// envelope. Discovery uses the effective token before catalog HTTP. Catalog
+// failure omits controls and does not fail the attempt. A canceled caller
+// context stops before the chat send. The function does not mutate req or the
+// shared provider.
+func (p *Proxy) applyKiroCapability(ctx context.Context, provider *domain.Provider, req *ir.Request, body []byte) ([]byte, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if p == nil || p.kiroCatalog == nil || provider == nil || req == nil {
+		return body, nil
+	}
+	catalogProvider := kiroCatalogProvider(provider)
+	var refresh func(context.Context) (string, error)
+	if catalogProvider.Method() == domain.AuthOAuth && p.oauth != nil {
+		tok, err := p.resolveKiroCatalogToken(ctx, catalogProvider, false)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err != nil {
+			observability.Logger(ctx, p.logger).Debug("kiro_catalog_resolve_failed",
+				"event", "kiro_catalog_resolve_failed",
+				"provider", provider.Name,
+				"reason", "oauth_resolve_failed",
+			)
+			return body, nil
+		}
+		catalogProvider.APIKey = tok
+		refresh = func(refreshCtx context.Context) (string, error) {
+			forced, rerr := p.resolveKiroCatalogToken(refreshCtx, catalogProvider, true)
+			if rerr != nil {
+				observability.Logger(refreshCtx, p.logger).Debug("kiro_catalog_refresh_failed",
+					"event", "kiro_catalog_refresh_failed",
+					"provider", provider.Name,
+					"reason", "oauth_refresh_failed",
+				)
+			}
+			return forced, rerr
+		}
+	}
+	lookup, err := p.kiroCatalog.LookupWithRefresh(ctx, p.logger, catalogProvider, req.Model, refresh)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return body, nil
+	}
+	effort, effortSet, thinkingType, budget := kiroIntent(req.Thinking)
+	sel := kiro.ResolveSelection(lookup.Capability, effort, effortSet, thinkingType, budget)
+	if sel != nil && sel.BudgetIgnored {
+		observability.Logger(ctx, p.logger).Debug("kiro_budget_not_applied",
+			"event", "kiro_budget_not_applied",
+			"reason", "schema_has_no_budget",
+		)
+	}
+	if sel != nil && sel.EffortOmitted {
+		observability.Logger(ctx, p.logger).Debug("kiro_effort_omitted",
+			"event", "kiro_effort_omitted",
+			"reason", "filtered_enum_empty",
+		)
+	}
+	return kiro.ApplyAdditionalFields(body, sel), nil
+}
+
+func kiroPrepareCanceled(ctx context.Context, backend codec, err error) bool {
+	if err == nil || ctx == nil || ctx.Err() == nil {
+		return false
+	}
+	return backend.id == "kiro" || backend.id == "kiro-runtime"
+}
+
+func kiroCatalogProvider(p *domain.Provider) *domain.Provider {
+	if p == nil {
+		return nil
+	}
+	out := *p
+	if p.OAuthCreds != nil {
+		creds := *p.OAuthCreds
+		out.OAuthCreds = &creds
+	}
+	if p.Tags != nil {
+		out.Tags = append([]string(nil), p.Tags...)
+	}
+	return &out
+}
+
+// Resolve can read newer stored credentials. Validate both sides of that read
+// so discovery never combines a new account token with an old profile/config.
+func (p *Proxy) resolveKiroCatalogToken(ctx context.Context, probe *domain.Provider, force bool) (string, error) {
+	return kirocatalog.ResolveToken(ctx, p.oauth, p.store, probe, force)
+}
+
+func kiroIntent(t *ir.Thinking) (effort string, effortSet bool, thinkingType string, budget bool) {
+	cfg := thinking.FromIR(t)
+	if cfg == nil {
+		return "", false, "", false
+	}
+	if cfg.Effort == "none" || cfg.Effort == "off" {
+		thinkingType = kiro.ThinkingDisabled
+	}
+	switch cfg.Enable {
+	case thinking.EnableDisabled:
+		thinkingType = kiro.ThinkingDisabled
+	case thinking.EnableEnabled:
+		thinkingType = kiro.ThinkingAdaptive
+	}
+	budget = cfg.BudgetSet || cfg.Mode == thinking.ModeBudget || cfg.Budget > 0
+	if cfg.Effort != "" && cfg.Effort != "none" && cfg.Effort != "off" && cfg.Effort != "auto" {
+		return cfg.Effort, true, thinkingType, budget
+	}
+	switch cfg.Mode {
+	case thinking.ModeNone:
+		if thinkingType == "" {
+			thinkingType = kiro.ThinkingDisabled
+		}
+		return "", false, thinkingType, budget
+	case thinking.ModeAuto:
+		return "", false, thinkingType, budget
+	case thinking.ModeLevel:
+		return cfg.Level, cfg.Level != "", thinkingType, budget
+	case thinking.ModeBudget:
+		if thinkingType == "" {
+			thinkingType = kiro.ThinkingAdaptive
+		}
+		return "", false, thinkingType, budget
+	default:
+		return "", false, thinkingType, budget
 	}
 }
 

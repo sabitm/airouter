@@ -86,8 +86,16 @@ func TestFromAnthropicPriority(t *testing.T) {
 		t.Fatalf("output_config should win: %+v", cfg)
 	}
 	cfg = FromAnthropic("disabled", 0, "")
-	if cfg == nil || cfg.Mode != ModeNone {
+	if cfg == nil || cfg.Mode != ModeNone || cfg.Enable != EnableDisabled {
 		t.Fatalf("disabled: %+v", cfg)
+	}
+	cfg = FromAnthropic("disabled", 0, "xhigh")
+	if cfg == nil || cfg.Mode != ModeLevel || cfg.Level != "xhigh" || cfg.Enable != EnableDisabled {
+		t.Fatalf("typed effort lost disable: %+v", cfg)
+	}
+	none := FromOpenAIEffort("none")
+	if none == nil || none.Mode != ModeNone || none.Enable != EnableDisabled {
+		t.Fatalf("none enable: %+v", none)
 	}
 	cfg = FromAnthropic("enabled", 8192, "")
 	if cfg == nil || cfg.Mode != ModeBudget || cfg.Budget != 8192 {
@@ -103,6 +111,12 @@ func TestMerge(t *testing.T) {
 	}
 	if Merge(base, nil).Level != "low" {
 		t.Fatal("base")
+	}
+	disabled := &Config{Mode: ModeLevel, Level: "xhigh", Enable: EnableDisabled}
+	suffix := &Config{Mode: ModeLevel, Level: "high"}
+	merged := Merge(disabled, suffix)
+	if merged.Level != "high" || merged.Enable != EnableDisabled {
+		t.Fatalf("suffix lost disable: %+v", merged)
 	}
 }
 
@@ -319,6 +333,7 @@ func TestCapture(t *testing.T) {
 		{`{"thinking":{"type":"enabled","budget_tokens":4096}}`, ModeBudget, "", 4096},
 		{`{"thinking":{"type":"disabled"}}`, ModeNone, "", 0},
 		{`{"output_config":{"effort":"max"},"thinking":{"type":"adaptive"}}`, ModeLevel, "max", 0},
+		{`{"output_config":{"effort":"xhigh"},"thinking":{"type":"disabled"}}`, ModeLevel, "xhigh", 0},
 		{`{"enable_thinking":true,"thinking_budget":2048}`, ModeBudget, "", 2048},
 		{`{"enable_thinking":false}`, ModeNone, "", 0},
 		{`{"model":"x"}`, "", "", 0},
@@ -334,6 +349,30 @@ func TestCapture(t *testing.T) {
 		if cfg == nil || cfg.Mode != tc.mode || cfg.Level != tc.lvl || cfg.Budget != tc.bud {
 			t.Errorf("Capture(%s) = %+v", tc.body, cfg)
 		}
+	}
+	both := Capture([]byte(`{"output_config":{"effort":"xhigh"},"thinking":{"type":"disabled"}}`))
+	if both == nil || both.Mode != ModeLevel || both.Level != "xhigh" || both.Enable != EnableDisabled {
+		t.Fatalf("independent disable lost: %+v", both)
+	}
+	budget := Capture([]byte(`{"thinking":{"type":"enabled","budget_tokens":50}}`))
+	if budget == nil || budget.Mode != ModeBudget || budget.Budget != 50 || budget.Enable != EnableEnabled {
+		t.Fatalf("budget enable lost: %+v", budget)
+	}
+	disabledEffort := Capture([]byte(`{"reasoning_effort":"xhigh","thinking":{"type":"disabled"}}`))
+	if disabledEffort == nil || disabledEffort.Mode != ModeNone || disabledEffort.Effort != "xhigh" || disabledEffort.Enable != EnableDisabled {
+		t.Fatalf("reasoning_effort lost disable: %+v", disabledEffort)
+	}
+	reasoningDisabled := Capture([]byte(`{"reasoning":{"effort":"xhigh"},"thinking":{"type":"disabled"}}`))
+	if reasoningDisabled == nil || reasoningDisabled.Mode != ModeNone || reasoningDisabled.Effort != "xhigh" || reasoningDisabled.Enable != EnableDisabled {
+		t.Fatalf("reasoning.effort lost disable: %+v", reasoningDisabled)
+	}
+	none := Capture([]byte(`{"reasoning_effort":"none"}`))
+	if none == nil || none.Mode != ModeNone || none.Enable != EnableDisabled {
+		t.Fatalf("none enable lost: %+v", none)
+	}
+	bothBudget := Capture([]byte(`{"output_config":{"effort":"high"},"thinking":{"type":"enabled","budget_tokens":50}}`))
+	if bothBudget == nil || bothBudget.Mode != ModeLevel || bothBudget.Level != "high" || bothBudget.BudgetSet != true || bothBudget.Budget != 0 || bothBudget.Enable != EnableEnabled {
+		t.Fatalf("budget diagnostic lost when effort wins: %+v", bothBudget)
 	}
 }
 

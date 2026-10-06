@@ -117,12 +117,27 @@ const (
 	ThinkingBudget ThinkingMode = "budget"
 )
 
+// ThinkingEnable is an independent enable or disable request. It is absent
+// when the client did not state one. Intensity fields do not imply it.
+type ThinkingEnable string
+
+const (
+	ThinkingEnableUnset    ThinkingEnable = ""
+	ThinkingEnableEnabled  ThinkingEnable = "enabled"
+	ThinkingEnableDisabled ThinkingEnable = "disabled"
+)
+
 // Thinking captures request-side reasoning effort. Nil on Request means the
-// client expressed no intent; Mode none is an explicit disable.
+// client expressed no intent; Mode none is an explicit intensity disable.
+// Effort, Enable, and BudgetSet retain independent intent for schema-driven
+// consumers. Existing writers keep Mode, Level, and Budget precedence.
 type Thinking struct {
-	Mode   ThinkingMode
-	Level  string // minimal|low|medium|high|xhigh|max when Mode==level
-	Budget int    // token budget when Mode==budget
+	Mode      ThinkingMode
+	Level     string // minimal|low|medium|high|xhigh|max when Mode==level
+	Budget    int    // token budget when Mode==budget
+	Enable    ThinkingEnable
+	Effort    string
+	BudgetSet bool
 }
 
 type Request struct {

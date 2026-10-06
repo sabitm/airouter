@@ -35,6 +35,10 @@ func setupRuntimeKiro(t *testing.T, responses ...[]byte) (string, string, *store
 		hit := &atomic.Int32{}
 		hits = append(hits, hit)
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if kiroTestIsCatalog(r) {
+				kiroTestCatalog(w, "runtime-model")
+				return
+			}
 			hit.Add(1)
 			if r.Method != http.MethodPost || r.URL.Path != "/custom/" || r.URL.RawQuery != "" {
 				t.Errorf("Runtime method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
@@ -296,6 +300,11 @@ func setupRuntimeKiroBody(t *testing.T, saw *[]byte, response []byte) (string, s
 	st := newTestStore(t)
 	hit := &atomic.Int32{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"models":[{"modelId":"runtime-model"}]}`)
+			return
+		}
 		hit.Add(1)
 		raw, _ := io.ReadAll(r.Body)
 		*saw = append([]byte(nil), raw...)

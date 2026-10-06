@@ -12,10 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/kirocatalog"
 	"airouter/internal/observability"
 	"airouter/internal/proxy/kiro"
 )
@@ -28,9 +30,10 @@ func (f kiroRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) 
 
 func withKiroCatalogTransport(t *testing.T, fn kiroRoundTripFunc) {
 	t.Helper()
-	previous := kiroCatalogClient
-	kiroCatalogClient = &http.Client{Transport: fn}
-	t.Cleanup(func() { kiroCatalogClient = previous })
+	previous := kirocatalog.CurrentDefaultHTTPClient()
+	fake := &http.Client{Transport: fn}
+	kirocatalog.SetDefaultHTTPClient(fake)
+	t.Cleanup(func() { kirocatalog.SetDefaultHTTPClient(previous) })
 }
 
 // OAuth's default client resolves its transport at send time. These tests run
@@ -62,6 +65,35 @@ func kiroJSONResponse(status int, body string) *http.Response {
 		Header:        make(http.Header),
 		Body:          io.NopCloser(strings.NewReader(body)),
 		ContentLength: int64(len(body)),
+	}
+}
+
+func TestDashboardDiscoveryPopulatesSharedService(t *testing.T) {
+	var hits atomic.Int32
+	withKiroCatalogTransport(t, func(req *http.Request) (*http.Response, error) {
+		hits.Add(1)
+		return kiroJSONResponse(http.StatusOK, `{"models":[{"modelId":"shared","additionalModelRequestFieldsSchema":{"properties":{"output_config":{"properties":{"effort":{"enum":["low","high"],"default":"low"}}}}}}]}`), nil
+	})
+	st := newWebTestStore(t)
+	p := &domain.Provider{Name: "k", BaseURL: "https://catalog.example", APIKey: "k", Protocol: domain.ProtocolKiro, AuthMethod: domain.AuthAPIKey}
+	if err := st.CreateProvider(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	catalog := kirocatalog.New(nil)
+	h := NewHandlerWithDeps(st, nil, nil, nil, catalog)
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/providers/models?provider_id=1", nil)
+	rec := httptest.NewRecorder()
+	h.providerModels(rec, req)
+	if rec.Code != http.StatusOK || hits.Load() != 1 || !strings.Contains(rec.Body.String(), "shared") {
+		t.Fatalf("status=%d hits=%d body=%s", rec.Code, hits.Load(), rec.Body.String())
+	}
+	models, err := catalog.Models(context.Background(), nil, p)
+	if err != nil || hits.Load() != 1 || len(models) != 1 || models[0].Capability == nil {
+		t.Fatalf("shared cache not populated models=%v hits=%d err=%v", models, hits.Load(), err)
+	}
+	ok, msg := h.checkKiroUpstream(context.Background(), p, nil)
+	if !ok || hits.Load() != 2 || !strings.Contains(msg, "catalog access confirmed") {
+		t.Fatalf("check used cache ok=%v hits=%d msg=%s", ok, hits.Load(), msg)
 	}
 }
 

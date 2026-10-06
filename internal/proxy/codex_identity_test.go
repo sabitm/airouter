@@ -322,7 +322,7 @@ func TestCodexPrepareBodyMatchesSessionHeader(t *testing.T) {
 	h.Set("session_id", "client-sess")
 	trace := &TraceInfo{}
 	ctx := WithTraceInfo(withCodexRequest(context.Background(), "tenant-hash", h, nil), trace)
-	body, err := prepareUpstreamRequest(ctx, codexCodec, p, []byte(`{"model":"gpt-5.3-codex","input":[]}`))
+	body, err := prepareUpstreamRequest(ctx, nil, codexCodec, p, nil, []byte(`{"model":"gpt-5.3-codex","input":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +347,7 @@ func TestCodexPrepareBodyMatchesSessionHeader(t *testing.T) {
 func TestCodexPreparePreservesToolSchemaNumbersAndPairsTrace(t *testing.T) {
 	trace := &TraceInfo{}
 	body := []byte(`{"model":"gpt-5.3-codex","tools":[{"parameters":{"maximum":9007199254740993,"huge":1e400}}]}`)
-	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), codexCodec, &domain.Provider{}, body)
+	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), nil, codexCodec, &domain.Provider{}, nil, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestCodexPreparePreservesToolSchemaNumbersAndPairsTrace(t *testing.T) {
 
 func TestCodexPrepareInjectionFailureLeavesTraceUnset(t *testing.T) {
 	trace := &TraceInfo{}
-	_, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), codexCodec, &domain.Provider{}, []byte("not json"))
+	_, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), nil, codexCodec, &domain.Provider{}, nil, []byte("not json"))
 	if err == nil {
 		t.Fatal("expected injection error")
 	}
@@ -584,7 +584,7 @@ func TestCodexHTTPFailoverProviderScopedKeys(t *testing.T) {
 }
 
 func TestCodexPrepareWithoutCaptureStillNonempty(t *testing.T) {
-	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), codexCodec, &domain.Provider{}, []byte(`{"model":"gpt-5.3-codex","input":[]}`))
+	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), nil, codexCodec, &domain.Provider{}, nil, []byte(`{"model":"gpt-5.3-codex","input":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}

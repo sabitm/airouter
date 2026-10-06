@@ -49,6 +49,20 @@ func buildKiroFrame(eventType string, payload string) []byte {
 	return msg.Bytes()
 }
 
+func kiroTestIsCatalog(r *http.Request) bool {
+	target := r.Header.Get("X-Amz-Target")
+	return strings.Contains(target, "ListAvailableModels")
+}
+
+func kiroTestCatalog(w http.ResponseWriter, model string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if model == "" {
+		model = "m"
+	}
+	_, _ = io.WriteString(w, `{"models":[{"modelId":"`+model+`","additionalModelRequestFieldsSchema":{"type":"object","properties":{"output_config":{"type":"object","properties":{"effort":{"enum":["low","medium","high","xhigh"],"default":"medium"}}},"thinking":{"type":"object","properties":{"type":{"enum":["disabled","adaptive"],"default":"adaptive"}}}}}}]}`)
+}
+
 func kiroTextStream() []byte {
 	var buf bytes.Buffer
 	buf.Write(buildKiroFrame("assistantResponseEvent", `{"content":"Hello "}`))
@@ -73,6 +87,10 @@ func setupKiro(t *testing.T, upstreamBody []byte, captured *kiroCapture) (string
 	ctx := context.Background()
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "claude-sonnet-4.5")
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		if captured != nil {
 			captured.path = r.URL.Path
@@ -189,6 +207,10 @@ func TestKiroStreamTranslate(t *testing.T) {
 func TestKiroTruncatedStreamFailover(t *testing.T) {
 	var n1, n2 int
 	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "m1")
+			return
+		}
 		n1++
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 		w.WriteHeader(http.StatusOK)
@@ -201,6 +223,10 @@ func TestKiroTruncatedStreamFailover(t *testing.T) {
 	}))
 	t.Cleanup(up1.Close)
 	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "m2")
+			return
+		}
 		n2++
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 		w.WriteHeader(http.StatusOK)
@@ -275,6 +301,10 @@ func TestKiroRuntimeTransportHeadersAndFailover(t *testing.T) {
 	var bodies [][]byte
 	handler := func(name string, body []byte, failAfter bool) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
+			if kiroTestIsCatalog(r) {
+				kiroTestCatalog(w, "m")
+				return
+			}
 			raw, _ := io.ReadAll(r.Body)
 			hits = append(hits, name+" "+r.URL.Path)
 			headers = append(headers, r.Header.Clone())
@@ -347,6 +377,10 @@ func TestKiroRuntimeTransportHeadersAndFailover(t *testing.T) {
 
 	var committedHits int
 	committed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "m")
+			return
+		}
 		committedHits++
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 		w.WriteHeader(http.StatusOK)
@@ -356,6 +390,10 @@ func TestKiroRuntimeTransportHeadersAndFailover(t *testing.T) {
 	}))
 	t.Cleanup(committed.Close)
 	next := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "m")
+			return
+		}
 		t.Errorf("failover after commitment")
 	}))
 	t.Cleanup(next.Close)
@@ -577,6 +615,10 @@ func TestKiroToolCloakFailover(t *testing.T) {
 	good := kiroToolStream("call_9", "lookup", `{"id":1}`)
 	var n1, n2 int
 	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "m1")
+			return
+		}
 		n1++
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 		w.WriteHeader(http.StatusOK)
@@ -585,6 +627,10 @@ func TestKiroToolCloakFailover(t *testing.T) {
 	}))
 	t.Cleanup(up1.Close)
 	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "m2")
+			return
+		}
 		n2++
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 		w.WriteHeader(http.StatusOK)
@@ -638,6 +684,10 @@ func TestKiroToolCloakFailover(t *testing.T) {
 func TestKiroToolCloakPostCommitNoFailover(t *testing.T) {
 	var n1, n2 int
 	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "m1")
+			return
+		}
 		n1++
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 		w.WriteHeader(http.StatusOK)
@@ -647,6 +697,10 @@ func TestKiroToolCloakPostCommitNoFailover(t *testing.T) {
 	}))
 	t.Cleanup(up1.Close)
 	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "m2")
+			return
+		}
 		n2++
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 		w.WriteHeader(http.StatusOK)
@@ -702,6 +756,10 @@ func TestKiroToolCloakUnaryDoesNotReturnPartial(t *testing.T) {
 	for i := range servers {
 		i := i
 		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if kiroTestIsCatalog(r) {
+				kiroTestCatalog(w, "m")
+				return
+			}
 			hits[i]++
 			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 			w.WriteHeader(http.StatusOK)
@@ -828,6 +886,10 @@ func setupKiroMethod(t *testing.T, upstreamBody []byte, captured *kiroCapture, m
 	st := newTestStore(t)
 	ctx := context.Background()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kiroTestIsCatalog(r) {
+			kiroTestCatalog(w, "claude-sonnet-4.5")
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		if captured != nil {
 			captured.path = r.URL.Path

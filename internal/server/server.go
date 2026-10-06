@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/harlog"
+	"airouter/internal/kirocatalog"
 	"airouter/internal/oauth"
 	"airouter/internal/observability"
 	"airouter/internal/proxy"
@@ -46,10 +47,11 @@ func New(s *store.Store, logger *slog.Logger, harFile, creatorVersion string, di
 	// One process-wide oauth.Service so proxy requests and dashboard probes
 	// coalesce token-endpoint refreshes instead of racing a rotating refresh token.
 	oauthSvc := oauth.New(s)
+	catalog := kirocatalog.New(nil)
 	if !disableDashboard {
-		web.NewHandlerWithOAuth(s, logger.With("component", "web"), har, oauthSvc).Mount(mux)
+		web.NewHandlerWithDeps(s, logger.With("component", "web"), har, oauthSvc, catalog).Mount(mux)
 	}
-	proxy.NewWithOAuth(s, logger.With("component", "proxy"), oauthSvc).Mount(mux)
+	proxy.NewWithDeps(s, logger.With("component", "proxy"), oauthSvc, catalog).Mount(mux)
 	srv := &Server{mux: mux, logger: httpLog, har: har}
 	mux.HandleFunc("GET /debug/har", srv.handleHAR)
 	return srv

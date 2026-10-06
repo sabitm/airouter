@@ -29,7 +29,7 @@ func TestCodexEncodeRequestEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err = prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), codexCodec, &domain.Provider{}, body)
+	body, err = prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), nil, codexCodec, &domain.Provider{}, nil, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestApplyAntigravityHeadersAndProject(t *testing.T) {
 			ProjectID:       "proj-1",
 		},
 	}
-	body, err = prepareUpstreamRequest(context.Background(), antigravityCodec, provider, body)
+	body, err = prepareUpstreamRequest(context.Background(), nil, antigravityCodec, provider, nil, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestApplyAntigravityHeadersAndProject(t *testing.T) {
 
 	// Missing project is terminal.
 	provider.OAuthCreds.ProjectID = ""
-	if _, err := prepareUpstreamRequest(context.Background(), antigravityCodec, provider, body); err == nil {
+	if _, err := prepareUpstreamRequest(context.Background(), nil, antigravityCodec, provider, nil, body); err == nil {
 		t.Fatal("expected missing project error")
 	}
 }
@@ -389,7 +389,7 @@ func TestCodexFinalizeThenPreparePreservesNumbersAndPairsTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	trace := &TraceInfo{}
-	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), codexCodec, provider, body)
+	out, err := prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), nil, codexCodec, provider, nil, body)
 	if err != nil {
 		t.Fatal(err)
 	}

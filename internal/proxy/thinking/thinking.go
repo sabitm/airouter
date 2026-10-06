@@ -21,13 +21,27 @@ const (
 	ModeBudget Mode = "budget"
 )
 
+// Enable is an independent thinking enablement request. Unset means the
+// client did not state one. It is not inferred from Mode or Level.
+type Enable string
+
+const (
+	EnableUnset    Enable = ""
+	EnableEnabled  Enable = "enabled"
+	EnableDisabled Enable = "disabled"
+)
+
 // Config is the package-local intent; convertible to/from ir.Thinking.
-// Intent is intensity-only: no source dialect is attached. The target provider
-// controls the outgoing dialect.
+// Mode, Level, and Budget remain the intensity intent used by existing writers.
+// Effort, Enable, and BudgetSet are independent metadata for schema-driven
+// consumers. They do not change existing writers' intensity precedence.
 type Config struct {
-	Mode   Mode
-	Level  string
-	Budget int
+	Mode      Mode
+	Level     string
+	Budget    int
+	Enable    Enable
+	Effort    string
+	BudgetSet bool
 }
 
 // ToIR converts cfg to ir.Thinking. Nil in, nil out.
@@ -36,9 +50,12 @@ func ToIR(cfg *Config) *ir.Thinking {
 		return nil
 	}
 	return &ir.Thinking{
-		Mode:   ir.ThinkingMode(cfg.Mode),
-		Level:  cfg.Level,
-		Budget: cfg.Budget,
+		Mode:      ir.ThinkingMode(cfg.Mode),
+		Level:     cfg.Level,
+		Budget:    cfg.Budget,
+		Enable:    ir.ThinkingEnable(cfg.Enable),
+		Effort:    cfg.Effort,
+		BudgetSet: cfg.BudgetSet,
 	}
 }
 
@@ -48,18 +65,31 @@ func FromIR(t *ir.Thinking) *Config {
 		return nil
 	}
 	return &Config{
-		Mode:   Mode(t.Mode),
-		Level:  t.Level,
-		Budget: t.Budget,
+		Mode:      Mode(t.Mode),
+		Level:     t.Level,
+		Budget:    t.Budget,
+		Enable:    Enable(t.Enable),
+		Effort:    t.Effort,
+		BudgetSet: t.BudgetSet,
 	}
 }
 
-// Merge returns override when set, otherwise base.
+// Merge returns override when set, otherwise base. A suffix override replaces
+// intensity but keeps an explicit body enablement state. Enablement is not
+// inferred from the override level.
 func Merge(base, override *Config) *Config {
-	if override != nil {
+	if override == nil {
+		return base
+	}
+	if base == nil {
 		return override
 	}
-	return base
+	out := *override
+	if out.Enable == EnableUnset {
+		out.Enable = base.Enable
+	}
+	out.BudgetSet = out.BudgetSet || base.BudgetSet || base.Mode == ModeBudget
+	return &out
 }
 
 // FromOpenAIEffort maps a reasoning_effort / reasoning.effort string.
@@ -70,15 +100,11 @@ func FromOpenAIEffort(effort string) *Config {
 	}
 	switch e {
 	case "none", "off":
-		return &Config{Mode: ModeNone}
+		return &Config{Mode: ModeNone, Enable: EnableDisabled}
 	case "auto":
 		return &Config{Mode: ModeAuto}
 	default:
-		if knownLevels[e] {
-			return &Config{Mode: ModeLevel, Level: e}
-		}
-		// Pass through unknown levels so encode can forward them.
-		return &Config{Mode: ModeLevel, Level: e}
+		return &Config{Mode: ModeLevel, Level: e, Effort: e}
 	}
 }
 
@@ -86,27 +112,35 @@ func FromOpenAIEffort(effort string) *Config {
 // output_config.effort wins over the thinking block (9router order).
 func FromAnthropic(thinkingType string, budgetTokens int, outputEffort string) *Config {
 	if e := strings.ToLower(strings.TrimSpace(outputEffort)); e != "" {
-		return FromOpenAIEffort(e)
+		cfg := FromOpenAIEffort(e)
+		if cfg != nil {
+			if enable := enableFromThinkingType(thinkingType); enable != EnableUnset {
+				cfg.Enable = enable
+			}
+			cfg.BudgetSet = budgetTokens > 0
+		}
+		return cfg
 	}
 	switch strings.ToLower(strings.TrimSpace(thinkingType)) {
 	case "":
 		return nil
 	case "disabled":
-		return &Config{Mode: ModeNone}
+		return &Config{Mode: ModeNone, Enable: EnableDisabled, BudgetSet: budgetTokens > 0}
 	case "adaptive", "enabled":
 		if budgetTokens > 0 {
-			return &Config{Mode: ModeBudget, Budget: budgetTokens}
+			return &Config{Mode: ModeBudget, Budget: budgetTokens, Enable: EnableEnabled, BudgetSet: true}
 		}
-		return &Config{Mode: ModeAuto}
+		return &Config{Mode: ModeAuto, Enable: EnableEnabled}
 	default:
 		return nil
 	}
 }
 
-// Capture extracts intensity-only thinking intent from a raw JSON body before
-// typed codecs drop unfamiliar fields. Recognizes reasoning_effort,
-// reasoning.effort, thinking.type/budget_tokens, output_config.effort,
-// enable_thinking, thinking_budget. Returns nil when no intent is present.
+// Capture extracts thinking intent from a raw JSON body before typed codecs
+// drop unfamiliar fields. Recognizes reasoning_effort, reasoning.effort,
+// thinking.type/budget_tokens, output_config.effort, enable_thinking, and
+// thinking_budget. Effort and explicit thinking.type are both retained.
+// Returns nil when no intent is present.
 func Capture(body []byte) *Config {
 	if len(body) == 0 {
 		return nil
@@ -123,64 +157,96 @@ func CaptureMap(m map[string]any) *Config {
 	if m == nil {
 		return nil
 	}
-
-	// Claude output_config.effort — priority over adaptive thinking.
-	if oc, ok := m["output_config"].(map[string]any); ok {
-		if e, ok := oc["effort"].(string); ok && strings.TrimSpace(e) != "" {
-			return FromOpenAIEffort(e)
+	cfg := captureIntensity(m)
+	if cfg == nil {
+		return nil
+	}
+	// Existing writers keep intensity precedence. Kiro consumes independent
+	// effort, enablement, and budget-presence metadata.
+	for _, effort := range []any{objectField(m, "output_config", "effort"), m["reasoning_effort"], objectField(m, "reasoning", "effort")} {
+		if value, ok := effort.(string); ok && strings.TrimSpace(value) != "" {
+			cfg.Effort = strings.ToLower(strings.TrimSpace(value))
+			break
 		}
 	}
-
-	// Claude / DeepSeek / ZAI thinking object.
-	if t, ok := m["thinking"].(map[string]any); ok {
-		typ, _ := t["type"].(string)
-		budget := 0
-		switch b := t["budget_tokens"].(type) {
-		case float64:
-			budget = int(b)
-		case json.Number:
-			if n, err := b.Int64(); err == nil {
-				budget = int(n)
-			}
+	if typ, ok := objectField(m, "thinking", "type").(string); ok {
+		if enable := enableFromThinkingType(typ); enable != EnableUnset {
+			cfg.Enable = enable
 		}
-		if cfg := FromAnthropic(typ, budget, ""); cfg != nil {
+	} else if enabled, ok := m["enable_thinking"].(bool); ok {
+		cfg.Enable = EnableDisabled
+		if enabled {
+			cfg.Enable = EnableEnabled
+		}
+	}
+	cfg.BudgetSet = numericField(objectField(m, "thinking", "budget_tokens")) || numericField(m["thinking_budget"])
+	return cfg
+}
+
+func captureIntensity(m map[string]any) *Config {
+	if effort, ok := objectField(m, "output_config", "effort").(string); ok && strings.TrimSpace(effort) != "" {
+		return FromOpenAIEffort(effort)
+	}
+	if typ, ok := objectField(m, "thinking", "type").(string); ok {
+		if cfg := FromAnthropic(typ, numberField(objectField(m, "thinking", "budget_tokens")), ""); cfg != nil {
 			return cfg
 		}
 	}
-
-	// OpenAI chat reasoning_effort.
-	if e, ok := m["reasoning_effort"].(string); ok && strings.TrimSpace(e) != "" {
-		return FromOpenAIEffort(e)
+	if effort, ok := m["reasoning_effort"].(string); ok && strings.TrimSpace(effort) != "" {
+		return FromOpenAIEffort(effort)
 	}
-
-	// OpenAI Responses / Codex reasoning.effort.
-	if r, ok := m["reasoning"].(map[string]any); ok {
-		if e, ok := r["effort"].(string); ok && strings.TrimSpace(e) != "" {
-			return FromOpenAIEffort(e)
-		}
+	if effort, ok := objectField(m, "reasoning", "effort").(string); ok && strings.TrimSpace(effort) != "" {
+		return FromOpenAIEffort(effort)
 	}
-
-	// Qwen enable_thinking + thinking_budget.
-	if et, ok := m["enable_thinking"].(bool); ok {
-		if !et {
-			return &Config{Mode: ModeNone}
+	if enabled, ok := m["enable_thinking"].(bool); ok {
+		if !enabled {
+			return &Config{Mode: ModeNone, Enable: EnableDisabled}
 		}
-		budget := 0
-		switch b := m["thinking_budget"].(type) {
-		case float64:
-			budget = int(b)
-		case json.Number:
-			if n, err := b.Int64(); err == nil {
-				budget = int(n)
-			}
+		if budget := numberField(m["thinking_budget"]); budget > 0 {
+			return &Config{Mode: ModeBudget, Budget: budget, Enable: EnableEnabled}
 		}
-		if budget > 0 {
-			return &Config{Mode: ModeBudget, Budget: budget}
-		}
-		return &Config{Mode: ModeAuto}
+		return &Config{Mode: ModeAuto, Enable: EnableEnabled}
 	}
-
 	return nil
+}
+
+func objectField(m map[string]any, object, field string) any {
+	if value, ok := m[object].(map[string]any); ok {
+		return value[field]
+	}
+	return nil
+}
+
+func numericField(value any) bool {
+	switch value.(type) {
+	case float64, json.Number:
+		return true
+	default:
+		return false
+	}
+}
+
+func enableFromThinkingType(typ string) Enable {
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "disabled":
+		return EnableDisabled
+	case "adaptive", "enabled":
+		return EnableEnabled
+	default:
+		return EnableUnset
+	}
+}
+
+func numberField(v any) int {
+	switch b := v.(type) {
+	case float64:
+		return int(b)
+	case json.Number:
+		if n, err := b.Int64(); err == nil {
+			return int(n)
+		}
+	}
+	return 0
 }
 
 // Effective returns cfg after capability clamps. Nil when there is nothing to send.

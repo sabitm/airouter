@@ -34,7 +34,7 @@ func ParseSuffix(model string) (base string, cfg *Config) {
 	}
 	switch {
 	case raw == "none" || raw == "off":
-		return clean, &Config{Mode: ModeNone}
+		return clean, &Config{Mode: ModeNone, Enable: EnableDisabled}
 	case raw == "auto":
 		return clean, &Config{Mode: ModeAuto}
 	case isAllDigits(raw):

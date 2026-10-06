@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/kirocatalog"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/antigravity"
@@ -338,6 +339,8 @@ type Proxy struct {
 	client       *http.Client
 	streamClient *http.Client
 	logger       *slog.Logger
+	// kiroCatalog resolves live Kiro model capabilities. It is not a global cache.
+	kiroCatalog *kirocatalog.Service
 
 	// rr holds per-combo round-robin counters, keyed by combo id. In-memory only:
 	// the rotation resets on restart, which is acceptable for load spreading.
@@ -390,11 +393,21 @@ func New(s *store.Store, logger *slog.Logger) *Proxy {
 // oauthSvc constructs a new service from s, matching New. Production injects
 // the process-wide service so proxy and dashboard coalesce refreshes together.
 func NewWithOAuth(s *store.Store, logger *slog.Logger, oauthSvc *oauth.Service) *Proxy {
+	return NewWithDeps(s, logger, oauthSvc, nil)
+}
+
+// NewWithDeps builds a Proxy with optional shared services. A nil oauthSvc or
+// catalog constructs an isolated service, matching NewWithOAuth. Production
+// injects the process-wide services so proxy and dashboard share them.
+func NewWithDeps(s *store.Store, logger *slog.Logger, oauthSvc *oauth.Service, catalog *kirocatalog.Service) *Proxy {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if oauthSvc == nil {
 		oauthSvc = oauth.New(s)
+	}
+	if catalog == nil {
+		catalog = kirocatalog.New(nil)
 	}
 	nonce, err := newOpencodeNonce()
 	if err != nil {
@@ -406,6 +419,7 @@ func NewWithOAuth(s *store.Store, logger *slog.Logger, oauthSvc *oauth.Service) 
 		client:        &http.Client{Timeout: 5 * time.Minute},
 		streamClient:  &http.Client{},
 		logger:        logger,
+		kiroCatalog:   catalog,
 		rr:            map[int64]uint64{},
 		bo:            map[int64]*backoffState{},
 		opencodeNonce: nonce,

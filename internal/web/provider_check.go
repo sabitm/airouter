@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"airouter/internal/domain"
+	"airouter/internal/kirocatalog"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
@@ -83,7 +84,13 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		probe.AuthMethod = domain.AuthAPIKey
 		probe.OAuthCreds = kiroProbeCreds(r, existing)
 	}
-	ok, msg := checkUpstream(r.Context(), h.logger, probe)
+	var ok bool
+	var msg string
+	if proto == domain.ProtocolKiro {
+		ok, msg = h.checkKiroUpstream(r.Context(), probe, nil)
+	} else {
+		ok, msg = checkUpstream(r.Context(), h.logger, probe)
+	}
 	render(w, r, CheckResult(ok, msg))
 }
 
@@ -129,12 +136,21 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 		if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
 			probe.ID = id
 		}
-		tok, err := h.oauth.Resolve(r.Context(), probe, false)
+		var tok string
+		var err error
+		if proto == domain.ProtocolKiro {
+			tok, err = kirocatalog.ResolveToken(r.Context(), h.oauth, h.store, probe, false)
+		} else {
+			tok, err = h.oauth.Resolve(r.Context(), probe, false)
+		}
 		if err != nil {
 			if oauth.IsCursorNotRotatable(err) {
 				probe.APIKey = tok
 			} else if oauth.IsInvalidGrant(err) {
 				render(w, r, CheckResult(false, "token expired - reconnect required"))
+				return
+			} else if proto == domain.ProtocolKiro {
+				render(w, r, CheckResult(false, "token resolution failed - retry or reconnect"))
 				return
 			} else {
 				render(w, r, CheckResult(false, "token refresh failed: "+err.Error()))
@@ -155,7 +171,7 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 // unsaved Kiro sessions keep the generic one-shot probe.
 func (h *Handler) checkUpstreamResolved(ctx context.Context, probe *domain.Provider, fromStore bool) (bool, string) {
 	if probe.Protocol == domain.ProtocolKiro {
-		return checkKiroUpstream(ctx, h.logger, probe, h.kiroCatalogRefresh(probe, fromStore))
+		return h.checkKiroUpstream(ctx, probe, h.kiroCatalogRefresh(probe, fromStore))
 	}
 	return checkUpstream(ctx, h.logger, probe)
 }
@@ -164,8 +180,13 @@ func (h *Handler) kiroCatalogRefresh(probe *domain.Provider, fromStore bool) fun
 	if !fromStore || probe.Method() != domain.AuthOAuth || probe.ID == 0 || h.oauth == nil {
 		return nil
 	}
+	local := *probe
+	if probe.OAuthCreds != nil {
+		creds := *probe.OAuthCreds
+		local.OAuthCreds = &creds
+	}
 	return func(ctx context.Context) (string, error) {
-		return h.oauth.Resolve(ctx, probe, true)
+		return kirocatalog.ResolveToken(ctx, h.oauth, h.store, &local, true)
 	}
 }
 

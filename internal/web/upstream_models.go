@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/kirocatalog"
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
@@ -51,7 +52,13 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 	// onto provider.APIKey so fetchUpstreamModels can send it as a bearer. Resolve
 	// does not mutate the provider, so the returned token must be assigned back.
 	if provider.Method() == domain.AuthOAuth {
-		tok, err := h.oauth.Resolve(r.Context(), provider, false)
+		var tok string
+		var err error
+		if provider.Protocol == domain.ProtocolKiro {
+			tok, err = kirocatalog.ResolveToken(r.Context(), h.oauth, h.store, provider, false)
+		} else {
+			tok, err = h.oauth.Resolve(r.Context(), provider, false)
+		}
 		if err != nil {
 			render(w, r, ModelOptions(nil, listID, true))
 			return
@@ -60,7 +67,7 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 	}
 	var models []string
 	if provider.Protocol == domain.ProtocolKiro {
-		models, err = queryKiroModelsWithRefresh(r.Context(), h.logger, provider, h.kiroCatalogRefresh(provider, true))
+		models, err = h.queryKiroModelsWithRefresh(r.Context(), provider, h.kiroCatalogRefresh(provider, true))
 	} else {
 		models, err = fetchUpstreamModels(r.Context(), h.logger, provider)
 	}

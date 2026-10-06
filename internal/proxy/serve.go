@@ -225,6 +225,14 @@ func terminal(status int, message, errType string) attemptResult {
 	return attemptResult{status: status, errMsg: message, logErr: message, errType: errType}
 }
 
+func callerCanceledResult() attemptResult {
+	return attemptResult{status: http.StatusBadGateway, errMsg: "request canceled", logErr: "request canceled", errType: "api_error"}
+}
+
+func ctxErr(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
+}
+
 // serve runs the full ingress lifecycle for one request. ingress is the codec
 // for the endpoint the client called.
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
@@ -368,6 +376,9 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		}
 
 		attachmentSkip := last.retry && (last.logErr == skipLogAttachment || last.logErr == skipLogThinking)
+		if last.logErr == "request canceled" && ctxErr(r.Context()) {
+			break
+		}
 		if !attachmentSkip && (last.retry || last.written || last.status != 0) {
 			sawRealAttempt = true
 			if last.retry || (!last.retry && !last.written) {
@@ -709,8 +720,11 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
 	}
-	upstreamBody, err = p.prepareUpstreamRequest(ctx, backend, provider, upstreamBody)
+	upstreamBody, err = p.prepareUpstreamRequestFor(ctx, backend, provider, req, upstreamBody)
 	if err != nil {
+		if kiroPrepareCanceled(ctx, backend, err) {
+			return callerCanceledResult()
+		}
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
 	if backend.streamOnly {
