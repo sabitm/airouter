@@ -239,6 +239,8 @@ func encodeInput(req *ir.Request) []map[string]any {
 		if m.Role == ir.RoleAssistant {
 			for _, b := range m.Content {
 				if b.Type == ir.BlockReasoning && b.Text != "" {
+					// Readable summary only. Anthropic signatures are not Responses
+					// encrypted_content, and redacted data is not emitted as text.
 					items = append(items, map[string]any{
 						"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": b.Text}},
 					})

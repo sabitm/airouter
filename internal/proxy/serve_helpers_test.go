@@ -41,6 +41,14 @@ func TestEstimateUsageUsesCharacterLength(t *testing.T) {
 	if got, gotOut := estimateUsage(nil, nil); got != 0 || gotOut != 0 {
 		t.Errorf("empty = %d/%d, want 0/0", got, gotOut)
 	}
+	opaque := &ir.Request{Messages: []ir.Message{{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+		{Type: ir.BlockReasoning, Text: "abcd", AnthropicSignature: strings.Repeat("s", 400)},
+		{Type: ir.BlockRedactedReasoning, RedactedData: strings.Repeat("r", 400)},
+	}}}}
+	in, out = estimateUsage(opaque, nil)
+	if in != 1 || out != 0 {
+		t.Fatalf("opaque estimate = %d/%d, want readable text only", in, out)
+	}
 }
 
 func TestApplyCursorUsageEstimateIgnoresTurnEnded(t *testing.T) {

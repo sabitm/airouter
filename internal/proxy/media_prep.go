@@ -14,6 +14,9 @@ import (
 type attachmentPrep struct {
 	atts      []media.Attachment
 	inspected bool
+	// preserveThinking is true when the decoded request carries signed or
+	// redacted Anthropic thinking that a target must be able to replay.
+	preserveThinking bool
 	// inlineBytes is the decoded size of locally available payloads, recorded
 	// once per request so materialize can charge remote bytes against the same
 	// budget without re-summing IR clones.
@@ -33,6 +36,7 @@ func (a *attachmentPrep) inspectDecoded(req *ir.Request) error {
 	}
 	a.atts = atts
 	a.inspected = true
+	a.preserveThinking = requiresAnthropicThinking(req)
 	n := 0
 	for _, att := range atts {
 		n += att.Bytes
@@ -43,6 +47,19 @@ func (a *attachmentPrep) inspectDecoded(req *ir.Request) error {
 
 func (a *attachmentPrep) hasAttachments() bool {
 	return a != nil && len(a.atts) > 0
+}
+
+func (a *attachmentPrep) needsThinkingPreservation() bool {
+	return a != nil && a.preserveThinking
+}
+
+// checkThinking returns a reason when backend cannot replay signed or
+// redacted Anthropic thinking present in the request.
+func (a *attachmentPrep) checkThinking(backend codec) string {
+	if a == nil || !a.preserveThinking || preservesAnthropicThinking(backend.id) {
+		return ""
+	}
+	return thinkingHistoryUnsupported
 }
 
 // checkCompatible returns a non-empty reason when backend cannot represent the

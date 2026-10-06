@@ -23,9 +23,11 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 	for _, b := range resp.Content {
 		switch b.Type {
 		case "thinking":
-			if b.Thinking != "" {
-				out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockReasoning, Text: b.Thinking})
-			}
+			out.Content = append(out.Content, ir.ContentBlock{
+				Type: ir.BlockReasoning, Text: thinkingText(b.Thinking), AnthropicSignature: b.Signature,
+			})
+		case "redacted_thinking":
+			out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockRedactedReasoning, RedactedData: b.Data})
 		case "text":
 			out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockText, Text: b.Text})
 		case "tool_use":
@@ -51,7 +53,9 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	for _, b := range resp.Content {
 		switch b.Type {
 		case ir.BlockReasoning:
-			content = append(content, anthBlock{Type: "thinking", Thinking: b.Text})
+			content = append(content, anthBlock{Type: "thinking", Thinking: thinkingPtr(b.Text), Signature: b.AnthropicSignature})
+		case ir.BlockRedactedReasoning:
+			content = append(content, anthBlock{Type: "redacted_thinking", Data: b.RedactedData})
 		case ir.BlockText:
 			content = append(content, anthBlock{Type: "text", Text: b.Text})
 		case ir.BlockToolUse:

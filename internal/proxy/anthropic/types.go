@@ -39,8 +39,13 @@ type anthMessage struct {
 type anthBlock struct {
 	Type string `json:"type"`
 
-	Text     string `json:"text,omitempty"`
-	Thinking string `json:"thinking,omitempty"`
+	Text string `json:"text,omitempty"`
+	// Thinking is a pointer so a signed empty thinking block can emit
+	// "thinking":"" without putting that field on text or tool blocks.
+	Thinking  *string `json:"thinking,omitempty"`
+	Signature string  `json:"signature,omitempty"`
+	// Data is the opaque redacted_thinking payload.
+	Data string `json:"data,omitempty"`
 
 	// image | document
 	Source *anthSource `json:"source,omitempty"`
@@ -56,6 +61,17 @@ type anthBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"` // string or []anthBlock
 	IsError   bool            `json:"is_error,omitempty"`
+}
+
+func thinkingText(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func thinkingPtr(s string) *string {
+	return &s
 }
 
 type anthSource struct {

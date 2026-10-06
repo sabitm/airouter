@@ -45,8 +45,12 @@ type wireMessage struct {
 // wireBlock covers every block kind the Anthropic format uses; only Type/Name
 // are read by the cloak (tool_use rename) and the rest are preserved verbatim.
 type wireBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+	// Thinking is a pointer so a signed empty block remarshals as thinking:"".
+	Thinking  *string         `json:"thinking,omitempty"`
+	Signature string          `json:"signature,omitempty"`
+	Data      string          `json:"data,omitempty"`
 	Source    *wireSource     `json:"source,omitempty"`
 	Title     string          `json:"title,omitempty"` // document blocks (optional filename-like label)
 	ID        string          `json:"id,omitempty"`

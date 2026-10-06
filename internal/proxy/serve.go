@@ -59,6 +59,9 @@ type reqResult struct {
 	anthOrdinary   int
 	anthCacheRead  int
 	anthCacheWrite int
+	// opaqueOmitted is set after one metadata diagnostic for projected-away
+	// Anthropic signature or redacted thinking. Failover attempts share it.
+	opaqueOmitted bool
 }
 
 // clampErrorMessage keeps client and request-history messages within the error
@@ -318,11 +321,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 
 	candidates, filterReason := p.orderTargets(r.Context(), combo, ingress, &prep)
 	if len(candidates) == 0 {
-		if prep.hasAttachments() {
-			msg := "attachment not supported by upstream: no compatible provider in combo"
-			if filterReason != "" {
-				msg = "attachment not supported by upstream: " + filterReason
-			}
+		if msg, ok := emptyCandidateMessage(combo, &prep, filterReason, meta.Model); ok {
 			res.fail(w, ingress, http.StatusBadRequest, msg, "invalid_request_error")
 			return
 		}
@@ -368,7 +367,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 			last = p.serveTranslated(w, r.Context(), res, ingress, backend, provider, t.UpstreamModel, body, &prep)
 		}
 
-		attachmentSkip := last.retry && last.logErr == skipLogAttachment
+		attachmentSkip := last.retry && (last.logErr == skipLogAttachment || last.logErr == skipLogThinking)
 		if !attachmentSkip && (last.retry || last.written || last.status != 0) {
 			sawRealAttempt = true
 			if last.retry || (!last.retry && !last.written) {
@@ -396,8 +395,12 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		}
 		if attachmentSkip {
 			// Materialization / late structural skip: no health penalty.
-			observability.Logger(r.Context(), p.logger).Debug("attachment_target_skipped",
-				"event", "attachment_target_skipped",
+			event := "attachment_target_skipped"
+			if last.logErr == skipLogThinking {
+				event = "thinking_target_skipped"
+			}
+			observability.Logger(r.Context(), p.logger).Debug(event,
+				"event", event,
 				"combo", combo.Name,
 				"provider", provider.Name,
 				"upstream_model", t.UpstreamModel,
@@ -443,7 +446,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		outcome := last
 		if last.logErr == skipLogAttachment && sawRealAttempt && lastReal.status != 0 {
 			outcome = lastReal
-		} else if last.logErr == skipLogAttachment && !sawRealAttempt {
+		} else if (last.logErr == skipLogAttachment || last.logErr == skipLogThinking) && !sawRealAttempt {
 			outcome = terminal(http.StatusBadRequest, last.errMsg, "invalid_request_error")
 		}
 		status := outcome.status
@@ -503,9 +506,38 @@ func hasOpencodeTarget(targets []domain.ComboTarget) bool {
 	return false
 }
 
+// emptyCandidateMessage distinguishes a combo with no enabled targets from
+// a combo whose enabled targets were all filtered. The second form is a 400.
+// Attachment and thinking reasons stay distinct when both filters apply.
+func emptyCandidateMessage(combo *domain.Combo, prep *attachmentPrep, filterReason, _ string) (string, bool) {
+	if len(activeComboTargets(combo)) == 0 {
+		return "", false
+	}
+	if prep != nil && prep.hasAttachments() && prep.needsThinkingPreservation() {
+		if filterReason != "" {
+			return filterReason, true
+		}
+		return thinkingHistoryNoProvider, true
+	}
+	if prep != nil && prep.needsThinkingPreservation() {
+		if filterReason != "" {
+			return filterReason, true
+		}
+		return thinkingHistoryNoProvider, true
+	}
+	if prep != nil && prep.hasAttachments() {
+		msg := "attachment not supported by upstream: no compatible provider in combo"
+		if filterReason != "" {
+			msg = "attachment not supported by upstream: " + filterReason
+		}
+		return msg, true
+	}
+	return "", false
+}
+
 // orderTargets returns the combo's targets in the order the resolution loop
-// should try them, plus the first structural attachment incompatibility reason
-// observed when every enabled target was filtered out (empty otherwise).
+// should try them, plus the first structural incompatibility reason observed
+// when every enabled target was filtered out (empty otherwise).
 // Failover keeps position order; round-robin rotates the start by a per-combo
 // counter, then continues through the remainder so it still fails over past a
 // dead target. In both cases, disabled targets and archived providers are
@@ -523,11 +555,13 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 	// Provider nil-guard keeps unit tests that omit the hydrated provider working.
 	enabled := activeComboTargets(combo)
 
-	// Structural attachment filter runs before health ordering so incompatible
-	// providers never consume skip credits.
+	// Structural attachment and thinking filters run before health ordering so
+	// incompatible providers never consume skip credits or receive penalties.
 	compatible := enabled
 	var firstFilterReason string
-	if prep != nil && prep.hasAttachments() {
+	needAttach := prep != nil && prep.hasAttachments()
+	needThink := prep != nil && prep.needsThinkingPreservation()
+	if needAttach || needThink {
 		compatible = make([]domain.ComboTarget, 0, len(enabled))
 		for _, t := range enabled {
 			backend := openaiCodec
@@ -535,7 +569,18 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 				backend = backendCodecForProvider(t.Provider.Protocol, t.Provider, t.UpstreamModel)
 			}
 			translated := ingress.id != backend.id
-			if reason := prep.checkCompatible(backend, translated); reason != "" {
+			reason := ""
+			event := "attachment_target_skipped"
+			if needAttach {
+				reason = prep.checkCompatible(backend, translated)
+			}
+			if reason == "" && needThink {
+				reason = prep.checkThinking(backend)
+				if reason != "" {
+					event = "thinking_target_skipped"
+				}
+			}
+			if reason != "" {
 				if firstFilterReason == "" {
 					firstFilterReason = reason
 				}
@@ -544,8 +589,8 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 					name = t.Provider.Name
 					proto = string(t.Provider.Protocol)
 				}
-				observability.Logger(ctx, p.logger).Debug("attachment_target_skipped",
-					"event", "attachment_target_skipped",
+				observability.Logger(ctx, p.logger).Debug(event,
+					"event", event,
 					"combo", combo.Name,
 					"provider", name,
 					"upstream_model", t.UpstreamModel,
@@ -604,6 +649,9 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 	if reason := prep.checkCompatible(ingress, false); reason != "" {
 		return incompatibleSkip(reason)
 	}
+	if reason := prep.checkThinking(ingress); reason != "" {
+		return thinkingSkip(reason)
+	}
 	rewritten, err := finalizeRequestBody(body, upstreamModel, ingress, provider)
 	if err != nil {
 		return terminal(http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
@@ -638,6 +686,9 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	}
 	if reason := prep.checkCompatible(backend, true); reason != "" {
 		return incompatibleSkip(reason)
+	}
+	if reason := prep.checkThinking(backend); reason != "" {
+		return thinkingSkip(reason)
 	}
 	if err := prep.materialize(ctx, req, backend); err != nil {
 		return materializeSkip(err)
@@ -683,6 +734,9 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	}
 	res.inTok = resp.Usage.InputTokens
 	res.outTok = resp.Usage.OutputTokens
+	if !preservesAnthropicThinking(ingress.id) && responseDropsOpaque(resp.Content) {
+		noteOpaqueOmission(res, observability.Logger(ctx, p.logger), ingress.id)
+	}
 	out, err := ingress.encodeResponse(resp)
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode response", "api_error")
@@ -1075,6 +1129,8 @@ func writeUsageBlocks(b *strings.Builder, blocks []ir.ContentBlock) {
 	for _, block := range blocks {
 		switch block.Type {
 		case ir.BlockText, ir.BlockReasoning:
+			// Readable text only. AnthropicSignature and RedactedData are opaque
+			// and must not inflate a character-length estimate.
 			b.WriteString(block.Text)
 		case ir.BlockToolUse:
 			b.WriteString(block.ToolName)

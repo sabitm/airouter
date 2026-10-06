@@ -20,12 +20,16 @@ const (
 type BlockType string
 
 const (
-	BlockText       BlockType = "text"
-	BlockReasoning  BlockType = "reasoning"
-	BlockImage      BlockType = "image"
-	BlockFile       BlockType = "file"
-	BlockToolUse    BlockType = "tool_use"
-	BlockToolResult BlockType = "tool_result"
+	BlockText      BlockType = "text"
+	BlockReasoning BlockType = "reasoning"
+	// BlockRedactedReasoning is Anthropic redacted_thinking. It is a distinct
+	// block, not a flag on BlockReasoning, because it has no readable text and
+	// must not be projected as ordinary reasoning.
+	BlockRedactedReasoning BlockType = "redacted_reasoning"
+	BlockImage             BlockType = "image"
+	BlockFile              BlockType = "file"
+	BlockToolUse           BlockType = "tool_use"
+	BlockToolResult        BlockType = "tool_result"
 )
 
 // Image holds an image from exactly one source: inline base64 Data, a remote
@@ -54,9 +58,17 @@ type File struct {
 type ContentBlock struct {
 	Type BlockType
 
-	Text  string // BlockText or BlockReasoning
+	Text  string // BlockText or BlockReasoning. Empty thinking text is valid.
 	Image *Image // BlockImage
 	File  *File  // BlockFile
+
+	// AnthropicSignature is the opaque Anthropic thinking signature. It is not
+	// an OpenAI encrypted_content value or a Gemini thought signature. Empty
+	// means the reasoning block is unsigned.
+	AnthropicSignature string
+	// RedactedData is the opaque Anthropic redacted_thinking data string.
+	// Meaningful only on BlockRedactedReasoning.
+	RedactedData string
 
 	// BlockToolUse: a model-issued call to a tool.
 	ToolID    string

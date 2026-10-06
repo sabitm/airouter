@@ -236,7 +236,11 @@ func encodeMessage(m ir.Message) []chatMessage {
 		for _, b := range m.Content {
 			switch b.Type {
 			case ir.BlockReasoning:
+				// Unsigned readable text only. Anthropic signatures are not copied
+				// into reasoning_content or reasoning_details.
 				reasoning.WriteString(b.Text)
+			case ir.BlockRedactedReasoning:
+				// Opaque redacted data has no OpenAI text projection.
 			case ir.BlockText:
 				text.WriteString(b.Text)
 			case ir.BlockToolUse:

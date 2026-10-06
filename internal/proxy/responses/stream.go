@@ -458,6 +458,24 @@ func (e *StreamEncoder) closeOpenFunctions(w *sse.Writer) error {
 	return nil
 }
 
+func (e *StreamEncoder) encodeReasoningText(w *sse.Writer, text string) error {
+	if text == "" {
+		return nil
+	}
+	if err := e.ensureCreated(w); err != nil {
+		return err
+	}
+	if e.open != openReasoning {
+		if err := e.openReasoningItem(w); err != nil {
+			return err
+		}
+	}
+	e.reasoningBuf.WriteString(text)
+	return e.emit(w, "response.reasoning_summary_text.delta", map[string]any{
+		"item_id": e.openItemID, "output_index": e.openOutIdx, "summary_index": 0, "delta": text,
+	})
+}
+
 func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 	switch ev.Kind {
 	case ir.EventMessageStart:
@@ -482,19 +500,12 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": 0, "delta": ev.Text,
 		})
 
-	case ir.EventReasoningDelta:
-		if err := e.ensureCreated(w); err != nil {
-			return err
-		}
-		if e.open != openReasoning {
-			if err := e.openReasoningItem(w); err != nil {
-				return err
-			}
-		}
-		e.reasoningBuf.WriteString(ev.Text)
-		return e.emit(w, "response.reasoning_summary_text.delta", map[string]any{
-			"item_id": e.openItemID, "output_index": e.openOutIdx, "summary_index": 0, "delta": ev.Text,
-		})
+	case ir.EventReasoningDelta, ir.EventReasoningStart:
+		return e.encodeReasoningText(w, ev.Text)
+	case ir.EventReasoningSignature, ir.EventReasoningEnd, ir.EventRedactedReasoning:
+		// Anthropic signature and redacted payloads are not Responses fields.
+		// Do not place them in encrypted_content.
+		return nil
 
 	case ir.EventToolCallStart:
 		if err := e.ensureCreated(w); err != nil {

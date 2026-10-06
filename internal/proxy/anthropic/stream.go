@@ -22,9 +22,12 @@ type streamMessageStart struct {
 type streamContentBlockStart struct {
 	Index        int `json:"index"`
 	ContentBlock struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-		Name string `json:"name"`
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		Thinking  string `json:"thinking"`
+		Signature string `json:"signature"`
+		Data      string `json:"data"`
 	} `json:"content_block"`
 }
 
@@ -34,8 +37,13 @@ type streamContentBlockDelta struct {
 		Type        string `json:"type"`
 		Text        string `json:"text"`
 		Thinking    string `json:"thinking"`
+		Signature   string `json:"signature"`
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
+}
+
+type streamContentBlockStop struct {
+	Index int `json:"index"`
 }
 
 type streamMessageDelta struct {
@@ -65,6 +73,16 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	inputTokens, outputTokens := 0, 0
 	finished := false
 	started := false
+	// thinkingOpen is the set of source indexes whose explicit thinking block
+	// has not stopped. Completed indexes are deleted so the map stays bounded
+	// by simultaneously open blocks, not stream history. A new explicit thinking
+	// block cannot start while one remains open. Text, tool, and redacted
+	// indexes may create gaps; those indexes are not required to be contiguous.
+	thinkingOpen := map[int]thinkingDecodeState{}
+	// stoppedThrough is the highest stopped source index. An index at or below
+	// it cannot open again. This avoids retaining every completed block and
+	// does not require thinking indexes to be contiguous.
+	stoppedThrough := -1
 	inclusiveInput := func() int { return ordinary + cacheRead + cacheWrite }
 
 	for {
@@ -113,7 +131,11 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if json.Unmarshal(ev.Data, &s) != nil {
 				continue
 			}
-			if s.ContentBlock.Type == "tool_use" {
+			switch s.ContentBlock.Type {
+			case "tool_use":
+				if len(thinkingOpen) != 0 {
+					return ir.ProtocolError("content block started while thinking block is open")
+				}
 				if err := emit(ir.StreamEvent{
 					Kind: ir.EventToolCallStart, Index: s.Index,
 					ToolID: s.ContentBlock.ID, ToolName: s.ContentBlock.Name,
@@ -121,6 +143,37 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 					return err
 				}
 				started = true
+			case "thinking":
+				if len(thinkingOpen) != 0 {
+					return ir.ProtocolError("thinking block started while another is open")
+				}
+				if s.Index <= stoppedThrough {
+					return ir.ProtocolError("thinking block restarted after stop")
+				}
+				if len(thinkingOpen) >= maxOpenThinkingBlocks {
+					return ir.ProtocolError("too many open thinking blocks")
+				}
+				thinkingOpen[s.Index] = thinkingDecodeState{signed: s.ContentBlock.Signature != ""}
+				if err := emit(ir.StreamEvent{
+					Kind: ir.EventReasoningStart, Index: s.Index,
+					Text: s.ContentBlock.Thinking, Signature: s.ContentBlock.Signature,
+				}); err != nil {
+					return err
+				}
+				started = true
+			case "redacted_thinking":
+				if len(thinkingOpen) != 0 {
+					return ir.ProtocolError("content block started while thinking block is open")
+				}
+				// The data arrives complete on start. Do not invent readable text.
+				if err := emit(ir.StreamEvent{Kind: ir.EventRedactedReasoning, Index: s.Index, Data: s.ContentBlock.Data}); err != nil {
+					return err
+				}
+				started = true
+			case "text":
+				if len(thinkingOpen) != 0 {
+					return ir.ProtocolError("content block started while thinking block is open")
+				}
 			}
 		case "content_block_delta":
 			var d streamContentBlockDelta
@@ -129,17 +182,58 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			}
 			switch d.Delta.Type {
 			case "thinking_delta":
-				if err := emit(ir.StreamEvent{Kind: ir.EventReasoningDelta, Text: d.Delta.Thinking}); err != nil {
+				st, open := thinkingOpen[d.Index]
+				if !open {
+					return ir.ProtocolError("thinking delta without an open thinking block")
+				}
+				// A signature, including one carried on content_block_start, closes
+				// the readable portion. Later thinking text is not replayed.
+				if st.signed {
+					return ir.ProtocolError("thinking delta after signature")
+				}
+				if err := emit(ir.StreamEvent{Kind: ir.EventReasoningDelta, Index: d.Index, Text: d.Delta.Thinking, Indexed: true}); err != nil {
+					return err
+				}
+				started = true
+			case "signature_delta":
+				st, open := thinkingOpen[d.Index]
+				if !open {
+					return ir.ProtocolError("signature delta without an open thinking block")
+				}
+				st.signed = true
+				thinkingOpen[d.Index] = st
+				if err := emit(ir.StreamEvent{Kind: ir.EventReasoningSignature, Index: d.Index, Signature: d.Delta.Signature}); err != nil {
 					return err
 				}
 				started = true
 			case "text_delta":
+				if len(thinkingOpen) != 0 {
+					return ir.ProtocolError("text delta while thinking block is open")
+				}
 				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: d.Delta.Text}); err != nil {
 					return err
 				}
 				started = true
 			case "input_json_delta":
+				if _, open := thinkingOpen[d.Index]; open {
+					return ir.ProtocolError("tool delta while thinking block is open")
+				}
 				if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: d.Index, ArgsFrag: d.Delta.PartialJSON}); err != nil {
+					return err
+				}
+				started = true
+			}
+		case "content_block_stop":
+			var s streamContentBlockStop
+			if json.Unmarshal(ev.Data, &s) != nil {
+				continue
+			}
+			if _, open := thinkingOpen[s.Index]; open {
+				delete(thinkingOpen, s.Index)
+				if s.Index > stoppedThrough {
+					stoppedThrough = s.Index
+				}
+				if err := emit(ir.StreamEvent{Kind: ir.EventReasoningEnd, Index: s.Index}); err != nil {
 					return err
 				}
 				started = true
@@ -162,6 +256,9 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			inputTokens = inclusiveInput()
 			outputTokens = m.Usage.OutputTokens
 		case "message_stop":
+			if len(thinkingOpen) != 0 {
+				return ir.ProtocolError("thinking block closed by stream end")
+			}
 			if err := emit(ir.StreamEvent{
 				Kind: ir.EventFinish, StopReason: stopReason,
 				InputTokens: inputTokens, OutputTokens: outputTokens,
@@ -177,13 +274,27 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			// Empty / comment-only stream: do not fabricate a successful completion.
 			return nil
 		}
+		if len(thinkingOpen) != 0 {
+			// An open thinking block has no signature association yet. Do not
+			// synthesize a finish that looks like valid signed history.
+			return ir.ProtocolError("thinking block closed by stream end")
+		}
 		return emit(ir.StreamEvent{
 			Kind: ir.EventFinish, StopReason: stopReason,
 			InputTokens: inputTokens, OutputTokens: outputTokens,
 			CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
 		})
 	}
+	if len(thinkingOpen) != 0 {
+		return ir.ProtocolError("thinking block closed by stream end")
+	}
 	return nil
+}
+
+// thinkingDecodeState tracks one open source thinking block. signed means a
+// signature has already arrived, so a later thinking_delta is invalid.
+type thinkingDecodeState struct {
+	signed bool
 }
 
 func stopReason2(s string) ir.StopReason {
@@ -204,6 +315,10 @@ const (
 // StreamEncoder renders IR stream events as an Anthropic Messages SSE stream.
 // It manages content-block indices and start/stop framing, which the flat
 // OpenAI delta stream does not carry. Used when Anthropic is the ingress format.
+//
+// Explicit reasoning events keep the source block index. Adjacent thinking
+// blocks are not merged. A signature is emitted before the matching stop and
+// is not buffered across later blocks.
 type StreamEncoder struct {
 	id            string
 	model         string
@@ -219,6 +334,27 @@ type StreamEncoder struct {
 	openToolIdx   []int // anthropic block indices started and not yet stopped
 	pendingBytes  int
 	finishEmitted bool
+
+	// thinking holds only open explicit thinking blocks, keyed by source index.
+	// A stopped block is removed. stoppedThrough is the highest stopped source
+	// index and rejects reuse. Indexes may have gaps; this is not a sequential
+	// index check and does not retain completed history.
+	thinking       map[int]*thinkingBlock
+	stoppedThrough int
+	legacyOpen     bool
+	legacyBlock    int
+}
+
+// maxOpenThinkingBlocks bounds simultaneously open source thinking blocks.
+// Completed blocks are released, so this is not a history limit.
+const maxOpenThinkingBlocks = 64
+
+// thinkingBlock is one open source-indexed thinking block. block is its wire
+// index after content_block_start. A signature before the start is a protocol
+// error; signatures are not queued out of order.
+type thinkingBlock struct {
+	block  int
+	signed bool
 }
 
 // streamTool is one IR-index tool call. block is -1 until content_block_start
@@ -232,7 +368,11 @@ type streamTool struct {
 }
 
 func NewStreamEncoder(model string) *StreamEncoder {
-	return &StreamEncoder{model: model, openKind: blockNone, tools: map[int]*streamTool{}}
+	return &StreamEncoder{
+		model: model, openKind: blockNone,
+		tools: map[int]*streamTool{}, thinking: map[int]*thinkingBlock{},
+		stoppedThrough: -1,
+	}
 }
 
 // maxPendingArgs bounds fragments buffered for an index whose Start has not
@@ -292,12 +432,27 @@ func (e *StreamEncoder) ensureStart(w *sse.Writer) error {
 	})
 }
 
+func (e *StreamEncoder) explicitThinkingOpen() bool {
+	return len(e.thinking) != 0
+}
+
 func (e *StreamEncoder) closeBlock(w *sse.Writer) error {
 	if e.openKind != blockText && e.openKind != blockReasoning {
 		return nil
 	}
+	// An explicit thinking stop must come from EventReasoningEnd. Closing it
+	// here would fabricate a successful stop for an invalid transition.
+	if e.explicitThinkingOpen() && e.openKind == blockReasoning {
+		return ir.ProtocolError("thinking block closed by invalid transition")
+	}
 	idx := e.openIndex
 	e.openKind = blockNone
+	// Any automatic close must clear the matching legacy record. A later text
+	// or reasoning segment otherwise writes into a block that already stopped.
+	// Explicit thinking is never released here; its stop is EventReasoningEnd.
+	if e.legacyOpen && e.legacyBlock == idx {
+		e.legacyOpen = false
+	}
 	return e.event(w, "content_block_stop", map[string]any{"index": idx})
 }
 
@@ -362,6 +517,68 @@ func (e *StreamEncoder) flushToolPending(w *sse.Writer, t *streamTool) error {
 	})
 }
 
+func (e *StreamEncoder) sourceStopped(index int) bool {
+	return index <= e.stoppedThrough
+}
+
+func (e *StreamEncoder) releaseThinking(index int) {
+	delete(e.thinking, index)
+	if index > e.stoppedThrough {
+		e.stoppedThrough = index
+	}
+}
+
+func (e *StreamEncoder) closeLegacyReasoning(w *sse.Writer) error {
+	if !e.legacyOpen {
+		return nil
+	}
+	e.legacyOpen = false
+	if e.openKind == blockReasoning && e.openIndex == e.legacyBlock {
+		e.openKind = blockNone
+	}
+	return e.event(w, "content_block_stop", map[string]any{"index": e.legacyBlock})
+}
+
+func (e *StreamEncoder) openThinking(w *sse.Writer, index int, initial, signature string) (*thinkingBlock, error) {
+	if e.explicitThinkingOpen() {
+		return nil, ir.ProtocolError("thinking block started while another is open")
+	}
+	if e.legacyOpen {
+		if err := e.closeLegacyReasoning(w); err != nil {
+			return nil, err
+		}
+	}
+	if e.openKind == blockText || e.openKind == blockReasoning {
+		if err := e.closeBlock(w); err != nil {
+			return nil, err
+		}
+	}
+	block := map[string]any{"type": "thinking", "thinking": initial}
+	if signature != "" {
+		block["signature"] = signature
+	}
+	tb := &thinkingBlock{block: e.nextIndex, signed: signature != ""}
+	e.nextIndex++
+	e.thinking[index] = tb
+	e.openKind = blockReasoning
+	e.openIndex = tb.block
+	if err := e.event(w, "content_block_start", map[string]any{
+		"index": tb.block, "content_block": block,
+	}); err != nil {
+		return nil, err
+	}
+	return tb, nil
+}
+
+func (e *StreamEncoder) stopThinking(w *sse.Writer, index int, tb *thinkingBlock) error {
+	wire := tb.block
+	if e.openKind == blockReasoning && e.openIndex == wire {
+		e.openKind = blockNone
+	}
+	e.releaseThinking(index)
+	return e.event(w, "content_block_stop", map[string]any{"index": wire})
+}
+
 func (e *StreamEncoder) closeOpenTools(w *sse.Writer) error {
 	if len(e.openToolIdx) == 0 {
 		return nil
@@ -389,6 +606,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		return e.ensureStart(w)
 
 	case ir.EventTextDelta:
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("text delta while thinking block is open")
+		}
 		if err := e.ensureStart(w); err != nil {
 			return err
 		}
@@ -409,28 +629,122 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 			"index": e.openIndex, "delta": map[string]any{"type": "text_delta", "text": ev.Text},
 		})
 
-	case ir.EventReasoningDelta:
+	case ir.EventReasoningStart:
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("thinking block started while another is open")
+		}
+		if _, open := e.thinking[ev.Index]; open {
+			return ir.ProtocolError("thinking block started twice")
+		}
+		if e.sourceStopped(ev.Index) {
+			return ir.ProtocolError("thinking block restarted after stop")
+		}
+		if len(e.thinking) >= maxOpenThinkingBlocks {
+			return ir.ProtocolError("too many open thinking blocks")
+		}
 		if err := e.ensureStart(w); err != nil {
 			return err
 		}
-		if e.openKind != blockReasoning {
-			if err := e.closeBlock(w); err != nil {
+		_, err := e.openThinking(w, ev.Index, ev.Text, ev.Signature)
+		return err
+
+	case ir.EventReasoningDelta:
+		if ev.Indexed {
+			if err := e.ensureStart(w); err != nil {
 				return err
 			}
-			e.openIndex = e.nextIndex
+			tb, ok := e.thinking[ev.Index]
+			if !ok {
+				return ir.ProtocolError("thinking delta without an open thinking block")
+			}
+			if tb.signed {
+				return ir.ProtocolError("thinking delta after signature")
+			}
+			return e.event(w, "content_block_delta", map[string]any{
+				"index": tb.block, "delta": map[string]any{"type": "thinking_delta", "thinking": ev.Text},
+			})
+		}
+		// Legacy unindexed reasoning stays one open block. It is not mixed into
+		// an explicit source-indexed thinking block. A later text segment closes
+		// it; the next unindexed delta opens a new block.
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("reasoning delta while thinking block is open")
+		}
+		if err := e.ensureStart(w); err != nil {
+			return err
+		}
+		if !e.legacyOpen {
+			if e.openKind == blockText || e.openKind == blockReasoning {
+				if err := e.closeBlock(w); err != nil {
+					return err
+				}
+			}
+			e.legacyBlock = e.nextIndex
 			e.nextIndex++
+			e.legacyOpen = true
 			e.openKind = blockReasoning
+			e.openIndex = e.legacyBlock
 			if err := e.event(w, "content_block_start", map[string]any{
-				"index": e.openIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""},
+				"index": e.legacyBlock, "content_block": map[string]any{"type": "thinking", "thinking": ""},
 			}); err != nil {
 				return err
 			}
 		}
 		return e.event(w, "content_block_delta", map[string]any{
-			"index": e.openIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": ev.Text},
+			"index": e.legacyBlock, "delta": map[string]any{"type": "thinking_delta", "thinking": ev.Text},
 		})
 
+	case ir.EventReasoningSignature:
+		if err := e.ensureStart(w); err != nil {
+			return err
+		}
+		tb, ok := e.thinking[ev.Index]
+		if !ok {
+			return ir.ProtocolError("signature delta without an open thinking block")
+		}
+		tb.signed = true
+		return e.event(w, "content_block_delta", map[string]any{
+			"index": tb.block, "delta": map[string]any{"type": "signature_delta", "signature": ev.Signature},
+		})
+
+	case ir.EventReasoningEnd:
+		tb, ok := e.thinking[ev.Index]
+		if !ok {
+			return ir.ProtocolError("thinking stop without an open thinking block")
+		}
+		return e.stopThinking(w, ev.Index, tb)
+
+	case ir.EventRedactedReasoning:
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("redacted block while thinking block is open")
+		}
+		if err := e.ensureStart(w); err != nil {
+			return err
+		}
+		if e.legacyOpen {
+			if err := e.closeLegacyReasoning(w); err != nil {
+				return err
+			}
+		}
+		if e.openKind == blockText || e.openKind == blockReasoning {
+			if err := e.closeBlock(w); err != nil {
+				return err
+			}
+		}
+		idx := e.nextIndex
+		e.nextIndex++
+		if err := e.event(w, "content_block_start", map[string]any{
+			"index":         idx,
+			"content_block": map[string]any{"type": "redacted_thinking", "data": ev.Data},
+		}); err != nil {
+			return err
+		}
+		return e.event(w, "content_block_stop", map[string]any{"index": idx})
+
 	case ir.EventToolCallStart:
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("tool start while thinking block is open")
+		}
 		if err := e.ensureStart(w); err != nil {
 			return err
 		}
@@ -444,6 +758,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		return e.openToolBlock(w, t)
 
 	case ir.EventToolCallDelta:
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("tool delta while thinking block is open")
+		}
 		t := e.tool(ev.Index)
 		if t.block < 0 {
 			// No content_block_start yet: buffer instead of emitting a delta
@@ -457,12 +774,18 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		})
 
 	case ir.EventFinish:
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("thinking block closed by stream end")
+		}
 		startEmitted := e.started
 		// OpenAI-family backends report input at Finish. Capture it before
 		// ensureStart so a Finish-first stream puts the count on message_start.
 		// Do not reset a nonzero start count with absent later fields.
 		e.applyUsage(ev)
 		if err := e.ensureStart(w); err != nil {
+			return err
+		}
+		if err := e.closeLegacyReasoning(w); err != nil {
 			return err
 		}
 		if err := e.closeBlock(w); err != nil {
@@ -513,6 +836,13 @@ func (e *StreamEncoder) EncodeError(w *sse.Writer, message, errType string) erro
 func (e *StreamEncoder) Close(w *sse.Writer) error {
 	if !e.started || e.finishEmitted {
 		return nil
+	}
+	// A missing explicit stop is a sequence error. Do not invent message_stop.
+	if e.explicitThinkingOpen() {
+		return ir.ProtocolError("thinking block closed by stream end")
+	}
+	if err := e.closeLegacyReasoning(w); err != nil {
+		return err
 	}
 	if err := e.closeBlock(w); err != nil {
 		return err

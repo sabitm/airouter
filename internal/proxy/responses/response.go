@@ -226,11 +226,14 @@ func buildOutput(blocks []ir.ContentBlock) []map[string]any {
 	var output []map[string]any
 	for _, b := range blocks {
 		if b.Type == ir.BlockReasoning && b.Text != "" {
+			// Readable summary only. Do not copy Anthropic signatures into
+			// encrypted_content or invent a signature for unsigned reasoning.
 			output = append(output, map[string]any{
 				"type": "reasoning", "id": ir.NewID("rs_"),
 				"summary": []any{map[string]any{"type": "summary_text", "text": b.Text}},
 			})
 		}
+		// BlockRedactedReasoning is omitted. Its data is not summary text.
 	}
 	var textParts []map[string]any
 	for _, b := range blocks {

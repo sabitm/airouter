@@ -80,9 +80,13 @@ func decodeBlocks(raw json.RawMessage) []ir.ContentBlock {
 	for _, b := range blocks {
 		switch b.Type {
 		case "thinking":
-			if b.Thinking != "" {
-				out = append(out, ir.ContentBlock{Type: ir.BlockReasoning, Text: b.Thinking})
-			}
+			// Empty thinking text is retained. A signature-only block is a valid
+			// replay block, not disposable content.
+			out = append(out, ir.ContentBlock{
+				Type: ir.BlockReasoning, Text: thinkingText(b.Thinking), AnthropicSignature: b.Signature,
+			})
+		case "redacted_thinking":
+			out = append(out, ir.ContentBlock{Type: ir.BlockRedactedReasoning, RedactedData: b.Data})
 		case "text":
 			out = append(out, ir.ContentBlock{Type: ir.BlockText, Text: b.Text})
 		case "image":
@@ -217,7 +221,9 @@ func encodeBlocks(blocks []ir.ContentBlock) []anthBlock {
 	for _, b := range blocks {
 		switch b.Type {
 		case ir.BlockReasoning:
-			out = append(out, anthBlock{Type: "thinking", Thinking: b.Text})
+			out = append(out, anthBlock{Type: "thinking", Thinking: thinkingPtr(b.Text), Signature: b.AnthropicSignature})
+		case ir.BlockRedactedReasoning:
+			out = append(out, anthBlock{Type: "redacted_thinking", Data: b.RedactedData})
 		case ir.BlockText:
 			out = append(out, anthBlock{Type: "text", Text: b.Text})
 		case ir.BlockImage:

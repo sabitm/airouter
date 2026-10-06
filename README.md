@@ -123,6 +123,14 @@ Matching API formats pass through with only the model rewritten, preserving
 provider-specific fields. Different formats are translated automatically,
 including live streams.
 
+Anthropic thinking signatures and redacted thinking blocks are preserved when
+both the client format and the selected provider format are Anthropic Messages,
+Claude Code, or OpenCode Messages. A request that already contains signed or
+redacted thinking is rejected with HTTP 400 when no enabled combo target can
+preserve that history. Other client formats receive only readable thinking text.
+The proxy does not copy Anthropic signatures into OpenAI encrypted content and
+does not return redacted data as text.
+
 ## Configuration
 
 Flags override environment variables.

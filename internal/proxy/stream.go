@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -22,6 +23,11 @@ import (
 const (
 	passthroughPendingMaxBytes  = 1 << 20
 	passthroughPendingMaxEvents = 1024
+	// translatedPendingMaxBytes counts every retained string payload held
+	// before commit. It matches the SSE parser event budget so one legal event
+	// can be retained, but a run of lifecycle events cannot grow without limit.
+	translatedPendingMaxBytes  = 8 << 20
+	translatedPendingMaxEvents = 1024
 )
 
 // streamPassthrough relays an upstream SSE response of the same codec as the
@@ -35,6 +41,9 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 	}
 	if reason := prep.checkCompatible(ingress, false); reason != "" {
 		return incompatibleSkip(reason)
+	}
+	if reason := prep.checkThinking(ingress); reason != "" {
+		return thinkingSkip(reason)
 	}
 	rewritten, err := finalizeRequestBody(body, upstreamModel, ingress, provider)
 	if err != nil {
@@ -290,6 +299,9 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if reason := prep.checkCompatible(backend, true); reason != "" {
 		return incompatibleSkip(reason)
 	}
+	if reason := prep.checkThinking(backend); reason != "" {
+		return thinkingSkip(reason)
+	}
 	if err := prep.materialize(ctx, req, backend); err != nil {
 		return materializeSkip(err)
 	}
@@ -341,7 +353,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	}
 
 	enc := ingress.newStreamEncoder(upstreamModel)
-	sink := &translatedSink{w: w, res: res, enc: enc}
+	sink := &translatedSink{w: w, res: res, enc: enc, ingressID: ingress.id, logger: observability.Logger(ctx, p.logger)}
 	var inTok, outTok int
 	publishUsage := func() {
 		res.inTok = inTok
@@ -484,42 +496,132 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 // translatedSink buffers lifecycle preamble until the first client-visible byte,
 // then commits SSE headers and replays. Commitment is deferred past
 // EventMessageStart so an upstream error before real output can still fail over.
+//
+// Anthropic-capable ingress treats signature and redacted payloads as visible
+// content. Other ingress formats project those payloads away and must not
+// commit or retain them without bound. Lifecycle-only events stay buffered
+// until a bound is exceeded; exceeding the bound is an error, not a silent drop.
 type translatedSink struct {
-	w          http.ResponseWriter
-	res        *reqResult
-	enc        streamEncoder
-	sw         *sse.Writer
-	pending    []ir.StreamEvent
-	committed  bool
-	text       strings.Builder
-	toolNames  []string
-	toolArgs   []string
-	stopReason ir.StopReason
+	w            http.ResponseWriter
+	res          *reqResult
+	enc          streamEncoder
+	sw           *sse.Writer
+	pending      []ir.StreamEvent
+	pendingBytes int
+	committed    bool
+	ingressID    string
+	logger       *slog.Logger
+	text         strings.Builder
+	toolNames    []string
+	toolArgs     []string
+	stopReason   ir.StopReason
+}
+
+func (s *translatedSink) anthropicIngress() bool {
+	return preservesAnthropicThinking(s.ingressID)
 }
 
 func (s *translatedSink) handle(ev ir.StreamEvent) error {
+	if s.projectAway(ev) {
+		// Drop before note and pending so a projected-away payload cannot grow
+		// the buffer or the usage estimate. Log only an actual opaque omission,
+		// not an empty thinking lifecycle frame.
+		s.noteProjectedOmission(ev)
+		return nil
+	}
+	// A readable start is kept, but its initial signature is not a projecting
+	// field. Record that omission without copying the signature forward.
+	if !s.anthropicIngress() && ev.Kind == ir.EventReasoningStart && ev.Signature != "" {
+		s.noteProjectedOmission(ev)
+		ev.Signature = ""
+	}
 	s.note(ev)
 	if !s.committed {
-		if ev.Kind == ir.EventMessageStart {
-			s.pending = append(s.pending, ev)
-			return nil
+		if !s.visible(ev) {
+			return s.buffer(ev)
 		}
-		switch ev.Kind {
-		case ir.EventTextDelta, ir.EventReasoningDelta, ir.EventToolCallStart, ir.EventToolCallDelta, ir.EventFinish:
-			if err := s.commit(); err != nil {
-				return err
-			}
-		default:
-			s.pending = append(s.pending, ev)
-			return nil
+		if err := s.commit(); err != nil {
+			return err
 		}
 	}
 	return s.enc.Encode(ev, s.sw)
 }
 
+// projectAway reports whether this ingress cannot represent the event. OpenAI
+// and Responses keep readable reasoning text and discard signature, redacted,
+// and empty thinking lifecycle frames. The drop decision is separate from
+// whether the event actually carried opaque bytes.
+func (s *translatedSink) projectAway(ev ir.StreamEvent) bool {
+	if s.anthropicIngress() {
+		return false
+	}
+	switch ev.Kind {
+	case ir.EventReasoningSignature, ir.EventReasoningEnd, ir.EventRedactedReasoning:
+		return true
+	case ir.EventReasoningStart:
+		return ev.Text == ""
+	case ir.EventReasoningDelta:
+		// An empty indexed delta is the Anthropic preamble before signature_delta.
+		// It is not readable output for a projecting ingress.
+		return ev.Indexed && ev.Text == ""
+	default:
+		return false
+	}
+}
+
+// visible reports whether ev must commit the client stream. An empty indexed
+// thinking delta is the normal preamble before signature_delta, so it stays
+// pending. Anthropic-capable ingress commits on an initial signature even when
+// the start text is empty. A projecting ingress commits a start only for
+// readable text and discards its signature.
+func (s *translatedSink) visible(ev ir.StreamEvent) bool {
+	switch ev.Kind {
+	case ir.EventTextDelta, ir.EventToolCallStart, ir.EventToolCallDelta, ir.EventFinish:
+		return true
+	case ir.EventReasoningDelta:
+		return ev.Text != "" || !ev.Indexed
+	case ir.EventReasoningStart:
+		if ev.Text != "" {
+			return true
+		}
+		return ev.Signature != "" && s.anthropicIngress()
+	case ir.EventReasoningSignature, ir.EventRedactedReasoning:
+		return s.anthropicIngress()
+	case ir.EventReasoningEnd:
+		return false
+	default:
+		return false
+	}
+}
+
+func (s *translatedSink) noteProjectedOmission(ev ir.StreamEvent) {
+	if opaqueThinkingOmitted(ev) {
+		noteOpaqueOmission(s.res, s.logger, s.ingressID)
+	}
+}
+
+func (s *translatedSink) buffer(ev ir.StreamEvent) error {
+	n := pendingEventBytes(ev)
+	if len(s.pending) >= translatedPendingMaxEvents || n > translatedPendingMaxBytes-s.pendingBytes {
+		return ir.ProtocolError("pending stream lifecycle exceeded limit")
+	}
+	s.pending = append(s.pending, ev)
+	s.pendingBytes += n
+	return nil
+}
+
+func pendingEventBytes(ev ir.StreamEvent) int {
+	return len(ev.ID) + len(ev.Model) + len(ev.Text) + len(ev.ToolID) + len(ev.ToolName) +
+		len(ev.ArgsFrag) + len(ev.Signature) + len(ev.Data)
+}
+
 func (s *translatedSink) note(ev ir.StreamEvent) {
 	switch ev.Kind {
-	case ir.EventTextDelta, ir.EventReasoningDelta:
+	case ir.EventTextDelta:
+		s.text.WriteString(ev.Text)
+	case ir.EventReasoningDelta, ir.EventReasoningStart:
+		// Readable reasoning contributes to usage estimates. Signature and
+		// redacted bytes do not, and projected-away events never reach here.
 		s.text.WriteString(ev.Text)
 	case ir.EventToolCallStart:
 		s.toolNames = append(s.toolNames, ev.ToolName)
@@ -566,6 +668,7 @@ func (s *translatedSink) commit() error {
 		}
 	}
 	s.pending = nil
+	s.pendingBytes = 0
 	return nil
 }
 

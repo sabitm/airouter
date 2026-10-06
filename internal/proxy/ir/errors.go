@@ -14,6 +14,15 @@ type StreamFailure struct {
 	Message string
 }
 
+// ProtocolError is a payload-free stream sequencing failure. Message must
+// not contain signature bytes, redacted data, or response bodies.
+func ProtocolError(message string) error {
+	if message == "" {
+		message = "invalid stream event sequence"
+	}
+	return &StreamFailure{Type: "invalid_request_error", Message: message}
+}
+
 func (e *StreamFailure) Error() string {
 	if e == nil {
 		return "upstream stream failed"

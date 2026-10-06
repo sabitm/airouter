@@ -287,6 +287,14 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		return e.emit(w, chunkDelta{Content: ev.Text}, nil)
 	case ir.EventReasoningDelta:
 		return e.emit(w, chunkDelta{ReasoningContent: ev.Text}, nil)
+	case ir.EventReasoningStart:
+		if ev.Text == "" {
+			return nil
+		}
+		return e.emit(w, chunkDelta{ReasoningContent: ev.Text}, nil)
+	case ir.EventReasoningSignature, ir.EventReasoningEnd, ir.EventRedactedReasoning:
+		// Anthropic signature and redacted payloads are not OpenAI stream fields.
+		return nil
 	case ir.EventToolCallStart:
 		// Repeated Starts for a known index reuse the client index; identity
 		// backfills on the same tool_calls entry rather than splitting the call.

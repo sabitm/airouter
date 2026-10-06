@@ -34,7 +34,7 @@ func TestRequestReasoningRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(encoded.Messages[0].Content, &blocks); err != nil {
 		t.Fatal(err)
 	}
-	if len(blocks) != 2 || blocks[0].Type != "thinking" || blocks[0].Thinking != "chain" {
+	if len(blocks) != 2 || blocks[0].Type != "thinking" || thinkingText(blocks[0].Thinking) != "chain" {
 		t.Fatalf("blocks = %+v; body=%s", blocks, out)
 	}
 }
@@ -56,7 +56,7 @@ func TestResponseReasoningRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(out, &encoded); err != nil {
 		t.Fatal(err)
 	}
-	if len(encoded.Content) != 2 || encoded.Content[0].Type != "thinking" || encoded.Content[0].Thinking != "chain" {
+	if len(encoded.Content) != 2 || encoded.Content[0].Type != "thinking" || thinkingText(encoded.Content[0].Thinking) != "chain" {
 		t.Fatalf("content = %+v; body=%s", encoded.Content, out)
 	}
 }
@@ -88,7 +88,9 @@ data: {"type":"message_stop"}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 3 || events[1].Kind != ir.EventReasoningDelta || events[1].Text != "chain" {
+	if len(events) != 5 || events[1].Kind != ir.EventReasoningStart || events[1].Index != 0 ||
+		events[2].Kind != ir.EventReasoningDelta || !events[2].Indexed || events[2].Text != "chain" || events[2].Index != 0 ||
+		events[3].Kind != ir.EventReasoningEnd || events[3].Index != 0 || events[4].Kind != ir.EventFinish {
 		t.Fatalf("events = %+v", events)
 	}
 

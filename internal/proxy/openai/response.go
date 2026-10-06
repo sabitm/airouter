@@ -78,7 +78,11 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	for _, b := range resp.Content {
 		switch b.Type {
 		case ir.BlockReasoning:
+			// Anthropic signatures are not OpenAI encrypted_content. Only readable
+			// reasoning text is projected. The proxy logs the omission once.
 			reasoning.WriteString(b.Text)
+		case ir.BlockRedactedReasoning:
+			// Redacted data is omitted. It is not emitted as text.
 		case ir.BlockText:
 			text.WriteString(b.Text)
 		case ir.BlockToolUse:
