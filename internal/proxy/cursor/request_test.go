@@ -91,6 +91,21 @@ func TestEncodeAgentRequestEnvelope(t *testing.T) {
 	if id, _ := stringField(umMsg, umMessageID); id == "" {
 		t.Error("message id empty")
 	}
+	if sel, ok := umMsg[umSelectedContext]; !ok || len(sel) == 0 || len(sel[0].value) != 0 {
+		t.Errorf("selected_context = %+v, want present and empty", sel)
+	}
+	if v, ok := varintField(umMsg, umMode); !ok || v != umModeAgent {
+		t.Errorf("mode = %d ok=%v, want 1", v, ok)
+	}
+
+	// model_details (3): model id repeated on fields 1, 3, and 4.
+	md := decodePath(t, run, runModelDetails)
+	mdMsg, _ := decodeMessage(md)
+	for _, num := range []int{mdModelID, mdModelIDAlt, mdDisplay} {
+		if got, ok := stringField(mdMsg, num); !ok || got != "default" {
+			t.Errorf("model_details field %d = %q ok=%v, want default", num, got, ok)
+		}
+	}
 
 	// requested_model (9): id + built_in_model=true.
 	rm := decodePath(t, run, runRequestedModel)
@@ -156,7 +171,7 @@ func TestMCPAvailabilityNoteUsesRequestTools(t *testing.T) {
 	}
 }
 
-func TestEncodeAgentRequestHistoryFoldedAsTranscript(t *testing.T) {
+func TestEncodeAgentRequestStructuredHistory(t *testing.T) {
 	body := mustEncodeAgent(t, &ir.Request{
 		Model: "default",
 		Messages: []ir.Message{
@@ -165,13 +180,41 @@ func TestEncodeAgentRequestHistoryFoldedAsTranscript(t *testing.T) {
 			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "third"}}},
 		},
 	})
-	um := decodePath(t, agentFramePayload(t, body), acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
+	payload := agentFramePayload(t, body)
+	um := decodePath(t, payload, acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
 	umMsg, _ := decodeMessage(um)
 	text, _ := stringField(umMsg, umText)
-	for _, want := range []string{"[Conversation History]", "User: first", "Assistant: second", "[Current Message]", "third"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("user text %q missing %q", text, want)
+	if text != "third" {
+		t.Errorf("current user text = %q, want third (history must not be folded in)", text)
+	}
+	for _, marker := range []string{"[Conversation History]", "User: first", "Assistant: second", "[Current Message]"} {
+		if strings.Contains(text, marker) {
+			t.Errorf("user text %q still contains transcript marker %q", text, marker)
 		}
+	}
+
+	hist := decodePath(t, payload, acmRunRequest, runAction, convUserMessageAction, umaConversationHistory)
+	hm, err := decodeMessage(hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := hm[chMessages]
+	if len(msgs) != 2 {
+		t.Fatalf("history messages = %d, want 2", len(msgs))
+	}
+	user, _ := decodeMessage(msgs[0].value)
+	userBody, _ := decodeMessage(user[chmUser][0].value)
+	userPart, _ := decodeMessage(userBody[chuContent][0].value)
+	userText, _ := decodeMessage(userPart[hcText][0].value)
+	if got, _ := stringField(userText, tpText); got != "first" {
+		t.Errorf("history user text = %q, want first", got)
+	}
+	asst, _ := decodeMessage(msgs[1].value)
+	asstBody, _ := decodeMessage(asst[chmAssistant][0].value)
+	asstPart, _ := decodeMessage(asstBody[chaContent][0].value)
+	asstText, _ := decodeMessage(asstPart[hcText][0].value)
+	if got, _ := stringField(asstText, tpText); got != "second" {
+		t.Errorf("history assistant text = %q, want second", got)
 	}
 }
 
@@ -190,13 +233,38 @@ func TestEncodeAgentRequestToolResultInCurrentMessage(t *testing.T) {
 			}}},
 		},
 	})
-	um := decodePath(t, agentFramePayload(t, body), acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
+	payload := agentFramePayload(t, body)
+	um := decodePath(t, payload, acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
 	umMsg, _ := decodeMessage(um)
 	text, _ := stringField(umMsg, umText)
-	for _, want := range []string{"Assistant (tool call): get_weather", "Tool result (get_weather): 18C cloudy"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("user text %q missing %q", text, want)
-		}
+	if !strings.Contains(text, "Tool result (get_weather): 18C cloudy") {
+		t.Errorf("current user text %q missing tool result label", text)
+	}
+	if strings.Contains(text, "Assistant (tool call)") || strings.Contains(text, "[Conversation History]") {
+		t.Errorf("current user text %q still folds prior turns", text)
+	}
+
+	hist := decodePath(t, payload, acmRunRequest, runAction, convUserMessageAction, umaConversationHistory)
+	hm, err := decodeMessage(hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := hm[chMessages]
+	if len(msgs) != 2 {
+		t.Fatalf("history messages = %d, want user text + assistant tool call", len(msgs))
+	}
+	asst, _ := decodeMessage(msgs[1].value)
+	asstBody, _ := decodeMessage(asst[chmAssistant][0].value)
+	part, _ := decodeMessage(asstBody[chaContent][0].value)
+	call, _ := decodeMessage(part[hcToolCall][0].value)
+	if got, _ := stringField(call, chtcID); got != "c1" {
+		t.Errorf("tool_call id = %q, want c1", got)
+	}
+	if got, _ := stringField(call, chtcName); got != "get_weather" {
+		t.Errorf("tool_call name = %q", got)
+	}
+	if got, _ := stringField(call, chtcArgsJSON); got != `{"city":"Tokyo"}` {
+		t.Errorf("tool_call args = %q", got)
 	}
 }
 
@@ -247,6 +315,171 @@ func TestEncodeAgentRequestMCPTools(t *testing.T) {
 	if !strings.Contains(schema, `"city"`) {
 		t.Errorf("input schema json = %q, want city property", schema)
 	}
+	valueRaw, ok := def[mcpDefInputSchemaValue]
+	if !ok || len(valueRaw) == 0 {
+		t.Fatal("input schema Value (field 3) missing")
+	}
+	got := protoValueToGo(valueRaw[0].value)
+	var want any
+	if err := json.Unmarshal([]byte(schema), &want); err != nil {
+		t.Fatal(err)
+	}
+	gb, _ := json.Marshal(got)
+	wb, _ := json.Marshal(want)
+	if string(gb) != string(wb) {
+		t.Errorf("schema Value = %s, want %s", gb, wb)
+	}
+}
+
+func TestEncodeAgentRequestHistoryToolCallAndResult(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "weather?"}}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "checking"},
+				{Type: ir.BlockToolUse, ToolID: "c1", ToolName: "get_weather", ToolInput: json.RawMessage(`{"city":"Tokyo"}`)},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{
+				Type: ir.BlockToolResult, ToolUseID: "c1", IsError: true,
+				ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "timeout"}},
+			}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "try again"}}},
+		},
+	})
+	payload := agentFramePayload(t, body)
+	um := decodePath(t, payload, acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
+	umMsg, _ := decodeMessage(um)
+	if text, _ := stringField(umMsg, umText); text != "try again" {
+		t.Errorf("current text = %q, want try again", text)
+	}
+	hist := decodePath(t, payload, acmRunRequest, runAction, convUserMessageAction, umaConversationHistory)
+	hm, err := decodeMessage(hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := hm[chMessages]
+	if len(msgs) != 3 {
+		t.Fatalf("history messages = %d, want user + assistant + tool", len(msgs))
+	}
+
+	asst, _ := decodeMessage(msgs[1].value)
+	asstBody, _ := decodeMessage(asst[chmAssistant][0].value)
+	parts := asstBody[chaContent]
+	if len(parts) != 2 {
+		t.Fatalf("assistant content parts = %d, want text + tool_call", len(parts))
+	}
+	textPart, _ := decodeMessage(parts[0].value)
+	if _, ok := textPart[hcText]; !ok {
+		t.Fatal("assistant part 0 is not text")
+	}
+	callPart, _ := decodeMessage(parts[1].value)
+	call, _ := decodeMessage(callPart[hcToolCall][0].value)
+	if got, _ := stringField(call, chtcName); got != "get_weather" {
+		t.Errorf("tool_call name = %q", got)
+	}
+	if got, _ := stringField(call, chtcArgsJSON); got != `{"city":"Tokyo"}` {
+		t.Errorf("args_json = %q", got)
+	}
+
+	toolMsg, _ := decodeMessage(msgs[2].value)
+	if _, ok := toolMsg[chmTool]; !ok {
+		t.Fatalf("history[2] fields = %v, want tool", fieldNums(toolMsg))
+	}
+	tool, _ := decodeMessage(toolMsg[chmTool][0].value)
+	if got, _ := stringField(tool, chtCallID); got != "c1" {
+		t.Errorf("tool_call_id = %q", got)
+	}
+	if got, _ := stringField(tool, chtName); got != "get_weather" {
+		t.Errorf("tool_name = %q, want name recovered from prior tool_use", got)
+	}
+	content, _ := decodeMessage(tool[chtContent][0].value)
+	if got, _ := stringField(content, chtcText); got != "timeout" {
+		t.Errorf("tool content = %q", got)
+	}
+	if v, ok := varintField(tool, chtIsError); !ok || v != 1 {
+		t.Errorf("is_error = %d ok=%v, want 1", v, ok)
+	}
+}
+
+func TestEncodeAgentRequestEmptyToolInputBecomesEmptyObject(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{
+				Type: ir.BlockToolUse, ToolID: "c0", ToolName: "noop",
+			}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{
+				Type: ir.BlockToolResult, ToolUseID: "missing",
+			}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "next"}}},
+		},
+	})
+	hist := decodePath(t, agentFramePayload(t, body), acmRunRequest, runAction, convUserMessageAction, umaConversationHistory)
+	hm, _ := decodeMessage(hist)
+	msgs := hm[chMessages]
+	if len(msgs) != 2 {
+		t.Fatalf("history messages = %d, want assistant + tool", len(msgs))
+	}
+	asst, _ := decodeMessage(msgs[0].value)
+	asstBody, _ := decodeMessage(asst[chmAssistant][0].value)
+	part, _ := decodeMessage(asstBody[chaContent][0].value)
+	call, _ := decodeMessage(part[hcToolCall][0].value)
+	if got, _ := stringField(call, chtcArgsJSON); got != "{}" {
+		t.Errorf("empty ToolInput args_json = %q, want {}", got)
+	}
+	toolMsg, _ := decodeMessage(msgs[1].value)
+	tool, _ := decodeMessage(toolMsg[chmTool][0].value)
+	if got, _ := stringField(tool, chtName); got != "tool" {
+		t.Errorf("unknown tool name = %q, want tool", got)
+	}
+	content, _ := decodeMessage(tool[chtContent][0].value)
+	if got, _ := stringField(content, chtcText); got != "[empty tool result]" {
+		t.Errorf("empty tool result = %q", got)
+	}
+}
+
+func TestEncodeAgentRequestOmitsEmptyHistory(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+	})
+	action := decodePath(t, agentFramePayload(t, body), acmRunRequest, runAction, convUserMessageAction)
+	m, _ := decodeMessage(action)
+	if _, ok := m[umaConversationHistory]; ok {
+		t.Error("conversation_history present on a single-turn request")
+	}
+}
+
+func TestEncodeAgentRequestEmptySchemaValue(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}},
+		},
+		Tools: []ir.Tool{{Name: "noop"}},
+	})
+	run := decodePath(t, agentFramePayload(t, body), acmRunRequest)
+	m, _ := decodeMessage(run)
+	tools, _ := decodeMessage(m[runMCPTools][0].value)
+	def, _ := decodeMessage(tools[mcpDefsName][0].value)
+	schema, _ := stringField(def, mcpDefInputSchemaJSON)
+	if schema != `{"type":"object","properties":{}}` {
+		t.Errorf("default schema json = %q", schema)
+	}
+	if _, ok := def[mcpDefInputSchemaValue]; !ok {
+		t.Fatal("default schema Value missing")
+	}
+}
+
+func fieldNums(m map[int][]field) []int {
+	var nums []int
+	for n := range m {
+		nums = append(nums, n)
+	}
+	return nums
 }
 
 func TestEncodeAgentRequestNoToolsOmitsMCPTools(t *testing.T) {

@@ -615,59 +615,130 @@ func mcpPartialArgsFrame(t *testing.T, callID, delta string) []byte {
 	return interactionUpdateFrame(t, iuPartialToolCall, inner)
 }
 
-func TestDecodeAgentStreamShellExecEmitsToolUse(t *testing.T) {
+func TestDecodeAgentStreamShellExecDoesNotEmitToolUse(t *testing.T) {
 	args := concatBytes(
 		encodeField(1, wireLen, "ls -la"),
 		encodeField(4, wireLen, "call-sh"),
 	)
 	ex := concatBytes(
 		encodeField(esmID, wireVarint, uint64(5)),
+		encodeField(esmExecID, wireLen, "exec-sh"),
 		encodeField(2, wireLen, args), // shell_args
 	)
-	events := collectAgentEvents(t, agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)))
-	assertInteractionToolUse(t, events, "call-sh", "shell", `{"command":"ls -la"}`)
-}
-
-func TestDecodeAgentStreamUnknownExecOneofStillSurfaces(t *testing.T) {
-	// Field 99 is not in execToolName; the decoder must still emit a tool
-	// call (name exec_99) instead of fail-closing.
-	args := encodeField(1, wireLen, "payload")
-	ex := encodeField(99, wireLen, args)
-	events := collectAgentEvents(t, agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)))
-	var start *ir.StreamEvent
-	for i, ev := range events {
+	var writes [][]byte
+	var events []ir.StreamEvent
+	err := DecodeAgentStream(bytes.NewReader(bytes.Join([][]byte{
+		agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)),
+		agentTextFrame(t, "still here"),
+		agentTurnEndedFrame(t, 4, 1),
+	}, nil)), func(frame []byte) error {
+		writes = append(writes, frame)
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 1 {
+		t.Fatalf("rejects = %d, want 1", len(writes))
+	}
+	_, payload, err := readFrame(bytes.NewReader(writes[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := decodeMessage(payload)
+	ecm, ok := cm[2]
+	if !ok {
+		t.Fatal("reject is not an exec_client_message")
+	}
+	em, _ := decodeMessage(ecm[0].value)
+	if _, ok := em[2]; !ok {
+		t.Fatal("shell result field missing")
+	}
+	var text strings.Builder
+	var stop ir.StopReason
+	for _, ev := range events {
 		if ev.Kind == ir.EventToolCallStart {
-			start = &events[i]
+			t.Fatalf("shell exec emitted tool_use %s", ev.ToolName)
+		}
+		if ev.Kind == ir.EventTextDelta {
+			text.WriteString(ev.Text)
+		}
+		if ev.Kind == ir.EventFinish {
+			stop = ev.StopReason
 		}
 	}
-	if start == nil {
-		t.Fatal("no tool call start")
+	if text.String() != "still here" {
+		t.Errorf("text = %q, want later text after rejected shell", text.String())
 	}
-	if start.ToolName != "exec_99" {
-		t.Errorf("name = %q, want exec_99", start.ToolName)
-	}
-	last := events[len(events)-1]
-	if last.Kind != ir.EventFinish || last.StopReason != ir.StopToolUse {
-		t.Fatalf("finish = %+v, want tool_use", last)
+	if stop != ir.StopEndTurn {
+		t.Errorf("stop = %q, want end_turn", stop)
 	}
 }
 
-func TestDecodeAgentStreamUnmatchedUpdateClosesWithoutRejection(t *testing.T) {
+func TestDecodeAgentStreamUnknownExecOneofRejected(t *testing.T) {
+	// Field 99 is not a known control field. It is still a built-in exec:
+	// reject it and do not invent exec_99.
+	args := encodeField(1, wireLen, "payload")
+	ex := concatBytes(
+		encodeField(esmID, wireVarint, uint64(11)),
+		encodeField(esmExecID, wireLen, "exec-99"),
+		encodeField(99, wireLen, args),
+	)
+	var writes int
+	events := []ir.StreamEvent{}
+	err := DecodeAgentStream(bytes.NewReader(bytes.Join([][]byte{
+		agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)),
+		agentTextFrame(t, "continued"),
+		agentTurnEndedFrame(t, 1, 1),
+	}, nil)), func([]byte) error {
+		writes++
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("rejects = %d, want 1", writes)
+	}
+	for _, ev := range events {
+		if ev.Kind == ir.EventToolCallStart {
+			t.Fatalf("unknown exec surfaced as %s", ev.ToolName)
+		}
+	}
+	var text strings.Builder
+	for _, ev := range events {
+		if ev.Kind == ir.EventTextDelta {
+			text.WriteString(ev.Text)
+		}
+	}
+	if text.String() != "continued" {
+		t.Errorf("text = %q, want continued", text.String())
+	}
+}
+
+func TestDecodeAgentStreamBuiltinUpdateDoesNotSurface(t *testing.T) {
 	var writes int
 	var sawTextAfter bool
 	var finished bool
 	err := DecodeAgentStreamTools([]ir.Tool{{Name: "bash"}, {Name: "read"}}, bytes.NewReader(bytes.Join([][]byte{
 		agentTextFrame(t, "Checking what is left to build."),
 		builtinToolUpdateFrame(t, 5, "call-grep", "/tmp", "**/xai*"),
-		agentTextFrame(t, "this later frame must not be consumed"),
+		agentTextFrame(t, "continued after builtin"),
+		agentTurnEndedFrame(t, 2, 1),
 	}, nil)), func([]byte) error {
 		writes++
 		return nil
 	}, func(ev ir.StreamEvent) error {
 		if ev.Kind == ir.EventToolCallStart {
-			t.Fatalf("unmatched tool emitted %s", ev.ToolName)
+			t.Fatalf("builtin tool update emitted %s", ev.ToolName)
 		}
-		if ev.Kind == ir.EventTextDelta && ev.Text == "this later frame must not be consumed" {
+		if ev.Kind == ir.EventTextDelta && ev.Text == "continued after builtin" {
 			sawTextAfter = true
 		}
 		if ev.Kind == ir.EventFinish {
@@ -682,32 +753,33 @@ func TestDecodeAgentStreamUnmatchedUpdateClosesWithoutRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	if writes != 0 {
-		t.Fatalf("rejects = %d, want 0", writes)
+		t.Fatalf("rejects = %d, want 0 (tool updates have no exec envelope)", writes)
 	}
 	if !finished {
-		t.Fatal("unmatched tool update did not finish the turn")
+		t.Fatal("builtin tool update stalled the stream")
 	}
-	if sawTextAfter {
-		t.Fatal("decoder consumed a frame after the unmatched tool update")
+	if !sawTextAfter {
+		t.Fatal("decoder stopped before text after the builtin tool update")
 	}
 }
 
-func TestDecodeAgentStreamUnmatchedPartialUpdateCloses(t *testing.T) {
+func TestDecodeAgentStreamBuiltinPartialUpdateDoesNotSurface(t *testing.T) {
 	var writes int
 	var sawTextAfter bool
 	var finished bool
 	err := DecodeAgentStreamTools([]ir.Tool{{Name: "bash"}}, bytes.NewReader(bytes.Join([][]byte{
 		agentTextFrame(t, "Checking what is left to build."),
 		builtinPartialToolUpdateFrame(t, "call-grep", "/tmp", "**/xai*"),
-		agentTextFrame(t, "this later frame must not be consumed"),
+		agentTextFrame(t, "continued after partial"),
+		agentTurnEndedFrame(t, 2, 1),
 	}, nil)), func([]byte) error {
 		writes++
 		return nil
 	}, func(ev ir.StreamEvent) error {
 		if ev.Kind == ir.EventToolCallStart {
-			t.Fatalf("unmatched tool emitted %s", ev.ToolName)
+			t.Fatalf("builtin partial update emitted %s", ev.ToolName)
 		}
-		if ev.Kind == ir.EventTextDelta && ev.Text == "this later frame must not be consumed" {
+		if ev.Kind == ir.EventTextDelta && ev.Text == "continued after partial" {
 			sawTextAfter = true
 		}
 		if ev.Kind == ir.EventFinish {
@@ -725,10 +797,10 @@ func TestDecodeAgentStreamUnmatchedPartialUpdateCloses(t *testing.T) {
 		t.Fatalf("rejects = %d, want 0", writes)
 	}
 	if !finished {
-		t.Fatal("unmatched partial update did not finish the turn")
+		t.Fatal("builtin partial update stalled the stream")
 	}
-	if sawTextAfter {
-		t.Fatal("decoder consumed a frame after the unmatched partial update")
+	if !sawTextAfter {
+		t.Fatal("decoder stopped before text after the builtin partial update")
 	}
 }
 
@@ -764,7 +836,7 @@ func builtinPartialToolUpdateFrame(t *testing.T, callID, path, pattern string) [
 	return interactionUpdateFrame(t, iuPartialToolCall, inner)
 }
 
-func TestDecodeAgentStreamReadToolCallStarted(t *testing.T) {
+func TestDecodeAgentStreamReadToolCallStartedDoesNotSurface(t *testing.T) {
 	readArgs := concatBytes(
 		encodeField(1, wireLen, "/etc/hostname"),
 		encodeField(2, wireLen, "call-rd"),
@@ -777,9 +849,21 @@ func TestDecodeAgentStreamReadToolCallStarted(t *testing.T) {
 	)
 	events := collectAgentEvents(t,
 		interactionUpdateFrame(t, iuToolCallStarted, inner),
+		agentTextFrame(t, "after read"),
 		agentTurnEndedFrame(t, 1, 1),
 	)
-	assertInteractionToolUse(t, events, "call-rd", "read", `{"path":"/etc/hostname"}`)
+	var text strings.Builder
+	for _, ev := range events {
+		if ev.Kind == ir.EventToolCallStart {
+			t.Fatalf("read tool_call_started emitted %s", ev.ToolName)
+		}
+		if ev.Kind == ir.EventTextDelta {
+			text.WriteString(ev.Text)
+		}
+	}
+	if text.String() != "after read" {
+		t.Errorf("text = %q, want after read", text.String())
+	}
 }
 
 func TestDecodeAgentStreamErrorFrameBeforeContent(t *testing.T) {
@@ -902,22 +986,18 @@ func TestDecodeAgentStreamEmptyStreamFinishes(t *testing.T) {
 	}
 }
 
-// TestDecodeAgentStreamWebSearchEmitsToolUse surfaces interaction_query web
-// search as IR tool_use under Cursor's native name, then finishes the turn.
-func TestDecodeAgentStreamWebSearchEmitsToolUse(t *testing.T) {
-	args := concatBytes(
-		encodeField(iqArgPrimary, wireLen, "SPUS"),
-		encodeField(iqArgCallID, wireLen, "call-ws"),
+// TestDecodeAgentStreamWebSearchDoesNotSurface ignores interaction_query
+// web search. Built-ins are not client tool calls, and the stream continues.
+func TestDecodeAgentStreamWebSearchDoesNotSurface(t *testing.T) {
+	events := collectAgentEvents(t,
+		webSearchQueryFrame(t, "call-ws", "SPUS"),
+		agentTextFrame(t, "after search"),
+		agentTurnEndedFrame(t, 1, 1),
 	)
-	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
-		encodeField(iqWebSearch, wireLen,
-			encodeField(iqQueryArgs, wireLen, args))))
-	events := collectAgentEvents(t, frame)
-	assertInteractionToolUse(t, events, "call-ws", "web_search", `{"search_term":"SPUS"}`)
+	assertNoToolUseContinues(t, events, "after search")
 }
 
-// TestDecodeAgentStreamWebFetchEmitsToolUse is the web_fetch counterpart.
-func TestDecodeAgentStreamWebFetchEmitsToolUse(t *testing.T) {
+func TestDecodeAgentStreamWebFetchDoesNotSurface(t *testing.T) {
 	args := concatBytes(
 		encodeField(iqArgPrimary, wireLen, "https://example.com"),
 		encodeField(iqArgCallID, wireLen, "call-wf"),
@@ -925,8 +1005,31 @@ func TestDecodeAgentStreamWebFetchEmitsToolUse(t *testing.T) {
 	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
 		encodeField(iqWebFetch, wireLen,
 			encodeField(iqQueryArgs, wireLen, args))))
-	events := collectAgentEvents(t, frame)
-	assertInteractionToolUse(t, events, "call-wf", "web_fetch", `{"url":"https://example.com"}`)
+	events := collectAgentEvents(t, frame, agentTextFrame(t, "after fetch"), agentTurnEndedFrame(t, 1, 1))
+	assertNoToolUseContinues(t, events, "after fetch")
+}
+
+func assertNoToolUseContinues(t *testing.T, events []ir.StreamEvent, wantText string) {
+	t.Helper()
+	var text strings.Builder
+	var stop ir.StopReason
+	for _, ev := range events {
+		if ev.Kind == ir.EventToolCallStart || ev.Kind == ir.EventToolCallDelta {
+			t.Fatalf("built-in surfaced as %v/%s", ev.Kind, ev.ToolName)
+		}
+		if ev.Kind == ir.EventTextDelta {
+			text.WriteString(ev.Text)
+		}
+		if ev.Kind == ir.EventFinish {
+			stop = ev.StopReason
+		}
+	}
+	if text.String() != wantText {
+		t.Errorf("text = %q, want %q", text.String(), wantText)
+	}
+	if stop != ir.StopEndTurn {
+		t.Errorf("stop = %q, want end_turn", stop)
+	}
 }
 
 func assertInteractionToolUse(t *testing.T, events []ir.StreamEvent, id, name, wantArgs string) {
@@ -989,12 +1092,14 @@ func webSearchStartedFrame(t *testing.T, callID string) []byte {
 	return interactionUpdateFrame(t, iuToolCallStarted, inner)
 }
 
-func TestDecodeAgentStreamWebSearchStartedThenQueryFlushesArgs(t *testing.T) {
+func TestDecodeAgentStreamWebSearchStartedThenQueryContinues(t *testing.T) {
 	events := collectAgentEvents(t,
 		webSearchStartedFrame(t, "call-ws"),
 		webSearchQueryFrame(t, "call-ws", "SPUS"),
+		agentTextFrame(t, "after query"),
+		agentTurnEndedFrame(t, 1, 1),
 	)
-	assertInteractionToolUse(t, events, "call-ws", "web_search", `{"search_term":"SPUS"}`)
+	assertNoToolUseContinues(t, events, "after query")
 }
 
 func TestDecodeAgentStreamMCPStartedDoesNotBecomeTool15(t *testing.T) {
@@ -1015,16 +1120,20 @@ func TestDecodeAgentStreamMCPStartedDoesNotBecomeTool15(t *testing.T) {
 	}
 }
 
-func TestDecodeAgentStreamWebSearchRemapsToDeclaredWebsearch(t *testing.T) {
+func TestDecodeAgentStreamWebSearchDoesNotRemapToDeclaredTool(t *testing.T) {
 	tools := []ir.Tool{{
 		Name:       "websearch",
 		Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
 	}}
-	events := collectAgentEventsTools(t, tools, webSearchQueryFrame(t, "call-ws", "SPUS"))
-	assertInteractionToolUse(t, events, "call-ws", "websearch", `{"query":"SPUS"}`)
+	events := collectAgentEventsTools(t, tools,
+		webSearchQueryFrame(t, "call-ws", "SPUS"),
+		agentTextFrame(t, "no remap"),
+		agentTurnEndedFrame(t, 1, 1),
+	)
+	assertNoToolUseContinues(t, events, "no remap")
 }
 
-func TestDecodeAgentStreamWebSearchUnmatchedDropped(t *testing.T) {
+func TestDecodeAgentStreamWebSearchIgnoredWhenToolsDeclared(t *testing.T) {
 	tools := []ir.Tool{{
 		Name:       "bash",
 		Parameters: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
@@ -1034,15 +1143,16 @@ func TestDecodeAgentStreamWebSearchUnmatchedDropped(t *testing.T) {
 	var finished bool
 	err := DecodeAgentStreamTools(tools, bytes.NewReader(bytes.Join([][]byte{
 		webSearchQueryFrame(t, "call-ws", "SPUS"),
-		agentTextFrame(t, "this later frame must not be consumed"),
+		agentTextFrame(t, "continued after query"),
+		agentTurnEndedFrame(t, 1, 1),
 	}, nil)), func([]byte) error {
 		writes++
 		return nil
 	}, func(ev ir.StreamEvent) error {
 		if ev.Kind == ir.EventToolCallStart {
-			t.Fatalf("unmatched interaction emitted %+v", ev)
+			t.Fatalf("interaction emitted %+v", ev)
 		}
-		if ev.Kind == ir.EventTextDelta && ev.Text == "this later frame must not be consumed" {
+		if ev.Kind == ir.EventTextDelta && ev.Text == "continued after query" {
 			sawTextAfter = true
 		}
 		if ev.Kind == ir.EventFinish {
@@ -1060,10 +1170,10 @@ func TestDecodeAgentStreamWebSearchUnmatchedDropped(t *testing.T) {
 		t.Fatalf("rejects = %d, want 0", writes)
 	}
 	if !finished {
-		t.Fatal("unmatched interaction did not finish the turn")
+		t.Fatal("interaction query stalled the stream")
 	}
-	if sawTextAfter {
-		t.Fatal("decoder consumed a frame after the unmatched interaction")
+	if !sawTextAfter {
+		t.Fatal("decoder stopped before text after the interaction query")
 	}
 }
 
@@ -1098,7 +1208,7 @@ func TestDecodeAgentStreamShellDoesNotMatchBash(t *testing.T) {
 	}
 }
 
-func TestDecodeAgentStreamShellMatchesDeclaredShell(t *testing.T) {
+func TestDecodeAgentStreamShellDoesNotMatchDeclaredShell(t *testing.T) {
 	tools := []ir.Tool{{
 		Name:       "shell",
 		Parameters: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
@@ -1111,43 +1221,55 @@ func TestDecodeAgentStreamShellMatchesDeclaredShell(t *testing.T) {
 		encodeField(esmID, wireVarint, uint64(5)),
 		encodeField(2, wireLen, args),
 	)
-	events := collectAgentEventsTools(t, tools, agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)))
-	assertInteractionToolUse(t, events, "call-sh", "shell", `{"command":"ls"}`)
+	var writes int
+	events := []ir.StreamEvent{}
+	err := DecodeAgentStreamTools(tools, bytes.NewReader(bytes.Join([][]byte{
+		agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)),
+		agentTextFrame(t, "after shell"),
+		agentTurnEndedFrame(t, 1, 1),
+	}, nil)), func([]byte) error {
+		writes++
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("rejects = %d, want 1", writes)
+	}
+	assertNoToolUseContinues(t, events, "after shell")
 }
 
-func TestDecodeAgentStreamAskQuestionPassThroughWithoutTools(t *testing.T) {
+func TestDecodeAgentStreamAskQuestionDoesNotSurface(t *testing.T) {
 	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
 		encodeField(3, wireLen, []byte{}))) // ask_question_interaction_query
-	events := collectAgentEvents(t, frame)
-	var start *ir.StreamEvent
-	for i, ev := range events {
-		if ev.Kind == ir.EventToolCallStart {
-			start = &events[i]
-		}
-	}
-	if start == nil || start.ToolName != "ask_question" {
-		t.Fatalf("tool = %+v, want ask_question", start)
-	}
+	events := collectAgentEvents(t, frame, agentTextFrame(t, "after ask"), agentTurnEndedFrame(t, 1, 1))
+	assertNoToolUseContinues(t, events, "after ask")
 }
 
-func TestDecodeAgentStreamAskQuestionUnmatched(t *testing.T) {
+func TestDecodeAgentStreamAskQuestionIgnoredWithTools(t *testing.T) {
 	tools := []ir.Tool{{Name: "bash"}}
 	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
 		encodeField(3, wireLen, []byte{})))
 	var writes int
 	var finished bool
+	var sawText bool
 	err := DecodeAgentStreamTools(tools, bytes.NewReader(bytes.Join([][]byte{
 		frame,
-		agentTextFrame(t, "this later frame must not be consumed"),
+		agentTextFrame(t, "continued after ask"),
+		agentTurnEndedFrame(t, 1, 1),
 	}, nil)), func([]byte) error {
 		writes++
 		return nil
 	}, func(ev ir.StreamEvent) error {
 		if ev.Kind == ir.EventToolCallStart {
-			t.Fatalf("unmatched interaction emitted %+v", ev)
+			t.Fatalf("interaction emitted %+v", ev)
 		}
-		if ev.Kind == ir.EventTextDelta && ev.Text == "this later frame must not be consumed" {
-			t.Fatal("decoder consumed a frame after the unmatched interaction")
+		if ev.Kind == ir.EventTextDelta && ev.Text == "continued after ask" {
+			sawText = true
 		}
 		if ev.Kind == ir.EventFinish {
 			finished = true
@@ -1163,27 +1285,19 @@ func TestDecodeAgentStreamAskQuestionUnmatched(t *testing.T) {
 	if writes != 0 {
 		t.Fatalf("rejects = %d, want 0", writes)
 	}
-	if !finished {
-		t.Fatal("unmatched interaction did not finish the turn")
+	if !finished || !sawText {
+		t.Fatalf("finished=%v sawText=%v, want both", finished, sawText)
 	}
 }
 
-func TestDecodeAgentStreamUnknownInteractionNamed(t *testing.T) {
+func TestDecodeAgentStreamUnknownInteractionIgnored(t *testing.T) {
 	frame := agentFrame(t, encodeField(asmInteractionQuery, wireLen,
 		encodeField(99, wireLen, []byte{})))
-	events := collectAgentEvents(t, frame)
-	var start *ir.StreamEvent
-	for i, ev := range events {
-		if ev.Kind == ir.EventToolCallStart {
-			start = &events[i]
-		}
-	}
-	if start == nil || start.ToolName != "interaction_99" {
-		t.Fatalf("tool = %+v, want interaction_99", start)
-	}
+	events := collectAgentEvents(t, frame, agentTextFrame(t, "after unknown"), agentTurnEndedFrame(t, 1, 1))
+	assertNoToolUseContinues(t, events, "after unknown")
 }
 
-func TestDecodeAgentStreamPiBashRemapsToBash(t *testing.T) {
+func TestDecodeAgentStreamPiBashRejectedNotRemapped(t *testing.T) {
 	tools := []ir.Tool{{
 		Name:       "bash",
 		Parameters: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
@@ -1196,8 +1310,26 @@ func TestDecodeAgentStreamPiBashRemapsToBash(t *testing.T) {
 		encodeField(esmID, wireVarint, uint64(5)),
 		encodeField(46, wireLen, args), // pi_bash_args
 	)
-	events := collectAgentEventsTools(t, tools, agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)))
-	assertInteractionToolUse(t, events, "call-pi", "bash", `{"command":"uname -a"}`)
+	var writes int
+	events := []ir.StreamEvent{}
+	err := DecodeAgentStreamTools(tools, bytes.NewReader(bytes.Join([][]byte{
+		agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex)),
+		agentTextFrame(t, "after pi"),
+		agentTurnEndedFrame(t, 1, 1),
+	}, nil)), func([]byte) error {
+		writes++
+		return nil
+	}, func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("rejects = %d, want 1", writes)
+	}
+	assertNoToolUseContinues(t, events, "after pi")
 }
 
 func TestParseCursorErrorPrefersDetailTitle(t *testing.T) {

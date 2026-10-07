@@ -2,6 +2,7 @@ package cursor
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -37,6 +38,25 @@ func TestEncodeFieldVarint(t *testing.T) {
 	want := []byte{216, 1, 1}
 	if !bytes.Equal(b, want) {
 		t.Errorf("got %v want %v", b, want)
+	}
+}
+
+func TestEncodeFieldFixed64(t *testing.T) {
+	b := encodeField(2, wireFixed64, 1.5)
+	// tag = (2<<3)|1 = 17, then little-endian IEEE-754.
+	if len(b) != 9 || b[0] != 17 {
+		t.Fatalf("got %v, want 9-byte fixed64 with tag 17", b)
+	}
+	m, err := decodeMessage(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := m[2]
+	if len(f) != 1 || f[0].wireType != wireFixed64 || len(f[0].value) != 8 {
+		t.Fatalf("decoded = %+v", f)
+	}
+	if float64FromBits(binary.LittleEndian.Uint64(f[0].value)) != 1.5 {
+		t.Fatalf("double = %v", f[0].value)
 	}
 }
 

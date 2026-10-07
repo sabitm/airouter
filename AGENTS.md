@@ -121,18 +121,24 @@ Qoder, Antigravity, Cursor, and Claude Code are backend-only variants.
   must not send the IDE-only headers, because an IDE identity makes `Run`
   return a false "usage limit" on non-Pro accounts. Native login must persist
   that identity and never regenerate it during refresh. Preserve the checksum
-  algorithm, full identity-header override, and the transcript-folded
-  history/tool results
-  (the server ignores inline `conversation_history`, and
-  `custom_system_prompt` is rejected). MCP tool definitions must carry
-  `provider_identifier`/`tool_name` — two or more identity-less definitions
-  are rejected by the provider with a 400. Every Cursor built-in
-  (`interaction_query`, non-MCP exec, ToolCall oneofs) is resolved onto a
-  declared ingress tool (exact name, lowercase alphanumeric equality such
-  as `web_search`/`websearch`, or Cursor's `pi_` namespace prefix). Unmatched
-  built-ins are not forwarded to the client. The proxy rejects the exec when
-  the message has a result field; otherwise it closes the turn. Unknown
-  interaction queries are not retried and must not fail the stream.
+  algorithm, and full identity-header override. Keep a fresh empty
+  `conversation_state`. Replay prior turns as structured
+  `conversation_history` on `UserMessageAction`, not as a transcript inside
+  the current user text. The current turn stays in `UserMessage` text,
+  including tool-result labels. `custom_system_prompt` is rejected, so fold
+  the system prompt into that text. `UserMessage` must carry empty
+  `selected_context` and `mode=1`. `RunRequest` must carry `model_details`
+  (model id on fields 1, 3, and 4) plus `RequestedModel`. Do not add
+  reasoning-effort or prompt-cache request fields; thinking is the model-id
+  suffix, and cache read/write still come from `turn_ended`. MCP tool
+  definitions must carry `provider_identifier`/`tool_name` and both schema
+  forms (protobuf `Value` and `input_schema_json`). Two or more identity-less
+  definitions are rejected by the provider with a 400. Surface only MCP exec
+  tool calls. Do not surface Cursor built-ins (`interaction_query`, non-MCP
+  exec, ToolCall oneofs), even when a declared tool name matches. Reject a
+  non-MCP exec that has a result field and keep reading. Ignore interaction
+  queries and built-in tool updates; do not end the turn or fail the stream
+  for them.
 - **Claude Code:** Keep an ID distinct from Anthropic so requests always pass
   through preparation. Preserve per-request session ID pairing between body and
   headers, OAuth-token-gated cloaking, tool decloaking, and CLI identity headers.

@@ -1,6 +1,10 @@
 package cursor
 
-import "fmt"
+import (
+	"encoding/binary"
+	"fmt"
+	"math"
+)
 
 // encodeVarint writes a base-128 varint (little-endian, 7 bits per byte, MSB
 // continuation). Matches the protobuf wire varint encoding.
@@ -36,7 +40,8 @@ func decodeVarint(b []byte, off int) (uint64, int, error) {
 
 // encodeField encodes one tagged field. value is a string, []byte, or uint64.
 // For wireLen types the length prefix is emitted; for wireVarint the value is
-// the varint itself.
+// the varint itself. wireFixed64 takes a float64 and writes a little-endian
+// IEEE-754 double (google.protobuf.Value number_value).
 func encodeField(fieldNum, wireType int, value any) []byte {
 	tag := uint64(fieldNum)<<3 | uint64(wireType)
 	tagBytes := encodeVarint(tag)
@@ -50,6 +55,10 @@ func encodeField(fieldNum, wireType int, value any) []byte {
 		return concatBytes(tagBytes, encodeVarint(v))
 	case int:
 		return concatBytes(tagBytes, encodeVarint(uint64(v)))
+	case float64:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(v))
+		return concatBytes(tagBytes, buf[:])
 	default:
 		return tagBytes
 	}

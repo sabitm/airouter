@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"io"
 	"math"
-	"strconv"
 	"strings"
 
 	"airouter/internal/proxy/ir"
@@ -140,43 +139,6 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		return nil
 	}
 
-	// startBuiltin surfaces a Cursor-native tool. With no declared list the
-	// name passes through. With a list, exact or canonical match remaps onto
-	// the client's tool; no match drops the call (no invented tool_use).
-	startBuiltin := func(id, name, argsJSON string) error {
-		if len(clientTools) == 0 {
-			return startToolCall(id, name, argsJSON)
-		}
-		declared, bound, ok := resolveClientTool(clientTools, name, argsJSON)
-		if !ok {
-			return nil
-		}
-		return startToolCall(id, declared, bound)
-	}
-
-	// answerBuiltin sends a matched built-in to Pi. An unmatched non-MCP tool
-	// update is not an ExecServerMessage, so it cannot carry a valid exec
-	// rejection. Close the client turn instead of writing a fake reply or
-	// waiting for heartbeats. An unmatched interaction query has the same
-	// constraint: it has no ExecServerMessage reply envelope.
-	answerBuiltin := func(id, name, argsJSON string, mcp bool) (closeTurn bool, err error) {
-		before := len(toolOrder)
-		start := startBuiltin
-		if mcp {
-			start = startToolCall
-		}
-		if err = start(id, name, argsJSON); err != nil {
-			return false, err
-		}
-		if len(toolOrder) != before {
-			return clientToolsReady(), nil
-		}
-		if mcp || len(clientTools) == 0 {
-			return false, nil
-		}
-		return true, nil
-	}
-
 	for {
 		flags, payload, err := readFrame(r)
 		if err != nil {
@@ -202,23 +164,21 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 			continue
 		}
 
-		// interaction_query: the server asks the client to run a built-in.
-		// Every variant is named and resolved. An unmatched query is not
-		// forwarded. Silent ignore stalls the upstream with heartbeats forever. A matched
-		// query is the client's tool call, so this turn ends now. Cursor does
-		// not send turn_ended until the query has its real result, and that
-		// result arrives on the next request.
+		// interaction_query asks the client to run a Cursor built-in.
+		// Built-ins are not surfaced. The query has no ExecServerMessage
+		// envelope, so it cannot be rejected here. Ignore the payload and keep
+		// reading: ending the turn drops later text, and a missing reply is
+		// heartbeats rather than a stream failure. A query that names an MCP
+		// tool already in toolOrder ends the turn once that call's args are
+		// complete (the client's result returns on the next request).
 		if iqs, ok := top[asmInteractionQuery]; ok && len(iqs) > 0 {
-			id, name, args, ok := extractInteractionToolCall(iqs[0].value)
-			if !ok {
-				id, name, args = ir.NewID("call_"), "interaction_query", "{}"
-			}
-			closeTurn, err := answerBuiltin(id, name, args, false)
-			if err != nil {
-				return err
-			}
-			if closeTurn {
-				return emitFinish()
+			if name, ok := interactionQueryNameOf(iqs[0].value); ok && clientToolsReady() {
+				want := decloakToolName(name)
+				for _, id := range toolOrder {
+					if toolCalls[id].name == want {
+						return emitFinish()
+					}
+				}
 			}
 		}
 
@@ -234,14 +194,15 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		}
 
 		// exec_server_message: request-context queries get an empty context.
-		// MCP and every other exec args oneof are surfaced as IR tool_use
-		// (the client executes or rejects; the result returns with the next
-		// request's history). A client-visible exec ends this turn. Waiting for
-		// turn_ended deadlocks: Cursor heartbeats until the exec is answered,
-		// and the answer is the client's next request, not a frame on this stream.
+		// Only MCP exec args are surfaced as IR tool_use. Every other exec
+		// oneof is a Cursor built-in: reject it and keep reading so a later
+		// declared MCP call or text delta can still be delivered. A matched
+		// MCP exec ends this turn. Waiting for turn_ended deadlocks: Cursor
+		// heartbeats until the exec is answered, and the answer is the client's
+		// next request, not a frame on this stream.
 		if exs, ok := top[asmExecServerMessage]; ok && len(exs) > 0 {
 			before := len(toolOrder)
-			if done, err := handleExecServerMessage(exs[0].value, writeFrame, startToolCall, startBuiltin); err != nil {
+			if done, err := handleExecServerMessage(exs[0].value, writeFrame, startToolCall); err != nil {
 				return err
 			} else if done && len(toolOrder) == before {
 				server, _ := decodeMessage(exs[0].value)
@@ -278,16 +239,13 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 				// thinking_delta: dropped. Cursor reasoning carries no
 				// cryptographic signature, so strict thinking consumers
 				// (Anthropic clients) would reject or stall on it.
-				// tool_call_started / partial_tool_call: client-visible calls
-				// (MCP and built-in ToolCall oneofs).
+				// tool_call_started / partial_tool_call: only the MCP ToolCall
+				// oneof is client-visible. Built-in oneofs are not surfaced; the
+				// matching exec message is rejected and the stream continues.
 				if tcss, ok := update[iuToolCallStarted]; ok && len(tcss) > 0 {
-					if id, name, args, mcp, ok := extractAnyToolCall(tcss[0].value); ok {
-						closeTurn, err := answerBuiltin(id, name, args, mcp)
-						if err != nil {
+					if id, name, args, ok := extractMCPToolCall(tcss[0].value); ok {
+						if err := startToolCall(id, name, args); err != nil {
 							return err
-						}
-						if closeTurn {
-							return emitFinish()
 						}
 					}
 				}
@@ -303,13 +261,9 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 						}
 					}
 					if id == "" || toolCalls[id] == nil {
-						if cid, name, args, mcp, ok := extractAnyToolCall(ptcs[0].value); ok {
-							closeTurn, err := answerBuiltin(cid, name, args, mcp)
-							if err != nil {
+						if cid, name, args, ok := extractMCPToolCall(ptcs[0].value); ok {
+							if err := startToolCall(cid, name, args); err != nil {
 								return err
-							}
-							if closeTurn {
-								return emitFinish()
 							}
 						}
 					}
@@ -383,8 +337,10 @@ func encodeKVReply(server []byte) []byte {
 }
 
 // handleExecServerMessage services one ExecServerMessage. Returns done=true
-// when the turn must end after surfacing a tool call to the client.
-func handleExecServerMessage(server []byte, writeFrame func([]byte) error, startMCP, startBuiltin func(id, name, args string) error) (bool, error) {
+// when the message was an MCP exec (surface and end the turn) or a built-in
+// exec that must be rejected without changing toolOrder. done=false means
+// the message was a control ack (request context) and the stream continues.
+func handleExecServerMessage(server []byte, writeFrame func([]byte) error, startMCP func(id, name, args string) error) (bool, error) {
 	m, err := decodeMessage(server)
 	if err != nil {
 		return false, nil
@@ -441,13 +397,9 @@ func handleExecServerMessage(server []byte, writeFrame func([]byte) error, start
 	}
 
 	// Any other exec args oneof (shell, read, grep, ...) is a Cursor
-	// built-in. A declared client tool ends this turn. An unmatched built-in
-	// is rejected on this stream: dropping it makes Cursor end the run after
-	// status text, and the client never sees the search it asked for.
-	if callID, name, argsJSON, ok := extractExecToolCall(m); ok {
-		if err := startBuiltin(callID, name, argsJSON); err != nil {
-			return false, err
-		}
+	// built-in. Do not surface it. done=true with no toolOrder change makes
+	// the caller reject the exec and keep reading.
+	if execResultField(m) != 0 {
 		return true, nil
 	}
 	return false, nil
@@ -500,9 +452,10 @@ func encodeMCPAck(id uint64, execID string) []byte {
 	return wrapConnectFrame(encodeField(2, wireLen, client), false)
 }
 
-// interactionQueryName is the IR tool name for each InteractionQuery oneof
-// (agent.v1, CLI 2026.08.11-e8db854). Unknown field numbers become
-// interaction_<n> so a new Cursor variant still resolves instead of hanging.
+// interactionQueryName is the MCP-comparable name for each InteractionQuery
+// oneof (agent.v1). Unknown field numbers are ignored: a built-in query is
+// never surfaced, and only a name match against an already-started MCP call
+// can end the turn.
 var interactionQueryName = map[int]string{
 	2:  "web_search",
 	3:  "ask_question",
@@ -517,61 +470,22 @@ var interactionQueryName = map[int]string{
 	14: "connect_scm",
 }
 
-// extractInteractionToolCall maps an InteractionQuery onto an IR tool call.
-// web_search / web_fetch keep Cursor-native arg keys. Every other oneof is
-// named from the proto; unknown fields become interaction_<n>. ok is false
-// only when the message has no query payload.
-func extractInteractionToolCall(query []byte) (id, name, argsJSON string, ok bool) {
+// interactionQueryNameOf returns the named oneof of an InteractionQuery.
+// ok is false when the message has no named payload. Args are not decoded:
+// the query is not a client tool call.
+func interactionQueryNameOf(query []byte) (name string, ok bool) {
 	m := decodeOrEmpty(query)
-	if m[iqWebSearch] != nil && len(m[iqWebSearch]) > 0 {
-		id, argsJSON = interactionArgJSON(m[iqWebSearch][0].value, "search_term")
-		if id == "" {
-			id = ir.NewID("call_")
-		}
-		return id, "web_search", argsJSON, true
-	}
-	if m[iqWebFetch] != nil && len(m[iqWebFetch]) > 0 {
-		id, argsJSON = interactionArgJSON(m[iqWebFetch][0].value, "url")
-		if id == "" {
-			id = ir.NewID("call_")
-		}
-		return id, "web_fetch", argsJSON, true
-	}
 	for num, fs := range m {
 		if num == iqID || len(fs) == 0 || fs[0].wireType != wireLen {
 			continue
 		}
 		name = interactionQueryName[num]
 		if name == "" {
-			name = "interaction_" + strconv.Itoa(num)
+			continue
 		}
-		id, argsJSON = encodeNamedArgs(fs[0].value, nil)
-		if id == "" {
-			id = ir.NewID("call_")
-		}
-		if argsJSON == "" {
-			argsJSON = "{}"
-		}
-		return id, name, argsJSON, true
+		return name, true
 	}
-	return "", "", "", false
-}
-
-// interactionArgJSON reads WebSearchRequestQuery / WebFetchRequestQuery
-// (field 1 = typed args) into (tool_call_id, {key: primary}).
-func interactionArgJSON(requestQuery []byte, key string) (callID, argsJSON string) {
-	rq := decodeOrEmpty(requestQuery)
-	args := rq
-	if inner, ok := rq[iqQueryArgs]; ok && len(inner) > 0 {
-		args = decodeOrEmpty(inner[0].value)
-	}
-	callID, _ = stringField(args, iqArgCallID)
-	primary, _ := stringField(args, iqArgPrimary)
-	b, err := json.Marshal(map[string]string{key: primary})
-	if err != nil {
-		return callID, "{}"
-	}
-	return callID, string(b)
+	return "", false
 }
 
 // extractMCPToolCall pulls the MCP variant out of a ToolCallStartedUpdate:
