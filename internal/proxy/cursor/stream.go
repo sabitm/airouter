@@ -33,8 +33,99 @@ type cursorErrorEnvelope struct {
 }
 
 func isCursorError(data []byte) bool {
-	// Cheap check before a full JSON unmarshal: must contain "error".
-	return len(data) > 10 && strings.Contains(string(data), "\"error\"")
+	// Historical unflagged Cursor JSON error frames start with an object that
+	// carries a non-null error. A flagged end-stream is validated separately:
+	// {"error":null} and a metadata key named "error" are not failures.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	errRaw, ok := raw["error"]
+	if !ok || isJSONNull(errRaw) {
+		return false
+	}
+	var errObj map[string]json.RawMessage
+	if err := json.Unmarshal(errRaw, &errObj); err != nil {
+		return false
+	}
+	return true
+}
+
+// endStreamError validates one Connect EndStreamResponse. Official transport
+// requires a non-null JSON object, not an array or primitive. Metadata, when
+// present, is a non-null object whose values are arrays of strings. An absent
+// or null error is success. A non-null error is an object and is forwarded
+// through the existing Cursor error parser. The payload is never logged.
+func endStreamError(data []byte) error {
+	if len(data) == 0 {
+		return ir.ProtocolError("cursor: missing end-stream frame")
+	}
+	var top any
+	if err := json.Unmarshal(data, &top); err != nil {
+		return ir.ProtocolError("cursor: malformed end-stream frame")
+	}
+	raw, ok := top.(map[string]any)
+	if !ok || raw == nil {
+		return ir.ProtocolError("cursor: malformed end-stream frame")
+	}
+	if meta, ok := raw["metadata"]; ok {
+		headers, ok := meta.(map[string]any)
+		if !ok || headers == nil {
+			return ir.ProtocolError("cursor: malformed end-stream frame")
+		}
+		for _, values := range headers {
+			list, ok := values.([]any)
+			if !ok {
+				return ir.ProtocolError("cursor: malformed end-stream frame")
+			}
+			for _, value := range list {
+				if _, ok := value.(string); !ok {
+					return ir.ProtocolError("cursor: malformed end-stream frame")
+				}
+			}
+		}
+	}
+	errVal, ok := raw["error"]
+	if !ok || errVal == nil {
+		return nil
+	}
+	errObj, ok := errVal.(map[string]any)
+	if !ok || errObj == nil {
+		return ir.ProtocolError("cursor: malformed end-stream frame")
+	}
+	if msg, ok := errObj["message"]; ok && msg != nil {
+		if _, ok := msg.(string); !ok {
+			return ir.ProtocolError("cursor: malformed end-stream frame")
+		}
+	}
+	if code, ok := errObj["code"]; ok && code != nil {
+		if _, ok := code.(string); !ok {
+			return ir.ProtocolError("cursor: malformed end-stream frame")
+		}
+	}
+	if details, ok := errObj["details"]; ok && details != nil {
+		items, ok := details.([]any)
+		if !ok {
+			return ir.ProtocolError("cursor: malformed end-stream frame")
+		}
+		for _, item := range items {
+			detail, ok := item.(map[string]any)
+			if !ok || detail == nil {
+				return ir.ProtocolError("cursor: malformed end-stream frame")
+			}
+			if _, ok := detail["type"].(string); !ok {
+				return ir.ProtocolError("cursor: malformed end-stream frame")
+			}
+			if _, ok := detail["value"].(string); !ok {
+				return ir.ProtocolError("cursor: malformed end-stream frame")
+			}
+		}
+	}
+	return parseCursorError(data)
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return strings.TrimSpace(string(raw)) == "null"
 }
 
 func parseCursorError(data []byte) error {

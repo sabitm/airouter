@@ -580,6 +580,316 @@ func TestCursorMissingPlanUsageUsesCLIUnavailable(t *testing.T) {
 	}
 }
 
+func encodeCursorMe(userID, teamID int32, enterprise bool) []byte {
+	out := append(encodeCursorInt32Field(2, userID), encodeCursorInt32Field(7, teamID)...)
+	if enterprise {
+		out = append(out, encodeCursorVarintField(9, 1)...)
+	}
+	return out
+}
+
+func encodeCursorMonthlyCycle(start, end int64) []byte {
+	return append(encodeCursorVarintField(1, uint64(start)), encodeCursorVarintField(2, uint64(end))...)
+}
+
+func TestCursorEnterpriseSpendSuccessAndZero(t *testing.T) {
+	start := int64(1_700_000_000_000)
+	end := start + int64(30*24*time.Hour/time.Millisecond)
+	now := time.UnixMilli(start + int64(10*24*time.Hour/time.Millisecond)).UTC()
+	var gotBody []byte
+	var gotPath string
+	cursorTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/aiserver.v1.DashboardService/GetCurrentPeriodUsage":
+			_, _ = w.Write(buildPeriodUsage(nil, nil, 0))
+		case "/aiserver.v1.DashboardService/GetPlanInfo":
+			_, _ = w.Write(encodeCursorLenField(1, encodeCursorStringField(1, "Enterprise")))
+		case "/aiserver.v1.DashboardService/GetMe":
+			if len(body) != 0 {
+				t.Errorf("GetMe body = %d bytes, want empty", len(body))
+			}
+			_, _ = w.Write(encodeCursorMe(42, 7, true))
+		case "/aiserver.v1.DashboardService/GetMonthlyBillingCycle":
+			if len(body) != 0 {
+				t.Errorf("monthly body = %d bytes, want empty", len(body))
+			}
+			_, _ = w.Write(encodeCursorMonthlyCycle(start, end))
+		case "/aiserver.v1.DashboardService/GetAggregatedUsageEvents":
+			gotPath = r.URL.Path
+			gotBody = append([]byte(nil), body...)
+			_, _ = w.Write(encodeCursorDoubleField(6, 251))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	svc := testSvc(t, &stubResolver{token: "tok"})
+	svc.now = func() time.Time { return now }
+	rep, err := svc.Fetch(context.Background(), cursorProvider("tok", "m1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath == "" {
+		t.Fatal("aggregated usage was not requested")
+	}
+	fields, ok := decodeCursorFields(gotBody)
+	if !ok {
+		t.Fatal("request did not decode")
+	}
+	if v, _, valid := cursorInt32(fields, 1); !valid || v != 7 {
+		t.Fatalf("team_id = %d valid=%v", v, valid)
+	}
+	if v, _, valid := cursorInt64(fields, 2); !valid || v != start {
+		t.Fatalf("start = %d", v)
+	}
+	if v, _, valid := cursorInt64(fields, 3); !valid || v != now.UnixMilli() {
+		t.Fatalf("end = %d, want clamped now %d", v, now.UnixMilli())
+	}
+	if v, _, valid := cursorInt32(fields, 4); !valid || v != 42 {
+		t.Fatalf("user_id = %d", v)
+	}
+	if rep.Plan != "Enterprise" || len(rep.Quotas) != 0 {
+		t.Fatalf("report = %+v", rep)
+	}
+	startDate := time.UnixMilli(start).UTC().Format("2006-01-02")
+	endDate := time.UnixMilli(end).UTC().Format("2006-01-02")
+	wantMsg := "Enterprise spend is $2.51 from " + startDate + " to " + endDate + " UTC."
+	if rep.Message != wantMsg {
+		t.Fatalf("message = %q, want %q", rep.Message, wantMsg)
+	}
+
+	t.Run("zero spend", func(t *testing.T) {
+		cursorTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/aiserver.v1.DashboardService/GetCurrentPeriodUsage":
+				_, _ = w.Write(buildPeriodUsage(nil, nil, 0))
+			case "/aiserver.v1.DashboardService/GetMe":
+				_, _ = w.Write(encodeCursorMe(42, 7, true))
+			case "/aiserver.v1.DashboardService/GetMonthlyBillingCycle":
+				_, _ = w.Write(encodeCursorMonthlyCycle(start, end))
+			case "/aiserver.v1.DashboardService/GetAggregatedUsageEvents":
+				_, _ = w.Write(encodeCursorDoubleField(6, 0))
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		svc := testSvc(t, &stubResolver{token: "tok"})
+		svc.now = func() time.Time { return now }
+		rep, err := svc.Fetch(context.Background(), cursorProvider("tok", "m1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rep.Quotas) != 0 || !strings.Contains(rep.Message, "$0.00") {
+			t.Fatalf("report = %+v", rep)
+		}
+	})
+	t.Run("omitted zero", func(t *testing.T) {
+		cursorTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/aiserver.v1.DashboardService/GetCurrentPeriodUsage":
+				_, _ = w.Write(buildPeriodUsage(nil, nil, 0))
+			case "/aiserver.v1.DashboardService/GetMe":
+				_, _ = w.Write(encodeCursorMe(42, 7, true))
+			case "/aiserver.v1.DashboardService/GetMonthlyBillingCycle":
+				_, _ = w.Write(encodeCursorMonthlyCycle(start, end))
+			case "/aiserver.v1.DashboardService/GetAggregatedUsageEvents":
+				_, _ = w.Write([]byte{})
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		svc := testSvc(t, &stubResolver{token: "tok"})
+		svc.now = func() time.Time { return now }
+		rep, err := svc.Fetch(context.Background(), cursorProvider("tok", "m1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rep.Quotas) != 0 || !strings.Contains(rep.Message, "$0.00") || strings.Contains(rep.Message, "not started") {
+			t.Fatalf("report = %+v", rep)
+		}
+	})
+}
+
+func TestCursorEnterpriseSpendFailures(t *testing.T) {
+	start := int64(1_700_000_000_000)
+	end := start + int64(30*24*time.Hour/time.Millisecond)
+	now := time.UnixMilli(start + int64(time.Hour/time.Millisecond)).UTC()
+	cases := []struct {
+		name string
+		hit  func(w http.ResponseWriter, r *http.Request)
+	}{
+		{name: "missing ids", hit: func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/aiserver.v1.DashboardService/GetMe" {
+				_, _ = w.Write(encodeCursorVarintField(9, 1))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}},
+		{name: "malformed cycle", hit: func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/aiserver.v1.DashboardService/GetMe":
+				_, _ = w.Write(encodeCursorMe(1, 2, true))
+			case "/aiserver.v1.DashboardService/GetMonthlyBillingCycle":
+				_, _ = w.Write([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f})
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}},
+		{name: "denied", hit: func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/aiserver.v1.DashboardService/GetMe":
+				_, _ = w.Write(encodeCursorMe(1, 2, true))
+			case "/aiserver.v1.DashboardService/GetMonthlyBillingCycle":
+				http.Error(w, "no", http.StatusForbidden)
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}},
+		{name: "partial failure", hit: func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/aiserver.v1.DashboardService/GetMe":
+				_, _ = w.Write(encodeCursorMe(1, 2, true))
+			case "/aiserver.v1.DashboardService/GetMonthlyBillingCycle":
+				_, _ = w.Write(encodeCursorMonthlyCycle(start, end))
+			case "/aiserver.v1.DashboardService/GetAggregatedUsageEvents":
+				http.Error(w, "no", http.StatusBadGateway)
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cursorTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/aiserver.v1.DashboardService/GetCurrentPeriodUsage" {
+					_, _ = w.Write(buildPeriodUsage(nil, nil, 0))
+					return
+				}
+				tc.hit(w, r)
+			})
+			svc := testSvc(t, &stubResolver{token: "tok"})
+			svc.now = func() time.Time { return now }
+			rep, err := svc.Fetch(context.Background(), cursorProvider("tok", "m1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rep.Message == "" || len(rep.Quotas) != 0 {
+				t.Fatalf("report = %+v, want unavailable fallback", rep)
+			}
+		})
+	}
+}
+
+func TestCursorEnterpriseSpendWindow(t *testing.T) {
+	start := int64(1_700_000_000_000)
+	end := start + int64(30*24*time.Hour/time.Millisecond)
+	cases := []struct {
+		name    string
+		now     time.Time
+		ask     bool
+		started bool
+	}{
+		{name: "before", now: time.UnixMilli(start - 1).UTC(), started: false},
+		{name: "start", now: time.UnixMilli(start).UTC(), started: true},
+		{name: "mid", now: time.UnixMilli(start + 1).UTC(), ask: true, started: true},
+		{name: "after", now: time.UnixMilli(end + 1).UTC(), ask: true, started: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			asked := false
+			cursorTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/aiserver.v1.DashboardService/GetCurrentPeriodUsage":
+					_, _ = w.Write(buildPeriodUsage(nil, nil, 0))
+				case "/aiserver.v1.DashboardService/GetMe":
+					_, _ = w.Write(encodeCursorMe(1, 2, true))
+				case "/aiserver.v1.DashboardService/GetMonthlyBillingCycle":
+					_, _ = w.Write(encodeCursorMonthlyCycle(start, end))
+				case "/aiserver.v1.DashboardService/GetAggregatedUsageEvents":
+					asked = true
+					_, _ = w.Write(encodeCursorDoubleField(6, 100))
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			})
+			svc := testSvc(t, &stubResolver{token: "tok"})
+			svc.now = func() time.Time { return tc.now }
+			rep, err := svc.Fetch(context.Background(), cursorProvider("tok", "m1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if asked != tc.ask {
+				t.Fatalf("asked = %v, want %v", asked, tc.ask)
+			}
+			if len(rep.Quotas) != 0 {
+				t.Fatalf("quotas = %+v", rep.Quotas)
+			}
+			if tc.started {
+				if strings.Contains(rep.Message, "has not started") {
+					t.Fatalf("message = %q, cycle has started", rep.Message)
+				}
+				wantAmount := "$0.00"
+				if tc.ask {
+					wantAmount = "$1.00"
+				}
+				if !strings.Contains(rep.Message, wantAmount) {
+					t.Fatalf("message = %q, want %s", rep.Message, wantAmount)
+				}
+			}
+			if !tc.started && !strings.Contains(rep.Message, "has not started") {
+				t.Fatalf("message = %q", rep.Message)
+			}
+		})
+	}
+}
+
+func TestCursorEnterpriseInvalidCostRejected(t *testing.T) {
+	start := int64(1_700_000_000_000)
+	end := start + 10_000
+	nonFinite := func(bits uint64) []byte {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], bits)
+		out := append([]byte{byte(6<<3 | 1)}, buf[:]...)
+		return out
+	}
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{name: "varint", body: encodeCursorInt32Field(6, 250)},
+		{name: "nan", body: nonFinite(0x7ff8000000000001)},
+		{name: "inf", body: nonFinite(0x7ff0000000000000)},
+		{name: "malformed", body: []byte{0xff}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cursorTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/aiserver.v1.DashboardService/GetCurrentPeriodUsage":
+					_, _ = w.Write(buildPeriodUsage(nil, nil, 0))
+				case "/aiserver.v1.DashboardService/GetMe":
+					_, _ = w.Write(encodeCursorMe(1, 2, true))
+				case "/aiserver.v1.DashboardService/GetMonthlyBillingCycle":
+					_, _ = w.Write(encodeCursorMonthlyCycle(start, end))
+				case "/aiserver.v1.DashboardService/GetAggregatedUsageEvents":
+					_, _ = w.Write(tc.body)
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			})
+			svc := testSvc(t, &stubResolver{token: "tok"})
+			svc.now = func() time.Time { return time.UnixMilli(start + 1).UTC() }
+			rep, err := svc.Fetch(context.Background(), cursorProvider("tok", "m1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rep.Quotas) != 0 || rep.Message != cursorEnterpriseUnavailable {
+				t.Fatalf("report = %+v", rep)
+			}
+		})
+	}
+}
+
 func TestCursorProviderBaseURLOverridesDashboard(t *testing.T) {
 	var gotHost atomic.Value
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

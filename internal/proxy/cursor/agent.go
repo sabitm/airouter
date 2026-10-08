@@ -162,7 +162,16 @@ const (
 	kvcSetBlobRes  = 3
 )
 
-// ExecClientMessage replies.
+// AgentClientMessage reply envelopes. ExecClientMessage is field 2.
+// ExecClientControlMessage is field 5; its throw oneof is field 2.
+const (
+	acmExecClientMessage = 2
+	acmKVClientMessage   = 3
+	acmExecClientControl = 5
+)
+
+// ExecClientMessage replies. Field 45 is hook_additional_contexts, not a
+// result. Result field numbers come from execArgResult.
 const (
 	ecmID                = 1
 	ecmExecID            = 15
@@ -170,11 +179,13 @@ const (
 	ecmMCPResult         = 11
 )
 
-// Exec result oneofs. Field 2 is the rejected variant on ShellResult,
-// GrepResult, and the other built-in results that share that shape.
+// ExecClientControlMessage / ExecClientThrow. The official handler uses
+// throw when a recognized exec has no handler. id is the exec id; error is
+// the human message. stack_trace and error_code stay unset for this rejection.
 const (
-	execResultRejected = 2
-	execRejectedError  = 2
+	eccThrow = 2
+	ectID    = 1
+	ectError = 2
 )
 
 // McpResult oneof. Field 1 is McpSuccess. The proxy acks with an empty
@@ -358,27 +369,39 @@ func encodeConversationHistory(messages []ir.Message, toolNames map[string]strin
 	return out
 }
 
-// encodeHistoryUser emits one user HistoryMessage per text block, then one
-// tool HistoryMessage per tool_result. Empty text is skipped. Tool-result-only
-// turns still produce tool messages so the model sees the prior call's output.
+// encodeHistoryUser groups contiguous text parts into one user
+// HistoryMessage. ConversationHistoryUserMessage.content is repeated, so a
+// prior user turn with several text blocks stays one turn. A tool result is
+// a separate structured message and splits the surrounding text groups.
+// Empty text is skipped. Tool-result-only turns still produce tool messages
+// so the model sees the prior call's output.
 func encodeHistoryUser(m ir.Message, toolNames map[string]string) []byte {
 	var out []byte
+	var textParts []byte
+	flushText := func() {
+		if len(textParts) == 0 {
+			return
+		}
+		user := encodeField(chmUser, wireLen, textParts)
+		out = append(out, encodeField(chMessages, wireLen, user)...)
+		textParts = nil
+	}
 	for _, b := range m.Content {
 		switch b.Type {
 		case ir.BlockText:
 			if b.Text == "" {
 				continue
 			}
-			text := encodeField(hcText, wireLen, encodeField(tpText, wireLen, b.Text))
-			user := encodeField(chuContent, wireLen, text)
-			msg := encodeField(chmUser, wireLen, user)
-			out = append(out, encodeField(chMessages, wireLen, msg)...)
+			part := encodeField(hcText, wireLen, encodeField(tpText, wireLen, b.Text))
+			textParts = append(textParts, encodeField(chuContent, wireLen, part)...)
 		case ir.BlockToolResult:
+			flushText()
 			if msg := encodeHistoryToolResult(b, toolNames); len(msg) > 0 {
 				out = append(out, encodeField(chMessages, wireLen, msg)...)
 			}
 		}
 	}
+	flushText()
 	return out
 }
 

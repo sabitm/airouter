@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 
 	"airouter/internal/proxy/ir"
@@ -29,16 +30,22 @@ func DecodeAgentStream(r io.Reader, writeFrame func([]byte) error, emit func(ir.
 func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func([]byte) error, emit func(ir.StreamEvent) error) error {
 	started := false
 	msgID := ""
+	sawTurnEnded := false
+	mcpHandoff := false
 
 	type tcall struct {
-		index   int
-		id      string
-		name    string
-		args    strings.Builder
-		started bool
+		index        int
+		id           string
+		name         string
+		args         strings.Builder
+		started      bool
+		provisional  bool
+		emittedArgs  bool
+		pendingFrags strings.Builder
 	}
 	toolCalls := map[string]*tcall{}
 	toolOrder := []string{}
+	seenExec := map[string]bool{}
 	var stopReason ir.StopReason = ir.StopEndTurn
 	var inTok, outTok, cacheRead, cacheWrite int
 
@@ -53,19 +60,32 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		return emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: msgID})
 	}
 
+	emitArgsOnce := func(tc *tcall, argsJSON string) error {
+		if tc.emittedArgs || argsJSON == "" {
+			return nil
+		}
+		tc.emittedArgs = true
+		tc.args.Reset()
+		tc.args.WriteString(argsJSON)
+		return emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: tc.index, ToolID: tc.id, ToolName: tc.name, ArgsFrag: argsJSON})
+	}
+
 	emitFinish := func() error {
 		// Finalize tool calls that never completed (stream cut short).
 		for _, id := range toolOrder {
 			tc := toolCalls[id]
+			if tc.provisional || (tc.pendingFrags.Len() > 0 && !json.Valid([]byte(tc.pendingFrags.String()))) {
+				return ir.ProtocolError("cursor: incomplete tool arguments")
+			}
 			if !tc.started {
 				tc.started = true
 				if err := emit(ir.StreamEvent{Kind: ir.EventToolCallStart, Index: tc.index, ToolID: tc.id, ToolName: tc.name}); err != nil {
 					return err
 				}
-				if tc.args.Len() > 0 {
-					if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: tc.index, ToolID: tc.id, ToolName: tc.name, ArgsFrag: tc.args.String()}); err != nil {
-						return err
-					}
+			}
+			if !tc.emittedArgs && tc.pendingFrags.Len() > 0 {
+				if err := emitArgsOnce(tc, tc.pendingFrags.String()); err != nil {
+					return err
 				}
 			}
 		}
@@ -83,13 +103,17 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 	// arguments. A name without arguments is not ready: Cursor often sends
 	// the name first and the arguments in later updates. A partial fragment
 	// is not ready either. An unmatched built-in is not in toolOrder, so it
-	// does not make this true.
+	// does not make this true. Provisional "{}" is not complete.
 	clientToolsReady := func() bool {
 		if len(toolOrder) == 0 {
 			return false
 		}
 		for _, id := range toolOrder {
-			raw := toolCalls[id].args.String()
+			tc := toolCalls[id]
+			if tc.provisional {
+				return false
+			}
+			raw := tc.args.String()
 			if raw == "" || !json.Valid([]byte(raw)) {
 				return false
 			}
@@ -97,46 +121,63 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		return true
 	}
 
-	// startToolCall registers (or looks up) a call and emits identity-only
-	// Start. Ingress encoders read arguments only from EventToolCallDelta, so
-	// a one-shot McpArgs snapshot must go out as a Delta. "{}" is the empty
-	// map placeholder from mcpArgsMapJSON and must not be emitted: incremental
-	// tool_call_started + ptcArgsDelta would otherwise become "{}"+fragments.
-	startToolCall := func(id, name, argsJSON string) error {
+	// ensureToolCall registers a call and emits identity-only Start. "{}" from
+	// tool_call_started is provisional: Cursor sends that empty map before
+	// argument fragments. An authoritative exec snapshot may carry the same
+	// bytes as a real no-arg call, and that "{}" must be emitted once.
+	ensureToolCall := func(id, name string, provisional bool) (*tcall, error) {
 		if id == "" || name == "" {
-			return nil
+			return nil, nil
 		}
 		tc, seen := toolCalls[id]
 		if !seen {
-			tc = &tcall{index: len(toolOrder), id: id, name: name}
+			tc = &tcall{index: len(toolOrder), id: id, name: name, provisional: provisional}
 			toolCalls[id] = tc
 			toolOrder = append(toolOrder, id)
 		}
-		substantive := argsJSON != "" && argsJSON != "{}"
 		if !tc.started {
 			tc.started = true
-			if substantive {
-				tc.args.WriteString(argsJSON)
-			}
 			if err := emitStart(); err != nil {
-				return err
+				return nil, err
 			}
 			if err := emit(ir.StreamEvent{Kind: ir.EventToolCallStart, Index: tc.index, ToolID: tc.id, ToolName: tc.name}); err != nil {
-				return err
+				return nil, err
 			}
-			if substantive {
-				return emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: tc.index, ToolID: tc.id, ToolName: tc.name, ArgsFrag: argsJSON})
+		}
+		return tc, nil
+	}
+
+	// acceptToolArgs applies one argument snapshot. Authoritative snapshots
+	// replace a provisional placeholder. Fragments stay buffered until the
+	// joined value is valid JSON, then emit exactly once.
+	acceptToolArgs := func(id, name, argsJSON string, authoritative bool) error {
+		tc, err := ensureToolCall(id, name, !authoritative && (argsJSON == "" || argsJSON == "{}"))
+		if err != nil || tc == nil {
+			return err
+		}
+		if authoritative {
+			if !json.Valid([]byte(argsJSON)) {
+				return ir.ProtocolError("cursor: invalid tool arguments")
 			}
+			tc.provisional = false
+			tc.pendingFrags.Reset()
+			return emitArgsOnce(tc, argsJSON)
+		}
+		if tc.emittedArgs {
 			return nil
 		}
-		// tool_call_started often precedes the frame that carries args.
-		// A second startToolCall for the same id must flush those args as a
-		// Delta; dropping them is how ingress clients assembled "{}".
-		if substantive && tc.args.Len() == 0 {
-			tc.args.WriteString(argsJSON)
-			return emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: tc.index, ToolID: tc.id, ToolName: tc.name, ArgsFrag: argsJSON})
+		if argsJSON == "" || argsJSON == "{}" {
+			tc.provisional = true
+			return nil
 		}
-		return nil
+		tc.pendingFrags.WriteString(argsJSON)
+		joined := tc.pendingFrags.String()
+		if !json.Valid([]byte(joined)) {
+			tc.provisional = true
+			return nil
+		}
+		tc.provisional = false
+		return emitArgsOnce(tc, joined)
 	}
 
 	for {
@@ -155,13 +196,33 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 			return err
 		}
 
+		// A flagged end-stream is validated before any JSON error scan. Official
+		// success is {} or {"error":null}; a metadata key named "error" is not a
+		// failure. Unflagged historical Cursor JSON error frames still use the
+		// error parser. Bodies are not logged.
+		if flags&flagTrailer != 0 {
+			if err := endStreamError(data); err != nil {
+				return err
+			}
+			if !sawTurnEnded {
+				return ir.ProtocolError("cursor: stream ended without turnEnded")
+			}
+			// EndStreamResponse ends the Connect stream. Another envelope is a
+			// protocol error, so success is not emitted until that check passes.
+			if _, _, err := readFrame(r); err != io.EOF {
+				if err == nil {
+					return ir.ProtocolError("cursor: extra envelope after end-stream")
+				}
+				return err
+			}
+			return emitFinish()
+		}
 		if len(data) > 0 && data[0] == 0x7b && isCursorError(data) {
 			return parseCursorError(data)
 		}
-
 		top, derr := decodeMessage(data)
 		if derr != nil {
-			continue
+			return ir.ProtocolError("cursor: malformed protobuf message")
 		}
 
 		// interaction_query asks the client to run a Cursor built-in.
@@ -172,7 +233,14 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		// tool already in toolOrder ends the turn once that call's args are
 		// complete (the client's result returns on the next request).
 		if iqs, ok := top[asmInteractionQuery]; ok && len(iqs) > 0 {
-			if name, ok := interactionQueryNameOf(iqs[0].value); ok && clientToolsReady() {
+			if iqs[0].wireType != wireLen {
+				return ir.ProtocolError("cursor: malformed interaction query")
+			}
+			name, recognized, qerr := interactionQueryNameOf(iqs[0].value)
+			if qerr != nil {
+				return qerr
+			}
+			if recognized && clientToolsReady() {
 				want := decloakToolName(name)
 				for _, id := range toolOrder {
 					if toolCalls[id].name == want {
@@ -186,7 +254,14 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		// conversation state blobs here; without a reply the run stalls. The
 		// proxy is stateless across requests, so nothing is persisted.
 		if kvs, ok := top[asmKVServerMessage]; ok && len(kvs) > 0 && writeFrame != nil {
-			if reply := encodeKVReply(kvs[0].value); reply != nil {
+			if kvs[0].wireType != wireLen {
+				return ir.ProtocolError("cursor: malformed kv request")
+			}
+			reply, kerr := encodeKVReply(kvs[0].value)
+			if kerr != nil {
+				return kerr
+			}
+			if reply != nil {
 				if err := writeFrame(reply); err != nil {
 					return err
 				}
@@ -201,19 +276,34 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		// heartbeats until the exec is answered, and the answer is the client's
 		// next request, not a frame on this stream.
 		if exs, ok := top[asmExecServerMessage]; ok && len(exs) > 0 {
-			before := len(toolOrder)
-			if done, err := handleExecServerMessage(exs[0].value, writeFrame, startToolCall); err != nil {
+			if exs[0].wireType != wireLen {
+				return ir.ProtocolError("cursor: malformed exec request")
+			}
+			execKey, keyErr := execSeenKey(exs[0].value)
+			if keyErr != nil {
+				return keyErr
+			}
+			if execKey != "" {
+				if seenExec[execKey] {
+					continue
+				}
+				seenExec[execKey] = true
+			}
+			outcome, server, err := handleExecServerMessage(exs[0].value, writeFrame, acceptToolArgs)
+			if err != nil {
 				return err
-			} else if done && len(toolOrder) == before {
-				server, _ := decodeMessage(exs[0].value)
+			}
+			switch outcome {
+			case execBuiltinRejected:
 				if err := rejectUnmatchedExec(server, writeFrame); err != nil {
 					return err
 				}
 				continue
-			} else if done {
+			case execMCPHandoff:
 				// The empty ack closes a matched MCP exec. It is not the tool
 				// output, so Cursor does not send turn_ended. Reading further only
 				// receives heartbeats and holds the client until timeout.
+				mcpHandoff = true
 				return emitFinish()
 			}
 		}
@@ -223,14 +313,18 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 			for _, iu := range ius {
 				update, err := decodeMessage(iu.value)
 				if err != nil {
-					continue
+					return ir.ProtocolError("cursor: malformed protobuf message")
 				}
 				if err := emitStart(); err != nil {
 					return err
 				}
 				// text_delta
 				if tds, ok := update[iuTextDelta]; ok && len(tds) > 0 {
-					if text, ok := stringField(decodeOrEmpty(tds[0].value), tdText); ok && text != "" {
+					text, terr := textDeltaOf(tds[0])
+					if terr != nil {
+						return terr
+					}
+					if text != "" {
 						if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: text}); err != nil {
 							return err
 						}
@@ -243,26 +337,46 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 				// oneof is client-visible. Built-in oneofs are not surfaced; the
 				// matching exec message is rejected and the stream continues.
 				if tcss, ok := update[iuToolCallStarted]; ok && len(tcss) > 0 {
-					if id, name, args, ok := extractMCPToolCall(tcss[0].value); ok {
-						if err := startToolCall(id, name, args); err != nil {
+					id, name, args, ok, terr := extractMCPToolCall(tcss[0])
+					if terr != nil {
+						return terr
+					}
+					if ok {
+						if err := acceptToolArgs(id, name, args, false); err != nil {
 							return err
 						}
 					}
 				}
 				if ptcs, ok := update[iuPartialToolCall]; ok && len(ptcs) > 0 {
-					p, _ := decodeMessage(ptcs[0].value)
-					id, _ := stringField(p, ptcCallID)
-					if delta, ok := stringField(p, ptcArgsDelta); ok && delta != "" && id != "" {
-						if tc, seen := toolCalls[id]; seen {
-							tc.args.WriteString(delta)
-							if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: tc.index, ToolID: tc.id, ToolName: tc.name, ArgsFrag: delta}); err != nil {
+					if ptcs[0].wireType != wireLen {
+						return ir.ProtocolError("cursor: malformed partial tool call")
+					}
+					p, perr := decodeMessage(ptcs[0].value)
+					if perr != nil {
+						return ir.ProtocolError("cursor: malformed partial tool call")
+					}
+					id, idOK := stringField(p, ptcCallID)
+					if !idOK && len(p[ptcCallID]) > 0 {
+						return ir.ProtocolError("cursor: malformed partial tool call")
+					}
+					delta, deltaOK := stringField(p, ptcArgsDelta)
+					if !deltaOK && len(p[ptcArgsDelta]) > 0 {
+						return ir.ProtocolError("cursor: malformed partial tool call")
+					}
+					if delta != "" && id != "" {
+						if tc, seen := toolCalls[id]; seen && !tc.emittedArgs {
+							if err := acceptToolArgs(tc.id, tc.name, delta, false); err != nil {
 								return err
 							}
 						}
 					}
 					if id == "" || toolCalls[id] == nil {
-						if cid, name, args, ok := extractMCPToolCall(ptcs[0].value); ok {
-							if err := startToolCall(cid, name, args); err != nil {
+						cid, name, args, ok, terr := extractMCPToolCall(ptcs[0])
+						if terr != nil {
+							return terr
+						}
+						if ok {
+							if err := acceptToolArgs(cid, name, args, false); err != nil {
 								return err
 							}
 						}
@@ -272,85 +386,182 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 				// with turn_ended. inputTokens is already the inclusive prompt
 				// total; cache read/write partition it and must not be added.
 				if tes, ok := update[iuTurnEnded]; ok && len(tes) > 0 {
-					te, _ := decodeMessage(tes[0].value)
-					if v, ok := varintField(te, teInputTokens); ok {
-						inTok = usageInt(v)
+					in, out, read, write, terr := turnEndedUsage(tes[0])
+					if terr != nil {
+						return terr
 					}
-					if v, ok := varintField(te, teOutputTokens); ok {
-						outTok = usageInt(v)
-					}
-					if v, ok := varintField(te, teCacheReadTokens); ok {
-						cacheRead = usageInt(v)
-					}
-					if v, ok := varintField(te, teCacheWriteTokens); ok {
-						cacheWrite = usageInt(v)
-					}
-					return emitFinish()
+					inTok, outTok, cacheRead, cacheWrite = in, out, read, write
+					sawTurnEnded = true
+					continue
 				}
 			}
 			// A client-visible tool call can arrive as an interaction update
 			// before, or without, the exec message that used to end the turn.
 			// Leaving the stream open after the arguments are complete only
 			// receives heartbeats. The client's real result returns on the next
-			// request, so this turn ends here.
-			if clientToolsReady() {
+			// request, so this MCP handoff ends here. Text-only turns still wait
+			// for the Connect end-stream frame.
+			if len(toolOrder) > 0 && clientToolsReady() {
+				mcpHandoff = true
 				return emitFinish()
 			}
 		}
 	}
 
-	return emitFinish()
+	if mcpHandoff {
+		return emitFinish()
+	}
+	if !sawTurnEnded {
+		return ir.ProtocolError("cursor: stream ended without turnEnded")
+	}
+	return ir.ProtocolError("cursor: missing end-stream frame")
 }
 
-func decodeOrEmpty(b []byte) map[int][]field {
-	m, err := decodeMessage(b)
-	if err != nil {
-		return map[int][]field{}
+func textDeltaOf(f field) (string, error) {
+	if f.wireType != wireLen {
+		return "", ir.ProtocolError("cursor: malformed text delta")
 	}
-	return m
+	m, err := decodeMessage(f.value)
+	if err != nil {
+		return "", ir.ProtocolError("cursor: malformed text delta")
+	}
+	text, ok := stringField(m, tdText)
+	if !ok && len(m[tdText]) > 0 {
+		return "", ir.ProtocolError("cursor: malformed text delta")
+	}
+	return text, nil
+}
+
+func turnEndedUsage(f field) (inTok, outTok, cacheRead, cacheWrite int, err error) {
+	if f.wireType != wireLen {
+		return 0, 0, 0, 0, ir.ProtocolError("cursor: malformed turn ended")
+	}
+	te, err := decodeMessage(f.value)
+	if err != nil {
+		return 0, 0, 0, 0, ir.ProtocolError("cursor: malformed turn ended")
+	}
+	read := func(num int) (int, error) {
+		fs := te[num]
+		if len(fs) == 0 {
+			return 0, nil
+		}
+		if fs[0].wireType != wireVarint {
+			return 0, ir.ProtocolError("cursor: malformed turn ended")
+		}
+		v, ok := varintField(te, num)
+		if !ok {
+			return 0, ir.ProtocolError("cursor: malformed turn ended")
+		}
+		return usageInt(v), nil
+	}
+	if inTok, err = read(teInputTokens); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if outTok, err = read(teOutputTokens); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if cacheRead, err = read(teCacheReadTokens); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if cacheWrite, err = read(teCacheWriteTokens); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return inTok, outTok, cacheRead, cacheWrite, nil
 }
 
 // encodeKVReply builds the KvClientMessage for one KvServerMessage: get ->
 // empty GetBlobResult (blob not found), set -> empty SetBlobResult (success).
-func encodeKVReply(server []byte) []byte {
+// A malformed known envelope is an error. An unrecognized variant is ignored.
+func encodeKVReply(server []byte) ([]byte, error) {
 	m, err := decodeMessage(server)
 	if err != nil {
-		return nil
+		return nil, ir.ProtocolError("cursor: malformed kv request")
 	}
-	id, _ := varintField(m, kvsID)
+	id, idOK := varintField(m, kvsID)
+	if !idOK && len(m[kvsID]) > 0 {
+		return nil, ir.ProtocolError("cursor: malformed kv request")
+	}
+	for _, num := range []int{kvsGetBlobArgs, kvsSetBlobArgs} {
+		if len(m[num]) > 0 && m[num][0].wireType != wireLen {
+			return nil, ir.ProtocolError("cursor: malformed kv request")
+		}
+	}
 	switch {
 	case m[kvsGetBlobArgs] != nil:
 		client := concatBytes(
 			encodeField(kvcID, wireVarint, id),
 			encodeField(kvcGetBlobRes, wireLen, []byte{}),
 		)
-		return wrapConnectFrame(encodeField(3, wireLen, client), false)
+		return wrapConnectFrame(encodeField(acmKVClientMessage, wireLen, client), false), nil
 	case m[kvsSetBlobArgs] != nil:
 		client := concatBytes(
 			encodeField(kvcID, wireVarint, id),
 			encodeField(kvcSetBlobRes, wireLen, []byte{}),
 		)
-		return wrapConnectFrame(encodeField(3, wireLen, client), false)
+		return wrapConnectFrame(encodeField(acmKVClientMessage, wireLen, client), false), nil
 	default:
-		return nil
+		return nil, nil
 	}
 }
 
-// handleExecServerMessage services one ExecServerMessage. Returns done=true
-// when the message was an MCP exec (surface and end the turn) or a built-in
-// exec that must be rejected without changing toolOrder. done=false means
-// the message was a control ack (request context) and the stream continues.
-func handleExecServerMessage(server []byte, writeFrame func([]byte) error, startMCP func(id, name, args string) error) (bool, error) {
+func execSeenKey(server []byte) (string, error) {
 	m, err := decodeMessage(server)
 	if err != nil {
-		return false, nil
+		return "", ir.ProtocolError("cursor: malformed exec request")
 	}
-	id, _ := varintField(m, esmID)
-	execID, _ := stringField(m, esmExecID)
+	if len(m[esmExecID]) > 0 {
+		id, ok := stringField(m, esmExecID)
+		if !ok {
+			return "", ir.ProtocolError("cursor: malformed exec request")
+		}
+		if id != "" {
+			return "e:" + id, nil
+		}
+	}
+	if len(m[esmID]) > 0 {
+		id, ok := varintField(m, esmID)
+		if !ok {
+			return "", ir.ProtocolError("cursor: malformed exec request")
+		}
+		return "i:" + strconv.FormatUint(id, 10), nil
+	}
+	return "", nil
+}
 
-	if m[esmRequestContextArgs] != nil {
+// execOutcome is the explicit result of one ExecServerMessage. Control
+// replies continue the stream. A built-in rejection is not an MCP handoff.
+type execOutcome int
+
+const (
+	execControlHandled execOutcome = iota
+	execBuiltinRejected
+	execMCPHandoff
+)
+
+// handleExecServerMessage services one ExecServerMessage.
+func handleExecServerMessage(server []byte, writeFrame func([]byte) error, acceptMCP func(id, name, args string, authoritative bool) error) (execOutcome, map[int][]field, error) {
+	m, err := decodeMessage(server)
+	if err != nil {
+		return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+	}
+	id, idOK := varintField(m, esmID)
+	if !idOK && len(m[esmID]) > 0 {
+		return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+	}
+	execID, execOK := stringField(m, esmExecID)
+	if !execOK && len(m[esmExecID]) > 0 {
+		return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+	}
+
+	if ctxArgs := m[esmRequestContextArgs]; len(ctxArgs) > 0 {
+		if ctxArgs[0].wireType != wireLen {
+			return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+		}
+		if _, err := decodeMessage(ctxArgs[0].value); err != nil {
+			return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+		}
 		if writeFrame == nil {
-			return false, nil
+			return execControlHandled, m, nil
 		}
 		// ExecClientMessage{1: id, 15: exec_id, 10: RequestContextResult{
 		// 1: RequestContextSuccess{}}} — empty context, like the CLI on a
@@ -362,80 +573,220 @@ func handleExecServerMessage(server []byte, writeFrame func([]byte) error, start
 			encodeField(ecmExecID, wireLen, execID),
 			result,
 		)
-		if err := writeFrame(wrapConnectFrame(encodeField(2, wireLen, client), false)); err != nil {
-			return false, err
+		if err := writeFrame(wrapConnectFrame(encodeField(acmExecClientMessage, wireLen, client), false)); err != nil {
+			return execControlHandled, m, err
 		}
-		return false, nil
+		return execControlHandled, m, nil
 	}
 
 	if args, ok := m[esmMCPArgs]; ok && len(args) > 0 {
+		if args[0].wireType != wireLen {
+			return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+		}
 		am, err := decodeMessage(args[0].value)
 		if err != nil {
-			return false, nil
+			return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
 		}
-		callID, _ := stringField(am, maCallID)
-		name, _ := stringField(am, maToolName)
+		callID, callOK := stringField(am, maCallID)
+		if !callOK && len(am[maCallID]) > 0 {
+			return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+		}
+		name, nameOK := stringField(am, maToolName)
+		if !nameOK && len(am[maToolName]) > 0 {
+			return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+		}
 		if name == "" {
-			name, _ = stringField(am, maName)
+			alt, altOK := stringField(am, maName)
+			if !altOK && len(am[maName]) > 0 {
+				return execControlHandled, nil, ir.ProtocolError("cursor: malformed exec request")
+			}
+			name = alt
 		}
-		argsJSON := mcpArgsMapJSON(am)
+		argsJSON, aerr := mcpArgsMapJSON(am)
+		if aerr != nil {
+			return execControlHandled, nil, aerr
+		}
 		if callID != "" && name != "" {
-			if err := startMCP(callID, decloakToolName(name), argsJSON); err != nil {
-				return false, err
+			// The exec snapshot is authoritative, including a real no-arg "{}".
+			// It replaces a provisional tool_call_started placeholder for the
+			// same id instead of concatenating onto it.
+			if err := acceptMCP(callID, decloakToolName(name), argsJSON, true); err != nil {
+				return execControlHandled, m, err
 			}
 			// Empty McpSuccess closes the exec. The client's real result is not
 			// available yet; it is replayed on the next request. A missing ack
 			// leaves AgentService on heartbeats until the stream times out.
 			if writeFrame != nil {
 				if err := writeFrame(encodeMCPAck(id, execID)); err != nil {
-					return false, err
+					return execControlHandled, m, err
 				}
 			}
-			return true, nil
+			return execMCPHandoff, m, nil
 		}
-		return false, nil
+		return execControlHandled, m, nil
 	}
 
 	// Any other exec args oneof (shell, read, grep, ...) is a Cursor
-	// built-in. Do not surface it. done=true with no toolOrder change makes
-	// the caller reject the exec and keep reading.
-	if execResultField(m) != 0 {
-		return true, nil
+	// built-in. Do not surface it. The caller writes the rejection and keeps
+	// reading.
+	if execArgField(m) != 0 {
+		return execBuiltinRejected, m, nil
 	}
-	return false, nil
+	return execControlHandled, m, nil
 }
 
-// rejectUnmatchedExec writes ExecClientMessage with the built-in result's
-// rejected variant. Cursor can then call a declared MCP tool instead of
-// waiting, or ending the run, on a tool the client cannot execute.
+// rejectUnmatchedExec writes the official failure variant for one recognized
+// built-in exec. A recognized exec with no failure variant gets
+// ExecClientThrow. Unknown fields are never copied into a fabricated result.
+// Cursor can then call a declared MCP tool instead of waiting on a tool the
+// client cannot execute.
 func rejectUnmatchedExec(server map[int][]field, writeFrame func([]byte) error) error {
 	if writeFrame == nil {
 		return nil
 	}
-	fieldNum := execResultField(server)
-	if fieldNum == 0 {
+	argField := execArgField(server)
+	if argField == 0 {
 		return nil
 	}
 	id, _ := varintField(server, esmID)
 	execID, _ := stringField(server, esmExecID)
-	rejected := encodeField(execResultRejected, wireLen,
-		encodeField(execRejectedError, wireLen, []byte("not available; use the declared MCP tools")))
+	resultField, ok := execArgResult[argField]
+	if !ok {
+		return writeFrame(encodeExecThrow(id, execUnavailableReason))
+	}
+	path, command, url, aerr := execArgText(server, argField)
+	if aerr != nil {
+		return aerr
+	}
+	body, ok := encodeExecRejection(resultField, path, command, url)
+	if !ok {
+		return writeFrame(encodeExecThrow(id, execUnavailableReason))
+	}
 	client := concatBytes(
 		encodeField(ecmID, wireVarint, id),
 		encodeField(ecmExecID, wireLen, execID),
-		encodeField(fieldNum, wireLen, rejected),
+		encodeField(resultField, wireLen, body),
 	)
-	return writeFrame(wrapConnectFrame(encodeField(2, wireLen, client), false))
+	return writeFrame(wrapConnectFrame(encodeField(acmExecClientMessage, wireLen, client), false))
 }
 
-func execResultField(server map[int][]field) int {
+func execArgField(server map[int][]field) int {
+	// A known args oneof wins even when the same message also carries an
+	// unrecognized field. Map iteration is not ordered, so the known winner
+	// is the lowest known field number. Unknown-only messages use the lowest
+	// unknown field so the throw id stays deterministic.
+	known := 0
+	unknown := 0
 	for num := range server {
 		if execControlFields[num] {
 			continue
 		}
-		return num
+		if _, ok := execArgResult[num]; ok {
+			if known == 0 || num < known {
+				known = num
+			}
+			continue
+		}
+		if unknown == 0 || num < unknown {
+			unknown = num
+		}
 	}
-	return 0
+	if known != 0 {
+		return known
+	}
+	return unknown
+}
+
+// execIdentityField is the schema-defined string a rejection result copies.
+// kind is path, command, or url. num 0 means the result spec does not need an
+// args string, so field 1 is not read: RecordScreenArgs.mode and
+// WriteShellStdinArgs.shell_id are scalars, and AgentStoreConflictArgs field 1
+// is a message.
+func execIdentityField(argField int) (num int, kind string) {
+	switch argField {
+	case 2, 14, 16, 46, 52:
+		return 1, "command"
+	case 5:
+		return 2, "path"
+	case 18:
+		return 2, "path"
+	case 20, 43:
+		return 1, "url"
+	case 3, 4, 7, 8, 9, 29, 40, 45, 51:
+		return 1, "path"
+	default:
+		return 0, ""
+	}
+}
+
+func execArgText(server map[int][]field, argField int) (path, command, url string, err error) {
+	num, kind := execIdentityField(argField)
+	if num == 0 {
+		return "", "", "", nil
+	}
+	fs := server[argField]
+	if len(fs) == 0 {
+		return "", "", "", nil
+	}
+	if fs[0].wireType != wireLen {
+		return "", "", "", ir.ProtocolError("cursor: malformed exec request")
+	}
+	args, derr := decodeMessage(fs[0].value)
+	if derr != nil {
+		return "", "", "", ir.ProtocolError("cursor: malformed exec request")
+	}
+	if len(args[num]) == 0 {
+		return "", "", "", nil
+	}
+	got, ok := stringField(args, num)
+	if !ok {
+		return "", "", "", ir.ProtocolError("cursor: malformed exec request")
+	}
+	switch kind {
+	case "command":
+		command = got
+	case "url":
+		url = got
+	default:
+		path = got
+	}
+	return path, command, url, nil
+}
+
+func encodeExecRejection(resultField int, path, command, url string) ([]byte, bool) {
+	spec, ok := execResultSpecs[resultField]
+	if !ok {
+		return nil, false
+	}
+	reason := execUnavailableReason
+	if spec.enum {
+		return encodeField(spec.outer, wireVarint, spec.enumVal), true
+	}
+	if spec.reason == 0 {
+		return encodeField(spec.outer, wireLen, reason), true
+	}
+	identity := path
+	switch {
+	case spec.command:
+		identity = command
+	case spec.url:
+		identity = url
+	}
+	var inner []byte
+	if spec.path != 0 {
+		inner = append(inner, encodeField(spec.path, wireLen, identity)...)
+	}
+	inner = append(inner, encodeField(spec.reason, wireLen, reason)...)
+	return encodeField(spec.outer, wireLen, inner), true
+}
+
+func encodeExecThrow(id uint64, reason string) []byte {
+	throw := concatBytes(
+		encodeField(ectID, wireVarint, id),
+		encodeField(ectError, wireLen, reason),
+	)
+	control := encodeField(eccThrow, wireLen, throw)
+	return wrapConnectFrame(encodeField(acmExecClientControl, wireLen, control), false)
 }
 
 // encodeMCPAck is ExecClientMessage{1: id, 15: exec_id, 11: McpResult{1: McpSuccess{}}}.
@@ -471,166 +822,310 @@ var interactionQueryName = map[int]string{
 }
 
 // interactionQueryNameOf returns the named oneof of an InteractionQuery.
-// ok is false when the message has no named payload. Args are not decoded:
-// the query is not a client tool call.
-func interactionQueryNameOf(query []byte) (name string, ok bool) {
-	m := decodeOrEmpty(query)
-	for num, fs := range m {
-		if num == iqID || len(fs) == 0 || fs[0].wireType != wireLen {
-			continue
-		}
-		name = interactionQueryName[num]
-		if name == "" {
-			continue
-		}
-		return name, true
+// ok is false when the message has no named payload. Unknown fields are
+// ignored regardless of wire type. Only a named variant is validated as a
+// length-delimited message. Args are not decoded: the query is not a client
+// tool call.
+func interactionQueryNameOf(query []byte) (name string, ok bool, err error) {
+	m, derr := decodeMessage(query)
+	if derr != nil {
+		return "", false, ir.ProtocolError("cursor: malformed interaction query")
 	}
-	return "", false
+	for num, fs := range m {
+		named := interactionQueryName[num]
+		if named == "" || len(fs) == 0 {
+			continue
+		}
+		if fs[0].wireType != wireLen {
+			return "", false, ir.ProtocolError("cursor: malformed interaction query")
+		}
+		if _, derr := decodeMessage(fs[0].value); derr != nil {
+			return "", false, ir.ProtocolError("cursor: malformed interaction query")
+		}
+		return named, true, nil
+	}
+	return "", false, nil
+}
+
+// toolCallOneofFields are the official ToolCall oneof field numbers. Fields
+// outside this set are unknown and are skipped before any wire-type check.
+// Metadata on the same message is not a oneof and is not nested protobuf.
+var toolCallOneofFields = map[int]bool{
+	1: true, 3: true, 4: true, 5: true, 8: true, 9: true, 10: true, 12: true,
+	13: true, 14: true, 15: true, 16: true, 17: true, 18: true, 19: true,
+	20: true, 21: true, 22: true, 23: true, 24: true, 25: true, 28: true,
+	29: true, 30: true, 31: true, 32: true, 33: true, 34: true, 35: true,
+	36: true, 37: true, 38: true, 39: true, 40: true, 41: true, 42: true,
+	43: true, 44: true, 45: true, 46: true, 48: true, 49: true, 50: true,
+	51: true, 52: true, 53: true, 55: true, 56: true, 58: true, 61: true,
+	62: true, 63: true, 64: true, 65: true, 66: true, 67: true, 68: true,
+	69: true, 70: true, 71: true, 72: true, 73: true, 74: true, 75: true,
+	76: true, 77: true, 78: true, 79: true, 80: true,
+}
+
+// toolCallMetaFields are ToolCall metadata, not oneof variants. Field 54 is
+// repeated HookAdditionalContext. Field 57 is an optional string. Fields 59
+// and 60 are optional uint64 timestamps.
+var toolCallMetaFields = map[int]int{
+	54: wireLen,
+	57: wireLen,
+	59: wireVarint,
+	60: wireVarint,
 }
 
 // extractMCPToolCall pulls the MCP variant out of a ToolCallStartedUpdate:
 // {1: call_id, 2: ToolCall{15: McpToolCall{1: McpArgs{...}}}, 3: model_call_id}.
-func extractMCPToolCall(update []byte) (id, name, argsJSON string, ok bool) {
-	m, err := decodeMessage(update)
-	if err != nil {
-		return "", "", "", false
+func extractMCPToolCall(update field) (id, name, argsJSON string, ok bool, err error) {
+	if update.wireType != wireLen {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
 	}
-	callID, _ := stringField(m, tcsCallID)
-	if tcs, ok := m[tcsToolCall]; ok && len(tcs) > 0 {
-		tc, err := decodeMessage(tcs[0].value)
-		if err != nil {
-			return "", "", "", false
+	m, derr := decodeMessage(update.value)
+	if derr != nil {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	}
+	callID, callOK := stringField(m, tcsCallID)
+	if !callOK && len(m[tcsCallID]) > 0 {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	}
+	tcs := m[tcsToolCall]
+	if len(tcs) == 0 {
+		return "", "", "", false, nil
+	}
+	if tcs[0].wireType != wireLen {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	}
+	tc, derr := decodeMessage(tcs[0].value)
+	if derr != nil {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	}
+	if err := validateToolCallFields(tc); err != nil {
+		return "", "", "", false, err
+	}
+	mtcs := tc[tcMCPTOolCall]
+	if len(mtcs) == 0 {
+		// A non-MCP tool oneof is a Cursor built-in. Ignore it, including when
+		// its nested tool name matches a declared MCP tool.
+		return "", "", "", false, nil
+	}
+	if mtcs[0].wireType != wireLen {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	}
+	mtc, derr := decodeMessage(mtcs[0].value)
+	if derr != nil {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	}
+	mas := mtc[mtcArgs]
+	if len(mas) == 0 {
+		return "", "", "", false, nil
+	}
+	if mas[0].wireType != wireLen {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	}
+	am, derr := decodeMessage(mas[0].value)
+	if derr != nil {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	}
+	if n, nOK := stringField(am, maToolName); !nOK && len(am[maToolName]) > 0 {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	} else if n != "" {
+		name = n
+	}
+	if name == "" {
+		if n, nOK := stringField(am, maName); !nOK && len(am[maName]) > 0 {
+			return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+		} else {
+			name = n
 		}
-		if mtcs, ok := tc[tcMCPTOolCall]; ok && len(mtcs) > 0 {
-			mtc, err := decodeMessage(mtcs[0].value)
-			if err != nil {
-				return "", "", "", false
+	}
+	if c, cOK := stringField(am, maCallID); !cOK && len(am[maCallID]) > 0 {
+		return "", "", "", false, ir.ProtocolError("cursor: malformed tool call")
+	} else if c != "" {
+		callID = c
+	}
+	argsJSON, err = mcpArgsMapJSON(am)
+	if err != nil {
+		return "", "", "", false, err
+	}
+	if callID == "" || name == "" {
+		return "", "", "", false, nil
+	}
+	return callID, decloakToolName(name), argsJSON, true, nil
+}
+
+// validateToolCallFields checks known oneof and metadata fields. Unknown
+// fields are skipped before any assumed wire type is checked. A known oneof
+// must be a nested message. Metadata keeps its official wire type: string
+// and hook context are length-delimited, timestamps are varints.
+func validateToolCallFields(tc map[int][]field) error {
+	for num, fs := range tc {
+		if len(fs) == 0 {
+			continue
+		}
+		want, meta := toolCallMetaFields[num]
+		switch {
+		case toolCallOneofFields[num]:
+			if fs[0].wireType != wireLen {
+				return ir.ProtocolError("cursor: malformed tool call")
 			}
-			if mas, ok := mtc[mtcArgs]; ok && len(mas) > 0 {
-				am, err := decodeMessage(mas[0].value)
-				if err == nil {
-					if n, ok := stringField(am, maToolName); ok && n != "" {
-						name = n
-					} else if n, ok := stringField(am, maName); ok {
-						name = n
+			if _, err := decodeMessage(fs[0].value); err != nil {
+				return ir.ProtocolError("cursor: malformed tool call")
+			}
+		case meta:
+			for _, f := range fs {
+				if f.wireType != want {
+					return ir.ProtocolError("cursor: malformed tool call")
+				}
+				if num == 54 {
+					if _, err := decodeMessage(f.value); err != nil {
+						return ir.ProtocolError("cursor: malformed tool call")
 					}
-					if c, ok := stringField(am, maCallID); ok && c != "" {
-						callID = c
-					}
-					argsJSON = mcpArgsMapJSON(am)
 				}
 			}
 		}
 	}
-	if callID == "" || name == "" {
-		return "", "", "", false
-	}
-	return callID, decloakToolName(name), argsJSON, true
+	return nil
 }
 
 // mcpArgsMapJSON renders McpArgs.args (field 2, map<string, google.protobuf.
-// Value>) as a JSON object string. Empty map renders as "{}".
-func mcpArgsMapJSON(am map[int][]field) string {
-	entries, ok := am[maArgs]
-	if !ok || len(entries) == 0 {
-		return "{}"
+// Value>) as a JSON object string. An absent map renders as "{}". An empty
+// string key is valid and is preserved when the entry has a value.
+func mcpArgsMapJSON(am map[int][]field) (string, error) {
+	entries := am[maArgs]
+	if len(entries) == 0 {
+		return "{}", nil
 	}
-	var sb strings.Builder
-	sb.WriteByte('{')
-	first := true
+	out := map[string]any{}
 	for _, e := range entries {
-		entry, err := decodeMessage(e.value)
+		key, val, err := protoMapEntry(e)
 		if err != nil {
-			continue
+			return "", err
 		}
-		key, _ := stringField(entry, 1)
-		if key == "" {
-			continue
-		}
-		var val any
-		if vs, ok := entry[2]; ok && len(vs) > 0 {
-			val = protoValueToGo(vs[0].value)
-		}
-		encoded, err := json.Marshal(val)
-		if err != nil {
-			continue
-		}
-		kb, _ := json.Marshal(key)
-		if !first {
-			sb.WriteByte(',')
-		}
-		first = false
-		sb.Write(kb)
-		sb.WriteByte(':')
-		sb.Write(encoded)
+		out[key] = val
 	}
-	sb.WriteByte('}')
-	return sb.String()
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return "", ir.ProtocolError("cursor: malformed tool arguments")
+	}
+	return string(encoded), nil
 }
 
-// protoValueToGo converts a google.protobuf.Value message to a Go value that
-// json.Marshal can render. Unknown/absent kind marshals as null.
-func protoValueToGo(b []byte) any {
+func protoMapEntry(e field) (string, any, error) {
+	if e.wireType != wireLen {
+		return "", nil, ir.ProtocolError("cursor: malformed tool arguments")
+	}
+	entry, err := decodeMessage(e.value)
+	if err != nil {
+		return "", nil, ir.ProtocolError("cursor: malformed tool arguments")
+	}
+	key, ok := stringField(entry, 1)
+	if !ok && len(entry[1]) > 0 {
+		return "", nil, ir.ProtocolError("cursor: malformed tool arguments")
+	}
+	vs, ok := entry[2]
+	if !ok || len(vs) == 0 {
+		return "", nil, ir.ProtocolError("cursor: malformed tool arguments")
+	}
+	if vs[0].wireType != wireLen {
+		return "", nil, ir.ProtocolError("cursor: malformed tool arguments")
+	}
+	val, err := protoValueToGo(vs[0].value)
+	if err != nil {
+		return "", nil, err
+	}
+	return key, val, nil
+}
+
+// protoValueToGo converts a google.protobuf.Value message. Official Value
+// requires one selected kind. Explicit null_value (field 1, enum 0) is JSON
+// null. An empty or unknown-only Value is invalid. Unknown fields beside a
+// valid kind are ignored. NaN and Inf are rejected.
+func protoValueToGo(b []byte) (any, error) {
 	m, err := decodeMessage(b)
 	if err != nil {
-		return nil
+		return nil, ir.ProtocolError("cursor: malformed tool arguments")
+	}
+	if f, ok := m[1]; ok && len(f) > 0 { // null_value
+		if f[0].wireType != wireVarint {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
+		}
+		v, ok := varintField(m, 1)
+		if !ok || v != 0 {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
+		}
+		return nil, nil
 	}
 	if f, ok := m[3]; ok && len(f) > 0 { // string_value
-		return string(f[0].value)
+		if f[0].wireType != wireLen {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
+		}
+		return string(f[0].value), nil
 	}
 	if f, ok := m[4]; ok && len(f) > 0 { // bool_value
-		return len(f[0].value) > 0 && f[0].value[0] != 0
+		if f[0].wireType != wireVarint {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
+		}
+		v, ok := varintField(m, 4)
+		if !ok {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
+		}
+		return v != 0, nil
 	}
 	if f, ok := m[2]; ok && len(f) > 0 { // number_value (fixed64 double)
-		if len(f[0].value) == 8 {
-			bits := uint64(f[0].value[0]) | uint64(f[0].value[1])<<8 | uint64(f[0].value[2])<<16 | uint64(f[0].value[3])<<24 |
-				uint64(f[0].value[4])<<32 | uint64(f[0].value[5])<<40 | uint64(f[0].value[6])<<48 | uint64(f[0].value[7])<<56
-			return float64FromBits(bits)
+		if f[0].wireType != wireFixed64 || len(f[0].value) != 8 {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
 		}
-		return nil
+		bits := uint64(f[0].value[0]) | uint64(f[0].value[1])<<8 | uint64(f[0].value[2])<<16 | uint64(f[0].value[3])<<24 |
+			uint64(f[0].value[4])<<32 | uint64(f[0].value[5])<<40 | uint64(f[0].value[6])<<48 | uint64(f[0].value[7])<<56
+		n := float64FromBits(bits)
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
+		}
+		return n, nil
 	}
 	if f, ok := m[5]; ok && len(f) > 0 { // struct_value
+		if f[0].wireType != wireLen {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
+		}
 		return protoStructToGo(f[0].value)
 	}
 	if f, ok := m[6]; ok && len(f) > 0 { // list_value
+		if f[0].wireType != wireLen {
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
+		}
 		lm, err := decodeMessage(f[0].value)
 		if err != nil {
-			return nil
+			return nil, ir.ProtocolError("cursor: malformed tool arguments")
 		}
-		var out []any
+		out := []any{}
 		for _, e := range lm[1] {
-			out = append(out, protoValueToGo(e.value))
+			if e.wireType != wireLen {
+				return nil, ir.ProtocolError("cursor: malformed tool arguments")
+			}
+			item, err := protoValueToGo(e.value)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, item)
 		}
-		if out == nil {
-			return []any{}
-		}
-		return out
+		return out, nil
 	}
-	return nil // null_value
+	return nil, ir.ProtocolError("cursor: malformed tool arguments")
 }
 
-func protoStructToGo(b []byte) map[string]any {
+func protoStructToGo(b []byte) (map[string]any, error) {
 	m, err := decodeMessage(b)
 	if err != nil {
-		return map[string]any{}
+		return nil, ir.ProtocolError("cursor: malformed tool arguments")
 	}
 	out := map[string]any{}
 	for _, e := range m[1] {
-		entry, err := decodeMessage(e.value)
+		key, val, err := protoMapEntry(e)
 		if err != nil {
-			continue
+			return nil, err
 		}
-		key, _ := stringField(entry, 1)
-		if key == "" {
-			continue
-		}
-		if vs, ok := entry[2]; ok && len(vs) > 0 {
-			out[key] = protoValueToGo(vs[0].value)
-		} else {
-			out[key] = nil
-		}
+		out[key] = val
 	}
-	return out
+	return out, nil
 }
 
 func float64FromBits(bits uint64) float64 {

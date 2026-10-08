@@ -90,6 +90,40 @@ func safeString(m map[int][]field, num int) string {
 	return s
 }
 
+func TestStringFieldRequiresLen(t *testing.T) {
+	valid, err := decodeMessage(encodeField(1, wireLen, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := stringField(valid, 1); !ok || s != "" {
+		t.Fatalf("empty LEN = %q ok=%v", s, ok)
+	}
+	if _, ok := stringField(valid, 2); ok {
+		t.Fatal("absent field reported present")
+	}
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "varint", raw: encodeField(1, wireVarint, uint64(7))},
+		{name: "fixed32", raw: concatBytes([]byte{0x0d}, []byte{1, 2, 3, 4})},
+		{name: "fixed64", raw: encodeField(1, wireFixed64, 1.5)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := decodeMessage(tc.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := stringField(m, 1); ok {
+				t.Fatal("non-LEN field accepted as string")
+			}
+			if len(m[1]) == 0 {
+				t.Fatal("present field was dropped")
+			}
+		})
+	}
+}
+
 func TestDecodeMessageUnknownFieldRetained(t *testing.T) {
 	// A message with an unknown field 99 (LEN) plus a known one.
 	data := concatBytes(encodeField(99, wireLen, "x"), encodeField(1, wireLen, "known"))

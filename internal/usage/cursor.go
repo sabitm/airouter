@@ -3,6 +3,8 @@ package usage
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/url"
@@ -23,6 +25,8 @@ const (
 	cursorMethodHardLimit       = "GetHardLimit"
 	cursorMethodPlanInfo        = "GetPlanInfo"
 	cursorMethodGetMe           = "GetMe"
+	cursorMethodMonthlyCycle    = "GetMonthlyBillingCycle"
+	cursorMethodAggregatedUsage = "GetAggregatedUsageEvents"
 	cursorHardLimitUnlimited    = int32(2147483647)
 	cursorRPCTimeout            = 10 * time.Second
 )
@@ -117,7 +121,13 @@ func (s *Service) fetchCursorPeriodBundle(ctx context.Context, p *domain.Provide
 
 func (s *Service) fetchCursorEnterpriseOrUnavailable(ctx context.Context, p *domain.Provider, token string, planInfo *cursorPlanInfo) (*Report, error) {
 	meRes, meErr := s.doCursorRPC(ctx, p, token, cursorMethodGetMe)
-	if meErr != nil || meRes.Status != http.StatusOK {
+	if meErr != nil {
+		if isLocalErr(meErr) || errors.Is(meErr, context.Canceled) || errors.Is(meErr, context.DeadlineExceeded) {
+			return nil, meErr
+		}
+		return soft(cursorPlan, cursorUnavailableMessage), nil
+	}
+	if meRes.Status != http.StatusOK {
 		return soft(cursorPlan, cursorUnavailableMessage), nil
 	}
 	me, ok := decodeCursorMe(meRes.Body)
@@ -131,7 +141,44 @@ func (s *Service) fetchCursorEnterpriseOrUnavailable(ctx context.Context, p *dom
 	if me.teamID == 0 || me.userID == 0 {
 		return soft(plan, cursorEnterpriseUnavailable), nil
 	}
-	return soft(plan, cursorEnterpriseUnavailable), nil
+	cycleRes, cycleErr := s.doCursorRPC(ctx, p, token, cursorMethodMonthlyCycle)
+	if cycleErr != nil {
+		if isLocalErr(cycleErr) || errors.Is(cycleErr, context.Canceled) || errors.Is(cycleErr, context.DeadlineExceeded) {
+			return nil, cycleErr
+		}
+		return soft(plan, cursorEnterpriseUnavailable), nil
+	}
+	if cycleRes.Status == http.StatusUnauthorized || cycleRes.Status == http.StatusForbidden {
+		return soft(plan, cursorEnterpriseUnavailable), nil
+	}
+	if cycleRes.Status != http.StatusOK {
+		return soft(plan, cursorEnterpriseUnavailable), nil
+	}
+	cycle, ok := decodeCursorMonthlyCycle(cycleRes.Body)
+	if !ok || cycle.start <= 0 || cycle.end <= cycle.start {
+		return soft(plan, cursorEnterpriseUnavailable), nil
+	}
+	now := s.now().UTC()
+	start, end, elapsed := cursorSpendWindow(cycle.start, cycle.end, now)
+	if !elapsed {
+		return buildCursorEnterpriseReport(plan, 0, cycle, now), nil
+	}
+	reqBody := encodeCursorAggregatedUsageRequest(me.teamID, me.userID, start, end)
+	usageRes, usageErr := s.doCursorRPCBody(ctx, p, token, cursorMethodAggregatedUsage, reqBody)
+	if usageErr != nil {
+		if isLocalErr(usageErr) || errors.Is(usageErr, context.Canceled) || errors.Is(usageErr, context.DeadlineExceeded) {
+			return nil, usageErr
+		}
+		return soft(plan, cursorEnterpriseUnavailable), nil
+	}
+	if usageRes.Status == http.StatusUnauthorized || usageRes.Status == http.StatusForbidden || usageRes.Status != http.StatusOK {
+		return soft(plan, cursorEnterpriseUnavailable), nil
+	}
+	spendCents, ok := decodeCursorAggregatedCostCents(usageRes.Body)
+	if !ok {
+		return soft(plan, cursorEnterpriseUnavailable), nil
+	}
+	return buildCursorEnterpriseReport(plan, spendCents, cycle, now), nil
 }
 
 func buildCursorStandardReport(period cursorPeriodUsage, hard *cursorHardLimit, planInfo *cursorPlanInfo) *Report {
@@ -276,11 +323,60 @@ func cursorOnDemandKind(spend *cursorSpendLimit, hard *cursorHardLimit) (kind st
 }
 
 func (s *Service) doCursorRPC(ctx context.Context, p *domain.Provider, token, method string) (httpResult, error) {
+	return s.doCursorRPCBody(ctx, p, token, method, []byte{})
+}
+
+func (s *Service) doCursorRPCBody(ctx context.Context, p *domain.Provider, token, method string, body []byte) (httpResult, error) {
 	rpcCtx, cancel := context.WithTimeout(ctx, cursorRPCTimeout)
 	defer cancel()
 	headers := cursorUsageHeaders(token)
 	rawURL := cursorDashboardURL(p, method)
-	return s.doRequest(rpcCtx, http.MethodPost, rawURL, "", headers, []byte{})
+	return s.doRequest(rpcCtx, http.MethodPost, rawURL, "", headers, body)
+}
+
+// cursorSpendWindow follows the CLI current-cycle clamp: now is bounded by
+// the billing cycle, and a non-positive elapsed window has no spend request.
+func cursorSpendWindow(start, end int64, now time.Time) (int64, int64, bool) {
+	nowMs := now.UnixMilli()
+	if nowMs < start {
+		nowMs = start
+	}
+	if nowMs > end {
+		nowMs = end
+	}
+	if nowMs-start <= 0 {
+		return start, start, false
+	}
+	return start, nowMs, true
+}
+
+func encodeCursorAggregatedUsageRequest(teamID, userID int32, start, end int64) []byte {
+	// GetAggregatedUsageEventsRequest: team_id int32, optional start_date and
+	// end_date int64, optional user_id int32.
+	return concatCursor(
+		cursorEncodeVarintField(1, uint64(uint32(teamID))),
+		cursorEncodeVarintField(2, uint64(start)),
+		cursorEncodeVarintField(3, uint64(end)),
+		cursorEncodeVarintField(4, uint64(uint32(userID))),
+	)
+}
+
+func buildCursorEnterpriseReport(plan string, costCents float64, cycle cursorMonthlyCycle, now time.Time) *Report {
+	if costCents < 0 || math.IsNaN(costCents) || math.IsInf(costCents, 0) {
+		return soft(plan, cursorEnterpriseUnavailable)
+	}
+	used := costCents / 100
+	start := time.UnixMilli(cycle.start).UTC().Format("2006-01-02")
+	end := time.UnixMilli(cycle.end).UTC().Format("2006-01-02")
+	msg := fmt.Sprintf("Enterprise spend is $%.2f from %s to %s UTC.", used, start, end)
+	if now.Before(time.UnixMilli(cycle.start).UTC()) {
+		msg = fmt.Sprintf("Enterprise spend is $0.00 from %s to %s UTC. The billing cycle has not started.", start, end)
+	}
+	return &Report{
+		Plan:      plan,
+		Message:   msg,
+		FetchedAt: time.Now(),
+	}
 }
 
 func cursorUsageHeaders(token string) map[string]string {
@@ -364,6 +460,11 @@ type cursorMe struct {
 	userID           int32
 	teamID           int32
 	isEnterpriseUser bool
+}
+
+type cursorMonthlyCycle struct {
+	start int64
+	end   int64
 }
 
 func decodeCursorPeriodUsage(body []byte) (cursorPeriodUsage, bool) {
@@ -488,6 +589,43 @@ func decodeCursorPlanInfo(body []byte) (cursorPlanInfo, bool) {
 	return out, true
 }
 
+func decodeCursorMonthlyCycle(body []byte) (cursorMonthlyCycle, bool) {
+	fields, ok := decodeCursorFields(body)
+	if !ok {
+		return cursorMonthlyCycle{}, false
+	}
+	out := cursorMonthlyCycle{}
+	if v, present, valid := cursorInt64(fields, 1); !valid {
+		return cursorMonthlyCycle{}, false
+	} else if present {
+		out.start = v
+	}
+	if v, present, valid := cursorInt64(fields, 2); !valid {
+		return cursorMonthlyCycle{}, false
+	} else if present {
+		out.end = v
+	}
+	return out, true
+}
+
+func decodeCursorAggregatedCostCents(body []byte) (float64, bool) {
+	fields, ok := decodeCursorFields(body)
+	if !ok {
+		return 0, false
+	}
+	// total_cost_cents is a non-optional fixed64. Proto3 omits scalar zero,
+	// including a valid empty response, so absence is zero. A present field
+	// with the wrong wire type, NaN, or Inf is invalid.
+	v, present, valid := cursorDouble(fields, 6)
+	if !valid {
+		return 0, false
+	}
+	if !present {
+		return 0, true
+	}
+	return v, true
+}
+
 func decodeCursorMe(body []byte) (cursorMe, bool) {
 	fields, ok := decodeCursorFields(body)
 	if !ok {
@@ -510,6 +648,32 @@ func decodeCursorMe(body []byte) (cursorMe, bool) {
 		out.isEnterpriseUser = v
 	}
 	return out, true
+}
+
+func cursorEncodeVarintField(field int, value uint64) []byte {
+	tag := uint64(field)<<3 | uint64(cursorWireVarint)
+	return append(cursorEncodeUvarint(tag), cursorEncodeUvarint(value)...)
+}
+
+func cursorEncodeUvarint(v uint64) []byte {
+	var out []byte
+	for v >= 0x80 {
+		out = append(out, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(out, byte(v))
+}
+
+func concatCursor(parts ...[]byte) []byte {
+	var n int
+	for _, p := range parts {
+		n += len(p)
+	}
+	out := make([]byte, 0, n)
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
 }
 
 func clampInt32NonNeg(v int32) int32 {

@@ -86,7 +86,7 @@ func serveAgentRun(capture *cursorAgentCapture, kvWG *sync.WaitGroup) http.Handl
 		te = append(te, teVarintField(2, 3)...)
 		_, _ = w.Write(wrapFrameForTest(teField(1, teBytes, teField(14, teBytes, te))))
 		fl.Flush()
-		// End-stream trailer.
+		// End-stream trailer. Connect requires this JSON object after turn_ended.
 		_, _ = w.Write(wrapTrailerForTest([]byte(`{}`)))
 		fl.Flush()
 	}
@@ -486,6 +486,124 @@ func TestCursorOversizedFrameLifecycle(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCursorMissingTurnEndedLifecycle(t *testing.T) {
+	t.Run("precommit eof fails over", func(t *testing.T) {
+		var badHits atomic.Int64
+		bad := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			badHits.Add(1)
+			go io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", cursor.ConnectContentType)
+			w.WriteHeader(http.StatusOK)
+			fl := w.(http.Flusher)
+			hb := teField(13, teBytes, nil)
+			_, _ = w.Write(wrapFrameForTest(teField(1, teBytes, teField(13, teBytes, hb))))
+			fl.Flush()
+		}))
+		bad.EnableHTTP2 = true
+		bad.StartTLS()
+		t.Cleanup(bad.Close)
+
+		goodCap := &cursorAgentCapture{}
+		var goodKV sync.WaitGroup
+		goodKV.Add(1)
+		good := httptest.NewUnstartedServer(serveAgentRun(goodCap, &goodKV))
+		good.EnableHTTP2 = true
+		good.StartTLS()
+		t.Cleanup(good.Close)
+
+		base, token := setupCursorFailoverProxy(t, bad.URL, good.URL)
+		resp, body := postStream(t, base+"/v1/chat/completions", token,
+			`{"model":"default","stream":true,"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+		if badHits.Load() != 1 {
+			t.Fatalf("primary hits = %d", badHits.Load())
+		}
+		goodCap.mu.Lock()
+		hitGood := goodCap.runPayload != nil
+		goodCap.mu.Unlock()
+		if !hitGood {
+			t.Fatal("empty stream did not fail over")
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		text, finished := collectStreamText(t, "/v1/chat/completions", body)
+		if text != "Hello world" || !finished {
+			t.Fatalf("text=%q finished=%v", text, finished)
+		}
+	})
+
+	t.Run("postcommit eof has no success finish", func(t *testing.T) {
+		var hits [2]atomic.Int64
+		serve := func(i int) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				hits[i].Add(1)
+				go io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", cursor.ConnectContentType)
+				w.WriteHeader(http.StatusOK)
+				writeTextDelta(w, "partial")
+			}
+		}
+		bad := httptest.NewUnstartedServer(serve(0))
+		bad.EnableHTTP2 = true
+		bad.StartTLS()
+		t.Cleanup(bad.Close)
+		good := httptest.NewUnstartedServer(serve(1))
+		good.EnableHTTP2 = true
+		good.StartTLS()
+		t.Cleanup(good.Close)
+
+		base, token := setupCursorFailoverProxy(t, bad.URL, good.URL)
+		resp, body := postStream(t, base+"/v1/chat/completions", token,
+			`{"model":"default","stream":true,"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+		if hits[0].Load() != 1 || hits[1].Load() != 0 {
+			t.Fatalf("hits = %d/%d, want 1/0", hits[0].Load(), hits[1].Load())
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "partial") || !strings.Contains(body, "error") {
+			t.Fatalf("body = %s, want partial text and ingress error", body)
+		}
+		if strings.Contains(body, "[DONE]") || strings.Contains(body, `"finish_reason":"stop"`) || strings.Contains(body, "message_stop") {
+			t.Fatalf("successful finish after post-commit EOF: %s", body)
+		}
+	})
+
+	t.Run("malformed protobuf fails over before output", func(t *testing.T) {
+		var badHits atomic.Int64
+		bad := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			badHits.Add(1)
+			go io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", cursor.ConnectContentType)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(wrapFrameForTest([]byte{0x0a, 0x05, 0x01}))
+			w.(http.Flusher).Flush()
+		}))
+		bad.EnableHTTP2 = true
+		bad.StartTLS()
+		t.Cleanup(bad.Close)
+		goodCap := &cursorAgentCapture{}
+		var goodKV sync.WaitGroup
+		goodKV.Add(1)
+		good := httptest.NewUnstartedServer(serveAgentRun(goodCap, &goodKV))
+		good.EnableHTTP2 = true
+		good.StartTLS()
+		t.Cleanup(good.Close)
+		base, token := setupCursorFailoverProxy(t, bad.URL, good.URL)
+		resp, body := postStream(t, base+"/v1/chat/completions", token,
+			`{"model":"default","stream":true,"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+		if badHits.Load() != 1 || resp.StatusCode != http.StatusOK {
+			t.Fatalf("hits=%d status=%d body=%s", badHits.Load(), resp.StatusCode, body)
+		}
+		goodCap.mu.Lock()
+		hitGood := goodCap.runPayload != nil
+		goodCap.mu.Unlock()
+		if !hitGood {
+			t.Fatal("malformed protobuf did not fail over")
+		}
+	})
 }
 
 func setupCursorFailoverProxy(t *testing.T, badURL, goodURL string) (string, string) {

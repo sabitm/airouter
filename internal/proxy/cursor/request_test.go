@@ -319,7 +319,10 @@ func TestEncodeAgentRequestMCPTools(t *testing.T) {
 	if !ok || len(valueRaw) == 0 {
 		t.Fatal("input schema Value (field 3) missing")
 	}
-	got := protoValueToGo(valueRaw[0].value)
+	got, err := protoValueToGo(valueRaw[0].value)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var want any
 	if err := json.Unmarshal([]byte(schema), &want); err != nil {
 		t.Fatal(err)
@@ -436,6 +439,92 @@ func TestEncodeAgentRequestEmptyToolInputBecomesEmptyObject(t *testing.T) {
 	content, _ := decodeMessage(tool[chtContent][0].value)
 	if got, _ := stringField(content, chtcText); got != "[empty tool result]" {
 		t.Errorf("empty tool result = %q", got)
+	}
+}
+
+func TestEncodeAgentRequestGroupsUserTextParts(t *testing.T) {
+	body := mustEncodeAgent(t, &ir.Request{
+		Model: "default",
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "alpha"},
+				{Type: ir.BlockText, Text: ""},
+				{Type: ir.BlockText, Text: "beta"},
+			}},
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolUse, ToolID: "c1", ToolName: "lookup", ToolInput: json.RawMessage(`{"q":"x"}`)},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "before"},
+				{Type: ir.BlockToolResult, ToolUseID: "c1", IsError: true, ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "nope"}}},
+				{Type: ir.BlockText, Text: "after"},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "missing", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "only"}}},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "current"}}},
+		},
+	})
+	payload := agentFramePayload(t, body)
+	um := decodePath(t, payload, acmRunRequest, runAction, convUserMessageAction, umaUserMessage)
+	umMsg, _ := decodeMessage(um)
+	if text, _ := stringField(umMsg, umText); text != "current" {
+		t.Fatalf("current text = %q", text)
+	}
+	hist := decodePath(t, payload, acmRunRequest, runAction, convUserMessageAction, umaConversationHistory)
+	hm, err := decodeMessage(hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := hm[chMessages]
+	if len(msgs) != 6 {
+		t.Fatalf("history messages = %d, want grouped user, assistant, before, tool, after, result-only", len(msgs))
+	}
+	assertUserTexts(t, msgs[0].value, "alpha", "beta")
+	tool, _ := decodeMessage(msgs[3].value)
+	if _, ok := tool[chmTool]; !ok {
+		t.Fatal("mixed turn did not keep the tool result between text groups")
+	}
+	bodyMsg, _ := decodeMessage(tool[chmTool][0].value)
+	if got, _ := stringField(bodyMsg, chtCallID); got != "c1" {
+		t.Fatalf("call id = %q", got)
+	}
+	if got, _ := stringField(bodyMsg, chtName); got != "lookup" {
+		t.Fatalf("tool name = %q", got)
+	}
+	if v, ok := varintField(bodyMsg, chtIsError); !ok || v != 1 {
+		t.Fatalf("is_error = %d ok=%v", v, ok)
+	}
+	assertUserTexts(t, msgs[2].value, "before")
+	assertUserTexts(t, msgs[4].value, "after")
+	only, _ := decodeMessage(msgs[5].value)
+	if _, ok := only[chmTool]; !ok {
+		t.Fatal("result-only history was not a tool message")
+	}
+}
+
+func assertUserTexts(t *testing.T, raw []byte, want ...string) {
+	t.Helper()
+	msg, err := decodeMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, ok := msg[chmUser]
+	if !ok || len(user) == 0 {
+		t.Fatalf("not a user history message: %v", fieldNums(msg))
+	}
+	body, _ := decodeMessage(user[0].value)
+	parts := body[chuContent]
+	if len(parts) != len(want) {
+		t.Fatalf("content parts = %d, want %d", len(parts), len(want))
+	}
+	for i, part := range parts {
+		pm, _ := decodeMessage(part.value)
+		textMsg, _ := decodeMessage(pm[hcText][0].value)
+		got, _ := stringField(textMsg, tpText)
+		if got != want[i] {
+			t.Fatalf("part %d = %q, want %q", i, got, want[i])
+		}
 	}
 }
 

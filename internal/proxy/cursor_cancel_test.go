@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,6 +133,79 @@ func TestCursorAgentCancelBeforeHeaders(t *testing.T) {
 		t.Log("handler returned after cancel")
 	case <-time.After(10 * time.Second):
 		t.Fatal("proxy handler did not return after client cancel before headers; HAR lease would stay in-flight")
+	}
+}
+
+func TestCursorAgentCancelDoesNotFailOver(t *testing.T) {
+	var hits [2]atomic.Int64
+	st := newTestStore(t)
+	ctx := context.Background()
+	serve := func(i int) *httptest.Server {
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits[i].Add(1)
+			go io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", cursor.ConnectContentType)
+			w.WriteHeader(http.StatusOK)
+			if i == 0 {
+				writeTextDelta(w, "partial")
+			}
+			<-r.Context().Done()
+		}))
+		srv.EnableHTTP2 = true
+		srv.StartTLS()
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	bad := serve(0)
+	good := serve(1)
+	providers := []*domain.Provider{
+		{Name: "cursor-bad", BaseURL: bad.URL, Protocol: domain.ProtocolCursor, AuthMethod: domain.AuthAPIKey, APIKey: "agent-tok", OAuthCreds: &domain.OAuthCreds{CursorAuth: true, MachineID: "m-1"}},
+		{Name: "cursor-good", BaseURL: good.URL, Protocol: domain.ProtocolCursor, AuthMethod: domain.AuthAPIKey, APIKey: "agent-tok", OAuthCreds: &domain.OAuthCreds{CursorAuth: true, MachineID: "m-1"}},
+	}
+	for _, p := range providers {
+		if err := st.CreateProvider(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: providers[0].ID, UpstreamModel: "default", Enabled: true},
+		{ProviderID: providers[1].ID, UpstreamModel: "default", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	p := New(st, nil)
+	p.streamClient = &http.Client{Transport: &http.Transport{
+		ForceAttemptHTTP2:   true,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		TLSHandshakeTimeout: 10 * time.Second,
+	}}
+	p.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, ts.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"default","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+key.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	time.Sleep(300 * time.Millisecond)
+	if hits[0].Load() != 1 || hits[1].Load() != 0 {
+		t.Fatalf("hits = %d/%d, cancel must not fail over", hits[0].Load(), hits[1].Load())
 	}
 }
 

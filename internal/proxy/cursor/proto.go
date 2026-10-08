@@ -134,11 +134,16 @@ func decodeMessage(data []byte) (map[int][]field, error) {
 	return out, nil
 }
 
-// stringField returns the first LEN field's bytes as a string, ok=false when
-// absent.
+// stringField returns the first LEN field's bytes as a string. ok is false
+// when the field is absent. A present field of any other wire type is also
+// ok=false so callers can reject a malformed string instead of treating
+// varint or fixed bytes as text.
 func stringField(m map[int][]field, num int) (string, bool) {
 	f, ok := m[num]
 	if !ok || len(f) == 0 {
+		return "", false
+	}
+	if f[0].wireType != wireLen {
 		return "", false
 	}
 	return string(f[0].value), true
