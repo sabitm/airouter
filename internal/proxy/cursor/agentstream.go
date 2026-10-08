@@ -564,10 +564,13 @@ func handleExecServerMessage(server []byte, writeFrame func([]byte) error, accep
 			return execControlHandled, m, nil
 		}
 		// ExecClientMessage{1: id, 15: exec_id, 10: RequestContextResult{
-		// 1: RequestContextSuccess{}}} — empty context, like the CLI on a
-		// context-less run.
+		// 1: RequestContextSuccess{1: RequestContext{}}}}. The nested
+		// request_context must be present and empty. Upstream rejects a success
+		// message that omits it with "Failed to get request context". Do not
+		// fill tools, environment, or user system text: tools already travel on
+		// RunRequest.mcp_tools, and echoing them previously stalled the run.
 		result := encodeField(ecmRequestContextRes, wireLen,
-			encodeField(1, wireLen, []byte{}))
+			encodeField(1, wireLen, encodeField(1, wireLen, []byte{})))
 		client := concatBytes(
 			encodeField(ecmID, wireVarint, id),
 			encodeField(ecmExecID, wireLen, execID),

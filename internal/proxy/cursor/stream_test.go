@@ -79,12 +79,37 @@ func kvServerFrame(t *testing.T, variant int) []byte {
 // execRequestContextFrame builds an ExecServerMessage with request_context_args.
 func execRequestContextFrame(t *testing.T) []byte {
 	t.Helper()
-	ex := concatBytes(
-		encodeField(esmID, wireVarint, uint64(3)),
-		encodeField(esmExecID, wireLen, "exec-1"),
+	return execRequestContextFrameWith(t, true)
+}
+
+// execRequestContextFrameWith builds the request-context exec. withIDs false
+// matches the live server: numeric id and exec_id are omitted, so both decode
+// as the zero default, while span metadata is still present.
+func execRequestContextFrameWith(t *testing.T, withIDs bool) []byte {
+	t.Helper()
+	var parts [][]byte
+	if withIDs {
+		parts = append(parts,
+			encodeField(esmID, wireVarint, uint64(3)),
+			encodeField(esmExecID, wireLen, "exec-1"),
+		)
+	}
+	parts = append(parts,
 		encodeField(esmRequestContextArgs, wireLen, []byte{}),
+		encodeField(esmSpanContext, wireLen, encodeSpanContext("c2c12bbfe63300373e14a63561373372", "bcb0d995fe395270")),
 	)
-	return agentFrame(t, encodeField(asmExecServerMessage, wireLen, ex))
+	return agentFrame(t, encodeField(asmExecServerMessage, wireLen, concatBytes(parts...)))
+}
+
+// encodeSpanContext is the span metadata carried beside a context request:
+// field 1 trace id, field 2 span id, field 3 flags. It is not copied into the
+// reply.
+func encodeSpanContext(traceID, spanID string) []byte {
+	return concatBytes(
+		encodeField(1, wireLen, traceID),
+		encodeField(2, wireLen, spanID),
+		encodeField(3, wireVarint, uint64(0)),
+	)
 }
 
 // mcpExecFrame builds an ExecServerMessage carrying mcp_args.
@@ -294,47 +319,101 @@ func TestDecodeAgentStreamKVReplies(t *testing.T) {
 }
 
 func TestDecodeAgentStreamRequestContextReply(t *testing.T) {
-	var writes [][]byte
-	var events []ir.StreamEvent
-	err := DecodeAgentStream(bytes.NewReader(bytes.Join([][]byte{
-		execRequestContextFrame(t),
-		agentTextFrame(t, "hi"),
-		agentTurnEndedFrame(t, 1, 1),
-		connectEndStreamFrame(t, []byte(`{}`)),
-	}, nil)), func(frame []byte) error {
-		writes = append(writes, frame)
-		return nil
-	}, func(ev ir.StreamEvent) error {
-		events = append(events, ev)
-		return nil
-	})
+	for _, withIDs := range []bool{true, false} {
+		t.Run(map[bool]string{true: "explicit ids", false: "omitted ids"}[withIDs], func(t *testing.T) {
+			var writes [][]byte
+			var events []ir.StreamEvent
+			err := DecodeAgentStream(bytes.NewReader(bytes.Join([][]byte{
+				execRequestContextFrameWith(t, withIDs),
+				agentTextFrame(t, "hi"),
+				agentTurnEndedFrame(t, 1, 1),
+				connectEndStreamFrame(t, []byte(`{}`)),
+			}, nil)), func(frame []byte) error {
+				writes = append(writes, frame)
+				return nil
+			}, func(ev ir.StreamEvent) error {
+				events = append(events, ev)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(writes) != 1 {
+				t.Fatalf("client writes = %d, want 1", len(writes))
+			}
+			_, payload, err := readFrame(bytes.NewReader(writes[0]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cm, err := decodeMessage(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ecm, ok := cm[acmExecClientMessage]
+			if !ok || len(ecm) != 1 || ecm[0].wireType != wireLen {
+				t.Fatal("reply is not one exec_client_message")
+			}
+			em, err := decodeMessage(ecm[0].value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantID := uint64(0)
+			wantExecID := ""
+			if withIDs {
+				wantID = 3
+				wantExecID = "exec-1"
+			}
+			if id, ok := varintField(em, ecmID); !ok || id != wantID {
+				t.Errorf("exec id = %d ok=%v, want %d", id, ok, wantID)
+			}
+			if eid, ok := stringField(em, ecmExecID); !ok || eid != wantExecID {
+				t.Errorf("exec_id = %q ok=%v, want %q", eid, ok, wantExecID)
+			}
+			assertEmptyRequestContext(t, em)
+			if len(events) == 0 || events[len(events)-1].Kind != ir.EventFinish {
+				t.Error("stream did not finish")
+			}
+		})
+	}
+}
+
+// assertEmptyRequestContext requires the three nested layers upstream accepts:
+// result field 10, success field 1, and an empty request_context field 1.
+// A success message without that nested field is the rejected old shape.
+func assertEmptyRequestContext(t *testing.T, exec map[int][]field) {
+	t.Helper()
+	resultFields, ok := exec[ecmRequestContextRes]
+	if !ok || len(resultFields) != 1 || resultFields[0].wireType != wireLen {
+		t.Fatal("request_context_result missing")
+	}
+	result, err := decodeMessage(resultFields[0].value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(writes) != 1 {
-		t.Fatalf("client writes = %d, want 1", len(writes))
+	successFields, ok := result[1]
+	if !ok || len(successFields) != 1 || successFields[0].wireType != wireLen {
+		t.Fatal("RequestContextSuccess missing")
 	}
-	_, payload, err := readFrame(bytes.NewReader(writes[0]))
+	success, err := decodeMessage(successFields[0].value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cm, _ := decodeMessage(payload)
-	ecm, ok := cm[2] // exec_client_message
-	if !ok {
-		t.Fatal("reply is not an exec_client_message")
+	ctxFields, ok := success[1]
+	if !ok || len(ctxFields) != 1 || ctxFields[0].wireType != wireLen {
+		t.Fatal("request_context missing")
 	}
-	em, _ := decodeMessage(ecm[0].value)
-	if id, _ := varintField(em, ecmID); id != 3 {
-		t.Errorf("exec id = %d, want 3", id)
+	if len(ctxFields[0].value) != 0 {
+		t.Fatalf("request_context = %d bytes, want empty", len(ctxFields[0].value))
 	}
-	if eid, _ := stringField(em, ecmExecID); eid != "exec-1" {
-		t.Errorf("exec_id = %q", eid)
+	if _, ok := success[7]; ok {
+		t.Fatal("empty request_context echoed tools")
 	}
-	if _, ok := em[ecmRequestContextRes]; !ok {
-		t.Error("request_context_result missing")
-	}
-	if events[len(events)-1].Kind != ir.EventFinish {
-		t.Error("stream did not finish")
+	// The old encoder stopped at success{}. Its result payload is 52 02 0a 00.
+	// The accepted payload adds the empty nested context: 52 04 0a 02 0a 00.
+	wantResult := encodeField(ecmRequestContextRes, wireLen, encodeField(1, wireLen, encodeField(1, wireLen, []byte{})))
+	gotResult := encodeField(ecmRequestContextRes, wireLen, resultFields[0].value)
+	if !bytes.Equal(gotResult, wantResult) {
+		t.Fatalf("request_context_result = %x, want %x", gotResult, wantResult)
 	}
 }
 

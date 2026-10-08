@@ -29,11 +29,25 @@ type cursorAgentCapture struct {
 	accept      string
 	runPayload  []byte // initial AgentClientMessage payload (unframed)
 	clientRepl  [][]byte
+	contextErr  string
+}
+
+func (c *cursorAgentCapture) recordContextError(msg string) {
+	c.mu.Lock()
+	c.contextErr = msg
+	c.mu.Unlock()
 }
 
 // agentServerFrames builds an AgentService response: a KV get request, text
 // deltas, and turn end. The server asserts a KV reply arrives before finishing.
 func serveAgentRun(capture *cursorAgentCapture, kvWG *sync.WaitGroup) http.HandlerFunc {
+	return serveAgentRunGate(capture, kvWG, false)
+}
+
+// serveAgentRunGate is serveAgentRun with an optional request-context gate.
+// The context request is sent before text. Only a KV reply (top-level field 3)
+// releases kvWG, and it is released once. A context reply is not a KV reply.
+func serveAgentRunGate(capture *cursorAgentCapture, kvWG *sync.WaitGroup, askContext bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		capture.mu.Lock()
 		capture.path = r.URL.Path
@@ -42,8 +56,16 @@ func serveAgentRun(capture *cursorAgentCapture, kvWG *sync.WaitGroup) http.Handl
 		capture.accept = r.Header.Get("Accept")
 		capture.mu.Unlock()
 
+		var (
+			kvOnce      sync.Once
+			kvReply     = make(chan struct{})
+			contextRepl = make(chan []byte, 1)
+		)
 		// Read the initial run frame, then keep reading for duplex replies.
+		// Request cancellation closes the body, so this read cannot outlive the
+		// handler. Do not call t.Fatal from this goroutine.
 		go func() {
+			defer close(contextRepl)
 			for {
 				_, payload, err := readConnectFrameForTest(r.Body)
 				if err != nil {
@@ -51,13 +73,23 @@ func serveAgentRun(capture *cursorAgentCapture, kvWG *sync.WaitGroup) http.Handl
 				}
 				capture.mu.Lock()
 				if capture.runPayload == nil {
-					capture.runPayload = payload
-				} else {
-					capture.clientRepl = append(capture.clientRepl, payload)
+					capture.runPayload = append([]byte(nil), payload...)
+					capture.mu.Unlock()
+					continue
 				}
+				capture.clientRepl = append(capture.clientRepl, append([]byte(nil), payload...))
 				capture.mu.Unlock()
-				if kvWG != nil && len(capture.clientRepl) > 0 {
-					kvWG.Done()
+				if kvWG != nil && isKVClientReply(payload) {
+					kvOnce.Do(func() {
+						kvWG.Done()
+						close(kvReply)
+					})
+				}
+				if isExecClientReply(payload) {
+					select {
+					case contextRepl <- append([]byte(nil), payload...):
+					default:
+					}
 				}
 			}
 		}()
@@ -65,6 +97,27 @@ func serveAgentRun(capture *cursorAgentCapture, kvWG *sync.WaitGroup) http.Handl
 		w.Header().Set("Content-Type", "application/connect+proto")
 		w.WriteHeader(http.StatusOK)
 		fl := w.(http.Flusher)
+
+		if askContext {
+			// ExecServerMessage{10: request_context_args{}, 19: span}. Numeric id
+			// and exec_id are omitted, matching the captured upstream request.
+			ex := teField(10, teBytes, nil)
+			ex = append(ex, teField(19, teBytes, teSpanContext("c2c12bbfe63300373e14a63561373372", "bcb0d995fe395270"))...)
+			_, _ = w.Write(wrapFrameForTest(teField(2, teBytes, ex)))
+			fl.Flush()
+			var reply []byte
+			select {
+			case reply = <-contextRepl:
+			case <-r.Context().Done():
+				return
+			}
+			if !hasEmptyRequestContext(reply) {
+				capture.recordContextError("request_context missing")
+				_, _ = w.Write(wrapTrailerForTest([]byte(`{"error":{"code":"internal","message":"Failed to get request context"}}`)))
+				fl.Flush()
+				return
+			}
+		}
 
 		// Ask for a blob; the proxy must reply on the request body before the
 		// turn can be considered healthy (the decoder replies immediately).
@@ -75,9 +128,13 @@ func serveAgentRun(capture *cursorAgentCapture, kvWG *sync.WaitGroup) http.Handl
 		fl.Flush()
 
 		// If a KV gate was supplied, wait for the client's reply before sending
-		// content — proves the duplex write path works end to end.
+		// content. This proves the duplex write path works end to end.
 		if kvWG != nil {
-			kvWG.Wait()
+			select {
+			case <-kvReply:
+			case <-r.Context().Done():
+				return
+			}
 		}
 
 		writeTextDelta(w, "Hello ")
@@ -90,6 +147,134 @@ func serveAgentRun(capture *cursorAgentCapture, kvWG *sync.WaitGroup) http.Handl
 		_, _ = w.Write(wrapTrailerForTest([]byte(`{}`)))
 		fl.Flush()
 	}
+}
+
+func teSpanContext(traceID, spanID string) []byte {
+	out := teField(1, teBytes, []byte(traceID))
+	out = append(out, teField(2, teBytes, []byte(spanID))...)
+	return append(out, teVarintField(3, 0)...)
+}
+
+func isKVClientReply(payload []byte) bool {
+	return hasTopLevelField(payload, 3)
+}
+
+func isExecClientReply(payload []byte) bool {
+	return hasTopLevelField(payload, 2)
+}
+
+func hasTopLevelField(payload []byte, want int) bool {
+	off := 0
+	for off < len(payload) {
+		tag, n, ok := teDecodeVarint(payload, off)
+		if !ok {
+			return false
+		}
+		off = n
+		fieldNum := int(tag >> 3)
+		wire := int(tag & 7)
+		switch wire {
+		case teVarint:
+			_, n, ok = teDecodeVarint(payload, off)
+			if !ok {
+				return false
+			}
+			off = n
+		case teBytes:
+			ln, n, ok := teDecodeVarint(payload, off)
+			if !ok || n+int(ln) > len(payload) {
+				return false
+			}
+			off = n + int(ln)
+		default:
+			return false
+		}
+		if fieldNum == want {
+			return true
+		}
+	}
+	return false
+}
+
+func teDecodeVarint(b []byte, off int) (uint64, int, bool) {
+	var result uint64
+	var shift uint
+	for {
+		if off >= len(b) || shift > 63 {
+			return 0, off, false
+		}
+		cur := b[off]
+		off++
+		result |= uint64(cur&0x7f) << shift
+		if cur < 0x80 {
+			return result, off, true
+		}
+		shift += 7
+	}
+}
+
+// hasEmptyRequestContext accepts only the nested shape upstream requires:
+// ExecClientMessage field 2 -> result field 10 -> success field 1 ->
+// request_context field 1, present and empty. Tools field 7 must be absent.
+func hasEmptyRequestContext(payload []byte) bool {
+	exec, ok := teNestedMessage(payload, 2)
+	if !ok {
+		return false
+	}
+	result, ok := teNestedMessage(exec, 10)
+	if !ok {
+		return false
+	}
+	success, ok := teNestedMessage(result, 1)
+	if !ok {
+		return false
+	}
+	ctx, ok := teFieldBytes(success, 1)
+	if !ok || len(ctx) != 0 {
+		return false
+	}
+	if _, ok := teFieldBytes(success, 7); ok {
+		return false
+	}
+	return true
+}
+
+func teNestedMessage(payload []byte, fieldNum int) ([]byte, bool) {
+	return teFieldBytes(payload, fieldNum)
+}
+
+func teFieldBytes(payload []byte, want int) ([]byte, bool) {
+	off := 0
+	for off < len(payload) {
+		tag, n, ok := teDecodeVarint(payload, off)
+		if !ok {
+			return nil, false
+		}
+		off = n
+		fieldNum := int(tag >> 3)
+		wire := int(tag & 7)
+		switch wire {
+		case teVarint:
+			_, n, ok = teDecodeVarint(payload, off)
+			if !ok {
+				return nil, false
+			}
+			off = n
+		case teBytes:
+			ln, n, ok := teDecodeVarint(payload, off)
+			if !ok || n+int(ln) > len(payload) {
+				return nil, false
+			}
+			val := payload[n : n+int(ln)]
+			off = n + int(ln)
+			if fieldNum == want {
+				return val, true
+			}
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
 }
 
 func writeTextDelta(w io.Writer, text string) {
@@ -131,13 +316,23 @@ func teVarintField(num int, v uint64) []byte {
 
 func setupCursorAgent(t *testing.T, capture *cursorAgentCapture, kvWG *sync.WaitGroup) (string, string, *store.Store) {
 	t.Helper()
+	return setupCursorAgentHandler(t, capture, serveAgentRun(capture, kvWG))
+}
+
+func setupCursorAgentContext(t *testing.T, capture *cursorAgentCapture, kvWG *sync.WaitGroup) (string, string, *store.Store) {
+	t.Helper()
+	return setupCursorAgentHandler(t, capture, serveAgentRunGate(capture, kvWG, true))
+}
+
+func setupCursorAgentHandler(t *testing.T, capture *cursorAgentCapture, handler http.Handler) (string, string, *store.Store) {
+	t.Helper()
 	st := newTestStore(t)
 	ctx := context.Background()
 
 	// HTTP/2 is required for the duplex test path: over HTTP/1.1 the Go
 	// server blocks flushing response headers until the chunked request body
 	// is drained, which deadlocks a bidi stream.
-	upstream := httptest.NewUnstartedServer(serveAgentRun(capture, kvWG))
+	upstream := httptest.NewUnstartedServer(handler)
 	upstream.EnableHTTP2 = true
 	upstream.StartTLS()
 	t.Cleanup(upstream.Close)
@@ -252,6 +447,179 @@ func TestCursorUnaryCollected(t *testing.T) {
 	if got.Usage.PromptTokens != 12 || got.Usage.CompletionTokens != 3 {
 		t.Errorf("usage = %+v, want 12/3", got.Usage)
 	}
+}
+
+// TestCursorAgentRequestContextGate sends the omitted-id context request before
+// text. A missing nested request_context reproduces the captured Connect error
+// and the ingress 502. A valid empty context lets the stream finish.
+func TestCursorAgentRequestContextGate(t *testing.T) {
+	for _, tc := range []struct {
+		name, ingress, body string
+		unary               bool
+	}{
+		{name: "openai stream", ingress: "/v1/chat/completions", body: `{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "anthropic stream", ingress: "/v1/messages", body: `{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "openai unary", ingress: "/v1/chat/completions", body: `{"model":"default","messages":[{"role":"user","content":"hi"}]}`, unary: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := &cursorAgentCapture{}
+			var kvWG sync.WaitGroup
+			kvWG.Add(1)
+			base, token, _ := setupCursorAgentContext(t, capture, &kvWG)
+			var resp *http.Response
+			var body []byte
+			if tc.unary {
+				resp, body = post(t, base+tc.ingress, token, tc.body)
+			} else {
+				var text string
+				resp, text = postStream(t, base+tc.ingress, token, tc.body)
+				body = []byte(text)
+			}
+			capture.mu.Lock()
+			contextErr := capture.contextErr
+			repls := append([][]byte(nil), capture.clientRepl...)
+			capture.mu.Unlock()
+			if contextErr != "" {
+				t.Fatalf("context gate: %s", contextErr)
+			}
+			if !sawEmptyContextReply(repls) {
+				t.Fatal("no empty request_context reply captured")
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			if tc.unary {
+				var got struct {
+					Choices []struct {
+						Message struct {
+							Content string `json:"content"`
+						} `json:"message"`
+					} `json:"choices"`
+				}
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatal(err)
+				}
+				if len(got.Choices) != 1 || got.Choices[0].Message.Content != "Hello world" {
+					t.Fatalf("choices = %+v", got.Choices)
+				}
+				return
+			}
+			text, finished := collectStreamText(t, tc.ingress, string(body))
+			if text != "Hello world" || !finished {
+				t.Fatalf("text=%q finished=%v", text, finished)
+			}
+		})
+	}
+}
+
+func sawEmptyContextReply(repls [][]byte) bool {
+	for _, repl := range repls {
+		if hasEmptyRequestContext(repl) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCursorAgentRequestContextOldShape502 proves the captured failure: a
+// success message without nested request_context gets the Connect internal
+// error, and the ingress reports 502 before any text is committed.
+func TestCursorAgentRequestContextOldShape502(t *testing.T) {
+	capture := &cursorAgentCapture{}
+	var kvWG sync.WaitGroup
+	kvWG.Add(1)
+	base, token, _ := setupCursorAgentHandler(t, capture, serveOldContextShape(capture, &kvWG))
+	resp, body := postStream(t, base+"/v1/chat/completions", token,
+		`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "Failed to get request context") {
+		t.Fatalf("body = %s, want captured context error", body)
+	}
+	if strings.Contains(body, "Hello") {
+		t.Fatalf("text committed after context rejection: %s", body)
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if capture.contextErr != "request_context missing" {
+		t.Fatalf("context gate = %q", capture.contextErr)
+	}
+}
+
+// serveOldContextShape sends the same omitted-id context request, then answers
+// it with the rejected encoder shape: result 10 -> success 1 -> empty success,
+// with no nested request_context. The shared gate must then emit the captured
+// error instead of text.
+func serveOldContextShape(capture *cursorAgentCapture, kvWG *sync.WaitGroup) http.HandlerFunc {
+	inner := serveAgentRunGate(capture, kvWG, true)
+	return func(w http.ResponseWriter, r *http.Request) {
+		pr, pw := io.Pipe()
+		req := r.Clone(r.Context())
+		req.Body = pr
+		go func() {
+			defer pw.Close()
+			_, payload, err := readConnectFrameForTest(r.Body)
+			if err != nil {
+				return
+			}
+			if _, err := pw.Write(wrapFrameForTest(payload)); err != nil {
+				return
+			}
+			_, reply, err := readConnectFrameForTest(r.Body)
+			if err != nil {
+				return
+			}
+			old := oldRequestContextReply(reply)
+			if _, err := pw.Write(wrapFrameForTest(old)); err != nil {
+				return
+			}
+			_, _ = io.Copy(pw, r.Body)
+		}()
+		inner(w, req)
+	}
+}
+
+func oldRequestContextReply(reply []byte) []byte {
+	exec, ok := teFieldBytes(reply, 2)
+	if !ok {
+		return reply
+	}
+	var kept []byte
+	off := 0
+	for off < len(exec) {
+		start := off
+		tag, n, ok := teDecodeVarint(exec, off)
+		if !ok {
+			return reply
+		}
+		off = n
+		fieldNum := int(tag >> 3)
+		wire := int(tag & 7)
+		switch wire {
+		case teVarint:
+			_, n, ok = teDecodeVarint(exec, off)
+			if !ok {
+				return reply
+			}
+			off = n
+		case teBytes:
+			ln, n, ok := teDecodeVarint(exec, off)
+			if !ok || n+int(ln) > len(exec) {
+				return reply
+			}
+			off = n + int(ln)
+		default:
+			return reply
+		}
+		if fieldNum == 10 {
+			continue
+		}
+		kept = append(kept, exec[start:off]...)
+	}
+	// 52 02 0a 00 is result 10 wrapping success 1 with no nested context.
+	kept = append(kept, teField(10, teBytes, teField(1, teBytes, nil))...)
+	return teField(2, teBytes, kept)
 }
 
 // TestCursorTruncatedStreamFailover verifies that a Cursor AgentService stream
