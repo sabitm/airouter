@@ -2,6 +2,17 @@ package ir
 
 import "testing"
 
+func TestUsageReportedDefaultsFalse(t *testing.T) {
+	var u Usage
+	if u.UsageReported {
+		t.Fatal("default UsageReported must stay false")
+	}
+	var ev StreamEvent
+	if ev.UsageReported {
+		t.Fatal("default StreamEvent.UsageReported must stay false")
+	}
+}
+
 func TestClampCacheTokens(t *testing.T) {
 	cases := []struct {
 		name      string

@@ -402,6 +402,13 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 				res.errMsg = last.errMsg
 				res.logErr = last.logErr
 			}
+			// The winning attempt owns the final log. Copy its token flags even
+			// when a count is zero so an earlier shared estimate cannot remain.
+			if last.written && last.hasTok {
+				res.inTok = last.inTok
+				res.outTok = last.outTok
+				res.usageEstimated = last.usageEstimated
+			}
 			break
 		}
 		if attachmentSkip {
@@ -798,6 +805,9 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 		}
 		return retryableStreamDecode(err)
 	}
+	if backend.protocol == domain.ProtocolCursor {
+		applyCursorUsage(req, irResp, len(upstreamBody))
+	}
 	out, err := ingress.encodeResponse(irResp)
 	if err != nil {
 		return terminal(http.StatusInternalServerError, "failed to encode response", "api_error")
@@ -809,14 +819,14 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	res.inTok = irResp.Usage.InputTokens
 	res.outTok = irResp.Usage.OutputTokens
 	if backend.protocol == domain.ProtocolCursor {
-		applyCursorUsageEstimate(req, irResp, len(upstreamBody))
-		res.inTok = irResp.Usage.InputTokens
-		res.outTok = irResp.Usage.OutputTokens
-		res.usageEstimated = true
+		// applyCursorUsage already chose raw or estimate. Do not run the
+		// request-byte heuristic: Cursor adds context the proxy did not send.
+		res.usageEstimated = !irResp.Usage.UsageReported
 	} else if !usageInputPlausible(len(upstreamBody), res.inTok) {
 		res.inTok = 0
 	}
-	if res.inTok == 0 && res.outTok == 0 && !res.usageEstimated {
+	// A reported Cursor 0/0 is explicit. Do not replace it with the generic estimate.
+	if res.inTok == 0 && res.outTok == 0 && !res.usageEstimated && (backend.protocol != domain.ProtocolCursor || !irResp.Usage.UsageReported) {
 		inEst, outEst := estimateUsage(req, irResp)
 		res.inTok = inEst
 		res.outTok = outEst
@@ -825,7 +835,10 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
-	return committed()
+	if res.usageEstimated {
+		return committed().withEstimatedTokens(res.inTok, res.outTok)
+	}
+	return committed().withTokens(res.inTok, res.outTok)
 }
 
 // collectStreamResponse folds backend stream events into a unary IR response.
@@ -841,6 +854,12 @@ func applyCollectedUsage(u *ir.Usage, ev ir.StreamEvent) {
 	}
 	if ev.CacheWriteTokens != 0 {
 		u.CacheWriteTokens = ev.CacheWriteTokens
+	}
+	// Cursor sets this only on a normal finish with a complete counter pair.
+	// A later event without the marker must not clear a reported finish, and
+	// a false default must not erase another codec's collected counts.
+	if ev.UsageReported {
+		u.UsageReported = true
 	}
 }
 
@@ -962,8 +981,18 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 				return err
 			}
 		case ir.EventFinish:
-			applyCollectedUsage(&resp.Usage, ev)
-			resp.Usage.OutputTokens = ev.OutputTokens
+			// A reported finish replaces the whole usage object. Nonzero-only
+			// collection would turn an explicit zero counter into a stale value.
+			if ev.UsageReported {
+				resp.Usage = ir.Usage{
+					InputTokens: ev.InputTokens, OutputTokens: ev.OutputTokens,
+					CacheReadTokens: ev.CacheReadTokens, CacheWriteTokens: ev.CacheWriteTokens,
+					UsageReported: true,
+				}.Clamped()
+			} else {
+				applyCollectedUsage(&resp.Usage, ev)
+				resp.Usage.OutputTokens = ev.OutputTokens
+			}
 			if ev.StopReason != "" {
 				resp.StopReason = ev.StopReason
 			}
@@ -1155,13 +1184,19 @@ func writeUsageBlocks(b *strings.Builder, blocks []ir.ContentBlock) {
 	}
 }
 
-// applyCursorUsageEstimate replaces Cursor turn_ended counts. That message
-// is not reliable for a proxy that finishes a tool turn before the server
-// ends the run, and a decoded input count can be far larger than the sent
-// request. The estimate uses the same 4 characters per token as 9router.
-// It does not add 9router's context-guard buffer.
-func applyCursorUsageEstimate(req *ir.Request, resp *ir.Response, requestBytes int) {
+// applyCursorUsage keeps a normal turn_ended when UsageReported is set.
+// Inclusive input may exceed the request body because Cursor adds its own
+// context; that count is not rejected. Explicit zero stays reported and is
+// not an estimate. Missing or incomplete counters, including an immediate
+// MCP handoff, fall back to a character estimate with cache buckets at zero.
+// The estimate uses the same 4 characters per token as 9router and does not
+// add 9router's context-guard buffer.
+func applyCursorUsage(req *ir.Request, resp *ir.Response, requestBytes int) {
 	if resp == nil {
+		return
+	}
+	if resp.Usage.UsageReported {
+		resp.Usage = resp.Usage.Clamped()
 		return
 	}
 	inEst, outEst := estimateUsage(req, resp)

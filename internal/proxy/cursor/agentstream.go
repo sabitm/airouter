@@ -48,6 +48,7 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 	seenExec := map[string]bool{}
 	var stopReason ir.StopReason = ir.StopEndTurn
 	var inTok, outTok, cacheRead, cacheWrite int
+	var usageReported bool
 
 	emitStart := func() error {
 		if started {
@@ -95,8 +96,21 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 		if err := emitStart(); err != nil {
 			return err
 		}
-		cacheRead, cacheWrite = ir.ClampCacheTokens(inTok, cacheRead, cacheWrite)
-		return emit(ir.StreamEvent{Kind: ir.EventFinish, StopReason: stopReason, InputTokens: inTok, OutputTokens: outTok, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite})
+		// An immediate MCP handoff can see token_delta or an earlier
+		// turn_ended. Those counts are not a completed turn, so the finish
+		// must not look authoritative.
+		reported := usageReported && !mcpHandoff
+		if !reported {
+			inTok, outTok, cacheRead, cacheWrite = 0, 0, 0, 0
+		} else {
+			cacheRead, cacheWrite = ir.ClampCacheTokens(inTok, cacheRead, cacheWrite)
+		}
+		return emit(ir.StreamEvent{
+			Kind: ir.EventFinish, StopReason: stopReason,
+			InputTokens: inTok, OutputTokens: outTok,
+			CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
+			UsageReported: reported,
+		})
 	}
 
 	// clientToolsReady is true when every surfaced call has complete JSON
@@ -386,12 +400,19 @@ func DecodeAgentStreamTools(clientTools []ir.Tool, r io.Reader, writeFrame func(
 				// with turn_ended. inputTokens is already the inclusive prompt
 				// total; cache read/write partition it and must not be added.
 				if tes, ok := update[iuTurnEnded]; ok && len(tes) > 0 {
-					in, out, read, write, terr := turnEndedUsage(tes[0])
+					usage, terr := turnEndedUsageOf(tes[0])
 					if terr != nil {
 						return terr
 					}
-					inTok, outTok, cacheRead, cacheWrite = in, out, read, write
+					// The terminal frame ends the Connect stream even when its
+					// counters are incomplete. Only a complete input+output pair
+					// is authoritative; a partial pair is not mixed with estimates.
 					sawTurnEnded = true
+					if usage.complete {
+						inTok, outTok = usage.inTok, usage.outTok
+						cacheRead, cacheWrite = usage.cacheRead, usage.cacheWrite
+						usageReported = true
+					}
 					continue
 				}
 			}
@@ -432,41 +453,61 @@ func textDeltaOf(f field) (string, error) {
 	return text, nil
 }
 
-func turnEndedUsage(f field) (inTok, outTok, cacheRead, cacheWrite int, err error) {
+// turnEndedUsage is one turn_ended usage object. complete is true only
+// when both input and output counters are present, including explicit zero.
+// Omitted cache counters are zero and do not make the object incomplete.
+// A missing input or output counter leaves complete false; callers must not
+// keep a partial pair.
+type turnEndedUsage struct {
+	inTok      int
+	outTok     int
+	cacheRead  int
+	cacheWrite int
+	complete   bool
+}
+
+func turnEndedUsageOf(f field) (turnEndedUsage, error) {
 	if f.wireType != wireLen {
-		return 0, 0, 0, 0, ir.ProtocolError("cursor: malformed turn ended")
+		return turnEndedUsage{}, ir.ProtocolError("cursor: malformed turn ended")
 	}
 	te, err := decodeMessage(f.value)
 	if err != nil {
-		return 0, 0, 0, 0, ir.ProtocolError("cursor: malformed turn ended")
+		return turnEndedUsage{}, ir.ProtocolError("cursor: malformed turn ended")
 	}
-	read := func(num int) (int, error) {
+	read := func(num int) (int, bool, error) {
 		fs := te[num]
 		if len(fs) == 0 {
-			return 0, nil
+			return 0, false, nil
 		}
 		if fs[0].wireType != wireVarint {
-			return 0, ir.ProtocolError("cursor: malformed turn ended")
+			return 0, false, ir.ProtocolError("cursor: malformed turn ended")
 		}
 		v, ok := varintField(te, num)
 		if !ok {
-			return 0, ir.ProtocolError("cursor: malformed turn ended")
+			return 0, false, ir.ProtocolError("cursor: malformed turn ended")
 		}
-		return usageInt(v), nil
+		return usageInt(v), true, nil
 	}
-	if inTok, err = read(teInputTokens); err != nil {
-		return 0, 0, 0, 0, err
+	inTok, inOK, err := read(teInputTokens)
+	if err != nil {
+		return turnEndedUsage{}, err
 	}
-	if outTok, err = read(teOutputTokens); err != nil {
-		return 0, 0, 0, 0, err
+	outTok, outOK, err := read(teOutputTokens)
+	if err != nil {
+		return turnEndedUsage{}, err
 	}
-	if cacheRead, err = read(teCacheReadTokens); err != nil {
-		return 0, 0, 0, 0, err
+	cacheRead, _, err := read(teCacheReadTokens)
+	if err != nil {
+		return turnEndedUsage{}, err
 	}
-	if cacheWrite, err = read(teCacheWriteTokens); err != nil {
-		return 0, 0, 0, 0, err
+	cacheWrite, _, err := read(teCacheWriteTokens)
+	if err != nil {
+		return turnEndedUsage{}, err
 	}
-	return inTok, outTok, cacheRead, cacheWrite, nil
+	return turnEndedUsage{
+		inTok: inTok, outTok: outTok, cacheRead: cacheRead, cacheWrite: cacheWrite,
+		complete: inOK && outOK,
+	}, nil
 }
 
 // encodeKVReply builds the KvClientMessage for one KvServerMessage: get ->

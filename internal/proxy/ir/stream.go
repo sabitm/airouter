@@ -72,4 +72,9 @@ type StreamEvent struct {
 	// EventFinish
 	StopReason   StopReason
 	OutputTokens int
+	// UsageReported is set only by the Cursor agent decoder on a normal
+	// Connect completion whose turn_ended supplied both input and output
+	// counters, including explicit zero. It is not encoded. Other codecs
+	// leave it false, which must not be read as missing usage.
+	UsageReported bool
 }

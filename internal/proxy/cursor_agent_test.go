@@ -16,6 +16,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/sse"
 	"airouter/internal/store"
 )
 
@@ -1046,4 +1047,414 @@ func wrapTrailerForTest(payload []byte) []byte {
 	out := wrapFrameForTest(payload)
 	out[0] = 2
 	return out
+}
+
+type cursorUsageWant struct {
+	input      int
+	output     int
+	cacheRead  int
+	cacheWrite int
+	estimated  bool
+}
+
+func TestCursorUsageIngressMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		ingress string
+		body    string
+		stream  bool
+	}{
+		{name: "chat unary", ingress: "/v1/chat/completions", body: `{"model":"default","messages":[{"role":"user","content":"hi"}]}`},
+		{name: "chat stream", ingress: "/v1/chat/completions", body: `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`, stream: true},
+		{name: "anthropic unary", ingress: "/v1/messages", body: `{"model":"default","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "anthropic stream", ingress: "/v1/messages", body: `{"model":"default","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`, stream: true},
+		{name: "responses unary", ingress: "/v1/responses", body: `{"model":"default","input":"hi"}`},
+		{name: "responses stream", ingress: "/v1/responses", body: `{"model":"default","stream":true,"input":"hi"}`, stream: true},
+	}
+	usageCases := []struct {
+		name   string
+		frames func() [][]byte
+		want   cursorUsageWant
+	}{
+		{
+			name: "read and write",
+			frames: func() [][]byte {
+				return [][]byte{cursorUsageText("ok"), cursorUsageTurn(25231, 101, 18719, 6508, true), cursorUsageTrailer(`{}`)}
+			},
+			want: cursorUsageWant{input: 25231, output: 101, cacheRead: 18719, cacheWrite: 6508},
+		},
+		{
+			name: "read only",
+			frames: func() [][]byte {
+				return [][]byte{cursorUsageText("ok"), cursorUsageTurn(25231, 0, 25227, 0, true), cursorUsageTrailer(`{}`)}
+			},
+			want: cursorUsageWant{input: 25231, output: 0, cacheRead: 25227},
+		},
+		{
+			name: "write only",
+			frames: func() [][]byte {
+				return [][]byte{cursorUsageText("ok"), cursorUsageTurn(25231, 101, 0, 25227, true), cursorUsageTrailer(`{}`)}
+			},
+			want: cursorUsageWant{input: 25231, output: 101, cacheWrite: 25227},
+		},
+		{
+			name: "explicit zero",
+			frames: func() [][]byte {
+				return [][]byte{cursorUsageText("ok"), cursorUsageTurn(0, 0, 0, 0, true), cursorUsageTrailer(`{}`)}
+			},
+			want: cursorUsageWant{},
+		},
+	}
+	for _, usage := range usageCases {
+		for _, tc := range cases {
+			t.Run(usage.name+" "+tc.name, func(t *testing.T) {
+				st := newTestStore(t)
+				base, token := setupCursorUsageProxy(t, st, usage.frames())
+				var resp *http.Response
+				var body []byte
+				if tc.stream {
+					var text string
+					resp, text = postStream(t, base+tc.ingress, token, tc.body)
+					body = []byte(text)
+				} else {
+					resp, body = post(t, base+tc.ingress, token, tc.body)
+				}
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("status = %d body = %s", resp.StatusCode, body)
+				}
+				assertCursorIngressUsage(t, tc.ingress, tc.stream, body, usage.want)
+				logs := waitForLogs(t, st, 1)
+				if logs[0].InputTokens != usage.want.input || logs[0].OutputTokens != usage.want.output || logs[0].UsageEstimated != usage.want.estimated {
+					t.Fatalf("log usage = %d/%d estimated=%v, want %+v", logs[0].InputTokens, logs[0].OutputTokens, logs[0].UsageEstimated, usage.want)
+				}
+			})
+		}
+	}
+}
+
+func TestCursorUsageEstimateWhenUnreported(t *testing.T) {
+	for _, tc := range []struct {
+		name, ingress, body string
+		stream              bool
+	}{
+		{name: "unary", ingress: "/v1/chat/completions", body: `{"model":"default","messages":[{"role":"user","content":"hi"}]}`},
+		{name: "stream", ingress: "/v1/chat/completions", body: `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`, stream: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			frames := [][]byte{cursorUsageText("abcd"), cursorUsageTurn(0, 0, 0, 0, false), cursorUsageTrailer(`{}`)}
+			base, token := setupCursorUsageProxy(t, st, frames)
+			var resp *http.Response
+			var body []byte
+			if tc.stream {
+				var text string
+				resp, text = postStream(t, base+tc.ingress, token, tc.body)
+				body = []byte(text)
+			} else {
+				resp, body = post(t, base+tc.ingress, token, tc.body)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d body = %s", resp.StatusCode, body)
+			}
+			assertCursorIngressUsage(t, tc.ingress, tc.stream, body, cursorUsageWant{input: 1, output: 1, estimated: true})
+			log := waitForLogs(t, st, 1)[0]
+			if log.InputTokens != 1 || log.OutputTokens != 1 || !log.UsageEstimated {
+				t.Fatalf("log = %d/%d estimated=%v, want estimate", log.InputTokens, log.OutputTokens, log.UsageEstimated)
+			}
+		})
+	}
+}
+
+func TestCursorMCPHandoffDoesNotInventCache(t *testing.T) {
+	st := newTestStore(t)
+	base, token := setupCursorUsageProxyWait(t, st, [][]byte{cursorUsageMCPExec()}, true)
+	body := `{"model":"default","messages":[{"role":"user","content":"abcd"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]}`
+	resp, raw := post(t, base+"/v1/chat/completions", token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.StatusCode, raw)
+	}
+	var got struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				ToolCalls []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				Cached int `json:"cached_tokens"`
+				Write  int `json:"cache_write_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Choices) != 1 || got.Choices[0].FinishReason != "tool_calls" || len(got.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("choices = %+v, want one tool call", got.Choices)
+	}
+	if got.Choices[0].Message.ToolCalls[0].Function.Name != "read" {
+		t.Fatalf("tool = %+v", got.Choices[0].Message.ToolCalls[0])
+	}
+	if got.Usage.PromptTokensDetails != nil {
+		t.Fatalf("cache details = %+v, want omitted", got.Usage.PromptTokensDetails)
+	}
+	if got.Usage.PromptTokens == 0 || got.Usage.CompletionTokens == 0 {
+		t.Fatalf("usage = %+v, want character estimate", got.Usage)
+	}
+	log := waitForLogs(t, st, 1)[0]
+	if !log.UsageEstimated || log.InputTokens != got.Usage.PromptTokens || log.OutputTokens != got.Usage.CompletionTokens {
+		t.Fatalf("log = %d/%d estimated=%v, want client estimate", log.InputTokens, log.OutputTokens, log.UsageEstimated)
+	}
+}
+
+func setupCursorUsageProxy(t *testing.T, st *store.Store, frames [][]byte) (string, string) {
+	t.Helper()
+	return setupCursorUsageProxyWait(t, st, frames, false)
+}
+
+func setupCursorUsageProxyWait(t *testing.T, st *store.Store, frames [][]byte, waitReply bool) (string, string) {
+	t.Helper()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reply := make(chan struct{})
+		go func() {
+			defer close(reply)
+			for {
+				_, payload, err := readConnectFrameForTest(r.Body)
+				if err != nil {
+					return
+				}
+				// The first payload is the RunRequest. The MCP ack is a later frame.
+				if hasTopLevelField(payload, 2) {
+					return
+				}
+			}
+		}()
+		w.Header().Set("Content-Type", cursor.ConnectContentType)
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		for _, frame := range frames {
+			_, _ = w.Write(frame)
+			fl.Flush()
+		}
+		if !waitReply {
+			return
+		}
+		// Handler return closes the duplex body. An MCP exec needs its ack
+		// first, or the proxy records a closed-pipe decode error.
+		select {
+		case <-reply:
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	})
+	upstream := httptest.NewUnstartedServer(handler)
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
+	t.Cleanup(upstream.Close)
+	ctx := context.Background()
+	prov := &domain.Provider{
+		Name: "cursor", BaseURL: upstream.URL, Protocol: domain.ProtocolCursor,
+		AuthMethod: domain.AuthAPIKey, APIKey: "agent-tok",
+		OAuthCreds: &domain.OAuthCreds{CursorAuth: true, MachineID: "m-1"},
+	}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "default", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	p := New(st, nil)
+	p.streamClient = &http.Client{Transport: &http.Transport{
+		ForceAttemptHTTP2:   true,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		TLSHandshakeTimeout: 10 * time.Second,
+	}}
+	p.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL, key.Token
+}
+
+func assertCursorIngressUsage(t *testing.T, ingress string, stream bool, body []byte, want cursorUsageWant) {
+	t.Helper()
+	if stream {
+		assertCursorStreamUsage(t, ingress, string(body), want)
+		return
+	}
+	switch {
+	case strings.HasSuffix(ingress, "/messages"):
+		var got struct {
+			Usage struct {
+				Input         int `json:"input_tokens"`
+				Output        int `json:"output_tokens"`
+				CacheRead     int `json:"cache_read_input_tokens"`
+				CacheCreation int `json:"cache_creation_input_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Usage.Output != want.output || got.Usage.CacheRead != want.cacheRead || got.Usage.CacheCreation != want.cacheWrite {
+			t.Fatalf("anthropic usage = %+v, want %+v", got.Usage, want)
+		}
+		if want.cacheRead == 0 && want.cacheWrite == 0 {
+			if got.Usage.Input != want.input {
+				t.Fatalf("anthropic input = %d, want %d", got.Usage.Input, want.input)
+			}
+			return
+		}
+		if got.Usage.Input != want.input-want.cacheRead-want.cacheWrite {
+			t.Fatalf("anthropic ordinary input = %d, want %d", got.Usage.Input, want.input-want.cacheRead-want.cacheWrite)
+		}
+	case strings.HasSuffix(ingress, "/responses"):
+		var got struct {
+			Usage struct {
+				Input   int `json:"input_tokens"`
+				Output  int `json:"output_tokens"`
+				Details *struct {
+					Cached int `json:"cached_tokens"`
+					Write  int `json:"cache_write_tokens"`
+				} `json:"input_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Usage.Input != want.input || got.Usage.Output != want.output {
+			t.Fatalf("responses usage = %+v, want %+v", got.Usage, want)
+		}
+		assertCursorDetails(t, got.Usage.Details, want)
+	default:
+		var got struct {
+			Usage struct {
+				Prompt   int `json:"prompt_tokens"`
+				Complete int `json:"completion_tokens"`
+				Details  *struct {
+					Cached int `json:"cached_tokens"`
+					Write  int `json:"cache_write_tokens"`
+				} `json:"prompt_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Usage.Prompt != want.input || got.Usage.Complete != want.output {
+			t.Fatalf("chat usage = %+v, want %+v", got.Usage, want)
+		}
+		assertCursorDetails(t, got.Usage.Details, want)
+	}
+}
+
+func assertCursorStreamUsage(t *testing.T, ingress, body string, want cursorUsageWant) {
+	t.Helper()
+	var usageRaw []byte
+	finished := false
+	reader := sse.NewReader(strings.NewReader(body))
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case strings.HasSuffix(ingress, "/messages"):
+			if ev.Name == "message_start" || ev.Name == "message_delta" {
+				usageRaw = append([]byte(nil), ev.Data...)
+			}
+			if ev.Name == "message_stop" {
+				finished = true
+			}
+		case strings.HasSuffix(ingress, "/responses"):
+			if ev.Name == "response.completed" {
+				var frame struct {
+					Response json.RawMessage `json:"response"`
+				}
+				if json.Unmarshal(ev.Data, &frame) == nil && len(frame.Response) > 0 {
+					usageRaw = append([]byte(nil), frame.Response...)
+				}
+				finished = true
+			}
+		default:
+			if string(ev.Data) == "[DONE]" {
+				finished = true
+				continue
+			}
+			var chunk struct {
+				Usage json.RawMessage `json:"usage"`
+			}
+			if json.Unmarshal(ev.Data, &chunk) == nil && len(chunk.Usage) > 0 {
+				usageRaw = append([]byte(nil), ev.Data...)
+			}
+		}
+	}
+	if !finished {
+		t.Fatalf("stream did not finish: %s", body)
+	}
+	if len(usageRaw) == 0 {
+		t.Fatalf("stream usage missing: %s", body)
+	}
+	assertCursorIngressUsage(t, ingress, false, usageRaw, want)
+}
+
+func assertCursorDetails(t *testing.T, details *struct {
+	Cached int `json:"cached_tokens"`
+	Write  int `json:"cache_write_tokens"`
+}, want cursorUsageWant) {
+	t.Helper()
+	if want.cacheRead == 0 && want.cacheWrite == 0 {
+		if details != nil {
+			t.Fatalf("details = %+v, want omitted", details)
+		}
+		return
+	}
+	if details == nil || details.Cached != want.cacheRead || details.Write != want.cacheWrite {
+		t.Fatalf("details = %+v, want read %d write %d", details, want.cacheRead, want.cacheWrite)
+	}
+}
+
+func cursorUsageText(text string) []byte {
+	return wrapFrameForTest(teField(1, teBytes, teField(1, teBytes, teField(1, teBytes, []byte(text)))))
+}
+
+func cursorUsageTurn(in, out, read, write int, withCounters bool) []byte {
+	var inner []byte
+	if withCounters {
+		inner = append(inner, teVarintField(1, uint64(in))...)
+		inner = append(inner, teVarintField(2, uint64(out))...)
+		if read != 0 {
+			inner = append(inner, teVarintField(3, uint64(read))...)
+		}
+		if write != 0 {
+			inner = append(inner, teVarintField(4, uint64(write))...)
+		}
+	}
+	return wrapFrameForTest(teField(1, teBytes, teField(14, teBytes, inner)))
+}
+
+func cursorUsageTrailer(payload string) []byte {
+	return wrapTrailerForTest([]byte(payload))
+}
+
+func cursorUsageMCPExec() []byte {
+	val := teField(3, teBytes, []byte("prices.py"))
+	entry := append(teField(1, teBytes, []byte("path")), teField(2, teBytes, val)...)
+	ma := append(teField(5, teBytes, []byte("read")), teField(2, teBytes, entry)...)
+	ma = append(ma, teField(3, teBytes, []byte("call-1"))...)
+	ex := append(teVarintField(1, 5), teField(15, teBytes, []byte("exec-1"))...)
+	ex = append(ex, teField(11, teBytes, ma)...)
+	return wrapFrameForTest(teField(2, teBytes, ex))
 }

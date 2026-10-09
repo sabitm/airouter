@@ -51,21 +51,54 @@ func TestEstimateUsageUsesCharacterLength(t *testing.T) {
 	}
 }
 
-func TestApplyCursorUsageEstimateIgnoresTurnEnded(t *testing.T) {
+func TestApplyCursorUsageKeepsAuthoritativeTurnEnded(t *testing.T) {
+	req := &ir.Request{System: strings.Repeat("a", 400)}
+	resp := &ir.Response{
+		Content: []ir.ContentBlock{{Type: ir.BlockText, Text: strings.Repeat("b", 40)}},
+		Usage: ir.Usage{
+			InputTokens: 25231, OutputTokens: 101, CacheReadTokens: 25227, CacheWriteTokens: 0,
+			UsageReported: true,
+		},
+	}
+	applyCursorUsage(req, resp, 80)
+	if resp.Usage.InputTokens != 25231 || resp.Usage.OutputTokens != 101 {
+		t.Fatalf("usage = %+v, want raw 25231/101", resp.Usage)
+	}
+	if resp.Usage.CacheReadTokens != 25227 || resp.Usage.CacheWriteTokens != 0 || !resp.Usage.UsageReported {
+		t.Fatalf("cache marker = %+v, want read 25227 reported", resp.Usage)
+	}
+
+	zero := &ir.Response{Usage: ir.Usage{UsageReported: true}}
+	applyCursorUsage(req, zero, 80)
+	if zero.Usage.InputTokens != 0 || zero.Usage.OutputTokens != 0 || !zero.Usage.UsageReported {
+		t.Fatalf("explicit zero = %+v, want reported 0/0", zero.Usage)
+	}
+
+	over := &ir.Response{Usage: ir.Usage{InputTokens: 10, CacheReadTokens: 12, CacheWriteTokens: 4, UsageReported: true}}
+	applyCursorUsage(nil, over, 0)
+	if over.Usage.CacheReadTokens != 10 || over.Usage.CacheWriteTokens != 0 || !over.Usage.UsageReported {
+		t.Fatalf("clamped = %+v, want read 10 write 0", over.Usage)
+	}
+}
+
+func TestApplyCursorUsageEstimatesWhenUnreported(t *testing.T) {
 	req := &ir.Request{System: strings.Repeat("a", 400)}
 	resp := &ir.Response{
 		Content: []ir.ContentBlock{{Type: ir.BlockText, Text: strings.Repeat("b", 40)}},
 		Usage:   ir.Usage{InputTokens: 2761154, OutputTokens: 11996, CacheReadTokens: 2372032},
 	}
-	applyCursorUsageEstimate(req, resp, 727415)
-	if resp.Usage.InputTokens != 100 {
-		t.Fatalf("input = %d, want 100 from request text", resp.Usage.InputTokens)
-	}
-	if resp.Usage.OutputTokens != 10 {
-		t.Fatalf("output = %d, want 10", resp.Usage.OutputTokens)
+	applyCursorUsage(req, resp, 727415)
+	if resp.Usage.InputTokens != 100 || resp.Usage.OutputTokens != 10 || resp.Usage.UsageReported {
+		t.Fatalf("estimate = %+v, want 100/10 unreported", resp.Usage)
 	}
 	if resp.Usage.CacheReadTokens != 0 || resp.Usage.CacheWriteTokens != 0 {
 		t.Fatalf("cache = %d/%d, want 0/0", resp.Usage.CacheReadTokens, resp.Usage.CacheWriteTokens)
+	}
+
+	empty := &ir.Response{}
+	applyCursorUsage(&ir.Request{}, empty, 8)
+	if empty.Usage.InputTokens != 2 || empty.Usage.OutputTokens != 0 || empty.Usage.UsageReported {
+		t.Fatalf("byte fallback = %+v, want input 2", empty.Usage)
 	}
 }
 
@@ -456,6 +489,22 @@ func TestCollectStreamResponseLimits(t *testing.T) {
 		}
 		if resp.Usage.CacheReadTokens != 2000 || resp.Usage.CacheWriteTokens != 400 {
 			t.Fatalf("cache = %+v", resp.Usage)
+		}
+	})
+
+	t.Run("reported zero finish replaces start usage", func(t *testing.T) {
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
+			{Kind: ir.EventMessageStart, ID: "r1", Model: "m", InputTokens: 13, CacheWriteTokens: 10},
+			{Kind: ir.EventFinish, StopReason: ir.StopEndTurn, UsageReported: true},
+		}), nil, "m", nil, 1024, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if !resp.Usage.UsageReported || resp.Usage.InputTokens != 0 || resp.Usage.OutputTokens != 0 {
+			t.Fatalf("usage = %+v, want reported zeros", resp.Usage)
+		}
+		if resp.Usage.CacheReadTokens != 0 || resp.Usage.CacheWriteTokens != 0 {
+			t.Fatalf("cache = %+v, want cleared", resp.Usage)
 		}
 	})
 

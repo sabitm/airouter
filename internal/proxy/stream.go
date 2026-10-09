@@ -376,22 +376,35 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			return kiro.DecodeStreamToolsTransport(req.Tools, r, emit, backend.id == "kiro-runtime")
 		}
 	}
-	cursorEstimated := backend.protocol == domain.ProtocolCursor
+	cursorBackend := backend.protocol == domain.ProtocolCursor
+	cursorReported := false
 	emit := func(ev ir.StreamEvent) error {
-		if cursorEstimated && ev.Kind == ir.EventFinish {
-			// Estimate before the encoder writes the usage chunk. turn_ended
-			// counts are not Cursor billing for this proxy.
-			inEst, outEst := estimateUsage(req, sink.response())
-			if inEst == 0 && len(upstreamBody) > 0 {
-				inEst = charsToTokens(len(upstreamBody))
+		if cursorBackend && ev.Kind == ir.EventFinish {
+			if ev.UsageReported {
+				// Inclusive totals can exceed the request body. Cursor adds
+				// context the proxy did not send, so do not apply the byte heuristic.
+				ev.CacheReadTokens, ev.CacheWriteTokens = ir.ClampCacheTokens(ev.InputTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
+				inTok = ev.InputTokens
+				outTok = ev.OutputTokens
+				cursorReported = true
+				res.usageEstimated = false
+			} else {
+				// No complete turn_ended pair. Estimate before the encoder writes
+				// usage, and do not keep a partial cache bucket.
+				inEst, outEst := estimateUsage(req, sink.response())
+				if inEst == 0 && len(upstreamBody) > 0 {
+					inEst = charsToTokens(len(upstreamBody))
+				}
+				ev.InputTokens = inEst
+				ev.OutputTokens = outEst
+				ev.CacheReadTokens = 0
+				ev.CacheWriteTokens = 0
+				ev.UsageReported = false
+				inTok = inEst
+				outTok = outEst
+				cursorReported = false
+				res.usageEstimated = true
 			}
-			ev.InputTokens = inEst
-			ev.OutputTokens = outEst
-			ev.CacheReadTokens = 0
-			ev.CacheWriteTokens = 0
-			inTok = inEst
-			outTok = outEst
-			res.usageEstimated = true
 		} else {
 			switch ev.Kind {
 			case ir.EventMessageStart:
@@ -478,7 +491,10 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		)
 	}
 	publishUsage()
-	if cursorEstimated {
+	if cursorBackend {
+		if cursorReported {
+			return committed().withTokens(inTok, outTok)
+		}
 		return committed().withEstimatedTokens(inTok, outTok)
 	}
 	if !usageInputPlausible(len(upstreamBody), inTok) {

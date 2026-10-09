@@ -248,6 +248,109 @@ func TestDecodeAgentStreamCacheTokensInclusive(t *testing.T) {
 	}
 }
 
+func TestDecodeAgentStreamUsageAuthority(t *testing.T) {
+	end := connectEndStreamFrame(t, []byte(`{}`))
+	finishOf := func(t *testing.T, frames ...[]byte) ir.StreamEvent {
+		t.Helper()
+		events := collectAgentEvents(t, frames...)
+		last := events[len(events)-1]
+		if last.Kind != ir.EventFinish {
+			t.Fatalf("last = %+v, want finish", last)
+		}
+		return last
+	}
+	t.Run("explicit zero", func(t *testing.T) {
+		last := finishOf(t, agentTextFrame(t, "ok"), agentTurnEndedFrame(t, 0, 0), end)
+		if !last.UsageReported || last.InputTokens != 0 || last.OutputTokens != 0 {
+			t.Fatalf("finish = %+v, want reported 0/0", last)
+		}
+		if last.CacheReadTokens != 0 || last.CacheWriteTokens != 0 {
+			t.Fatalf("cache = %d/%d, want 0/0", last.CacheReadTokens, last.CacheWriteTokens)
+		}
+	})
+	t.Run("omitted counters", func(t *testing.T) {
+		last := finishOf(t, agentTextFrame(t, "ok"), interactionUpdateFrame(t, iuTurnEnded, nil), end)
+		if last.UsageReported || last.InputTokens != 0 || last.OutputTokens != 0 {
+			t.Fatalf("finish = %+v, want unreported empty usage", last)
+		}
+	})
+	t.Run("input only", func(t *testing.T) {
+		frame := interactionUpdateFrame(t, iuTurnEnded, encodeField(teInputTokens, wireVarint, uint64(9)))
+		last := finishOf(t, agentTextFrame(t, "ok"), frame, end)
+		if last.UsageReported || last.InputTokens != 0 || last.CacheReadTokens != 0 {
+			t.Fatalf("finish = %+v, want no partial input", last)
+		}
+	})
+	t.Run("output only", func(t *testing.T) {
+		frame := interactionUpdateFrame(t, iuTurnEnded, encodeField(teOutputTokens, wireVarint, uint64(4)))
+		last := finishOf(t, agentTextFrame(t, "ok"), frame, end)
+		if last.UsageReported || last.OutputTokens != 0 {
+			t.Fatalf("finish = %+v, want no partial output", last)
+		}
+	})
+	t.Run("cache without totals", func(t *testing.T) {
+		frame := interactionUpdateFrame(t, iuTurnEnded, concatBytes(
+			encodeField(teCacheReadTokens, wireVarint, uint64(8)),
+			encodeField(teCacheWriteTokens, wireVarint, uint64(2)),
+		))
+		last := finishOf(t, agentTextFrame(t, "ok"), frame, end)
+		if last.UsageReported || last.CacheReadTokens != 0 || last.CacheWriteTokens != 0 {
+			t.Fatalf("finish = %+v, want cache dropped", last)
+		}
+	})
+	t.Run("omitted cache defaults zero", func(t *testing.T) {
+		last := finishOf(t, agentTextFrame(t, "ok"), agentTurnEndedFrame(t, 25231, 101), end)
+		if !last.UsageReported || last.InputTokens != 25231 || last.OutputTokens != 101 {
+			t.Fatalf("finish = %+v, want reported 25231/101", last)
+		}
+		if last.CacheReadTokens != 0 || last.CacheWriteTokens != 0 {
+			t.Fatalf("cache = %d/%d, want 0/0", last.CacheReadTokens, last.CacheWriteTokens)
+		}
+	})
+	t.Run("server total larger than a small request", func(t *testing.T) {
+		last := finishOf(t, agentTextFrame(t, "ok"), agentTurnEndedCacheFrame(t, 25231, 101, 25227, 0), end)
+		if !last.UsageReported || last.InputTokens != 25231 || last.OutputTokens != 101 {
+			t.Fatalf("finish = %+v, want raw large total", last)
+		}
+		if last.CacheReadTokens != 25227 || last.CacheWriteTokens != 0 {
+			t.Fatalf("cache = %d/%d, want 25227/0", last.CacheReadTokens, last.CacheWriteTokens)
+		}
+	})
+}
+
+func TestDecodeAgentStreamMCPHandoffIgnoresEarlierUsage(t *testing.T) {
+	// turn_ended before a matched exec is not a completed usage report. The
+	// handoff returns without waiting for a trailer.
+	blocked := &blockingAfterReader{r: bytes.NewReader(bytes.Join([][]byte{
+		agentTurnEndedCacheFrame(t, 25231, 101, 25227, 4),
+		mcpExecFrame(t, "call-1", "read", map[string]any{"path": "prices.py"}),
+	}, nil))}
+	var last ir.StreamEvent
+	done := make(chan error, 1)
+	go func() {
+		done <- DecodeAgentStream(blocked, func([]byte) error { return nil }, func(ev ir.StreamEvent) error {
+			if ev.Kind == ir.EventFinish {
+				last = ev
+			}
+			return nil
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("MCP handoff waited after an earlier turn_ended")
+	}
+	if last.StopReason != ir.StopToolUse || last.UsageReported {
+		t.Fatalf("finish = %+v, want unreported tool_use", last)
+	}
+	if last.InputTokens != 0 || last.OutputTokens != 0 || last.CacheReadTokens != 0 || last.CacheWriteTokens != 0 {
+		t.Fatalf("usage = %+v, want zeros", last)
+	}
+}
+
 func TestDecodeAgentStreamCacheTokensClamped(t *testing.T) {
 	events := collectAgentEvents(t,
 		agentTextFrame(t, "ok"),
@@ -263,6 +366,9 @@ func TestDecodeAgentStreamCacheTokensClamped(t *testing.T) {
 	}
 	if last.CacheReadTokens != 10 || last.CacheWriteTokens != 0 {
 		t.Errorf("cache = %d/%d, want 10/0", last.CacheReadTokens, last.CacheWriteTokens)
+	}
+	if !last.UsageReported {
+		t.Fatal("clamped complete usage was not reported")
 	}
 }
 

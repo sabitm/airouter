@@ -167,11 +167,19 @@ const (
 //
 // InputTokens is the inclusive prompt/input total. CacheReadTokens and
 // CacheWriteTokens are subsets of that total and must never be added again.
+//
+// UsageReported is an internal marker, not a wire field. Today only the
+// Cursor agent decoder sets it, and only on a normal Connect completion
+// whose turn_ended carried both input and output counters. Explicit zero is
+// reported. A missing counter, a partial pair, or an immediate MCP handoff
+// leaves it false so callers can estimate instead of mixing buckets. Other
+// codecs leave it false; that does not mean their counts are missing.
 type Usage struct {
 	InputTokens      int
 	OutputTokens     int
 	CacheReadTokens  int
 	CacheWriteTokens int
+	UsageReported    bool
 }
 
 // ClampCacheTokens bounds cache read/write so they cannot exceed inclusive
