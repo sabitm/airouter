@@ -94,6 +94,7 @@ type respUsage struct {
 }
 
 type respOutputItem struct {
+	ID        string              `json:"id"`
 	Type      string              `json:"type"` // message | reasoning | function_call
 	Content   []respOutputContent `json:"content"`
 	Summary   []reasoningSummary  `json:"summary"`

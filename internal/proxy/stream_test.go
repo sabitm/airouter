@@ -3335,6 +3335,428 @@ func TestOpenCodeChatRoleOnlyEOFFailsOver(t *testing.T) {
 	}
 }
 
+func codexSnapshotSSE(paths ...string) string {
+	var b strings.Builder
+	b.WriteString("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex\",\"model\":\"gpt-test\",\"status\":\"in_progress\"}}\n\n")
+	var finals []string
+	for i, path := range paths {
+		args := fmt.Sprintf(`{"limit":25,"offset":1,"path":%q}`, path)
+		id := fmt.Sprintf("fc_%d", i)
+		callID := fmt.Sprintf("call_%d", i)
+		index := i + 2
+		fmt.Fprintf(&b, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":%d,\"item\":{\"id\":%q,\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":%q,\"name\":\"read\",\"arguments\":\"\"}}\n\n", index, id, callID)
+		fmt.Fprintf(&b, "event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":%q,\"output_index\":%d,\"name\":\"read\",\"arguments\":%q}\n\n", id, index, args)
+		fmt.Fprintf(&b, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":%d,\"item\":{\"id\":%q,\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":%q,\"name\":\"read\",\"arguments\":%q}}\n\n", index, id, callID, args)
+		finals = append(finals, fmt.Sprintf(`{"id":%q,"type":"function_call","call_id":%q,"name":"read","arguments":%q}`, id, callID, args))
+	}
+	fmt.Fprintf(&b, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[%s],\"usage\":{\"input_tokens\":11,\"output_tokens\":4}}}\n\n", strings.Join(finals, ","))
+	return b.String()
+}
+
+type clientToolCall struct {
+	index int
+	id    string
+	name  string
+	args  string
+}
+
+func collectClientToolCalls(t *testing.T, ingress, body string) []clientToolCall {
+	t.Helper()
+	reader := sse.NewReader(strings.NewReader(body))
+	byIndex := map[int]int{}
+	var calls []clientToolCall
+	upsert := func(index int) *clientToolCall {
+		n, ok := byIndex[index]
+		if !ok {
+			n = len(calls)
+			byIndex[index] = n
+			calls = append(calls, clientToolCall{index: index})
+		}
+		return &calls[n]
+	}
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case strings.HasSuffix(ingress, "/chat/completions"):
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						ToolCalls []struct {
+							Index    int    `json:"index"`
+							ID       string `json:"id"`
+							Function struct {
+								Name      string `json:"name"`
+								Arguments string `json:"arguments"`
+							} `json:"function"`
+						} `json:"tool_calls"`
+					} `json:"delta"`
+				} `json:"choices"`
+			}
+			if json.Unmarshal(ev.Data, &chunk) != nil {
+				continue
+			}
+			for _, choice := range chunk.Choices {
+				for _, tc := range choice.Delta.ToolCalls {
+					call := upsert(tc.Index)
+					if tc.ID != "" {
+						call.id = tc.ID
+					}
+					if tc.Function.Name != "" {
+						call.name = tc.Function.Name
+					}
+					call.args += tc.Function.Arguments
+				}
+			}
+		case strings.HasSuffix(ingress, "/messages"):
+			switch ev.Name {
+			case "content_block_start":
+				var d struct {
+					Index        int `json:"index"`
+					ContentBlock struct {
+						Type string `json:"type"`
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"content_block"`
+				}
+				if json.Unmarshal(ev.Data, &d) != nil || d.ContentBlock.Type != "tool_use" {
+					continue
+				}
+				call := upsert(d.Index)
+				call.id = d.ContentBlock.ID
+				call.name = d.ContentBlock.Name
+			case "content_block_delta":
+				var d struct {
+					Index int `json:"index"`
+					Delta struct {
+						Type        string `json:"type"`
+						PartialJSON string `json:"partial_json"`
+					} `json:"delta"`
+				}
+				if json.Unmarshal(ev.Data, &d) != nil || d.Delta.Type != "input_json_delta" {
+					continue
+				}
+				upsert(d.Index).args += d.Delta.PartialJSON
+			}
+		default:
+			switch ev.Name {
+			case "response.output_item.added":
+				var d struct {
+					Index int `json:"output_index"`
+					Item  struct {
+						Type   string `json:"type"`
+						CallID string `json:"call_id"`
+						Name   string `json:"name"`
+					} `json:"item"`
+				}
+				if json.Unmarshal(ev.Data, &d) != nil || d.Item.Type != "function_call" {
+					continue
+				}
+				call := upsert(d.Index)
+				call.id = d.Item.CallID
+				call.name = d.Item.Name
+			case "response.function_call_arguments.delta":
+				var d struct {
+					Index int    `json:"output_index"`
+					Delta string `json:"delta"`
+				}
+				if json.Unmarshal(ev.Data, &d) != nil {
+					continue
+				}
+				upsert(d.Index).args += d.Delta
+			}
+		}
+	}
+	return calls
+}
+
+func assertClientToolCalls(t *testing.T, calls []clientToolCall, paths []string) {
+	t.Helper()
+	if len(calls) != len(paths) {
+		t.Fatalf("calls = %+v, want %d", calls, len(paths))
+	}
+	seen := map[string]bool{}
+	for i, call := range calls {
+		if call.name != "read" {
+			t.Fatalf("call %d name = %q", i, call.name)
+		}
+		wantID := fmt.Sprintf("call_%d", i)
+		if call.id != wantID {
+			t.Fatalf("call %d id = %q, want %q", i, call.id, wantID)
+		}
+		if seen[call.id] {
+			t.Fatalf("duplicate call id %s", call.id)
+		}
+		seen[call.id] = true
+		want := fmt.Sprintf(`{"limit":25,"offset":1,"path":%q}`, paths[i])
+		if call.args != want {
+			t.Fatalf("call %d args = %q, want %q", i, call.args, want)
+		}
+	}
+}
+
+func setupCodexSnapshotProxy(t *testing.T, upstreamSSE string, checkStream bool) (string, string) {
+	t.Helper()
+	st := newTestStore(t)
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read", http.StatusBadRequest)
+			return
+		}
+		if checkStream {
+			var req struct {
+				Stream *bool `json:"stream"`
+			}
+			if json.Unmarshal(body, &req) != nil || req.Stream == nil || !*req.Stream {
+				http.Error(w, "stream must be true", http.StatusBadRequest)
+				return
+			}
+		}
+		if !strings.HasSuffix(r.URL.Path, "/responses") {
+			http.Error(w, "unexpected path", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, upstreamSSE)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(upstream.Close)
+	prov := &domain.Provider{Name: "codex", BaseURL: upstream.URL, APIKey: "k", Protocol: domain.ProtocolOpenAICodex}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{
+		ProviderID: prov.ID, UpstreamModel: "gpt-test", Enabled: true,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL, key.Token
+}
+
+func TestCodexSnapshotArgumentsTranslatedStreams(t *testing.T) {
+	paths := []string{"/example/a.kt", "/example/b.kt", "/example/c.kt"}
+	base, token := setupCodexSnapshotProxy(t, codexSnapshotSSE(paths...), false)
+	ingresses := []struct {
+		path string
+		body string
+	}{
+		{"/v1/chat/completions", `{"model":"default","stream":true,"messages":[{"role":"user","content":"read"}]}`},
+		{"/v1/messages", `{"model":"default","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"read"}]}`},
+		{"/v1/responses", `{"model":"default","stream":true,"input":"read"}`},
+	}
+	for _, tc := range ingresses {
+		t.Run(tc.path, func(t *testing.T) {
+			resp, body := postStream(t, base+tc.path, token, tc.body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			assertClientToolCalls(t, collectClientToolCalls(t, tc.path, body), paths)
+		})
+	}
+}
+
+func TestCodexSnapshotArgumentsCollectedUnary(t *testing.T) {
+	paths := []string{"/example/a.kt", "/example/b.kt"}
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "stream false", body: `{"model":"default","stream":false,"messages":[{"role":"user","content":"read"}]}`},
+		{name: "stream omitted", body: `{"model":"default","messages":[{"role":"user","content":"read"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, token := setupCodexSnapshotProxy(t, codexSnapshotSSE(paths...), true)
+			resp, body := post(t, base+"/v1/chat/completions", token, tc.body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			var got struct {
+				Choices []struct {
+					Message struct {
+						ToolCalls []struct {
+							ID       string `json:"id"`
+							Function struct {
+								Name      string `json:"name"`
+								Arguments string `json:"arguments"`
+							} `json:"function"`
+						} `json:"tool_calls"`
+					} `json:"message"`
+					FinishReason string `json:"finish_reason"`
+				} `json:"choices"`
+			}
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Choices) != 1 || got.Choices[0].FinishReason != "tool_calls" {
+				t.Fatalf("choice = %+v", got.Choices)
+			}
+			calls := got.Choices[0].Message.ToolCalls
+			if len(calls) != len(paths) {
+				t.Fatalf("calls = %+v", calls)
+			}
+			for i, call := range calls {
+				if call.ID != fmt.Sprintf("call_%d", i) || call.Function.Name != "read" {
+					t.Fatalf("call %d = %+v", i, call)
+				}
+				want := fmt.Sprintf(`{"limit":25,"offset":1,"path":%q}`, paths[i])
+				if call.Function.Arguments != want {
+					t.Fatalf("args = %q, want %q", call.Function.Arguments, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCodexEmptyArgumentsAndTerminalConflict(t *testing.T) {
+	empty := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_empty\",\"model\":\"gpt-test\",\"status\":\"in_progress\"}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"name\":\"read\",\"arguments\":\"\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+	base, token := setupCodexSnapshotProxy(t, empty, false)
+	ingresses := []struct {
+		path string
+		body string
+	}{
+		{"/v1/chat/completions", `{"model":"default","stream":true,"messages":[{"role":"user","content":"read"}]}`},
+		{"/v1/messages", `{"model":"default","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"read"}]}`},
+		{"/v1/responses", `{"model":"default","stream":true,"input":"read"}`},
+	}
+	for _, tc := range ingresses {
+		t.Run("empty "+tc.path, func(t *testing.T) {
+			resp, body := postStream(t, base+tc.path, token, tc.body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			calls := collectClientToolCalls(t, tc.path, body)
+			if len(calls) != 1 || calls[0].name != "read" || calls[0].args != "" {
+				t.Fatalf("calls = %+v, body = %s", calls, body)
+			}
+			// OpenAI preserves an omitted call ID. Anthropic and Responses allocate
+			// one at the ingress encoder; that ID is not copied from the upstream.
+			if strings.HasSuffix(tc.path, "/chat/completions") && calls[0].id != "" {
+				t.Fatalf("openai invented call id: %+v", calls[0])
+			}
+			if !strings.HasSuffix(tc.path, "/chat/completions") && calls[0].id == "" {
+				t.Fatalf("ingress dropped required tool id: %+v", calls[0])
+			}
+		})
+	}
+
+	// The first text delta commits the client stream. The delta after completed
+	// must then be an ingress error, not a pre-commit 502 or a leaked payload.
+	late := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_term\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"zzlate\"}\n\n"
+	badBase, badToken := setupCodexSnapshotProxy(t, late, false)
+	for _, tc := range ingresses {
+		t.Run("terminal "+tc.path, func(t *testing.T) {
+			resp, body := postStream(t, badBase+tc.path, badToken, tc.body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			if !strings.Contains(body, "conflicting response content") {
+				t.Fatalf("missing terminal error: %s", body)
+			}
+			if strings.Contains(body, "zzlate") {
+				t.Fatalf("terminal delta leaked: %s", body)
+			}
+			errAt := strings.Index(body, "conflicting response content")
+			if errAt < 0 || strings.Contains(body[errAt:], "[DONE]") || strings.Contains(body[errAt:], "response.completed") {
+				t.Fatalf("terminal error was not the last frame: %s", body[errAt:])
+			}
+		})
+	}
+}
+
+func TestCodexPartialSnapshotAndCommittedConflict(t *testing.T) {
+	partial := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_part\",\"model\":\"gpt-test\",\"status\":\"in_progress\"}}\n\n" +
+		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_0\",\"type\":\"function_call\",\"call_id\":\"call_0\",\"name\":\"read\",\"arguments\":\"\"}}\n\n" +
+		"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_0\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}\n\n" +
+		"event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_0\",\"output_index\":0,\"arguments\":\"{\\\"path\\\":\\\"/example/a.kt\\\"}\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_part\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+	base, token := setupCodexSnapshotProxy(t, partial, false)
+	resp, body := postStream(t, base+"/v1/chat/completions", token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"read"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	calls := collectClientToolCalls(t, "/v1/chat/completions", body)
+	if len(calls) != 1 || calls[0].id != "call_0" || calls[0].args != `{"path":"/example/a.kt"}` {
+		t.Fatalf("calls = %+v", calls)
+	}
+
+	conflict := strings.Replace(partial,
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_part\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_part\",\"status\":\"completed\",\"output\":[{\"id\":\"fc_0\",\"type\":\"function_call\",\"call_id\":\"call_0\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"/example/other.kt\\\"}\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+		1)
+	var hits int
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, conflict)
+	}))
+	t.Cleanup(bad.Close)
+	var goodHits int
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		goodHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(good.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	p1 := &domain.Provider{Name: "codex-bad", BaseURL: bad.URL, APIKey: "k", Protocol: domain.ProtocolOpenAICodex}
+	p2 := &domain.Provider{Name: "codex-good", BaseURL: good.URL, APIKey: "k", Protocol: domain.ProtocolOpenAICodex}
+	if err := st.CreateProvider(ctx, p1); err != nil || st.CreateProvider(ctx, p2) != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: p1.ID, UpstreamModel: "gpt-test", Enabled: true},
+		{ProviderID: p2.ID, UpstreamModel: "gpt-test", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	resp, body = postStream(t, ts.URL+"/v1/chat/completions", key.Token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"read"}]}`)
+	if hits != 1 || goodHits != 0 {
+		t.Fatalf("hits = %d goodHits = %d, want 1/0", hits, goodHits)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "conflicting function call arguments") {
+		t.Fatalf("missing conflict error: %s", body)
+	}
+	if strings.Contains(body, "data: [DONE]") || strings.Contains(body, "/example/other.kt") {
+		t.Fatalf("conflict completed or leaked the conflicting snapshot: %s", body)
+	}
+	errIdx := strings.LastIndex(body, "conflicting function call arguments")
+	if strings.Contains(body[errIdx:], "/example") {
+		t.Fatalf("error frame leaked arguments: %s", body[errIdx:])
+	}
+}
+
 func TestResponsesTranslatedNumericErrorFailover(t *testing.T) {
 	const numericFailedSSE = `event: response.created
 data: {"type":"response.created","response":{"id":"resp_bad","model":"up","status":"in_progress"}}

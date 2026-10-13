@@ -10,44 +10,100 @@ import (
 	"airouter/internal/proxy/sse"
 )
 
+// Responses argument retention matches the unary collector budgets. These are
+// local so the codec does not import the proxy package. Count only recovered
+// growth; an identical snapshot is not counted again.
+const (
+	maxRetainedToolArgBytes = 64 << 20
+	maxTrackedToolCalls     = 1024
+)
+
 // streamEnvelope is the union of the Responses SSE event fields this decoder
 // reads. The event kind is taken from the JSON "type" field rather than the SSE
 // event name, so a producer that omits the name still decodes.
 type streamEnvelope struct {
-	Type        string           `json:"type"`
-	OutputIndex int              `json:"output_index"`
-	Delta       string           `json:"delta"`
-	Item        *streamItem      `json:"item"`
-	Response    *respObject      `json:"response"`
-	Error       *respErrorObject `json:"error"`
+	Type           string           `json:"type"`
+	OutputIndex    int              `json:"output_index"`
+	OutputIndexSet bool             `json:"-"`
+	ItemID         string           `json:"item_id"`
+	Delta          string           `json:"delta"`
+	Arguments      string           `json:"arguments"`
+	Name           string           `json:"name"`
+	Item           *streamItem      `json:"item"`
+	Response       *respObject      `json:"response"`
+	Error          *respErrorObject `json:"error"`
+}
+
+func (e *streamEnvelope) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type        string           `json:"type"`
+		OutputIndex *int             `json:"output_index"`
+		ItemID      string           `json:"item_id"`
+		Delta       string           `json:"delta"`
+		Arguments   string           `json:"arguments"`
+		Name        string           `json:"name"`
+		Item        *streamItem      `json:"item"`
+		Response    *respObject      `json:"response"`
+		Error       *respErrorObject `json:"error"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*e = streamEnvelope{
+		Type: raw.Type, ItemID: raw.ItemID, Delta: raw.Delta,
+		Arguments: raw.Arguments, Name: raw.Name, Item: raw.Item,
+		Response: raw.Response, Error: raw.Error,
+	}
+	if raw.OutputIndex != nil {
+		e.OutputIndex = *raw.OutputIndex
+		e.OutputIndexSet = true
+	}
+	return nil
 }
 
 type streamItem struct {
-	Type   string `json:"type"`
-	CallID string `json:"call_id"`
-	Name   string `json:"name"`
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // DecodeStream reads an OpenAI Responses SSE stream and emits IR stream events.
-// Used when Responses is the backend format. Tool calls are keyed by the event
-// output_index so argument fragments attribute to the right call. The Finish
-// event is deferred to end-of-stream so the response.completed usage is captured.
-// Explicit error / response.failed frames return *ir.StreamFailure without Finish.
+// Used when Responses is the backend format. Each function call is tracked by
+// output index, item ID, and call ID. Argument bytes are emitted only as
+// EventToolCallDelta. The Finish event is deferred to end-of-stream so the
+// response.completed usage is captured. Explicit error / response.failed frames
+// return *ir.StreamFailure without Finish.
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
+	return decodeStreamLimited(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls)
+}
+
+func decodeStreamLimited(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls int) error {
 	reader := sse.NewReader(r)
 	started := false
-	sawTool := false
+	startID, startModel := "", ""
 	stop := ir.StopEndTurn
 	inputTokens, outputTokens := 0, 0
 	cacheRead, cacheWrite := 0, 0
 	var pendingFail *ir.StreamFailure
 
 	ensureStarted := func(id, model string) error {
+		if id != "" {
+			startID = id
+		}
+		if model != "" {
+			startModel = model
+		}
 		if started {
 			return nil
 		}
 		started = true
-		return emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: id, Model: model})
+		return emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: startID, Model: startModel})
+	}
+	dec := &responsesToolDecoder{
+		emit: emit, maxArgBytes: maxArgBytes, maxCalls: maxCalls,
+		ensureStarted: func() error { return ensureStarted("", "") },
 	}
 
 	for {
@@ -110,18 +166,14 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			}
 		case "response.output_item.added":
 			if env.Item != nil && env.Item.Type == "function_call" {
-				if err := ensureStarted("", ""); err != nil {
-					return err
-				}
-				sawTool = true
-				if err := emit(ir.StreamEvent{
-					Kind: ir.EventToolCallStart, Index: env.OutputIndex,
-					ToolID: env.Item.CallID, ToolName: env.Item.Name,
-				}); err != nil {
+				if err := dec.observeAdded(&env); err != nil {
 					return err
 				}
 			}
 		case "response.output_text.delta":
+			if err := dec.rejectContent(env.Delta); err != nil {
+				return err
+			}
 			if env.Delta != "" {
 				if err := ensureStarted("", ""); err != nil {
 					return err
@@ -131,6 +183,9 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				}
 			}
 		case "response.reasoning_summary_text.delta":
+			if err := dec.rejectContent(env.Delta); err != nil {
+				return err
+			}
 			if env.Delta != "" {
 				if err := ensureStarted("", ""); err != nil {
 					return err
@@ -140,13 +195,31 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				}
 			}
 		case "response.function_call_arguments.delta":
-			if env.Delta != "" {
-				if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: env.OutputIndex, ArgsFrag: env.Delta}); err != nil {
+			if err := dec.observeDelta(&env); err != nil {
+				return err
+			}
+		case "response.function_call_arguments.done":
+			if err := dec.observeArgumentsDone(&env); err != nil {
+				return err
+			}
+		case "response.output_item.done":
+			if env.Item != nil && env.Item.Type == "function_call" {
+				if err := dec.observeItemDone(&env); err != nil {
 					return err
 				}
 			}
 		case "response.completed", "response.incomplete":
 			if env.Response != nil {
+				if err := ensureStarted(env.Response.ID, env.Response.Model); err != nil {
+					return err
+				}
+				// Both completed and incomplete close the response. An omitted status
+				// is still terminal; only an explicit incomplete stop overrides tools.
+				// observeFinal sets the response terminal flag after this snapshot, so
+				// a valid final-only call in the first completion is still accepted.
+				if err := dec.observeFinal(env.Response.Output); err != nil {
+					return err
+				}
 				if env.Response.Usage != nil {
 					u := usageFromWire(env.Response.Usage)
 					inputTokens = u.InputTokens
@@ -156,7 +229,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				}
 				if env.Response.Status == "incomplete" {
 					stop = ir.StopMaxTokens
-				} else if sawTool {
+				} else if dec.sawTool {
 					stop = ir.StopToolUse
 				}
 			}
@@ -164,6 +237,17 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	}
 	if pendingFail != nil {
 		return pendingFail
+	}
+	if err := dec.flushPending(); err != nil {
+		return err
+	}
+	if dec.sawTool {
+		if err := ensureStarted("", ""); err != nil {
+			return err
+		}
+		if stop != ir.StopMaxTokens {
+			stop = ir.StopToolUse
+		}
 	}
 	if !started {
 		return nil
@@ -173,6 +257,498 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		InputTokens: inputTokens, OutputTokens: outputTokens,
 		CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
 	})
+}
+
+// responsesToolCall tracks one function call. IR Index is assigned once and is
+// not the Responses output index: completion output uses array order, while
+// argument events may omit output_index or arrive before output_item.added.
+//
+// args is the one retained argument string. emitted is the byte offset already
+// sent as EventToolCallDelta. Growth is appended once; a flush only advances
+// emitted. terminal rejects every later change, including an identical-length
+// replacement, but an identical snapshot is not a change.
+//
+// fromFinal marks a call created by a completion output item that did not match
+// a streamed call. Those calls are keyed by output-array ordinal, not by the
+// streamed output_index map.
+type responsesToolCall struct {
+	index       int
+	hasIndex    bool
+	outputIndex int
+	itemID      string
+	callID      string
+	name        string
+	started     bool
+	fromFinal   bool
+	args        strings.Builder
+	emitted     int
+	terminal    bool
+}
+
+// responsesToolDecoder reconciles argument deltas and complete snapshots for
+// one Responses stream. Raw argument text is preserved; it is not parsed.
+type responsesToolDecoder struct {
+	emit          func(ir.StreamEvent) error
+	ensureStarted func() error
+	maxArgBytes   int
+	maxCalls      int
+	calls         []*responsesToolCall
+	byIndex       map[int]*responsesToolCall
+	byItem        map[string]*responsesToolCall
+	byCall        map[string]*responsesToolCall
+	byFinal       map[int]*responsesToolCall
+	nextIndex     int
+	argBytes      int
+	sawTool       bool
+	// responseDone is set after the first completed or incomplete snapshot is
+	// accepted. It blocks new calls and new content even when output is empty.
+	responseDone bool
+}
+
+func (d *responsesToolDecoder) observeAdded(env *streamEnvelope) error {
+	call, err := d.bind(toolIdentity{
+		outputIndex: env.OutputIndex, hasIndex: env.OutputIndexSet,
+		itemID: env.Item.ID, callID: env.Item.CallID, name: env.Item.Name,
+	}, true, false)
+	if err != nil {
+		return err
+	}
+	// An empty added arguments field is the normal pending placeholder, not a
+	// terminal empty snapshot. A later delta or done event supplies the bytes.
+	if env.Item.Arguments == "" {
+		return d.emitReady(call)
+	}
+	return d.reconcile(call, env.Item.Arguments, false)
+}
+
+func (d *responsesToolDecoder) observeDelta(env *streamEnvelope) error {
+	if env.Delta == "" && env.ItemID == "" && env.Name == "" && !env.OutputIndexSet {
+		return nil
+	}
+	call, err := d.bind(toolIdentity{
+		outputIndex: env.OutputIndex, hasIndex: env.OutputIndexSet,
+		itemID: env.ItemID, name: env.Name,
+	}, true, false)
+	if err != nil {
+		return err
+	}
+	if env.Delta == "" {
+		return nil
+	}
+	if call.terminal {
+		return ir.ProtocolError("conflicting function call arguments")
+	}
+	if err := d.appendArgs(call, env.Delta); err != nil {
+		return err
+	}
+	return d.emitReady(call)
+}
+
+func (d *responsesToolDecoder) observeArgumentsDone(env *streamEnvelope) error {
+	call, err := d.bind(toolIdentity{
+		outputIndex: env.OutputIndex, hasIndex: env.OutputIndexSet,
+		itemID: env.ItemID, name: env.Name,
+	}, true, false)
+	if err != nil {
+		return err
+	}
+	// args_done has no call_id. Mark the snapshot terminal immediately so a
+	// later delta cannot extend it, but hold emission until identity arrives.
+	return d.reconcile(call, env.Arguments, true)
+}
+
+func (d *responsesToolDecoder) observeItemDone(env *streamEnvelope) error {
+	call, err := d.bind(toolIdentity{
+		outputIndex: env.OutputIndex, hasIndex: env.OutputIndexSet,
+		itemID: env.Item.ID, callID: env.Item.CallID, name: env.Item.Name,
+	}, true, false)
+	if err != nil {
+		return err
+	}
+	return d.reconcile(call, env.Item.Arguments, true)
+}
+
+func (d *responsesToolDecoder) observeFinal(items []respOutputItem) error {
+	// Apply every item before emitting. An ID-less final-only call cannot start
+	// under the normal identity rule, so emitting inside the loop would let a
+	// later identified item pass it and reorder the output array.
+	touched := make([]*responsesToolCall, 0, len(items))
+	for i := range items {
+		item := &items[i]
+		if item.Type != "function_call" {
+			continue
+		}
+		call, err := d.matchFinal(i, item)
+		if err != nil {
+			return err
+		}
+		if err := d.applySnapshot(call, item.Arguments, true); err != nil {
+			return err
+		}
+		touched = append(touched, call)
+	}
+	for _, call := range touched {
+		// Final-only calls are complete in this snapshot, even with an empty call
+		// ID. Streamed calls still wait for a call ID unless EOF forces them.
+		if err := d.emitCall(call, call.fromFinal); err != nil {
+			return err
+		}
+	}
+	// Close after this snapshot so a final-only call in the first completion is
+	// accepted. A later event cannot create a call or append content. An empty
+	// output array is still terminal.
+	d.responseDone = true
+	for _, call := range d.calls {
+		call.terminal = true
+	}
+	return nil
+}
+
+// matchFinal binds a completion item without guessing by name or argument text.
+// Item ID or call ID identifies a streamed call. An output_index equals this
+// array ordinal only when that index has one streamed call; assign then fills
+// identity or reports a nonempty ID conflict. Otherwise a new final-only call
+// is safe only when every streamed call already has both IDs and at least one
+// ID proves it is a different call. An index-only call, or a call that has only
+// one ID, blocks creation. Final-only calls stay on byFinal, so repeated
+// snapshots resolve the same ordinal and same-name items stay separate.
+func (d *responsesToolDecoder) matchFinal(ordinal int, item *respOutputItem) (*responsesToolCall, error) {
+	if call := d.byFinal[ordinal]; call != nil {
+		if err := d.assign(call, toolIdentity{itemID: item.ID, callID: item.CallID, name: item.Name}); err != nil {
+			return nil, err
+		}
+		return call, nil
+	}
+	if item.ID != "" || item.CallID != "" {
+		call, err := d.bind(toolIdentity{itemID: item.ID, callID: item.CallID}, false, false)
+		if err != nil {
+			return nil, err
+		}
+		if call != nil {
+			if err := d.assign(call, toolIdentity{itemID: item.ID, callID: item.CallID, name: item.Name}); err != nil {
+				return nil, err
+			}
+			return call, nil
+		}
+		if call := d.uniqueIndexMatch(ordinal); call != nil {
+			if err := d.assign(call, toolIdentity{itemID: item.ID, callID: item.CallID, name: item.Name}); err != nil {
+				return nil, err
+			}
+			return call, nil
+		}
+		if d.blocksNewFinal(item) {
+			return nil, ir.ProtocolError("conflicting function call identity")
+		}
+		return d.bind(toolIdentity{
+			itemID: item.ID, callID: item.CallID, name: item.Name, finalOrdinal: ordinal,
+		}, true, true)
+	}
+	if call := d.uniqueIndexMatch(ordinal); call != nil {
+		if err := d.assign(call, toolIdentity{name: item.Name}); err != nil {
+			return nil, err
+		}
+		return call, nil
+	}
+	if d.hasStreamedCall() {
+		return nil, ir.ProtocolError("conflicting function call identity")
+	}
+	return d.bind(toolIdentity{
+		name: item.Name, finalOrdinal: ordinal,
+	}, true, true)
+}
+
+// blocksNewFinal reports that a streamed call cannot be proved distinct from
+// item. A call with both IDs is distinct when either ID differs. A call missing
+// either ID can still be this item, so creating another call would be a guess.
+func (d *responsesToolDecoder) blocksNewFinal(item *respOutputItem) bool {
+	for _, call := range d.calls {
+		if call.fromFinal {
+			continue
+		}
+		if call.itemID != "" && call.callID != "" && finalDistinct(call, item) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func finalDistinct(call *responsesToolCall, item *respOutputItem) bool {
+	if item.ID != "" && call.itemID != "" && item.ID != call.itemID {
+		return true
+	}
+	if item.CallID != "" && call.callID != "" && item.CallID != call.callID {
+		return true
+	}
+	return false
+}
+
+func (d *responsesToolDecoder) hasStreamedCall() bool {
+	for _, call := range d.calls {
+		if !call.fromFinal {
+			return true
+		}
+	}
+	return false
+}
+
+// uniqueIndexMatch returns the sole streamed call whose output_index equals
+// ordinal. Equality with the completion array position is not assumed for any
+// other call, and a final-only ordinal is never an output_index.
+func (d *responsesToolDecoder) uniqueIndexMatch(ordinal int) *responsesToolCall {
+	var found *responsesToolCall
+	for _, call := range d.calls {
+		if call.fromFinal || !call.hasIndex || call.outputIndex != ordinal {
+			continue
+		}
+		if found != nil {
+			return nil
+		}
+		found = call
+	}
+	return found
+}
+
+// flushPending releases every call that never started, including a zero-length
+// or ID-less call. EOF does not invent a call ID, item ID, or JSON object.
+// Already started calls are left unchanged.
+func (d *responsesToolDecoder) flushPending() error {
+	for _, call := range d.calls {
+		if call.started {
+			continue
+		}
+		if err := d.emitCall(call, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type toolIdentity struct {
+	outputIndex  int
+	hasIndex     bool
+	itemID       string
+	callID       string
+	name         string
+	finalOrdinal int
+}
+
+// bind looks up a streamed call by output index, item ID, and call ID. create
+// allocates only when no key matches. After the response is terminal, create is
+// refused so a new delta or a repeated completion cannot add a call. fromFinal
+// keeps the new call out of the streamed output_index map.
+func (d *responsesToolDecoder) bind(id toolIdentity, create, fromFinal bool) (*responsesToolCall, error) {
+	var found *responsesToolCall
+	match := func(call *responsesToolCall) error {
+		if call == nil {
+			return nil
+		}
+		if found == nil {
+			found = call
+			return nil
+		}
+		if found != call {
+			return ir.ProtocolError("conflicting function call identity")
+		}
+		return nil
+	}
+	if id.hasIndex {
+		if err := match(d.byIndex[id.outputIndex]); err != nil {
+			return nil, err
+		}
+	}
+	if id.itemID != "" {
+		if err := match(d.byItem[id.itemID]); err != nil {
+			return nil, err
+		}
+	}
+	if id.callID != "" {
+		if err := match(d.byCall[id.callID]); err != nil {
+			return nil, err
+		}
+	}
+	if found == nil {
+		if !create {
+			return nil, nil
+		}
+		// The response flag blocks creation here, not only on calls that already
+		// exist. Identity fill of a known call uses create=false or matches above.
+		if d.responseDone {
+			return nil, ir.ProtocolError("conflicting function call identity")
+		}
+		if len(d.calls) >= d.maxCalls {
+			return nil, ir.ProtocolError("too many function calls")
+		}
+		found = &responsesToolCall{index: d.nextIndex, fromFinal: fromFinal}
+		d.nextIndex++
+		d.calls = append(d.calls, found)
+		if fromFinal {
+			if d.byFinal == nil {
+				d.byFinal = map[int]*responsesToolCall{}
+			}
+			d.byFinal[id.finalOrdinal] = found
+		}
+	}
+	if err := d.assign(found, id); err != nil {
+		return nil, err
+	}
+	return found, nil
+}
+
+func (d *responsesToolDecoder) assign(call *responsesToolCall, id toolIdentity) error {
+	if id.hasIndex {
+		if call.hasIndex && call.outputIndex != id.outputIndex {
+			return ir.ProtocolError("conflicting function call index")
+		}
+		if other := d.byIndex[id.outputIndex]; other != nil && other != call {
+			return ir.ProtocolError("conflicting function call index")
+		}
+	}
+	if id.itemID != "" {
+		if call.itemID != "" && call.itemID != id.itemID {
+			return ir.ProtocolError("conflicting function call item")
+		}
+		if other := d.byItem[id.itemID]; other != nil && other != call {
+			return ir.ProtocolError("conflicting function call item")
+		}
+	}
+	if id.callID != "" {
+		if call.callID != "" && call.callID != id.callID {
+			return ir.ProtocolError("conflicting function call id")
+		}
+		if other := d.byCall[id.callID]; other != nil && other != call {
+			return ir.ProtocolError("conflicting function call id")
+		}
+	}
+	if id.name != "" && call.name != "" && call.name != id.name {
+		return ir.ProtocolError("conflicting function call name")
+	}
+	if d.byIndex == nil {
+		d.byIndex = map[int]*responsesToolCall{}
+		d.byItem = map[string]*responsesToolCall{}
+		d.byCall = map[string]*responsesToolCall{}
+	}
+	if id.hasIndex && !call.hasIndex {
+		call.hasIndex = true
+		call.outputIndex = id.outputIndex
+		d.byIndex[id.outputIndex] = call
+	}
+	if id.itemID != "" && call.itemID == "" {
+		call.itemID = id.itemID
+		d.byItem[id.itemID] = call
+	}
+	if id.callID != "" && call.callID == "" {
+		call.callID = id.callID
+		d.byCall[id.callID] = call
+	}
+	if id.name != "" && call.name == "" {
+		call.name = id.name
+	}
+	return nil
+}
+
+func (d *responsesToolDecoder) appendArgs(call *responsesToolCall, frag string) error {
+	if frag == "" {
+		return nil
+	}
+	if err := d.retain(len(frag)); err != nil {
+		return err
+	}
+	call.args.WriteString(frag)
+	return nil
+}
+
+// emitReady sends a tool start and any unsent argument suffix. A call stays
+// buffered until it has a name and call ID, unless EOF forces release. EOF does
+// not invent the missing identity. Every tool event follows EventMessageStart.
+func (d *responsesToolDecoder) emitReady(call *responsesToolCall) error {
+	return d.emitCall(call, false)
+}
+
+func (d *responsesToolDecoder) emitCall(call *responsesToolCall, force bool) error {
+	if !force && (call.name == "" || call.callID == "") {
+		return nil
+	}
+	if err := d.ensureMessageStart(); err != nil {
+		return err
+	}
+	if !call.started {
+		call.started = true
+		d.sawTool = true
+		if err := d.emit(ir.StreamEvent{
+			Kind: ir.EventToolCallStart, Index: call.index,
+			ToolID: call.callID, ToolName: call.name,
+		}); err != nil {
+			return err
+		}
+	}
+	if call.emitted >= call.args.Len() {
+		return nil
+	}
+	frag := call.args.String()[call.emitted:]
+	call.emitted = call.args.Len()
+	return d.emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: call.index, ArgsFrag: frag})
+}
+
+func (d *responsesToolDecoder) ensureMessageStart() error {
+	if d.ensureStarted == nil {
+		return nil
+	}
+	return d.ensureStarted()
+}
+
+// rejectContent fails a nonempty text or reasoning delta after the response
+// has completed or become incomplete. Empty lifecycle metadata is ignored.
+// The error carries no payload.
+func (d *responsesToolDecoder) rejectContent(delta string) error {
+	if delta != "" && d.responseDone {
+		return ir.ProtocolError("conflicting response content")
+	}
+	return nil
+}
+
+func (d *responsesToolDecoder) reconcile(call *responsesToolCall, snapshot string, terminal bool) error {
+	if err := d.applySnapshot(call, snapshot, terminal); err != nil {
+		return err
+	}
+	return d.emitReady(call)
+}
+
+// applySnapshot records snapshot growth without emitting. An identical snapshot
+// adds nothing. A terminal call rejects any suffix, including a repeated
+// completion that changes a known call.
+func (d *responsesToolDecoder) applySnapshot(call *responsesToolCall, snapshot string, terminal bool) error {
+	retained := call.args.String()
+	var suffix string
+	switch {
+	case retained == snapshot:
+		// An identical snapshot, including a legitimate empty call, adds nothing.
+	case strings.HasPrefix(snapshot, retained):
+		suffix = snapshot[len(retained):]
+	default:
+		return ir.ProtocolError("conflicting function call arguments")
+	}
+	if call.terminal && suffix != "" {
+		return ir.ProtocolError("conflicting function call arguments")
+	}
+	if err := d.appendArgs(call, suffix); err != nil {
+		return err
+	}
+	if terminal {
+		call.terminal = true
+	}
+	return nil
+}
+
+func (d *responsesToolDecoder) retain(n int) error {
+	if n <= 0 {
+		return nil
+	}
+	if n > d.maxArgBytes-d.argBytes {
+		return ir.ProtocolError("function call arguments too large")
+	}
+	d.argBytes += n
+	return nil
 }
 
 // streamFailureFrom builds a StreamFailure from a top-level error object and/or
