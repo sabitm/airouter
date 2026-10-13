@@ -135,6 +135,8 @@ func TestIsVersionedUserAgent(t *testing.T) {
 		"opencode/1.17.7 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
 		"opencode/0.16.7",
 		"OpenCode/1.18.31",
+		"opencode/latest/2.0.27/opencode",
+		"opencode/beta/2.0.27/desktop",
 	}
 	for _, ua := range keep {
 		if !IsVersionedUserAgent(ua) {
@@ -149,6 +151,10 @@ func TestIsVersionedUserAgent(t *testing.T) {
 		"my-opencode-agent/1.0",
 		"opencode/abc",
 		"opencode/1",
+		"opencode/latest/2.0.27",
+		"opencode/latest/nope/opencode",
+		"opencode/lat est/2.0.27/opencode",
+		"opencode/1.18.31\r\nX-Injected: 1",
 	}
 	for _, ua := range reject {
 		if IsVersionedUserAgent(ua) {

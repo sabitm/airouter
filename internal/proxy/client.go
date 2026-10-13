@@ -79,10 +79,19 @@ func (p *Proxy) prepareUpstreamRequest(ctx context.Context, backend codec, provi
 }
 
 func (p *Proxy) prepareUpstreamRequestFor(ctx context.Context, backend codec, provider *domain.Provider, req *ir.Request, body []byte) ([]byte, error) {
-	if p != nil && (backend.id == "opencode-chat" || backend.id == "opencode-responses") {
+	if p != nil && isOpencodeCodec(backend.id) {
 		ctx = withOpencodeNonce(ctx, p.opencodeNonce)
 	}
 	return prepareUpstreamRequest(ctx, p, backend, provider, req, body)
+}
+
+func isOpencodeCodec(id string) bool {
+	switch id {
+	case "opencode-chat", "opencode-responses", "opencode-messages":
+		return true
+	default:
+		return false
+	}
 }
 
 func prepareUpstreamRequest(ctx context.Context, p *Proxy, backend codec, provider *domain.Provider, req *ir.Request, body []byte) ([]byte, error) {
@@ -136,12 +145,19 @@ func prepareUpstreamRequest(ctx context.Context, p *Proxy, backend codec, provid
 			t.ClaudeCodeSessionID = sid
 		}
 		return claudecode.ApplyOAuthCloaking(body, claudeCodeToken(provider), sid, claudeCodeSeed(provider))
-	case "opencode-chat", "opencode-responses":
+	case "opencode-chat", "opencode-responses", "opencode-messages":
 		prepareOpencodeSession(ctx, provider, body)
+		body, err := prepareOpencodeFreeTier(ctx, backend, provider, body)
+		if err != nil {
+			return nil, err
+		}
 		if backend.id == "opencode-chat" {
 			return opencode.InjectReasoningEcho(body, reqModelFromBody(body))
 		}
-		return opencode.PrepareMuseSparkResponse(body)
+		if backend.id == "opencode-responses" {
+			return opencode.PrepareMuseSparkResponse(body)
+		}
+		return body, nil
 	case "cursor":
 		// Cursor needs no body mutation; headers (checksum, identity) are applied
 		// in applyUpstreamHeaders after the client-header copy.
@@ -555,6 +571,10 @@ type opencodeReqState struct {
 	identity opencode.Identity
 	nonce    string
 	session  string
+	// tools is the free-tier rename and decoy map for the current attempt.
+	// It is rewritten per provider so a later paid or non-OpenCode target does
+	// not inherit a previous attempt's map.
+	tools opencode.ToolMap
 }
 
 type opencodeStateKeyT struct{}
@@ -606,6 +626,32 @@ func prepareOpencodeSession(ctx context.Context, provider *domain.Provider, body
 	if t := traceInfoFrom(ctx); t != nil {
 		t.OpencodeSessionID = sid
 	}
+}
+
+func prepareOpencodeFreeTier(ctx context.Context, backend codec, provider *domain.Provider, body []byte) ([]byte, error) {
+	st := opencodeStateFrom(ctx)
+	if st != nil {
+		st.tools = opencode.ToolMap{}
+	}
+	if provider == nil || !opencode.NeedsFreeTier(provider.BaseURL, reqModelFromBody(body)) {
+		return body, nil
+	}
+	out, mapping, err := opencode.PrepareFreeTierBody(body, backend.id)
+	if err != nil {
+		return nil, err
+	}
+	if st != nil {
+		st.tools = mapping
+	}
+	return out, nil
+}
+
+func opencodeToolMapFrom(ctx context.Context) opencode.ToolMap {
+	st := opencodeStateFrom(ctx)
+	if st == nil {
+		return opencode.ToolMap{}
+	}
+	return st.tools
 }
 
 // applyClaudeCodeHeaders sets the Claude Code CLI identity fingerprint and the

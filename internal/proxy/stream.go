@@ -376,6 +376,9 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			return kiro.DecodeStreamToolsTransport(req.Tools, r, emit, backend.id == "kiro-runtime")
 		}
 	}
+	if isOpencodeCodec(backend.id) {
+		decode = opencode.DecodeStream(decode, opencodeToolMapFrom(ctx))
+	}
 	cursorBackend := backend.protocol == domain.ProtocolCursor
 	cursorReported := false
 	emit := func(ev ir.StreamEvent) error {

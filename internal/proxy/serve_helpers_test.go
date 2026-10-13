@@ -536,6 +536,105 @@ func TestCollectStreamResponseLimits(t *testing.T) {
 			t.Fatalf("error = %v, want response-too-large", err)
 		}
 	})
+
+	// Empty redacted events each bill the flat block overhead, so a flood
+	// stops at the byte budget instead of growing the extras slice unbounded.
+	t.Run("empty redacted flood bounded by overhead", func(t *testing.T) {
+		base := int64(len(ir.NewID("resp_")) + len("m"))
+		limit := base + 4*collectedBlockOverhead
+		events := make([]ir.StreamEvent, 0, 100)
+		for i := 0; i < 100; i++ {
+			events = append(events, ir.StreamEvent{Kind: ir.EventRedactedReasoning})
+		}
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream(events[:4]), nil, "m", nil, limit, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if len(resp.Content) != 4 {
+			t.Fatalf("blocks = %d, want 4", len(resp.Content))
+		}
+		for _, b := range resp.Content {
+			if b.Type != ir.BlockRedactedReasoning {
+				t.Fatalf("content = %+v", resp.Content)
+			}
+		}
+		_, err = collectStreamResponseWithLimits(strings.NewReader(""), stream(events[:5]), nil, "m", nil, limit, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("error = %v, want response-too-large", err)
+		}
+	})
+
+	// Distinct thinking indices bill one overhead each on top of payload, so
+	// tiny signatures across many indices hit the budget proportionally.
+	t.Run("distinct thinking blocks charged overhead", func(t *testing.T) {
+		base := int64(len(ir.NewID("resp_")) + len("m"))
+		limit := base + 3*collectedBlockOverhead + 3
+		events := make([]ir.StreamEvent, 0, 4)
+		for i := 0; i < 4; i++ {
+			events = append(events, ir.StreamEvent{Kind: ir.EventReasoningSignature, Index: i, Signature: "s"})
+		}
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream(events[:3]), nil, "m", nil, limit, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if len(resp.Content) != 3 {
+			t.Fatalf("blocks = %+v", resp.Content)
+		}
+		for i, b := range resp.Content {
+			if b.Type != ir.BlockReasoning || b.Text != "" || b.AnthropicSignature != "s" {
+				t.Fatalf("block %d = %+v", i, b)
+			}
+		}
+		_, err = collectStreamResponseWithLimits(strings.NewReader(""), stream(events), nil, "m", nil, limit, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("error = %v, want response-too-large", err)
+		}
+	})
+
+	// Repeated updates to one block bill payload only; the overhead is charged
+	// exactly once and the threshold is byte-exact.
+	t.Run("repeated thinking updates charge once", func(t *testing.T) {
+		base := int64(len(ir.NewID("resp_")) + len("m"))
+		events := make([]ir.StreamEvent, 0, 20)
+		for i := 0; i < 10; i++ {
+			events = append(events,
+				ir.StreamEvent{Kind: ir.EventReasoningDelta, Indexed: true, Index: 7, Text: "ab"},
+				ir.StreamEvent{Kind: ir.EventReasoningSignature, Index: 7, Signature: "s"},
+			)
+		}
+		limit := base + collectedBlockOverhead + 30
+		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream(events), nil, "m", nil, limit, 10)
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		if len(resp.Content) != 1 || resp.Content[0].Text != strings.Repeat("ab", 10) || resp.Content[0].AnthropicSignature != strings.Repeat("s", 10) {
+			t.Fatalf("content = %+v", resp.Content)
+		}
+		_, err = collectStreamResponseWithLimits(strings.NewReader(""), stream(events), nil, "m", nil, limit-1, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("error = %v, want response-too-large", err)
+		}
+	})
+
+	// The dedicated block cap holds even with a generous byte budget.
+	t.Run("thinking and redacted block count bounded", func(t *testing.T) {
+		thinking := make([]ir.StreamEvent, 0, maxCollectedStreamBlocks+1)
+		for i := 0; i <= maxCollectedStreamBlocks; i++ {
+			thinking = append(thinking, ir.StreamEvent{Kind: ir.EventReasoningSignature, Index: i, Signature: "s"})
+		}
+		_, err := collectStreamResponseWithLimits(strings.NewReader(""), stream(thinking), nil, "m", nil, 1<<30, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("thinking error = %v, want response-too-large", err)
+		}
+		redacted := make([]ir.StreamEvent, 0, maxCollectedStreamBlocks+1)
+		for i := 0; i <= maxCollectedStreamBlocks; i++ {
+			redacted = append(redacted, ir.StreamEvent{Kind: ir.EventRedactedReasoning, Data: "d"})
+		}
+		_, err = collectStreamResponseWithLimits(strings.NewReader(""), stream(redacted), nil, "m", nil, 1<<30, 10)
+		if !errors.Is(err, errCollectedStreamResponseTooLarge) {
+			t.Fatalf("redacted error = %v, want response-too-large", err)
+		}
+	})
 }
 
 func TestCollectStreamResponseQoderMetadata(t *testing.T) {

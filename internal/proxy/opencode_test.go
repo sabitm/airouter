@@ -495,8 +495,8 @@ func TestOpencodeTranslatedIdentityDoesNotLeak(t *testing.T) {
 		cap.cookie = r.Header.Get("Cookie")
 		cap.custom = r.Header.Get("X-Custom")
 		cap.clientReq = r.Header.Get("x-client-request-id")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, openaiUpstreamBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, openaiSSE)
 	})
 
 	body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
@@ -543,14 +543,9 @@ func TestOpencodeTranslatedExplicitIdentityUnaryAndStream(t *testing.T) {
 	var last http.Header
 	base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
 		last = r.Header.Clone()
-		if r.Header.Get("Accept") == "text/event-stream" {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, openaiSSE)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, openaiUpstreamBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, openaiSSE)
 	})
 
 	send := func(stream bool) {
@@ -601,8 +596,8 @@ func TestOpencodeTranslatedBodySessionField(t *testing.T) {
 	var session string
 	base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
 		session = r.Header.Get("x-opencode-session")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, openaiUpstreamBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, openaiSSE)
 	})
 
 	body := `{"model":"default","prompt_cache_key":"cache-from-body","messages":[{"role":"user","content":"hi"}]}`
@@ -629,8 +624,8 @@ func TestOpencodeTranslatedZenFirstTurnDistinctAcrossProxies(t *testing.T) {
 		var session string
 		base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
 			session = r.Header.Get("x-opencode-session")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, openaiUpstreamBody)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, openaiSSE)
 		})
 		body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
 		req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
@@ -655,8 +650,8 @@ func TestOpencodeTranslatedInvalidBodySessionFallsBack(t *testing.T) {
 	var session string
 	base, token, _ := setupOpencodeTranslated(t, func(w http.ResponseWriter, r *http.Request) {
 		session = r.Header.Get("x-opencode-session")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, openaiUpstreamBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, openaiSSE)
 	})
 
 	body := `{"model":"default","prompt_cache_key":"bad\nvalue","messages":[{"role":"user","content":"hi"}]}`
@@ -682,8 +677,8 @@ func TestOpencodeTranslatedInvalidIdentityFallsBack(t *testing.T) {
 		session = r.Header.Get("x-opencode-session")
 		ua = r.Header.Get("User-Agent")
 		client = r.Header.Get("x-opencode-client")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, openaiUpstreamBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, openaiSSE)
 	})
 
 	body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`

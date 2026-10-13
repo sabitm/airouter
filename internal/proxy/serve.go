@@ -17,6 +17,7 @@ import (
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/media"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/thinking"
 	"airouter/internal/store"
 )
@@ -30,6 +31,14 @@ const usageEstimateCharsPerToken = 4
 const (
 	maxCollectedStreamResponseBytes = maxUnaryUpstreamResponseBytes
 	maxCollectedStreamToolCalls     = 1024
+	// maxCollectedStreamBlocks bounds indexed thinking plus redacted blocks so
+	// many distinct indices or a flood of empty redacted events cannot grow
+	// the extras bookkeeping without bound.
+	maxCollectedStreamBlocks = 1024
+	// collectedBlockOverhead approximates the per-block map entry, order slot,
+	// and builder cost billed to the byte budget before a block is allocated.
+	// Updates to an existing block never bill it again.
+	collectedBlockOverhead = 128
 )
 
 var (
@@ -746,7 +755,11 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		return retryableUpstreamStatus(status, respBody)
 	}
 
-	resp, err := backend.decodeResponse(respBody)
+	decodeResponse := backend.decodeResponse
+	if isOpencodeCodec(backend.id) {
+		decodeResponse = opencode.DecodeResponse(decodeResponse, opencodeToolMapFrom(ctx))
+	}
+	resp, err := decodeResponse(respBody)
 	if err != nil {
 		if _, ok := ir.AsStreamFailure(err); ok {
 			return retryableStreamFailure(err)
@@ -792,7 +805,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
 		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
-	irResp, err := collectStreamResponse(resp.Body, backend, writeFrame, upstreamModel, req.Tools)
+	irResp, err := collectStreamResponse(resp.Body, opencodeBackendForAttempt(ctx, backend), writeFrame, upstreamModel, req.Tools)
 	if err != nil {
 		// Client disconnect: duplex streams surface it as a body-closed read
 		// error (see forwardStreamDuplex). Stop quietly instead of failing
@@ -807,6 +820,9 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	}
 	if backend.protocol == domain.ProtocolCursor {
 		applyCursorUsage(req, irResp, len(upstreamBody))
+	}
+	if !preservesAnthropicThinking(ingress.id) && responseDropsOpaque(irResp.Content) {
+		noteOpaqueOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
 	out, err := ingress.encodeResponse(irResp)
 	if err != nil {
@@ -863,6 +879,19 @@ func applyCollectedUsage(u *ir.Usage, ev ir.StreamEvent) {
 	}
 }
 
+func opencodeBackendForAttempt(ctx context.Context, backend codec) codec {
+	if !isOpencodeCodec(backend.id) {
+		return backend
+	}
+	mapping := opencodeToolMapFrom(ctx)
+	if !mapping.Active() {
+		return backend
+	}
+	backend.decodeStream = opencode.DecodeStream(backend.decodeStream, mapping)
+	backend.decodeResponse = opencode.DecodeResponse(backend.decodeResponse, mapping)
+	return backend
+}
+
 func collectStreamResponse(r io.Reader, backend codec, writeFrame func([]byte) error, fallbackModel string, clientTools []ir.Tool) (*ir.Response, error) {
 	return collectStreamResponseWithLimits(r, backend, writeFrame, fallbackModel, clientTools, maxCollectedStreamResponseBytes, maxCollectedStreamToolCalls)
 }
@@ -895,6 +924,35 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		return nil
 	}
 	var text, reasoning strings.Builder
+	// Indexed thinking and redacted blocks keep their arrival order so an
+	// Anthropic-compatible unary rendering can replay signatures exactly.
+	// Unsigned empty lifecycle frames never create a block.
+	type thinkBlock struct {
+		text      strings.Builder
+		signature strings.Builder
+	}
+	type extraBlock struct {
+		redacted bool
+		data     string
+		think    *thinkBlock
+	}
+	thinking := map[int]*thinkBlock{}
+	var extras []*extraBlock
+	extraFor := func(index int) (*thinkBlock, error) {
+		if b := thinking[index]; b != nil {
+			return b, nil
+		}
+		if len(extras) >= maxCollectedStreamBlocks {
+			return nil, errCollectedStreamResponseTooLarge
+		}
+		if err := reserve(collectedBlockOverhead); err != nil {
+			return nil, err
+		}
+		b := &thinkBlock{}
+		thinking[index] = b
+		extras = append(extras, &extraBlock{think: b})
+		return b, nil
+	}
 	type toolBuf struct {
 		id   string
 		name string
@@ -929,6 +987,9 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			return kiro.DecodeStreamToolsTransport(clientTools, r, emit, backend.id == "kiro-runtime")
 		}
 	}
+	if decode == nil {
+		return nil, fmt.Errorf("backend has no stream decoder")
+	}
 	err := decode(r, func(ev ir.StreamEvent) error {
 		sawEvent = true
 		switch ev.Kind {
@@ -949,9 +1010,59 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 				return err
 			}
 		case ir.EventReasoningDelta:
-			if err := appendTo(&reasoning, ev.Text); err != nil {
+			if !ev.Indexed {
+				if err := appendTo(&reasoning, ev.Text); err != nil {
+					return err
+				}
+				break
+			}
+			if ev.Text == "" {
+				break
+			}
+			b, err := extraFor(ev.Index)
+			if err != nil {
 				return err
 			}
+			if err := appendTo(&b.text, ev.Text); err != nil {
+				return err
+			}
+		case ir.EventReasoningStart:
+			if ev.Text == "" && ev.Signature == "" {
+				break
+			}
+			b, err := extraFor(ev.Index)
+			if err != nil {
+				return err
+			}
+			if err := appendTo(&b.text, ev.Text); err != nil {
+				return err
+			}
+			if err := appendTo(&b.signature, ev.Signature); err != nil {
+				return err
+			}
+		case ir.EventReasoningSignature:
+			if ev.Signature == "" {
+				break
+			}
+			b, err := extraFor(ev.Index)
+			if err != nil {
+				return err
+			}
+			if err := appendTo(&b.signature, ev.Signature); err != nil {
+				return err
+			}
+		case ir.EventReasoningEnd:
+			// The block stays in extras; only its lifecycle ended.
+		case ir.EventRedactedReasoning:
+			if len(extras) >= maxCollectedStreamBlocks {
+				return errCollectedStreamResponseTooLarge
+			}
+			// The overhead is reserved with the payload so repeated empty
+			// redacted events stop at the budget before appending.
+			if err := reserve(collectedBlockOverhead + len(ev.Data)); err != nil {
+				return err
+			}
+			extras = append(extras, &extraBlock{redacted: true, data: ev.Data})
 		case ir.EventToolCallStart:
 			tb, err := newTool(ev.Index)
 			if err != nil {
@@ -1010,6 +1121,15 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 	}
 	if reasoning.Len() > 0 {
 		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockReasoning, Text: reasoning.String()})
+	}
+	for _, b := range extras {
+		if b.redacted {
+			resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockRedactedReasoning, RedactedData: b.data})
+			continue
+		}
+		resp.Content = append(resp.Content, ir.ContentBlock{
+			Type: ir.BlockReasoning, Text: b.think.text.String(), AnthropicSignature: b.think.signature.String(),
+		})
 	}
 	if text.Len() > 0 {
 		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText, Text: text.String()})

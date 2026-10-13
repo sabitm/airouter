@@ -121,24 +121,29 @@ func headerValue(h http.Header, key string) string {
 // Valid values are returned byte-for-byte after trimming.
 func NormalizeIdentity(v string) string {
 	v = strings.TrimSpace(v)
-	if v == "" || len(v) > maxIdentityBytes {
+	if v == "" || len(v) > maxIdentityBytes || !safeIdentity(v) {
 		return ""
-	}
-	for i := 0; i < len(v); i++ {
-		c := v[i]
-		if c < 0x20 || c == 0x7F {
-			return ""
-		}
 	}
 	return v
 }
 
+func safeIdentity(v string) bool {
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if c < 0x20 || c == 0x7F {
+			return false
+		}
+	}
+	return true
+}
+
 // IsVersionedUserAgent reports whether ua is a syntactically valid versioned
-// OpenCode User-Agent (opencode/<semver> with optional product suffixes).
-// Bare "opencode" and strings that merely contain "opencode" are rejected.
+// OpenCode User-Agent. Accepted forms are opencode/<semver> and the official
+// channel form opencode/<channel>/<semver>/<client>, each with optional product
+// suffixes. Bare "opencode" and strings that merely contain "opencode" are rejected.
 func IsVersionedUserAgent(ua string) bool {
 	ua = strings.TrimSpace(ua)
-	if ua == "" {
+	if ua == "" || !safeIdentity(ua) {
 		return false
 	}
 	const prefix = "opencode/"
@@ -149,8 +154,36 @@ func IsVersionedUserAgent(ua string) bool {
 	if rest == "" {
 		return false
 	}
-	ver, _, _ := strings.Cut(rest, " ")
-	return isOpenCodeVersion(ver)
+	token, _, _ := strings.Cut(rest, " ")
+	return isOpenCodeVersionToken(token)
+}
+
+func isOpenCodeVersionToken(token string) bool {
+	parts := strings.Split(token, "/")
+	switch len(parts) {
+	case 1:
+		return isOpenCodeVersion(parts[0])
+	case 3:
+		return isOpenCodeIdentitySegment(parts[0]) && isOpenCodeVersion(parts[1]) && isOpenCodeIdentitySegment(parts[2])
+	default:
+		return false
+	}
+}
+
+func isOpenCodeIdentitySegment(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.' || c == '_' || c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isOpenCodeVersion(ver string) bool {

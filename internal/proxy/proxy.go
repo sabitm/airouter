@@ -285,6 +285,17 @@ var opencodeMessagesCodec = codec{
 	newStreamEncoder: func(model string) streamEncoder { return anthropic.NewStreamEncoder(model) },
 }
 
+func opencodeCodecFor(baseURL, model string) codec {
+	switch opencode.Endpoint(opencode.Tier(baseURL), model) {
+	case opencode.EndpointResponses:
+		return opencodeResponsesCodec
+	case opencode.EndpointMessages:
+		return opencodeMessagesCodec
+	default:
+		return opencodeChatCodec
+	}
+}
+
 func backendCodec(p domain.Protocol, model string) codec {
 	return backendCodecForProvider(p, nil, model)
 }
@@ -316,14 +327,13 @@ func backendCodecForProvider(p domain.Protocol, provider *domain.Provider, model
 	case domain.ProtocolClaudeCode:
 		return claudeCodeCodec
 	case domain.ProtocolOpencode:
-		switch opencode.Endpoint(opencode.Tier(baseURL), model) {
-		case opencode.EndpointResponses:
-			return opencodeResponsesCodec
-		case opencode.EndpointMessages:
-			return opencodeMessagesCodec
-		default:
-			return opencodeChatCodec
+		c := opencodeCodecFor(baseURL, model)
+		// Free Zen models are stream-only. The shared codec values stay false so
+		// a paid model on the same codec is not forced onto the collector.
+		if opencode.NeedsFreeTier(baseURL, model) {
+			c.streamOnly = true
 		}
+		return c
 	default:
 		return openaiCodec
 	}
