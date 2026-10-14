@@ -10,7 +10,25 @@ import (
 // max_output_tokens on the muse-spark Responses endpoint.
 const museSparkMinOutputTokens = 16
 
-// maxEffortForMuseSpark clamps reasoning effort: muse-spark accepts up to
+// museSparkModels are the catalog Responses IDs that reject max/ultra/none
+// and enforce the output-token floor. Matching is exact after the same
+// vendor-prefix and (level) normalization used by catalog lookup, so a
+// similarly named unsupported model is left unchanged.
+var museSparkModels = map[string]struct{}{
+	"muse-spark-1.2":                  {},
+	"muse-spark-1.2-contributor-free": {},
+	"muse-spark-1.3":                  {},
+	"muse-spark-1.3-contributor-free": {},
+	"muse-spark-1.2-contributor":      {},
+	"muse-spark-1.3-contributor":      {},
+}
+
+func isMuseSparkModel(model string) bool {
+	_, ok := museSparkModels[NormalizeModelID(model)]
+	return ok
+}
+
+// clampMuseSparkEffort clamps reasoning effort: muse-spark accepts up to
 // xhigh; max/ultra are rejected by the upstream.
 func clampMuseSparkEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
@@ -21,10 +39,12 @@ func clampMuseSparkEffort(effort string) string {
 	}
 }
 
-// PrepareMuseSparkResponse normalizes a muse-spark Responses body after the
-// generic reasoning finalizer: clamps max/ultra to xhigh, removes an explicit
-// none (the upstream rejects reasoning.effort=none with this model), defaults
-// summary to auto, and lifts max_output_tokens to the upstream floor.
+// PrepareMuseSparkResponse normalizes a supported muse-spark Responses body
+// after the generic reasoning finalizer: clamps max/ultra to xhigh, removes an
+// explicit none (the upstream rejects reasoning.effort=none with this model),
+// defaults summary to auto, and lifts max_output_tokens to the upstream floor.
+// Other models, including other OpenCode Responses models, are returned
+// unchanged. Invalid JSON and non-objects are still rejected.
 func PrepareMuseSparkResponse(body []byte) ([]byte, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -32,6 +52,9 @@ func PrepareMuseSparkResponse(body []byte) ([]byte, error) {
 	}
 	if m == nil {
 		return nil, fmt.Errorf("not a JSON object")
+	}
+	if !isMuseSparkModel(rawString(m["model"])) {
+		return body, nil
 	}
 	if rawReasoning, ok := m["reasoning"]; ok {
 		var r map[string]json.RawMessage

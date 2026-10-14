@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -895,7 +896,11 @@ func TestOpencodeMiniMaxMiMoCaps(t *testing.T) {
 
 func prepareOpencodeTranslated(t *testing.T, ingress codec, ingressBody []byte, upstreamModel string) map[string]any {
 	t.Helper()
-	p := opencodeTestProvider()
+	return prepareOpencodeTranslatedOn(t, opencodeTestProvider(), ingress, ingressBody, upstreamModel)
+}
+
+func prepareOpencodeTranslatedOn(t *testing.T, p *domain.Provider, ingress codec, ingressBody []byte, upstreamModel string) map[string]any {
+	t.Helper()
 	req, err := ingress.decodeRequest(ingressBody)
 	if err != nil {
 		t.Fatal(err)
@@ -1141,6 +1146,88 @@ func TestOpencodeTranslatedMiMoUnaryAndStreamStripReasoning(t *testing.T) {
 			t.Fatalf("stream=%v upstream body=%v", stream, got)
 		}
 		assertNoRecognizedReasoningControls(t, got)
+	}
+}
+
+func TestOpencodeResponsesPreservesGPTEffortAndOutputCap(t *testing.T) {
+	cases := []struct {
+		name   string
+		base   string
+		model  string
+		effort string
+		stream bool
+	}{
+		{name: "zen max", base: opencode.ZenBaseURL, model: "gpt-5.6-luna", effort: "max", stream: false},
+		{name: "zen none", base: opencode.ZenBaseURL, model: "gpt-5.6-luna", effort: "none", stream: true},
+		{name: "go max", base: opencode.GoBaseURL, model: "gpt-5.6-luna", effort: "max", stream: true},
+		{name: "go none", base: opencode.GoBaseURL, model: "gpt-5.6-luna", effort: "none", stream: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := opencodeTestProvider()
+			p.BaseURL = tc.base
+			ingresses := []struct {
+				name    string
+				ingress codec
+				body    string
+			}{
+				{
+					name:    "chat",
+					ingress: openaiCodec,
+					body:    fmt.Sprintf(`{"model":"combo","stream":%t,"reasoning_effort":%q,"max_completion_tokens":8,"messages":[{"role":"user","content":"hi"}]}`, tc.stream, tc.effort),
+				},
+				{
+					name:    "responses",
+					ingress: responsesCodec,
+					body:    fmt.Sprintf(`{"model":"combo","stream":%t,"reasoning":{"effort":%q},"max_output_tokens":8,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`, tc.stream, tc.effort),
+				},
+			}
+			for _, ing := range ingresses {
+				t.Run(ing.name, func(t *testing.T) {
+					got := prepareOpencodeTranslatedOn(t, p, ing.ingress, []byte(ing.body), tc.model)
+					if got["model"] != tc.model {
+						t.Fatalf("model = %v", got["model"])
+					}
+					if got["stream"] != tc.stream {
+						t.Fatalf("stream = %v, want %v", got["stream"], tc.stream)
+					}
+					if got["max_output_tokens"] != float64(8) {
+						t.Fatalf("max_output_tokens = %v, want 8", got["max_output_tokens"])
+					}
+					reasoning, _ := got["reasoning"].(map[string]any)
+					if reasoning["effort"] != tc.effort || reasoning["summary"] != "auto" {
+						t.Fatalf("reasoning = %+v, want effort %s and generated summary", reasoning, tc.effort)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestOpencodeResponsesMuseSparkNormalizationSurvivesPreparation(t *testing.T) {
+	cases := []struct {
+		base  string
+		model string
+	}{
+		{opencode.ZenBaseURL, "muse-spark-1.2"},
+		{opencode.ZenBaseURL, "muse-spark-1.3-contributor-free"},
+		{opencode.GoBaseURL, "muse-spark-1.2-contributor"},
+		{opencode.GoBaseURL, "muse-spark-1.3-contributor"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			p := opencodeTestProvider()
+			p.BaseURL = tc.base
+			body := []byte(`{"model":"combo","reasoning":{"effort":"max"},"max_output_tokens":8,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+			got := prepareOpencodeTranslatedOn(t, p, responsesCodec, body, tc.model)
+			reasoning, _ := got["reasoning"].(map[string]any)
+			if reasoning["effort"] != "xhigh" || reasoning["summary"] != "auto" {
+				t.Fatalf("reasoning = %+v", reasoning)
+			}
+			if got["max_output_tokens"] != float64(16) {
+				t.Fatalf("max_output_tokens = %v, want 16", got["max_output_tokens"])
+			}
+		})
 	}
 }
 

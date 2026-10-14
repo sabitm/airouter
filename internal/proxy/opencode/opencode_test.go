@@ -305,6 +305,31 @@ func TestPrepareMuseSparkResponse(t *testing.T) {
 			in:   `{"model":"muse-spark-1.2","max_output_tokens":8}`,
 			want: map[string]any{"max_output_tokens": 16.0},
 		},
+		{
+			name: "zen 1.3 clamps and floors",
+			in:   `{"model":"muse-spark-1.3","reasoning":{"effort":"max"},"max_output_tokens":8}`,
+			want: map[string]any{"reasoning": map[string]any{"effort": "xhigh", "summary": "auto"}, "max_output_tokens": 16.0},
+		},
+		{
+			name: "zen 1.3 free drops none",
+			in:   `{"model":"muse-spark-1.3-contributor-free","reasoning":{"effort":"none"},"max_output_tokens":8}`,
+			want: map[string]any{"max_output_tokens": 16.0},
+		},
+		{
+			name: "go 1.2 clamps ultra",
+			in:   `{"model":"muse-spark-1.2-contributor","reasoning":{"effort":"ultra"}}`,
+			want: map[string]any{"reasoning": map[string]any{"effort": "xhigh", "summary": "auto"}},
+		},
+		{
+			name: "go 1.3 floors and defaults summary",
+			in:   `{"model":"muse-spark-1.3-contributor","reasoning":{"effort":"high"},"max_output_tokens":1}`,
+			want: map[string]any{"reasoning": map[string]any{"effort": "high", "summary": "auto"}, "max_output_tokens": 16.0},
+		},
+		{
+			name: "vendor prefix and level suffix still match",
+			in:   `{"model":"openai/muse-spark-1.2(high)","reasoning":{"effort":"max"},"max_output_tokens":4}`,
+			want: map[string]any{"reasoning": map[string]any{"effort": "xhigh", "summary": "auto"}, "max_output_tokens": 16.0},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -327,11 +352,16 @@ func TestPrepareMuseSparkResponse(t *testing.T) {
 					t.Fatalf("key %q = %s, want %s", k, gj, wj)
 				}
 			}
+			if _, wantReasoning := tc.want["reasoning"]; !wantReasoning {
+				if _, ok := got["reasoning"]; ok {
+					t.Fatalf("reasoning remained: %v", got["reasoning"])
+				}
+			}
 		})
 	}
 
 	t.Run("preserves large sibling numbers while flooring", func(t *testing.T) {
-		in := []byte(`{"max_output_tokens":8,"n":9050000000000000001,"huge":1e400}`)
+		in := []byte(`{"model":"muse-spark-1.2","max_output_tokens":8,"n":9050000000000000001,"huge":1e400}`)
 		out, err := PrepareMuseSparkResponse(in)
 		if err != nil {
 			t.Fatalf("PrepareMuseSparkResponse: %v", err)
@@ -349,7 +379,7 @@ func TestPrepareMuseSparkResponse(t *testing.T) {
 	})
 
 	t.Run("fractional max_output_tokens unchanged", func(t *testing.T) {
-		in := []byte(`{"max_output_tokens":8.5}`)
+		in := []byte(`{"model":"muse-spark-1.2","max_output_tokens":8.5}`)
 		out, err := PrepareMuseSparkResponse(in)
 		if err != nil {
 			t.Fatalf("PrepareMuseSparkResponse: %v", err)
@@ -359,8 +389,105 @@ func TestPrepareMuseSparkResponse(t *testing.T) {
 		}
 	})
 
+	t.Run("null floor and effort keep original muse behavior", func(t *testing.T) {
+		in := []byte(`{"model":"muse-spark-1.2","reasoning":{"effort":null,"summary":"detailed"},"max_output_tokens":null}`)
+		out, err := PrepareMuseSparkResponse(in)
+		if err != nil {
+			t.Fatalf("PrepareMuseSparkResponse: %v", err)
+		}
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("unmarshal output: %v", err)
+		}
+		if string(got["max_output_tokens"]) != "16" {
+			t.Fatalf("max_output_tokens = %s, want 16", got["max_output_tokens"])
+		}
+		var reasoning map[string]json.RawMessage
+		if err := json.Unmarshal(got["reasoning"], &reasoning); err != nil {
+			t.Fatalf("unmarshal reasoning: %v", err)
+		}
+		if _, ok := reasoning["effort"]; ok {
+			t.Fatalf("null effort remained: %s", reasoning["effort"])
+		}
+		if string(reasoning["summary"]) != `"detailed"` {
+			t.Fatalf("summary = %s, want detailed", reasoning["summary"])
+		}
+	})
+
+	t.Run("nested schema bytes survive muse mutation", func(t *testing.T) {
+		// Duplicate members do not survive decoding into a map and encoding
+		// again. The outer marshal compacts insignificant whitespace, so the
+		// fixture uses duplicates rather than spacing as the visible difference.
+		schema := `{"type":"object","type":"string","description":"keep  me"}`
+		in := []byte(`{"model":"muse-spark-1.2","reasoning":{"effort":"max"},"max_output_tokens":8,"tools":[{"schema":` + schema + `}]}`)
+		out, err := PrepareMuseSparkResponse(in)
+		if err != nil {
+			t.Fatalf("PrepareMuseSparkResponse: %v", err)
+		}
+		var root map[string]json.RawMessage
+		if err := json.Unmarshal(out, &root); err != nil {
+			t.Fatalf("unmarshal output: %v", err)
+		}
+		var tools []json.RawMessage
+		if err := json.Unmarshal(root["tools"], &tools); err != nil {
+			t.Fatalf("unmarshal tools: %v", err)
+		}
+		if len(tools) != 1 {
+			t.Fatalf("tools = %d, want 1", len(tools))
+		}
+		var tool map[string]json.RawMessage
+		if err := json.Unmarshal(tools[0], &tool); err != nil {
+			t.Fatalf("unmarshal tool: %v", err)
+		}
+		if string(tool["schema"]) != schema {
+			t.Fatalf("schema reserialized: got %q, want %q", tool["schema"], schema)
+		}
+		var reasoning map[string]json.RawMessage
+		if err := json.Unmarshal(root["reasoning"], &reasoning); err != nil {
+			t.Fatalf("unmarshal reasoning: %v", err)
+		}
+		if string(reasoning["effort"]) != `"xhigh"` || string(reasoning["summary"]) != `"auto"` {
+			t.Fatalf("reasoning not updated: %s", root["reasoning"])
+		}
+		if string(root["max_output_tokens"]) != "16" {
+			t.Fatalf("max_output_tokens = %s, want 16", root["max_output_tokens"])
+		}
+	})
+
+	t.Run("non-muse responses body is not mutated", func(t *testing.T) {
+		for _, in := range []string{
+			`{"model":"gpt-5.6-luna","reasoning":{"effort":"max"},"max_output_tokens":8}`,
+			`{"model":"gpt-5.6-luna","reasoning":{"effort":"none"},"max_output_tokens":8}`,
+			`{"model":"gpt-5.6-luna","reasoning":{"effort":null},"max_output_tokens":null}`,
+			`{"model":"muse-spark-1.4","reasoning":{"effort":"max"},"max_output_tokens":8}`,
+			`{"model":"muse-spark","reasoning":{"effort":"none"},"max_output_tokens":4}`,
+			`{"model":"not-muse-spark-1.2","reasoning":{"effort":"ultra"},"max_output_tokens":1}`,
+			`{"reasoning":{"effort":"max"},"max_output_tokens":8}`,
+		} {
+			out, err := PrepareMuseSparkResponse([]byte(in))
+			if err != nil {
+				t.Fatalf("PrepareMuseSparkResponse(%s): %v", in, err)
+			}
+			if string(out) != in {
+				t.Fatalf("mutated %s into %s", in, out)
+			}
+		}
+	})
+
 	t.Run("top-level null rejected", func(t *testing.T) {
 		if _, err := PrepareMuseSparkResponse([]byte("null")); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("malformed json rejected", func(t *testing.T) {
+		if _, err := PrepareMuseSparkResponse([]byte(`{"model":`)); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("trailing data rejected", func(t *testing.T) {
+		if _, err := PrepareMuseSparkResponse([]byte(`{"model":"gpt-5.6-luna"} {"b":1}`)); err == nil {
 			t.Fatal("expected error")
 		}
 	})
