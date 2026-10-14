@@ -280,10 +280,11 @@ func TestOpencodeStreamResponseReasoningPreserved(t *testing.T) {
 
 func TestApplyOpencodeHeaders(t *testing.T) {
 	trace := &TraceInfo{OpencodeSessionID: "ses_abc"}
-	req, _ := http.NewRequestWithContext(WithTraceInfo(context.Background(), trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
-	// A forwarded client UA that is not opencode must be replaced.
+	req, _ := http.NewRequestWithContext(WithTraceInfo(context.Background(), trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", strings.NewReader(`{"model":"deepseek-v4-pro"}`))
+	// A forwarded client UA that is not opencode must be replaced. Paid Zen keeps
+	// the desktop fingerprint and does not synthesize a session-id mirror.
 	req.Header.Set("User-Agent", "some-agent/1.0")
-	applyUpstreamHeaders(req, opencodeTestProvider(), http.Header{}, req.Context(), nil)
+	applyUpstreamHeaders(req, opencodeTestProvider(), http.Header{}, req.Context(), []byte(`{"model":"deepseek-v4-pro"}`))
 	if got := req.Header.Get("User-Agent"); got != opencode.UserAgent {
 		t.Fatalf("User-Agent = %q", got)
 	}
@@ -300,8 +301,50 @@ func TestApplyOpencodeHeaders(t *testing.T) {
 	if got := req.Header.Get("x-opencode-request"); !opencode.IsNativeRequestID(got) {
 		t.Fatalf("x-opencode-request = %q", got)
 	}
+	if got := req.Header.Get(opencode.SessionIDHeader); got != "" {
+		t.Fatalf("paid request synthesized %s: %q", opencode.SessionIDHeader, got)
+	}
 	if got := req.Header.Get("Authorization"); got != "Bearer public" {
 		t.Fatalf("Authorization = %q", got)
+	}
+}
+
+func TestApplyOpencodeFreeHeaders(t *testing.T) {
+	native := "ses_0123456789abABCDEFGHIJKLMN"
+	body := []byte(`{"model":"big-pickle"}`)
+	trace := &TraceInfo{OpencodeSessionID: native}
+	req, _ := http.NewRequestWithContext(WithTraceInfo(context.Background(), trace), http.MethodPost, opencode.ZenBaseURL+"/chat/completions", strings.NewReader(string(body)))
+	req.Header.Set("User-Agent", "curl/8.0")
+	req.Header.Add(opencode.SessionIDHeader, "ses_0123456789abOTHERSESSIONID")
+	req.Header.Add(opencode.SessionIDHeader, native+"\r\nX-Injected: 1")
+	applyUpstreamHeaders(req, opencodeTestProvider(), nil, req.Context(), body)
+	if got := req.Header.Get("User-Agent"); got != opencode.FreeUserAgent {
+		t.Fatalf("free UA = %q", got)
+	}
+	if got := req.Header.Get("x-opencode-client"); got != opencode.FreeClient {
+		t.Fatalf("free client = %q", got)
+	}
+	if got := req.Header.Get("x-opencode-session"); got != native {
+		t.Fatalf("session = %q", got)
+	}
+	if got := req.Header.Values(opencode.SessionIDHeader); len(got) != 1 || got[0] != native {
+		t.Fatalf("session id mirror = %v", got)
+	}
+
+	goProvider := opencodeTestProvider()
+	goProvider.BaseURL = opencode.GoBaseURL
+	goReq, _ := http.NewRequest(http.MethodPost, opencode.GoBaseURL+"/chat/completions", nil)
+	applyUpstreamHeaders(goReq, goProvider, nil, context.Background(), []byte(`{"model":"ox-alpha-free"}`))
+	if goReq.Header.Get("User-Agent") != opencode.UserAgent || goReq.Header.Get("x-opencode-client") != "desktop" || goReq.Header.Get(opencode.SessionIDHeader) != "" {
+		t.Fatalf("Go free-id identity changed: %v", goReq.Header)
+	}
+
+	other := &domain.Provider{Name: "openai", BaseURL: opencode.ZenBaseURL, APIKey: "k", Protocol: domain.ProtocolOpenAI}
+	otherReq, _ := http.NewRequest(http.MethodPost, opencode.ZenBaseURL+"/chat/completions", nil)
+	otherReq.Header.Set("User-Agent", "caller/1")
+	applyUpstreamHeaders(otherReq, other, nil, context.Background(), body)
+	if otherReq.Header.Get("User-Agent") != "caller/1" || otherReq.Header.Get("x-opencode-client") != "" || otherReq.Header.Get(opencode.SessionIDHeader) != "" {
+		t.Fatalf("non-opencode protocol received OpenCode identity: %v", otherReq.Header)
 	}
 }
 
@@ -325,17 +368,20 @@ func TestOpencodeChatAndResponsesShareSessionPolicy(t *testing.T) {
 	p := opencodeTestProvider()
 	p.ID = 3
 	chatBody := []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)
-	respBody := []byte(`{"model":"muse-spark-1.2","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	respBody := []byte(`{"model":"muse-spark-1.3-contributor-free","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
 	chatTrace := &TraceInfo{}
 	respTrace := &TraceInfo{}
 	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), chatTrace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, chatBody); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), respTrace), backendCodec(domain.ProtocolOpencode, "muse-spark-1.2"), p, respBody); err != nil {
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), respTrace), backendCodec(domain.ProtocolOpencode, "muse-spark-1.3-contributor-free"), p, respBody); err != nil {
 		t.Fatal(err)
 	}
 	if chatTrace.OpencodeSessionID == "" || chatTrace.OpencodeSessionID != respTrace.OpencodeSessionID {
-		t.Fatalf("chat/responses first-turn sessions differ: %q vs %q", chatTrace.OpencodeSessionID, respTrace.OpencodeSessionID)
+		t.Fatalf("free chat/responses first-turn sessions differ: %q vs %q", chatTrace.OpencodeSessionID, respTrace.OpencodeSessionID)
+	}
+	if !opencode.IsNativeSessionID(chatTrace.OpencodeSessionID) {
+		t.Fatalf("free shared session = %q", chatTrace.OpencodeSessionID)
 	}
 
 	h := http.Header{}
@@ -347,11 +393,32 @@ func TestOpencodeChatAndResponsesShareSessionPolicy(t *testing.T) {
 	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, chatTrace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, chatBody); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, respTrace), backendCodec(domain.ProtocolOpencode, "muse-spark-1.2"), p, respBody); err != nil {
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, respTrace), backendCodec(domain.ProtocolOpencode, "muse-spark-1.3-contributor-free"), p, respBody); err != nil {
 		t.Fatal(err)
 	}
 	if chatTrace.OpencodeSessionID != nativeShared || respTrace.OpencodeSessionID != nativeShared {
 		t.Fatalf("explicit session not shared: %q vs %q", chatTrace.OpencodeSessionID, respTrace.OpencodeSessionID)
+	}
+
+	paidBody := []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	goBody := []byte(`{"model":"minimax-m3","messages":[{"role":"user","content":"hi"}]}`)
+	paid := opencodeTestProvider()
+	paid.ID = 3
+	goProvider := opencodeTestProvider()
+	goProvider.ID = 3
+	goProvider.BaseURL = opencode.GoBaseURL
+	wantPaid := opencode.ResolveSession(opencode.Identity{}, px.opencodeNonce, paid.ID, paid.BaseURL, paid.APIKey, "")
+	wantGo := opencode.ResolveSession(opencode.Identity{}, px.opencodeNonce, goProvider.ID, goProvider.BaseURL, goProvider.APIKey, "")
+	paidTrace := &TraceInfo{}
+	goTrace := &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), paidTrace), backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro"), paid, paidBody); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), goTrace), backendCodec(domain.ProtocolOpencode, "minimax-m3"), goProvider, goBody); err != nil {
+		t.Fatal(err)
+	}
+	if paidTrace.OpencodeSessionID != wantPaid || goTrace.OpencodeSessionID != wantGo {
+		t.Fatalf("paid/go legacy sessions changed: paid %q want %q go %q want %q", paidTrace.OpencodeSessionID, wantPaid, goTrace.OpencodeSessionID, wantGo)
 	}
 }
 
@@ -393,11 +460,14 @@ func TestOpencodeRequestIDFreshPerSendUnlessClientSupplied(t *testing.T) {
 		t.Fatal(err)
 	}
 	req1, _ := http.NewRequestWithContext(WithTraceInfo(ctx, trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
-	applyUpstreamHeaders(req1, p, nil, req1.Context(), nil)
+	applyUpstreamHeaders(req1, p, nil, req1.Context(), body)
 	req2, _ := http.NewRequestWithContext(WithTraceInfo(ctx, trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
-	applyUpstreamHeaders(req2, p, nil, req2.Context(), nil)
+	applyUpstreamHeaders(req2, p, nil, req2.Context(), body)
 	if !opencode.IsNativeSessionID(req1.Header.Get("x-opencode-session")) || req1.Header.Get("x-opencode-session") != req2.Header.Get("x-opencode-session") {
 		t.Fatalf("session not stable across sends: %q vs %q", req1.Header.Get("x-opencode-session"), req2.Header.Get("x-opencode-session"))
+	}
+	if req1.Header.Get(opencode.SessionIDHeader) != req1.Header.Get("x-opencode-session") || req2.Header.Get(opencode.SessionIDHeader) != req2.Header.Get("x-opencode-session") {
+		t.Fatalf("free session mirror drifted: %q %q", req1.Header.Get(opencode.SessionIDHeader), req2.Header.Get(opencode.SessionIDHeader))
 	}
 	if !opencode.IsNativeRequestID(req1.Header.Get("x-opencode-request")) || !opencode.IsNativeRequestID(req2.Header.Get("x-opencode-request")) || req1.Header.Get("x-opencode-request") == req2.Header.Get("x-opencode-request") {
 		t.Fatalf("request id not fresh: %q vs %q", req1.Header.Get("x-opencode-request"), req2.Header.Get("x-opencode-request"))
@@ -412,7 +482,7 @@ func TestOpencodeRequestIDFreshPerSendUnlessClientSupplied(t *testing.T) {
 		t.Fatal(err)
 	}
 	req3, _ := http.NewRequestWithContext(WithTraceInfo(ctx, trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
-	applyUpstreamHeaders(req3, p, nil, req3.Context(), nil)
+	applyUpstreamHeaders(req3, p, nil, req3.Context(), body)
 	if req3.Header.Get("x-opencode-request") != nativeReq {
 		t.Fatalf("client request id lost: %q", req3.Header.Get("x-opencode-request"))
 	}
@@ -431,11 +501,12 @@ func TestApplyOpencodeHeadersFromCapturedIdentity(t *testing.T) {
 	trace := &TraceInfo{}
 	px := New(nil, nil)
 	p := opencodeTestProvider()
-	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, trace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)); err != nil {
+	body := []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, trace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, body); err != nil {
 		t.Fatal(err)
 	}
 	req, _ := http.NewRequestWithContext(WithTraceInfo(ctx, trace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
-	applyUpstreamHeaders(req, p, nil, req.Context(), nil)
+	applyUpstreamHeaders(req, p, nil, req.Context(), body)
 	if got := req.Header.Get("User-Agent"); got != "opencode/0.16.7" {
 		t.Fatalf("UA = %q", got)
 	}
@@ -451,6 +522,85 @@ func TestApplyOpencodeHeadersFromCapturedIdentity(t *testing.T) {
 	if got := req.Header.Get("x-opencode-session"); got != nativeSes {
 		t.Fatalf("session = %q", got)
 	}
+	if got := req.Header.Get(opencode.SessionIDHeader); got != nativeSes {
+		t.Fatalf("session id mirror = %q", got)
+	}
+	if trace.OpencodeSessionID != nativeSes {
+		t.Fatalf("trace session = %q", trace.OpencodeSessionID)
+	}
+
+	generic := http.Header{}
+	generic.Set("x-session-id", "client-session")
+	genericCtx := withOpencodeRequest(context.Background(), px.opencodeNonce, generic, nil)
+	genericTrace := &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(genericCtx, genericTrace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, body); err != nil {
+		t.Fatal(err)
+	}
+	genericReq, _ := http.NewRequestWithContext(WithTraceInfo(genericCtx, genericTrace), http.MethodPost, "https://opencode.ai/zen/v1/chat/completions", nil)
+	applyUpstreamHeaders(genericReq, p, generic, genericReq.Context(), body)
+	if genericReq.Header.Get("x-opencode-session") != genericTrace.OpencodeSessionID || genericReq.Header.Get(opencode.SessionIDHeader) != genericTrace.OpencodeSessionID {
+		t.Fatalf("free mapped session not preferred: header %q mirror %q trace %q", genericReq.Header.Get("x-opencode-session"), genericReq.Header.Get(opencode.SessionIDHeader), genericTrace.OpencodeSessionID)
+	}
+	if genericTrace.OpencodeSessionID == opencode.NativeSessionID("client-session") {
+		t.Fatal("free header path kept the legacy generic hash")
+	}
+}
+
+func TestOpencodeFreeMappedSessionStableAndScoped(t *testing.T) {
+	px := New(nil, nil)
+	p := opencodeTestProvider()
+	p.ID = 4
+	body := []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)
+	h := http.Header{}
+	h.Set("x-session-id", "client-session")
+	ctx := withOpencodeRequest(context.Background(), px.opencodeNonce, h, nil)
+	trace1 := &TraceInfo{}
+	trace2 := &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, trace1), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, trace2), backendCodec(domain.ProtocolOpencode, "muse-spark-1.3-contributor-free"), p, []byte(`{"model":"muse-spark-1.3-contributor-free","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !opencode.IsNativeSessionID(trace1.OpencodeSessionID) || trace1.OpencodeSessionID != trace2.OpencodeSessionID {
+		t.Fatalf("generic free session not stable across families: %q %q", trace1.OpencodeSessionID, trace2.OpencodeSessionID)
+	}
+	if trace1.OpencodeSessionID == opencode.NativeSessionID("client-session") {
+		t.Fatal("free generic session used the legacy hash")
+	}
+
+	other := New(nil, nil)
+	otherTrace := &TraceInfo{}
+	if _, err := other.prepareUpstreamRequest(WithTraceInfo(context.Background(), otherTrace), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, body); err != nil {
+		t.Fatal(err)
+	}
+	if otherTrace.OpencodeSessionID == trace1.OpencodeSessionID {
+		t.Fatal("free fallback leaked across Proxy instances")
+	}
+
+	paid := &TraceInfo{}
+	paidBody := []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(ctx, paid), backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro"), p, paidBody); err != nil {
+		t.Fatal(err)
+	}
+	wantPaid := opencode.ResolveSession(opencode.Identity{Session: "client-session"}, px.opencodeNonce, p.ID, p.BaseURL, p.APIKey, "")
+	if paid.OpencodeSessionID != wantPaid {
+		t.Fatalf("paid attempt inherited free mapping: %q want %q", paid.OpencodeSessionID, wantPaid)
+	}
+
+	p2 := opencodeTestProvider()
+	p2.ID = 9
+	fallback1 := &TraceInfo{}
+	fallback2 := &TraceInfo{}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), fallback1), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), fallback2), backendCodec(domain.ProtocolOpencode, "big-pickle"), p2, body); err != nil {
+		t.Fatal(err)
+	}
+	if fallback1.OpencodeSessionID == "" || fallback1.OpencodeSessionID == fallback2.OpencodeSessionID || fallback1.OpencodeSessionID == trace1.OpencodeSessionID {
+		t.Fatalf("free fallback not provider-scoped: %q %q client %q", fallback1.OpencodeSessionID, fallback2.OpencodeSessionID, trace1.OpencodeSessionID)
+	}
 }
 
 func TestApplyOpencodeHeadersIgnoresInvalidPassthroughIdentity(t *testing.T) {
@@ -460,7 +610,7 @@ func TestApplyOpencodeHeadersIgnoresInvalidPassthroughIdentity(t *testing.T) {
 	clientHeaders.Set("x-opencode-session", "ses_ok\r\nX-Injected: 1")
 	clientHeaders.Set("x-opencode-client", strings.Repeat("c", 300))
 	trace := &TraceInfo{OpencodeSessionID: "ses_fallback"}
-	applyUpstreamHeaders(req, opencodeTestProvider(), clientHeaders, WithTraceInfo(context.Background(), trace), nil)
+	applyUpstreamHeaders(req, opencodeTestProvider(), clientHeaders, WithTraceInfo(context.Background(), trace), []byte(`{"model":"deepseek-v4-pro"}`))
 	if got := req.Header.Get("User-Agent"); got != opencode.UserAgent {
 		t.Fatalf("UA = %q", got)
 	}
@@ -470,6 +620,9 @@ func TestApplyOpencodeHeadersIgnoresInvalidPassthroughIdentity(t *testing.T) {
 	}
 	if got := req.Header.Get("x-opencode-client"); got != "desktop" {
 		t.Fatalf("client = %q", got)
+	}
+	if got := req.Header.Get(opencode.SessionIDHeader); got != "" {
+		t.Fatalf("paid request synthesized session id: %q", got)
 	}
 }
 
@@ -518,9 +671,8 @@ func TestOpencodeTranslatedIdentityDoesNotLeak(t *testing.T) {
 	if cap.auth != "Bearer public" {
 		t.Fatalf("auth leaked or missing: %q", cap.auth)
 	}
-	wantSession := opencode.NativeSessionID("client-req")
-	if cap.session != wantSession {
-		t.Fatalf("generic request id not mapped as session: %q want %q", cap.session, wantSession)
+	if !opencode.IsNativeSessionID(cap.session) || cap.session == opencode.NativeSessionID("client-req") {
+		t.Fatalf("generic request id not proxy-mapped: %q", cap.session)
 	}
 	if cap.clientReq != "" {
 		t.Fatalf("x-client-request-id leaked: %q", cap.clientReq)
@@ -528,10 +680,10 @@ func TestOpencodeTranslatedIdentityDoesNotLeak(t *testing.T) {
 	if cap.cookie != "" || cap.custom != "" {
 		t.Fatalf("unrelated headers leaked cookie=%q custom=%q", cap.cookie, cap.custom)
 	}
-	if cap.ua != opencode.UserAgent {
+	if cap.ua != opencode.FreeUserAgent {
 		t.Fatalf("non-opencode UA = %q", cap.ua)
 	}
-	if cap.client != "desktop" || cap.project != "global" {
+	if cap.client != opencode.FreeClient || cap.project != "global" {
 		t.Fatalf("defaults missing client=%q project=%q", cap.client, cap.project)
 	}
 	if !opencode.IsNativeRequestID(cap.request) {
@@ -612,9 +764,8 @@ func TestOpencodeTranslatedBodySessionField(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, out)
 	}
-	wantSession := opencode.NativeSessionID("cache-from-body")
-	if session != wantSession {
-		t.Fatalf("body session = %q want %q", session, wantSession)
+	if !opencode.IsNativeSessionID(session) || session == opencode.NativeSessionID("cache-from-body") {
+		t.Fatalf("body session not proxy-mapped: %q", session)
 	}
 }
 
@@ -700,10 +851,10 @@ func TestOpencodeTranslatedInvalidIdentityFallsBack(t *testing.T) {
 	if !opencode.IsNativeSessionID(session) || strings.Contains(session, "\n") || strings.Contains(session, "\r") {
 		t.Fatalf("fallback session = %q", session)
 	}
-	if ua != opencode.UserAgent {
+	if ua != opencode.FreeUserAgent {
 		t.Fatalf("UA = %q", ua)
 	}
-	if client != "desktop" {
+	if client != opencode.FreeClient {
 		t.Fatalf("client = %q", client)
 	}
 }

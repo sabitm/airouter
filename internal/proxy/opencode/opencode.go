@@ -16,7 +16,11 @@ import (
 
 const (
 	// ZenBaseURL is the free tier: Bearer "public" plus client fingerprint.
-	ZenBaseURL = "https://opencode.ai/zen/v1"
+	ZenBaseURL = "https://opencode.ai/inference/v1"
+	// LegacyZenBaseURL is the retired free-tier endpoint. Provider rows saved
+	// before the move still store it; EffectiveBaseURL aliases it at send time
+	// so stored rows and custom URLs are never rewritten.
+	LegacyZenBaseURL = "https://opencode.ai/zen/v1"
 	// GoBaseURL is the paid tier: a real opencode.ai API key.
 	GoBaseURL = "https://opencode.ai/zen/go/v1"
 	// PublicKey is the zen tier's literal credential.
@@ -69,6 +73,18 @@ func Tier(baseURL string) string {
 		return "go"
 	}
 	return "zen"
+}
+
+// EffectiveBaseURL returns the wire base URL for a stored provider base URL.
+// Only the exact official legacy Zen base aliases to the current inference
+// endpoint; trailing slashes normalize the same way forwarding trims them.
+// Custom, Go, and new Zen URLs are returned unchanged, so a custom /zen/v1
+// route is never silently migrated.
+func EffectiveBaseURL(baseURL string) string {
+	if strings.TrimRight(baseURL, "/") == LegacyZenBaseURL {
+		return ZenBaseURL
+	}
+	return baseURL
 }
 
 // DeriveSessionID hashes seed and transcript into a native-shaped ses_ id.
@@ -139,22 +155,45 @@ func identifierFromDigest(sum []byte) string {
 }
 
 func newIdentifier() string {
-	now := uint64(time.Now().UnixMilli())
+	return newIdentifierAt(uint64(time.Now().UnixMilli()), false)
+}
+
+// NewSessionID returns a fresh native-shaped ses_ id using the official
+// descending timestamp/counter layout. The leading 12 hex digits are the
+// complement of (unix milli << 12) + counter, truncated to 48 bits. A restart
+// or later eviction of a mapped id starts a new value; this function does not
+// restore affinity.
+func NewSessionID() string {
+	return sessionPrefix + newIdentifierAt(uint64(time.Now().UnixMilli()), true)
+}
+
+func newIdentifierAt(now uint64, descending bool) string {
+	current := nextIdentifierValue(now)
+	if descending {
+		current = ^current
+	}
+	var rb [identifierRandLen]byte
+	_, _ = rand.Read(rb[:])
+	return encodeTimeHex(current) + randomIdentifierTail(rb[:])
+}
+
+func nextIdentifierValue(now uint64) uint64 {
 	idMu.Lock()
+	defer idMu.Unlock()
 	if now != lastTimestamp {
 		lastTimestamp = now
 		idCounter = 0
 	}
 	idCounter++
-	current := lastTimestamp*0x1000 + idCounter
-	idMu.Unlock()
-	var rb [identifierRandLen]byte
-	_, _ = rand.Read(rb[:])
+	return lastTimestamp*0x1000 + idCounter
+}
+
+func randomIdentifierTail(raw []byte) string {
 	var randPart [identifierRandLen]byte
-	for i := 0; i < identifierRandLen; i++ {
-		randPart[i] = identifierAlphabet[int(rb[i])%len(identifierAlphabet)]
+	for i := 0; i < identifierRandLen && i < len(raw); i++ {
+		randPart[i] = identifierAlphabet[int(raw[i])%len(identifierAlphabet)]
 	}
-	return encodeTimeHex(current) + string(randPart[:])
+	return string(randPart[:])
 }
 
 func encodeTimeHex(v uint64) string {

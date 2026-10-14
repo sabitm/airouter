@@ -371,6 +371,10 @@ type Proxy struct {
 	// It is generated in New so instances and process restarts do not share
 	// Zen/public first-turn ids. Explicit client sessions ignore it.
 	opencodeNonce string
+	// opencodeSessions maps free-tier client and fallback keys to generated
+	// native session ids. Restart and LRU eviction reset generated affinity.
+	// Paid and probe resolution does not use it.
+	opencodeSessions *opencode.SessionMap
 }
 
 // backoffState tracks a provider's consecutive pre-commit failures and the number
@@ -424,15 +428,16 @@ func NewWithDeps(s *store.Store, logger *slog.Logger, oauthSvc *oauth.Service, c
 		panic("proxy: generate OpenCode session nonce: " + err.Error())
 	}
 	return &Proxy{
-		store:         s,
-		oauth:         oauthSvc,
-		client:        &http.Client{Timeout: 5 * time.Minute},
-		streamClient:  &http.Client{},
-		logger:        logger,
-		kiroCatalog:   catalog,
-		rr:            map[int64]uint64{},
-		bo:            map[int64]*backoffState{},
-		opencodeNonce: nonce,
+		store:            s,
+		oauth:            oauthSvc,
+		client:           &http.Client{Timeout: 5 * time.Minute},
+		streamClient:     &http.Client{},
+		logger:           logger,
+		kiroCatalog:      catalog,
+		rr:               map[int64]uint64{},
+		bo:               map[int64]*backoffState{},
+		opencodeNonce:    nonce,
+		opencodeSessions: opencode.NewSessionMap(opencode.SessionMapCapacity),
 	}
 }
 

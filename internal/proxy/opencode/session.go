@@ -1,12 +1,14 @@
 package opencode
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const maxIdentityBytes = 256
@@ -300,4 +302,103 @@ func fallbackSeed(nonce string, providerID int64, baseURL, apiKey string) string
 			strings.TrimSpace(apiKey),
 	))
 	return hex.EncodeToString(sum[:])
+}
+
+const (
+	// SessionMapCapacity bounds generated free-tier session affinity. Eviction
+	// or process restart drops a generated id; the next miss creates a new one.
+	// Explicit native client sessions are not stored and stay byte-for-byte.
+	SessionMapCapacity = 4096
+	clientSessionKeyNS = "client"
+)
+
+type sessionEntry struct {
+	key [32]byte
+	sid string
+}
+
+// SessionMap is a per-Proxy LRU of generated free-tier session ids. Keys are
+// fixed SHA-256 digests. Raw client ids, credentials, and transcripts are not
+// stored. Capacity eviction and process restart reset generated affinity.
+type SessionMap struct {
+	mu       sync.Mutex
+	capacity int
+	order    *list.List
+	index    map[[32]byte]*list.Element
+}
+
+// NewSessionMap returns a bounded map. capacity below 1 uses SessionMapCapacity.
+func NewSessionMap(capacity int) *SessionMap {
+	if capacity < 1 {
+		capacity = SessionMapCapacity
+	}
+	return &SessionMap{
+		capacity: capacity,
+		order:    list.New(),
+		index:    make(map[[32]byte]*list.Element),
+	}
+}
+
+// ClientSession returns the mapped native id for a non-native client candidate.
+// An explicit native id is returned unchanged and is not stored. Empty input
+// stays empty. The same candidate is stable until eviction or restart.
+func (m *SessionMap) ClientSession(candidate string) string {
+	if candidate == "" || m == nil {
+		return ""
+	}
+	if IsNativeSessionID(candidate) {
+		return candidate
+	}
+	return m.sessionFor(clientSessionKey(candidate))
+}
+
+// FallbackSession returns the mapped native id for one fallback namespace.
+// Equal nonce, provider, stored base URL, API key, and transcript inputs stay
+// stable. Those inputs are hashed before storage.
+func (m *SessionMap) FallbackSession(nonce string, providerID int64, baseURL, apiKey, transcript string) string {
+	if m == nil {
+		return ""
+	}
+	return m.sessionFor(fallbackSessionKey(nonce, providerID, baseURL, apiKey, transcript))
+}
+
+// Len reports stored mappings. It is for tests and diagnostics.
+func (m *SessionMap) Len() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.order.Len()
+}
+
+func (m *SessionMap) sessionFor(key [32]byte) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if el, ok := m.index[key]; ok {
+		m.order.MoveToFront(el)
+		return el.Value.(*sessionEntry).sid
+	}
+	sid := NewSessionID()
+	el := m.order.PushFront(&sessionEntry{key: key, sid: sid})
+	m.index[key] = el
+	for m.order.Len() > m.capacity {
+		old := m.order.Back()
+		if old == nil {
+			break
+		}
+		m.order.Remove(old)
+		delete(m.index, old.Value.(*sessionEntry).key)
+	}
+	return sid
+}
+
+func clientSessionKey(candidate string) [32]byte {
+	return sha256.Sum256([]byte(clientSessionKeyNS + "\x00" + candidate))
+}
+
+func fallbackSessionKey(nonce string, providerID int64, baseURL, apiKey, transcript string) [32]byte {
+	// Hash the existing fallback seed and transcript. Prefix keeps this domain
+	// disjoint from client candidate keys even if a candidate equals a seed.
+	return sha256.Sum256([]byte("fallback\x00" + fallbackSeed(nonce, providerID, baseURL, apiKey) + "\x00" + transcript))
 }

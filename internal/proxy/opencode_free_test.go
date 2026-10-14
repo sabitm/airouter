@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"airouter/internal/domain"
+	"airouter/internal/harlog"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/sse"
@@ -54,8 +56,11 @@ type freeUpstreamCapture struct {
 	body             []byte
 	accept           string
 	session          string
+	sessionID        string
+	sessionIDValues  []string
 	request          string
 	ua               string
+	client           string
 	auth             string
 	anthropicVersion string
 }
@@ -64,11 +69,14 @@ func (c *freeUpstreamCapture) record(r *http.Request, body []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.path = r.URL.Path
-	c.body = body
+	c.body = append([]byte(nil), body...)
 	c.accept = r.Header.Get("Accept")
 	c.session = r.Header.Get("x-opencode-session")
+	c.sessionID = r.Header.Get(opencode.SessionIDHeader)
+	c.sessionIDValues = append([]string(nil), r.Header.Values(opencode.SessionIDHeader)...)
 	c.request = r.Header.Get("x-opencode-request")
 	c.ua = r.Header.Get("User-Agent")
+	c.client = r.Header.Get("x-opencode-client")
 	c.auth = r.Header.Get("Authorization")
 	c.anthropicVersion = r.Header.Get("anthropic-version")
 }
@@ -79,11 +87,14 @@ func (c *freeUpstreamCapture) snapshot() freeUpstreamSnapshot {
 	defer c.mu.Unlock()
 	return freeUpstreamSnapshot{
 		path:             c.path,
-		body:             c.body,
+		body:             append([]byte(nil), c.body...),
 		accept:           c.accept,
 		session:          c.session,
+		sessionID:        c.sessionID,
+		sessionIDValues:  append([]string(nil), c.sessionIDValues...),
 		request:          c.request,
 		ua:               c.ua,
+		client:           c.client,
 		auth:             c.auth,
 		anthropicVersion: c.anthropicVersion,
 	}
@@ -94,8 +105,11 @@ type freeUpstreamSnapshot struct {
 	body             []byte
 	accept           string
 	session          string
+	sessionID        string
+	sessionIDValues  []string
 	request          string
 	ua               string
+	client           string
 	auth             string
 	anthropicVersion string
 }
@@ -132,6 +146,14 @@ func setupOpencodeProvider(t *testing.T, model, key, tierBase string, handler ht
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts.URL, access.Token, px
+}
+
+func setupOpencodeProviderMux(t *testing.T, model, key, tierBase string, handler http.HandlerFunc) (string, string, *http.ServeMux) {
+	t.Helper()
+	base, token, px := setupOpencodeProvider(t, model, key, tierBase, handler)
+	mux := http.NewServeMux()
+	px.Mount(mux)
+	return base, token, mux
 }
 
 func redirectTransport(upstreamURL string) roundTripFunc {
@@ -364,11 +386,397 @@ func TestOpencodePaidTiersStayUnary(t *testing.T) {
 					t.Fatalf("paid tier fingerprint tool %s injected: %s", name, got.body)
 				}
 			}
+			if got.ua != opencode.UserAgent || got.client != opencode.DefaultClient || got.sessionID != "" || len(got.sessionIDValues) != 0 {
+				t.Fatalf("paid identity changed: ua=%q client=%q sessionID=%q values=%v", got.ua, got.client, got.sessionID, got.sessionIDValues)
+			}
 			if !strings.Contains(string(out), "hello from openai") {
 				t.Fatalf("unary response lost: %s", out)
 			}
 		})
 	}
+}
+
+func TestOpencodeFreeIdentityAllBackends(t *testing.T) {
+	nativeReq := "msg_0123456789abABCDEFGHIJKLMN"
+	nativeSes := "ses_0123456789abABCDEFGHIJKLMN"
+	otherSes := "ses_0123456789abOTHERSESSIONID"
+	ingresses := []struct {
+		name  string
+		path  string
+		body  string
+		model string
+	}{
+		{name: "chat", path: "/v1/chat/completions", model: "big-pickle", body: `{"model":"default","messages":[{"role":"user","content":"hi"}]}`},
+		{name: "responses", path: "/v1/responses", model: "muse-spark-1.3-contributor-free", body: `{"model":"default","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "messages", path: "/v1/messages", model: "minimax-m3-free", body: `{"model":"default","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`},
+	}
+	for _, ing := range ingresses {
+		for _, mode := range []string{"unary", "stream"} {
+			t.Run(ing.name+"/"+mode+"/caller", func(t *testing.T) {
+				var cap freeUpstreamCapture
+				base, token, px := setupOpencodeProvider(t, ing.model, "real-zen-key", opencode.LegacyZenBaseURL, func(w http.ResponseWriter, r *http.Request) {
+					body, _ := io.ReadAll(r.Body)
+					cap.record(r, body)
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, freeTextSSE(ing.name))
+				})
+				body := ing.body
+				if mode == "stream" {
+					body = withStream(body)
+				}
+				req, _ := http.NewRequest(http.MethodPost, base+ing.path, strings.NewReader(body))
+				req.Header.Set("Authorization", "Bearer "+token)
+				req.Header.Set("User-Agent", "opencode/1.2.3")
+				req.Header.Set("x-opencode-client", "my-cli")
+				req.Header.Set("x-opencode-request", nativeReq)
+				req.Header.Set("x-session-id", "client-session")
+				req.Header.Set(opencode.SessionIDHeader, otherSes)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				out, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+				}
+				got := cap.snapshot()
+				if !opencode.IsNativeSessionID(got.session) || got.session == opencode.NativeSessionID("client-session") || got.session == otherSes {
+					t.Fatalf("generic session was not proxy-mapped: %q", got.session)
+				}
+				if got.ua != "opencode/1.2.3" || got.client != "my-cli" || got.request != nativeReq || got.sessionID != got.session || len(got.sessionIDValues) != 1 {
+					t.Fatalf("caller identity = ua=%q client=%q request=%q session=%q mirror=%q values=%v", got.ua, got.client, got.request, got.session, got.sessionID, got.sessionIDValues)
+				}
+				if got.session == otherSes {
+					t.Fatal("mirror-only session became the conversation session")
+				}
+				if got.auth != "Bearer real-zen-key" {
+					t.Fatalf("auth = %q", got.auth)
+				}
+				providers, err := px.store.ListProviders(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(providers) != 1 || providers[0].BaseURL != opencode.LegacyZenBaseURL {
+					t.Fatalf("stored provider changed: %+v", providers)
+				}
+			})
+			t.Run(ing.name+"/"+mode+"/sanitized", func(t *testing.T) {
+				var cap freeUpstreamCapture
+				_, token, mux := setupOpencodeProviderMux(t, ing.model, "public", opencode.ZenBaseURL, func(w http.ResponseWriter, r *http.Request) {
+					body, _ := io.ReadAll(r.Body)
+					cap.record(r, body)
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, freeTextSSE(ing.name))
+				})
+				body := ing.body
+				if mode == "stream" {
+					body = withStream(body)
+				}
+				req := httptest.NewRequest(http.MethodPost, ing.path, strings.NewReader(body))
+				req.Header.Set("Authorization", "Bearer "+token)
+				req.Header.Set("User-Agent", "curl/8.0")
+				req.Header.Set("x-opencode-client", strings.Repeat("c", 300))
+				req.Header.Set("x-opencode-session", nativeSes+"\r\nX-Injected: 1")
+				req.Header.Add(opencode.SessionIDHeader, otherSes)
+				req.Header.Add(opencode.SessionIDHeader, nativeSes+"\nX-Injected: 1")
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+				}
+				got := cap.snapshot()
+				if got.ua != opencode.FreeUserAgent || got.client != opencode.FreeClient {
+					t.Fatalf("malformed identity not replaced: ua=%q client=%q", got.ua, got.client)
+				}
+				if !opencode.IsNativeSessionID(got.session) || got.session == nativeSes || strings.ContainsAny(got.session, "\r\n") {
+					t.Fatalf("malformed session forwarded: %q", got.session)
+				}
+				if got.sessionID != got.session || len(got.sessionIDValues) != 1 || strings.ContainsAny(got.sessionID, "\r\n") {
+					t.Fatalf("mirror drifted or injected: %q values=%v", got.sessionID, got.sessionIDValues)
+				}
+			})
+		}
+	}
+}
+
+func freeTextSSE(kind string) string {
+	switch kind {
+	case "responses":
+		return freeResponsesTextSSE()
+	case "messages":
+		return freeAnthropicTextSSE()
+	default:
+		return freeChatTextSSE()
+	}
+}
+
+// TestOpencodeFreeHeadersPreservePreparedBody proves header application does
+// not mutate the prepared body or the bytes a transport reads. The expected
+// snapshot is copied before headers run; it is not derived from captured output.
+func TestOpencodeFreeHeadersPreservePreparedBody(t *testing.T) {
+	nativeReq := "msg_0123456789abABCDEFGHIJKLMN"
+	nativeSes := "ses_0123456789abABCDEFGHIJKLMN"
+	cases := []struct {
+		name     string
+		path     string
+		body     string
+		caller   bool
+		stream   bool
+		wantSess string
+	}{
+		{name: "chat/unary/caller", path: opencode.ChatPath, body: freePreparedChatBody(false), caller: true, wantSess: nativeSes},
+		{name: "chat/stream/caller", path: opencode.ChatPath, body: freePreparedChatBody(true), caller: true, stream: true, wantSess: nativeSes},
+		{name: "responses/unary/caller", path: opencode.ResponsesPath, body: freePreparedResponsesBody(false), caller: true, wantSess: nativeSes},
+		{name: "responses/stream/caller", path: opencode.ResponsesPath, body: freePreparedResponsesBody(true), caller: true, stream: true, wantSess: nativeSes},
+		{name: "messages/unary/caller", path: opencode.MessagesPath, body: freePreparedMessagesBody(false), caller: true, wantSess: nativeSes},
+		{name: "messages/stream/caller", path: opencode.MessagesPath, body: freePreparedMessagesBody(true), caller: true, stream: true, wantSess: nativeSes},
+		{name: "chat/unary/fallback", path: opencode.ChatPath, body: freePreparedChatBody(false), stream: false},
+		{name: "responses/stream/fallback", path: opencode.ResponsesPath, body: freePreparedResponsesBody(true), stream: true},
+		{name: "messages/unary/fallback", path: opencode.MessagesPath, body: freePreparedMessagesBody(false)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared := []byte(tc.body)
+			expected := append([]byte(nil), prepared...)
+			provider := &domain.Provider{
+				ID:       7,
+				Name:     "zen",
+				BaseURL:  opencode.ZenBaseURL,
+				APIKey:   "real-zen-key",
+				Protocol: domain.ProtocolOpencode,
+			}
+			trace := &TraceInfo{}
+			ctx := WithTraceInfo(context.Background(), trace)
+			clientHeaders := http.Header{}
+			if tc.caller {
+				clientHeaders.Set("User-Agent", "opencode/1.2.3")
+				clientHeaders.Set("x-opencode-client", "my-cli")
+				clientHeaders.Set("x-opencode-request", nativeReq)
+				clientHeaders.Set("x-opencode-session", nativeSes)
+				ctx = withOpencodeRequest(ctx, "nonce", clientHeaders, nil)
+			} else {
+				clientHeaders.Set("User-Agent", "curl/8.0")
+				clientHeaders.Set("x-opencode-client", strings.Repeat("c", 300))
+				clientHeaders.Set("x-opencode-session", nativeSes+"\r\nX-Injected: 1")
+				ctx = withOpencodeRequest(ctx, "nonce", nil, nil)
+			}
+			ctx = withOpencodeSessions(ctx, opencode.NewSessionMap(8))
+			prepareOpencodeSession(ctx, provider, prepared)
+			if !bytes.Equal(prepared, expected) {
+				t.Fatal("session resolution mutated the prepared body")
+			}
+			// The fixture is the post-preparation baseline. Confirming it here keeps
+			// a later rewrite from being mistaken for header preservation.
+			if again, _, err := opencode.PrepareFreeTierBody(prepared, freeCodecID(tc.path)); err != nil || !bytes.Equal(again, expected) {
+				t.Fatalf("fixture is not an unchanged prepared body: err=%v", err)
+			}
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, opencode.ZenBaseURL+tc.path, bytes.NewReader(prepared))
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyUpstreamHeaders(req, provider, clientHeaders, ctx, prepared)
+			if !bytes.Equal(prepared, expected) {
+				t.Fatal("header application mutated the prepared body slice")
+			}
+			if req.Body == nil {
+				t.Fatal("header application consumed req.Body")
+			}
+			gotReqBody, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(gotReqBody, expected) {
+				t.Fatalf("req.Body after headers = %q, want exact prepared snapshot", gotReqBody)
+			}
+
+			var cap freeUpstreamCapture
+			px := New(nil, nil)
+			px.client = &http.Client{Transport: freeBodyCaptureTransport(&cap)}
+			px.streamClient = px.client
+			if tc.stream {
+				resp, err := px.forwardStream(ctx, provider, tc.path, prepared, clientHeaders, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+			} else if _, _, err := px.forward(ctx, provider, tc.path, prepared, clientHeaders); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(prepared, expected) {
+				t.Fatal("forwarding mutated the prepared body slice")
+			}
+			wire := cap.snapshot()
+			if !bytes.Equal(wire.body, expected) {
+				t.Fatalf("wire body differs from prepared snapshot:\n got %q\nwant %q", wire.body, expected)
+			}
+			if tc.stream && wire.accept != "text/event-stream" {
+				t.Fatalf("stream Accept = %q", wire.accept)
+			}
+			if !tc.stream && wire.accept == "text/event-stream" {
+				t.Fatalf("unary Accept forced stream: %q", wire.accept)
+			}
+			if wire.auth != "Bearer real-zen-key" {
+				t.Fatalf("auth = %q", wire.auth)
+			}
+			wantSession := tc.wantSess
+			if wantSession == "" {
+				wantSession = trace.OpencodeSessionID
+			}
+			if !opencode.IsNativeSessionID(wantSession) || wire.session != wantSession || wire.sessionID != wantSession || len(wire.sessionIDValues) != 1 {
+				t.Fatalf("session=%q mirror=%q values=%v want=%q", wire.session, wire.sessionID, wire.sessionIDValues, wantSession)
+			}
+			if tc.caller {
+				if wire.ua != "opencode/1.2.3" || wire.client != "my-cli" || wire.request != nativeReq {
+					t.Fatalf("caller identity lost: ua=%q client=%q request=%q", wire.ua, wire.client, wire.request)
+				}
+			} else if wire.ua != opencode.FreeUserAgent || wire.client != opencode.FreeClient || !opencode.IsNativeRequestID(wire.request) {
+				t.Fatalf("fallback identity missing: ua=%q client=%q request=%q", wire.ua, wire.client, wire.request)
+			}
+			if strings.Contains(tc.path, "messages") && wire.anthropicVersion == "" {
+				t.Fatal("messages request lost anthropic-version")
+			}
+		})
+	}
+}
+
+func freeBodyCaptureTransport(cap *freeUpstreamCapture) roundTripFunc {
+	return func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		cap.record(req, body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	}
+}
+
+func freeCodecID(path string) string {
+	switch path {
+	case opencode.ResponsesPath:
+		return "opencode-responses"
+	case opencode.MessagesPath:
+		return "opencode-messages"
+	default:
+		return "opencode-chat"
+	}
+}
+
+func freePreparedChatBody(stream bool) string {
+	body := "{\n" +
+		"  \"model\": \"big-pickle\",\n" +
+		"  \"messages\": [{\n" +
+		"    \"role\": \"system\",\n" +
+		"    \"content\": \"  keep   whitespace  \"\n" +
+		"  }, {\n" +
+		"    \"role\": \"assistant\",\n" +
+		"    \"content\": null,\n" +
+		"    \"tool_calls\": [{\n" +
+		"      \"id\": \"call_1\",\n" +
+		"      \"type\": \"function\",\n" +
+		"      \"function\": {\"name\": \"bash\", \"arguments\": \"{\\\"limit\\\":1.50}\"}\n" +
+		"    }]\n" +
+		"  }, {\n" +
+		"    \"role\": \"tool\",\n" +
+		"    \"tool_call_id\": \"call_1\",\n" +
+		"    \"content\": \"done\"\n" +
+		"  }],\n" +
+		"  \"tools\": [\n" +
+		freeCanonicalNestedTools() +
+		"  ],\n" +
+		"  \"tool_choice\": {\"type\": \"function\", \"function\": {\"name\": \"bash\"}},\n" +
+		"  \"max_tokens\": 128,\n" +
+		"  \"reasoning_effort\": \"low\",\n" +
+		"  \"prompt_cache_key\": \"cache key  with spaces\",\n" +
+		"  \"stream\": false\n" +
+		"}"
+	if stream {
+		return strings.Replace(body, `"stream": false`, `"stream": true,
+  "stream_options": {"include_usage": true}`, 1)
+	}
+	return body
+}
+
+func freePreparedResponsesBody(stream bool) string {
+	body := "{\n" +
+		"  \"model\": \"muse-spark-1.3-contributor-free\",\n" +
+		"  \"instructions\": \"  system   line  \",\n" +
+		"  \"input\": [{\n" +
+		"    \"type\": \"function_call\",\n" +
+		"    \"call_id\": \"call_1\",\n" +
+		"    \"name\": \"bash\",\n" +
+		"    \"arguments\": \"{\\\"limit\\\":1.50}\"\n" +
+		"  }, {\n" +
+		"    \"type\": \"function_call_output\",\n" +
+		"    \"call_id\": \"call_1\",\n" +
+		"    \"output\": \"done\"\n" +
+		"  }],\n" +
+		"  \"tools\": [\n" +
+		freeCanonicalFlatTools(`"parameters"`) +
+		"  ],\n" +
+		"  \"tool_choice\": {\"type\": \"function\", \"name\": \"bash\"},\n" +
+		"  \"max_output_tokens\": 256,\n" +
+		"  \"reasoning\": {\"effort\": \"medium\"},\n" +
+		"  \"prompt_cache_key\": \"resp-cache\",\n" +
+		"  \"stream\": false\n" +
+		"}"
+	if stream {
+		return strings.Replace(body, `"stream": false`, `"stream": true`, 1)
+	}
+	return body
+}
+
+func freePreparedMessagesBody(stream bool) string {
+	body := "{\n" +
+		"  \"model\": \"minimax-m3-free\",\n" +
+		"  \"system\": \"  keep   whitespace  \",\n" +
+		"  \"max_tokens\": 128,\n" +
+		"  \"messages\": [{\n" +
+		"    \"role\": \"assistant\",\n" +
+		"    \"content\": [{\"type\": \"tool_use\", \"id\": \"toolu_1\", \"name\": \"bash\", \"input\": {\"limit\": 1.50}}]\n" +
+		"  }, {\n" +
+		"    \"role\": \"user\",\n" +
+		"    \"content\": [{\"type\": \"tool_result\", \"tool_use_id\": \"toolu_1\", \"content\": \"done\"}]\n" +
+		"  }],\n" +
+		"  \"tools\": [\n" +
+		freeCanonicalMessagesTools() +
+		"  ],\n" +
+		"  \"tool_choice\": {\"type\": \"tool\", \"name\": \"bash\"},\n" +
+		"  \"metadata\": {\"user_id\": \"cache key  with spaces\"},\n" +
+		"  \"thinking\": {\"type\": \"enabled\", \"budget_tokens\": 64},\n" +
+		"  \"stream\": false\n" +
+		"}"
+	if stream {
+		return strings.Replace(body, `"stream": false`, `"stream": true`, 1)
+	}
+	return body
+}
+
+func freeCanonicalNestedTools() string {
+	return "    {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": \"run\", \"parameters\": {\"type\": \"object\", \"properties\": {\"limit\": {\"type\": \"number\", \"minimum\": 1.50}}}}},\n" +
+		"    {\"type\": \"function\", \"function\": {\"name\": \"glob\", \"description\": \"find paths\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}},\n" +
+		"    {\"type\": \"function\", \"function\": {\"name\": \"grep\", \"description\": \"search\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}},\n" +
+		"    {\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"read file\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}"
+}
+
+func freeCanonicalFlatTools(schemaKey string) string {
+	return "    {\"type\": \"function\", \"name\": \"bash\", \"description\": \"run\", " + schemaKey + ": {\"type\": \"object\", \"properties\": {\"limit\": {\"type\": \"number\", \"minimum\": 1.50}}}},\n" +
+		"    {\"type\": \"function\", \"name\": \"glob\", \"description\": \"find paths\", " + schemaKey + ": {\"type\": \"object\", \"properties\": {}}},\n" +
+		"    {\"type\": \"function\", \"name\": \"grep\", \"description\": \"search\", " + schemaKey + ": {\"type\": \"object\", \"properties\": {}}},\n" +
+		"    {\"type\": \"function\", \"name\": \"read\", \"description\": \"read file\", " + schemaKey + ": {\"type\": \"object\", \"properties\": {}}}"
+}
+
+func freeCanonicalMessagesTools() string {
+	return "    {\"name\": \"bash\", \"description\": \"run\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"limit\": {\"type\": \"number\", \"minimum\": 1.50}}}},\n" +
+		"    {\"name\": \"glob\", \"description\": \"find paths\", \"input_schema\": {\"type\": \"object\", \"properties\": {}}},\n" +
+		"    {\"name\": \"grep\", \"description\": \"search\", \"input_schema\": {\"type\": \"object\", \"properties\": {}}},\n" +
+		"    {\"name\": \"read\", \"description\": \"read file\", \"input_schema\": {\"type\": \"object\", \"properties\": {}}}"
 }
 
 // TestOpencodeCustomTierCloaksDefaultZen proves a custom base URL defaults to
@@ -702,8 +1110,14 @@ func assertFreeUpstreamShape(t *testing.T, cap freeUpstreamSnapshot, codecID, au
 	if !opencode.IsNativeSessionID(cap.session) || !opencode.IsNativeRequestID(cap.request) {
 		t.Fatalf("identity session=%q request=%q", cap.session, cap.request)
 	}
-	if cap.ua == "" {
-		t.Fatal("UA missing")
+	if cap.ua != opencode.FreeUserAgent {
+		t.Fatalf("UA = %q, want %q", cap.ua, opencode.FreeUserAgent)
+	}
+	if cap.client != opencode.FreeClient {
+		t.Fatalf("client = %q, want %q", cap.client, opencode.FreeClient)
+	}
+	if cap.sessionID != cap.session || len(cap.sessionIDValues) != 1 {
+		t.Fatalf("session id mirror = %q values=%v, want %q", cap.sessionID, cap.sessionIDValues, cap.session)
 	}
 	if cap.auth != auth {
 		t.Fatalf("auth = %q, want %q", cap.auth, auth)
@@ -1258,4 +1672,223 @@ func paidToolBody(name string) string {
 func jsonString(s string) string {
 	raw, _ := json.Marshal(s)
 	return string(raw)
+}
+
+// urlRecordTransport records each request URL before the wrapped transport
+// rewrites it to the mock host, so tests observe the real wire destination.
+type urlRecordTransport struct {
+	mu   sync.Mutex
+	urls []string
+	next http.RoundTripper
+}
+
+func (t *urlRecordTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	t.urls = append(t.urls, req.URL.String())
+	t.mu.Unlock()
+	return t.next.RoundTrip(req)
+}
+
+func (t *urlRecordTransport) snapshot() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.urls...)
+}
+
+// TestOpencodeEndpointMigrationOnWire proves the stored legacy Zen base URL is
+// rewritten to the current inference endpoint on the actual request, for every
+// backend path and both client roles, while the provider row stays unchanged.
+func TestOpencodeEndpointMigrationOnWire(t *testing.T) {
+	backends := []struct {
+		name         string
+		ingress      string
+		upstreamPath string
+		model        string
+		build        func(stream bool) string
+		unaryBody    string
+		streamBody   string
+	}{
+		{
+			name:         "chat",
+			ingress:      "/v1/chat/completions",
+			upstreamPath: opencode.ChatPath,
+			model:        "deepseek-v4-pro",
+			build: func(stream bool) string {
+				if stream {
+					return `{"model":"default","messages":[{"role":"user","content":"hi"}],"stream":true}`
+				}
+				return `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
+			},
+			unaryBody:  openaiUpstreamBody,
+			streamBody: openaiSSE,
+		},
+		{
+			name:         "responses",
+			ingress:      "/v1/responses",
+			upstreamPath: opencode.ResponsesPath,
+			model:        "gpt-5.5",
+			build: func(stream bool) string {
+				if stream {
+					return `{"model":"default","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}`
+				}
+				return `{"model":"default","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+			},
+			unaryBody:  responsesUpstreamBody,
+			streamBody: responsesSSE,
+		},
+		{
+			name:         "messages",
+			ingress:      "/v1/messages",
+			upstreamPath: opencode.MessagesPath,
+			model:        "qwen3.6-plus",
+			build: func(stream bool) string {
+				if stream {
+					return `{"model":"default","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"stream":true}`
+				}
+				return `{"model":"default","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`
+			},
+			unaryBody:  anthropicUpstreamBody,
+			streamBody: anthropicSSE,
+		},
+	}
+	bases := []struct {
+		name string
+		base string
+	}{
+		{"new zen", opencode.ZenBaseURL},
+		{"stored legacy zen", opencode.LegacyZenBaseURL},
+	}
+	for _, backend := range backends {
+		for _, base := range bases {
+			for _, mode := range []string{"unary", "stream"} {
+				t.Run(backend.name+"/"+base.name+"/"+mode, func(t *testing.T) {
+					stream := mode == "stream"
+					response := backend.unaryBody
+					contentType := "application/json"
+					if stream {
+						response = backend.streamBody
+						contentType = "text/event-stream"
+					}
+					baseURL, token, px := setupOpencodeProvider(t, backend.model, "zen-key", base.base, func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", contentType)
+						_, _ = io.WriteString(w, response)
+					})
+					rec := &urlRecordTransport{next: px.client.Transport}
+					px.client.Transport = rec
+					px.streamClient.Transport = rec
+
+					if stream {
+						resp, out := postStream(t, baseURL+backend.ingress, token, backend.build(true))
+						if resp.StatusCode != http.StatusOK {
+							t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+						}
+					} else {
+						resp, out := post(t, baseURL+backend.ingress, token, backend.build(false))
+						if resp.StatusCode != http.StatusOK {
+							t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+						}
+					}
+
+					want := opencode.ZenBaseURL + backend.upstreamPath
+					urls := rec.snapshot()
+					if len(urls) != 1 || urls[0] != want {
+						t.Fatalf("wire URLs = %v, want [%s]", urls, want)
+					}
+
+					providers, err := px.store.ListProviders(context.Background())
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(providers) != 1 || providers[0].BaseURL != base.base {
+						t.Fatalf("stored provider changed: %+v", providers)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestOpencodeEndpointAliasScopedToProtocol proves the legacy Zen alias applies
+// only to OpenCode rows; other protocols and the Go/custom endpoints stay
+// unchanged.
+func TestOpencodeEndpointAliasScopedToProtocol(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider *domain.Provider
+		path     string
+		want     string
+	}{
+		{"legacy zen opencode", &domain.Provider{BaseURL: opencode.LegacyZenBaseURL, Protocol: domain.ProtocolOpencode}, opencode.ChatPath, opencode.ZenBaseURL + opencode.ChatPath},
+		{"legacy zen other protocol", &domain.Provider{BaseURL: opencode.LegacyZenBaseURL, Protocol: domain.ProtocolOpenAI}, opencode.ChatPath, opencode.LegacyZenBaseURL + opencode.ChatPath},
+		{"new zen opencode", &domain.Provider{BaseURL: opencode.ZenBaseURL, Protocol: domain.ProtocolOpencode}, opencode.ResponsesPath, opencode.ZenBaseURL + opencode.ResponsesPath},
+		{"legacy go opencode", &domain.Provider{BaseURL: opencode.GoBaseURL, Protocol: domain.ProtocolOpencode}, opencode.MessagesPath, opencode.GoBaseURL + opencode.MessagesPath},
+		{"custom zen path opencode", &domain.Provider{BaseURL: "https://example.test/zen/v1", Protocol: domain.ProtocolOpencode}, opencode.ChatPath, "https://example.test/zen/v1" + opencode.ChatPath},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upstreamURL(tc.provider, tc.path); got != tc.want {
+				t.Fatalf("upstreamURL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOpencodeLegacyEndpointAliasInTraceAndHAR proves the resolved wire URL
+// recorded in TraceInfo and HAR matches the migrated endpoint, not the stored
+// legacy value, for both the unary and streaming clients.
+func TestOpencodeLegacyEndpointAliasInTraceAndHAR(t *testing.T) {
+	want := opencode.ZenBaseURL + opencode.ChatPath
+	provider := &domain.Provider{Name: "zen", BaseURL: opencode.LegacyZenBaseURL, APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
+	for _, stream := range []bool{false, true} {
+		name := "unary"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			rec := harlog.New("opencode-alias")
+			trace := &TraceInfo{RequestID: name, HAR: rec}
+			ctx := WithTraceInfo(context.Background(), trace)
+			transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"data":[]}`)),
+				}, nil
+			})
+			p := New(nil, nil)
+			p.client = &http.Client{Transport: transport}
+			p.streamClient = &http.Client{Transport: transport}
+			if stream {
+				resp, err := p.forwardStream(ctx, provider, opencode.ChatPath, []byte(`{}`), nil, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = resp.Body.Close()
+			} else if _, _, err := p.forward(ctx, provider, opencode.ChatPath, []byte(`{}`), nil); err != nil {
+				t.Fatal(err)
+			}
+			if trace.UpstreamURL != want {
+				t.Fatalf("trace upstream URL = %q, want %q", trace.UpstreamURL, want)
+			}
+			data, err := rec.MarshalHAR()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc struct {
+				Log struct {
+					Entries []struct {
+						Request struct {
+							URL string `json:"url"`
+						} `json:"request"`
+					} `json:"entries"`
+				} `json:"log"`
+			}
+			if err := json.Unmarshal(data, &doc); err != nil {
+				t.Fatal(err)
+			}
+			if len(doc.Log.Entries) != 1 || doc.Log.Entries[0].Request.URL != want {
+				t.Fatalf("HAR entries = %+v, want URL %q", doc.Log.Entries, want)
+			}
+		})
+	}
 }

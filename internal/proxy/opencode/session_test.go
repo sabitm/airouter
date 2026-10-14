@@ -3,6 +3,7 @@ package opencode
 import (
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -246,5 +247,114 @@ func TestApplyIdentityMapsGenericSession(t *testing.T) {
 	ApplyIdentity(h, Identity{Session: native})
 	if h.Get("x-opencode-session") != native {
 		t.Fatalf("native session mutated: %q", h.Get("x-opencode-session"))
+	}
+}
+
+func TestSessionMapClientAndFallback(t *testing.T) {
+	m := NewSessionMap(4)
+	native := "ses_0123456789abABCDEFGHIJKLMN"
+	if got := m.ClientSession(native); got != native || m.Len() != 0 {
+		t.Fatalf("native client stored or changed: %q len=%d", got, m.Len())
+	}
+	if m.ClientSession("") != "" {
+		t.Fatal("empty client candidate mapped")
+	}
+	a := m.ClientSession("client-a")
+	b := m.ClientSession("client-b")
+	if a == b || m.ClientSession("client-a") != a {
+		t.Fatalf("client map unstable: %q %q", a, b)
+	}
+	assertNativeSessionID(t, a)
+	if a == NativeSessionID("client-a") {
+		t.Fatal("mapped client session reused the legacy hash")
+	}
+	if strings.Contains(a, "client-a") || strings.Contains(b, "client-b") {
+		t.Fatal("mapped session contains the raw candidate")
+	}
+
+	fallback := m.FallbackSession("nonce", 1, "https://opencode.ai/zen/v1", "public", "")
+	if fallback == a || m.FallbackSession("nonce", 1, "https://opencode.ai/zen/v1", "public", "") != fallback {
+		t.Fatalf("fallback unstable or overlapped client: %q", fallback)
+	}
+	if m.FallbackSession("nonce", 2, "https://opencode.ai/zen/v1", "public", "") == fallback {
+		t.Fatal("provider did not change fallback")
+	}
+	if m.FallbackSession("other", 1, "https://opencode.ai/zen/v1", "public", "") == fallback {
+		t.Fatal("nonce did not change fallback")
+	}
+	if m.FallbackSession("nonce", 1, "https://opencode.ai/zen/v1", "public", "assistant") == fallback {
+		t.Fatal("transcript did not change fallback")
+	}
+	if m.FallbackSession("nonce", 1, LegacyZenBaseURL, "public", "") == m.FallbackSession("nonce", 1, ZenBaseURL, "public", "") {
+		t.Fatal("stored base URL namespace collapsed legacy and current Zen")
+	}
+	other := NewSessionMap(4)
+	if other.ClientSession("client-a") == a {
+		t.Fatal("session maps are not per instance")
+	}
+	if strings.Contains(fallback, "public") || strings.Contains(fallback, "assistant") {
+		t.Fatal("fallback session contains raw key or transcript")
+	}
+}
+
+func TestSessionMapLRUEvictsLeastRecent(t *testing.T) {
+	m := NewSessionMap(2)
+	first := m.ClientSession("a")
+	second := m.ClientSession("b")
+	if m.ClientSession("a") != first {
+		t.Fatal("lookup did not keep the existing id")
+	}
+	// b is now least recent. Inserting c must evict b and keep a.
+	third := m.ClientSession("c")
+	if third == first || third == second {
+		t.Fatal("new key reused an existing session")
+	}
+	if m.Len() != 2 {
+		t.Fatalf("capacity not enforced: %d", m.Len())
+	}
+	if m.ClientSession("a") != first {
+		t.Fatal("recent key was evicted")
+	}
+	if m.ClientSession("c") != third {
+		t.Fatal("new key was evicted")
+	}
+	if got := m.ClientSession("b"); got == second {
+		t.Fatal("least-recent key survived eviction")
+	}
+}
+
+func TestSessionMapConcurrentSameKey(t *testing.T) {
+	m := NewSessionMap(8)
+	var wg sync.WaitGroup
+	got := make([]string, 32)
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got[i] = m.ClientSession("same")
+		}(i)
+	}
+	wg.Wait()
+	for _, sid := range got[1:] {
+		if sid != got[0] || !IsNativeSessionID(sid) {
+			t.Fatalf("concurrent same key diverged: %q vs %q", got[0], sid)
+		}
+	}
+	distinct := map[string]struct{}{}
+	var dwg sync.WaitGroup
+	ids := make([]string, 16)
+	for i := range ids {
+		dwg.Add(1)
+		go func(i int) {
+			defer dwg.Done()
+			ids[i] = m.ClientSession(string(rune('A' + i)))
+		}(i)
+	}
+	dwg.Wait()
+	for _, sid := range ids {
+		if _, ok := distinct[sid]; ok {
+			t.Fatalf("concurrent distinct keys collided: %q", sid)
+		}
+		distinct[sid] = struct{}{}
 	}
 }

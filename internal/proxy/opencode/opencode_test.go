@@ -1,10 +1,12 @@
 package opencode
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAnthropicEffortShapes(t *testing.T) {
@@ -62,6 +64,37 @@ func TestTier(t *testing.T) {
 	}
 }
 
+func TestEffectiveBaseURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"new default", ZenBaseURL, ZenBaseURL},
+		{"exact legacy", LegacyZenBaseURL, ZenBaseURL},
+		{"legacy one trailing slash", LegacyZenBaseURL + "/", ZenBaseURL},
+		{"legacy multiple trailing slashes", LegacyZenBaseURL + "///", ZenBaseURL},
+		{"legacy go", GoBaseURL, GoBaseURL},
+		{"legacy go trailing slash", GoBaseURL + "/", GoBaseURL + "/"},
+		{"custom host", "https://custom.example/v1", "https://custom.example/v1"},
+		{"custom localhost", "http://127.0.0.1:8080/zen/v1", "http://127.0.0.1:8080/zen/v1"},
+		{"custom example zen path", "https://example.test/zen/v1", "https://example.test/zen/v1"},
+		{"http official host", "http://opencode.ai/zen/v1", "http://opencode.ai/zen/v1"},
+		{"alternate port", "https://opencode.ai:8443/zen/v1", "https://opencode.ai:8443/zen/v1"},
+		{"longer path", "https://opencode.ai/zen/v1/chat", "https://opencode.ai/zen/v1/chat"},
+		{"query string", "https://opencode.ai/zen/v1?x=1", "https://opencode.ai/zen/v1?x=1"},
+		{"uppercase host", "https://OpenCode.ai/zen/v1", "https://OpenCode.ai/zen/v1"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EffectiveBaseURL(tc.in); got != tc.want {
+				t.Fatalf("EffectiveBaseURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDeriveSessionIDStable(t *testing.T) {
 	a := DeriveSessionID("public", "assistant text one")
 	b := DeriveSessionID("public", "assistant text one")
@@ -113,6 +146,74 @@ func TestNewRequestIDNativeShape(t *testing.T) {
 	if a == b {
 		t.Fatalf("request ids collided: %q", a)
 	}
+	assertAscendingTime(t, a, b)
+}
+
+func TestNewSessionIDDescendingTimestamp(t *testing.T) {
+	before := uint64(time.Now().UnixMilli())
+	a := NewSessionID()
+	b := NewSessionID()
+	after := uint64(time.Now().UnixMilli())
+	assertNativeSessionID(t, a)
+	assertNativeSessionID(t, b)
+	if a == b {
+		t.Fatalf("session ids collided: %q", a)
+	}
+	assertDescendingWindow(t, a, before, after)
+	assertDescendingWindow(t, b, before, after)
+	assertDescendingTime(t, a, b)
+}
+
+func assertAscendingTime(t *testing.T, first, second string) {
+	t.Helper()
+	if identifierTime(t, first) >= identifierTime(t, second) {
+		t.Fatalf("request ids are not ascending: %q then %q", first, second)
+	}
+}
+
+func assertDescendingTime(t *testing.T, first, second string) {
+	t.Helper()
+	if identifierTime(t, first) <= identifierTime(t, second) {
+		t.Fatalf("session ids are not descending: %q then %q", first, second)
+	}
+}
+
+func assertDescendingWindow(t *testing.T, id string, before, after uint64) {
+	t.Helper()
+	got := identifierTime(t, id)
+	// The official layout stores only the low 48 bits. Compare the same mask
+	// instead of reconstructing a full Unix millisecond timestamp.
+	low := got & 0xffffffffffff
+	start := (^((before << 12) + 1)) & 0xffffffffffff
+	end := (^((after << 12) + 0xfff)) & 0xffffffffffff
+	if !uint48Between(low, end, start) {
+		t.Fatalf("session time %x outside [%x, %x] for %q", low, end, start, id)
+	}
+}
+
+func identifierTime(t *testing.T, id string) uint64 {
+	t.Helper()
+	payload := id[4:]
+	raw, err := hex.DecodeString(payload[:identifierTimeLen])
+	if err != nil || len(raw) != 6 {
+		t.Fatalf("time prefix %q: %v", id, err)
+	}
+	var v uint64
+	for _, b := range raw {
+		v = (v << 8) | uint64(b)
+	}
+	return v
+}
+
+func uint48Between(v, start, end uint64) bool {
+	const mask = uint64(0xffffffffffff)
+	v &= mask
+	start &= mask
+	end &= mask
+	if start <= end {
+		return v >= start && v <= end
+	}
+	return v >= start || v <= end
 }
 
 func TestIsNativeIDRejectsLegacyHex(t *testing.T) {
@@ -132,6 +233,7 @@ func TestIsNativeIDRejectsLegacyHex(t *testing.T) {
 func TestIsVersionedUserAgent(t *testing.T) {
 	keep := []string{
 		"opencode/1.18.31",
+		FreeUserAgent,
 		"opencode/1.17.7 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
 		"opencode/0.16.7",
 		"OpenCode/1.18.31",
@@ -424,5 +526,65 @@ func TestFingerprintHeaders(t *testing.T) {
 	}
 	if got := h2.Get("x-opencode-session"); got != native {
 		t.Fatalf("client session clobbered: %q", got)
+	}
+	if got := h2.Get(SessionIDHeader); got != "" {
+		t.Fatalf("legacy fingerprint synthesized session id: %q", got)
+	}
+}
+
+func TestFingerprintFreeHeaders(t *testing.T) {
+	native := "ses_0123456789abABCDEFGHIJKLMN"
+	malicious := native + "\r\nX-Injected: 1"
+
+	empty := http.Header{}
+	FingerprintFreeHeaders(empty, "ses_generic")
+	if got := empty.Get("User-Agent"); got != FreeUserAgent {
+		t.Fatalf("free UA = %q, want %q", got, FreeUserAgent)
+	}
+	if got := empty.Get("x-opencode-client"); got != FreeClient {
+		t.Fatalf("free client = %q", got)
+	}
+	mapped := empty.Get("x-opencode-session")
+	assertNativeSessionID(t, mapped)
+	if mapped == "ses_generic" {
+		t.Fatal("generic fallback forwarded verbatim")
+	}
+	if got := empty.Get(SessionIDHeader); got != mapped {
+		t.Fatalf("session id mirror = %q, want %q", got, mapped)
+	}
+	if len(empty.Values(SessionIDHeader)) != 1 {
+		t.Fatalf("session id values = %v", empty.Values(SessionIDHeader))
+	}
+
+	preserved := http.Header{}
+	preserved.Set("User-Agent", "opencode/1.2.3 extra")
+	preserved.Set("x-opencode-client", "my-cli")
+	preserved.Set("x-opencode-session", native)
+	preserved.Set(SessionIDHeader, native)
+	FingerprintFreeHeaders(preserved, "ses_other")
+	if preserved.Get("User-Agent") != "opencode/1.2.3 extra" || preserved.Get("x-opencode-client") != "my-cli" {
+		t.Fatalf("valid caller identity clobbered: %v", preserved)
+	}
+	if preserved.Get("x-opencode-session") != native || preserved.Get(SessionIDHeader) != native {
+		t.Fatalf("paired native session drifted: %v", preserved)
+	}
+
+	conflict := http.Header{}
+	conflict.Set("x-opencode-session", native)
+	conflict.Add(SessionIDHeader, "ses_0123456789abOTHERSESSIONID")
+	conflict.Add(SessionIDHeader, malicious)
+	FingerprintFreeHeaders(conflict, "")
+	if conflict.Get("x-opencode-session") != native || conflict.Get(SessionIDHeader) != native || len(conflict.Values(SessionIDHeader)) != 1 {
+		t.Fatalf("conflicting mirror won: %v", conflict)
+	}
+
+	channel := http.Header{}
+	channel.Set("User-Agent", "opencode/beta/2.0.27/desktop")
+	FingerprintFreeHeaders(channel, native)
+	if channel.Get("User-Agent") != "opencode/beta/2.0.27/desktop" {
+		t.Fatalf("channel UA replaced: %q", channel.Get("User-Agent"))
+	}
+	if channel.Get(SessionIDHeader) != native {
+		t.Fatalf("native fallback not mirrored: %q", channel.Get(SessionIDHeader))
 	}
 }

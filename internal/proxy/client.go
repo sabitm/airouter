@@ -81,6 +81,7 @@ func (p *Proxy) prepareUpstreamRequest(ctx context.Context, backend codec, provi
 func (p *Proxy) prepareUpstreamRequestFor(ctx context.Context, backend codec, provider *domain.Provider, req *ir.Request, body []byte) ([]byte, error) {
 	if p != nil && isOpencodeCodec(backend.id) {
 		ctx = withOpencodeNonce(ctx, p.opencodeNonce)
+		ctx = withOpencodeSessions(ctx, p.opencodeSessions)
 	}
 	return prepareUpstreamRequest(ctx, p, backend, provider, req, body)
 }
@@ -437,7 +438,7 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	// after the client-header copy so a forwarded non-opencode UA is replaced.
 	// Authorization keeps the scheme-switch value ("public" or a real key).
 	if provider.Protocol == domain.ProtocolOpencode {
-		applyOpencodeHeaders(req, ctx)
+		applyOpencodeHeaders(req, provider, ctx, body)
 	}
 }
 
@@ -544,9 +545,11 @@ func applyKiroHeaders(req *http.Request, provider *domain.Provider) {
 
 // applyOpencodeHeaders sets the opencode client fingerprint. Sanitized ingress
 // identity (captured before translation) wins for UA/client/project/request/
-// session; FingerprintHeaders fills whatever is still missing. Authorization
-// stays on the provider credential set by the auth-scheme switch.
-func applyOpencodeHeaders(req *http.Request, ctx context.Context) {
+// session; fingerprinting fills whatever is still missing. Free Zen uses the
+// CLI fallback and mirrors the resolved session. Paid Zen, Go, and probes keep
+// the desktop defaults and do not synthesize the session-id mirror.
+// Authorization stays on the provider credential set by the auth-scheme switch.
+func applyOpencodeHeaders(req *http.Request, provider *domain.Provider, ctx context.Context, body []byte) {
 	opencode.SanitizeIdentityHeaders(req.Header)
 	st := opencodeStateFrom(ctx)
 	if st != nil {
@@ -561,6 +564,24 @@ func applyOpencodeHeaders(req *http.Request, ctx context.Context) {
 			sid = t.OpencodeSessionID
 		}
 	}
+	baseURL := ""
+	if provider != nil {
+		baseURL = provider.BaseURL
+	}
+	if opencode.NeedsFreeTier(baseURL, reqModelFromBody(body)) {
+		// ApplyIdentity maps a generic candidate before this seam. On free Zen the
+		// request-state session is the mapped native id and must win. An explicit
+		// native client id is already that value. Paid and probe paths keep
+		// ApplyIdentity's global mapping.
+		if sid != "" {
+			req.Header.Set("x-opencode-session", sid)
+		}
+		// Drop an unvalidated mirror before free fingerprinting. The helper then
+		// writes only the session resolved above, so a conflicting copy cannot drift.
+		req.Header.Del(opencode.SessionIDHeader)
+		opencode.FingerprintFreeHeaders(req.Header, sid)
+		return
+	}
 	opencode.FingerprintHeaders(req.Header, sid)
 }
 
@@ -571,6 +592,9 @@ type opencodeReqState struct {
 	identity opencode.Identity
 	nonce    string
 	session  string
+	// sessions is the Proxy that owns this request. Nil keeps deterministic
+	// ResolveSession, including direct header helpers without a Proxy.
+	sessions *opencode.SessionMap
 	// tools is the free-tier rename and decoy map for the current attempt.
 	// It is rewritten per provider so a later paid or non-OpenCode target does
 	// not inherit a previous attempt's map.
@@ -604,6 +628,20 @@ func withOpencodeNonce(ctx context.Context, nonce string) context.Context {
 	return withOpencodeRequest(ctx, nonce, nil, nil)
 }
 
+func withOpencodeSessions(ctx context.Context, sessions *opencode.SessionMap) context.Context {
+	if sessions == nil {
+		return ctx
+	}
+	if st := opencodeStateFrom(ctx); st != nil {
+		if st.sessions == nil {
+			st.sessions = sessions
+		}
+		return ctx
+	}
+	st := &opencodeReqState{sessions: sessions}
+	return context.WithValue(ctx, opencodeStateKey, st)
+}
+
 func prepareOpencodeSession(ctx context.Context, provider *domain.Provider, body []byte) {
 	st := opencodeStateFrom(ctx)
 	var id opencode.Identity
@@ -619,7 +657,17 @@ func prepareOpencodeSession(ctx context.Context, provider *domain.Provider, body
 		baseURL = provider.BaseURL
 		apiKey = provider.APIKey
 	}
-	sid := opencode.ResolveSession(id, nonce, providerID, baseURL, apiKey, opencode.AccumulateAssistantText(body))
+	transcript := opencode.AccumulateAssistantText(body)
+	sid := opencode.ResolveSession(id, nonce, providerID, baseURL, apiKey, transcript)
+	if st != nil && st.sessions != nil && opencode.NeedsFreeTier(baseURL, reqModelFromBody(body)) {
+		if opencode.IsNativeSessionID(id.Session) {
+			sid = id.Session
+		} else if id.Session != "" {
+			sid = st.sessions.ClientSession(id.Session)
+		} else {
+			sid = st.sessions.FallbackSession(nonce, providerID, baseURL, apiKey, transcript)
+		}
+	}
 	if st != nil {
 		st.session = sid
 	}
@@ -686,7 +734,7 @@ func newUUID() string {
 // when near expiry) before the first send; on a 401/403 the token is forcibly
 // refreshed and the request retried once.
 func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header) (int, []byte, error) {
-	url := strings.TrimRight(provider.BaseURL, "/") + path
+	url := strings.TrimRight(effectiveProviderBaseURL(provider), "/") + path
 	if t := traceInfoFrom(ctx); t != nil {
 		t.UpstreamURL = url
 	}
@@ -784,7 +832,21 @@ func upstreamURL(provider *domain.Provider, path string) string {
 		}
 		return path
 	}
-	return strings.TrimRight(provider.BaseURL, "/") + path
+	return strings.TrimRight(effectiveProviderBaseURL(provider), "/") + path
+}
+
+// effectiveProviderBaseURL returns the provider's stored base URL with
+// backend-specific endpoint migrations applied. Only OpenCode rows move; every
+// other protocol keeps its stored URL byte-for-byte, and the provider record
+// itself is never mutated.
+func effectiveProviderBaseURL(provider *domain.Provider) string {
+	if provider == nil {
+		return ""
+	}
+	if provider.Protocol == domain.ProtocolOpencode {
+		return opencode.EffectiveBaseURL(provider.BaseURL)
+	}
+	return provider.BaseURL
 }
 
 func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header, streamAccept string) (*http.Response, error) {

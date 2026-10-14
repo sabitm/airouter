@@ -327,6 +327,67 @@ func TestOpencodeModelQueriesShareRequestAndParsing(t *testing.T) {
 	}
 }
 
+// TestOpencodeModelQueriesRouteMigratedEndpoints proves model discovery and
+// Check resolve the stored legacy Zen base to the current inference endpoint at
+// the probe seam, while Go and custom URLs stay unchanged.
+func TestOpencodeModelQueriesRouteMigratedEndpoints(t *testing.T) {
+	cases := []struct {
+		name string
+		base string
+		want string
+	}{
+		{"new zen", opencode.ZenBaseURL, opencode.ZenBaseURL + "/models"},
+		{"legacy zen", opencode.LegacyZenBaseURL, opencode.ZenBaseURL + "/models"},
+		{"legacy zen trailing slash", opencode.LegacyZenBaseURL + "/", opencode.ZenBaseURL + "/models"},
+		{"go", opencode.GoBaseURL, opencode.GoBaseURL + "/models"},
+		{"custom", "https://models.example/v1/", "https://models.example/v1/models"},
+		{"custom zen path", "http://127.0.0.1:9/zen/v1", "http://127.0.0.1:9/zen/v1/models"},
+	}
+	for _, route := range cases {
+		for _, op := range []struct {
+			name      string
+			operation string
+			discovery bool
+		}{
+			{name: "check", operation: "check_opencode"},
+			{name: "discovery", operation: "fetch_opencode_models", discovery: true},
+		} {
+			t.Run(route.name+"/"+op.name, func(t *testing.T) {
+				var got *http.Request
+				withOpencodeProbeTransport(t, func(req *http.Request) (*http.Response, error) {
+					got = req.Clone(req.Context())
+					return opencodeModelsHTTPResponse(http.StatusOK, `{"data":[{"id":"model-a"},{"id":""},{"id":"model-b"}]}`), nil
+				})
+				p := &domain.Provider{BaseURL: route.base, APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
+				if op.discovery {
+					models, err := fetchOpencodeModels(context.Background(), nil, p)
+					if err != nil || strings.Join(models, ",") != "model-a,model-b" {
+						t.Fatalf("models=%v err=%v", models, err)
+					}
+				} else {
+					ok, msg := checkOpencodeUpstream(context.Background(), nil, p)
+					if !ok || !strings.Contains(msg, "(2 models)") {
+						t.Fatalf("check ok=%v msg=%q", ok, msg)
+					}
+				}
+				if got == nil || got.URL.String() != route.want {
+					t.Fatalf("request URL = %v, want %s", got, route.want)
+				}
+				if got.Header.Get("Authorization") != "Bearer "+opencode.PublicKey || got.Header.Get("Accept") != "application/json" {
+					t.Fatalf("auth/accept headers = %v", got.Header)
+				}
+				if got.Header.Get("User-Agent") != opencode.UserAgent || got.Header.Get("x-opencode-client") != "desktop" ||
+					got.Header.Get("x-opencode-project") != "global" || !strings.HasPrefix(got.Header.Get("x-opencode-request"), "msg_") {
+					t.Fatalf("fingerprint headers = %v", got.Header)
+				}
+				if p.BaseURL != route.base {
+					t.Fatalf("provider base URL mutated: %q", p.BaseURL)
+				}
+			})
+		}
+	}
+}
+
 func TestOpencodeModelQueriesResponseSemantics(t *testing.T) {
 	p := &domain.Provider{BaseURL: opencode.ZenBaseURL, APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
 
