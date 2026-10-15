@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"testing"
 
 	"airouter/internal/domain"
+	"airouter/internal/harlog"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/openai"
 	"airouter/internal/proxy/opencode"
@@ -1251,5 +1254,481 @@ func TestOpencodeMuseSparkCaps(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("muse-spark missing xhigh level: %v", caps.Levels)
+	}
+}
+
+func TestOpencodeMessagesReconcilesFinalThinkingBudget(t *testing.T) {
+	const (
+		qwenHigh   = 32768
+		qwenMax    = 65535
+		qwenOutput = 65536
+		opusBudget = 16000
+	)
+	p := opencodeTestProvider()
+
+	t.Run("explicit cap preserved", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			ingress codec
+			body    string
+			model   string
+			budget  int
+			cap     int
+		}{
+			{name: "chat", ingress: openaiCodec, model: "qwen3.6-plus", budget: qwenHigh, cap: 40000, body: `{"model":"combo","reasoning_effort":"high","max_tokens":40000,"messages":[{"role":"user","content":"hi"}],"metadata":{"keep":true}}`},
+			{name: "chat alias", ingress: openaiCodec, model: "qwen3.6-plus", budget: qwenHigh, cap: 40000, body: `{"model":"combo","reasoning_effort":"high","max_completion_tokens":40000,"messages":[{"role":"user","content":"hi"}]}`},
+			{name: "responses", ingress: responsesCodec, model: "qwen3.6-plus", budget: qwenHigh, cap: 40000, body: `{"model":"combo","reasoning":{"effort":"high"},"max_output_tokens":40000,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+			{name: "anthropic", ingress: anthropicCodec, model: "qwen3.6-plus", budget: qwenHigh, cap: 40000, body: `{"model":"combo","max_tokens":40000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000}}`},
+			{name: "opus", ingress: openaiCodec, model: "claude-opus-4-5", budget: opusBudget, cap: 32000, body: `{"model":"combo","reasoning_effort":"high","max_completion_tokens":32000,"messages":[{"role":"user","content":"hi"}]}`},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				req := decodeOpencodeIngress(t, tc.ingress, []byte(tc.body), tc.model)
+				backend := backendCodecFor(p.Protocol, p.BaseURL, tc.model)
+				encoded, err := backend.encodeRequest(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				out, err := finalizeEncodedBody(encoded, req, backend, p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got map[string]any
+				if err := json.Unmarshal(out, &got); err != nil {
+					t.Fatal(err)
+				}
+				assertOpencodeBudget(t, got, tc.budget, tc.cap)
+				if req.MaxTokens != tc.cap {
+					t.Fatalf("IR max changed to %d", req.MaxTokens)
+				}
+			})
+		}
+	})
+
+	t.Run("generic encoder raise is restored", func(t *testing.T) {
+		req := &ir.Request{
+			Model:     "qwen3.6-plus",
+			MaxTokens: 40000,
+			Thinking:  &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+			Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		}
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		// The generic Anthropic encoder can raise max_tokens before OpenCode finalization.
+		// Feed that raised body directly so restoration does not depend on the current generic budget.
+		encoded := []byte(`{"model":"qwen3.6-plus","max_tokens":50000,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"thinking":{"type":"enabled","budget_tokens":24576},"metadata":{"keep":true}}`)
+		out, err := finalizeEncodedBody(encoded, req, backend, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		assertOpencodeBudget(t, got, qwenHigh, 40000)
+		meta, _ := got["metadata"].(map[string]any)
+		if meta["keep"] != true {
+			t.Fatalf("metadata = %#v", got["metadata"])
+		}
+		if req.MaxTokens != 40000 {
+			t.Fatalf("IR max changed to %d", req.MaxTokens)
+		}
+	})
+
+	t.Run("nested raw fields survive cap patch", func(t *testing.T) {
+		req := &ir.Request{
+			Model:    "qwen3.6-plus",
+			Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+			Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		}
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		// Duplicate members and key order are lost by recursive map reserialization.
+		nested := json.RawMessage(`{"z":1,"a":2,"a":{"k":"</script>","n":9050000000000000001}}`)
+		encoded := []byte(`{"model":"qwen3.6-plus","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":32768},"metadata":` + string(nested) + `}`)
+		out, err := reconcileOpencodeMessagesBudget(encoded, req, backend, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(out, &doc); err != nil {
+			t.Fatal(err)
+		}
+		// encoding/json escapes < when the changed cap is marshaled. Duplicate
+		// members and key order still prove the nested value was not rebuilt.
+		wantNested := `{"z":1,"a":2,"a":{"k":"\u003c/script\u003e","n":9050000000000000001}}`
+		if string(doc["metadata"]) != wantNested {
+			t.Fatalf("metadata raw = %s", doc["metadata"])
+		}
+		if string(doc["max_tokens"]) != "33792" {
+			t.Fatalf("max_tokens raw = %s", doc["max_tokens"])
+		}
+		if req.MaxTokens != 0 || p.APIKey != opencode.PublicKey {
+			t.Fatal("request or provider changed")
+		}
+	})
+
+	t.Run("omitted cap grows within ceiling", func(t *testing.T) {
+		got := prepareOpencodeMessagesBudget(t, p, openaiCodec, []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`), "qwen3.6-plus")
+		assertOpencodeBudget(t, got, qwenHigh, qwenHigh+1024)
+	})
+	t.Run("max effort near ceiling", func(t *testing.T) {
+		got := prepareOpencodeMessagesBudget(t, p, responsesCodec, []byte(`{"model":"combo","reasoning":{"effort":"max"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`), "qwen3.6-plus")
+		assertOpencodeBudget(t, got, qwenMax, qwenOutput)
+	})
+	t.Run("opus omitted", func(t *testing.T) {
+		got := prepareOpencodeMessagesBudget(t, p, anthropicCodec, []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"low"}}`), "claude-opus-4-5")
+		assertOpencodeBudget(t, got, opusBudget, opusBudget+1024)
+	})
+	t.Run("omitted generated cap clamps to catalog ceiling", func(t *testing.T) {
+		const (
+			model   = "claude-opus-4-1"
+			ceiling = 32000
+			budget  = ceiling - 1
+		)
+		req := &ir.Request{
+			Model:    model,
+			Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "max"},
+			Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		}
+		backend := backendCodecFor(p.Protocol, p.BaseURL, model)
+		encoded, err := backend.encodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var before map[string]any
+		if err := json.Unmarshal(encoded, &before); err != nil {
+			t.Fatal(err)
+		}
+		if before["max_tokens"] != float64(64000) {
+			t.Fatalf("generic encoder cap = %v, want 64000", before["max_tokens"])
+		}
+		originalReq := req.MaxTokens
+		originalKey := p.APIKey
+		out, err := finalizeEncodedBody(encoded, req, backend, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		assertOpencodeBudget(t, got, budget, ceiling)
+		if req.MaxTokens != originalReq || p.APIKey != originalKey {
+			t.Fatal("request or provider changed")
+		}
+	})
+
+	t.Run("conflicts", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			ingress codec
+			model   string
+			body    string
+		}{
+			{name: "equal", ingress: openaiCodec, model: "qwen3.6-plus", body: fmt.Sprintf(`{"model":"combo","reasoning_effort":"high","max_tokens":%d,"messages":[{"role":"user","content":"hi"}]}`, qwenHigh)},
+			{name: "below", ingress: openaiCodec, model: "qwen3.6-plus", body: `{"model":"combo","reasoning_effort":"high","max_completion_tokens":1000,"messages":[{"role":"user","content":"hi"}]}`},
+			{name: "over ceiling", ingress: responsesCodec, model: "qwen3.6-plus", body: fmt.Sprintf(`{"model":"combo","reasoning":{"effort":"high"},"max_output_tokens":%d,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`, qwenOutput+1)},
+			{name: "opus equal", ingress: anthropicCodec, model: "claude-opus-4-5", body: fmt.Sprintf(`{"model":"combo","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000}}`, opusBudget)},
+			{name: "opus over ceiling", ingress: anthropicCodec, model: "claude-opus-4-5", body: `{"model":"combo","max_tokens":64001,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"high"}}`},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				req := decodeOpencodeIngress(t, tc.ingress, []byte(tc.body), tc.model)
+				original := req.MaxTokens
+				backend := backendCodecFor(p.Protocol, p.BaseURL, tc.model)
+				encoded, err := backend.encodeRequest(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = finalizeEncodedBody(encoded, req, backend, p)
+				if !errors.Is(err, errOpencodeThinkingBudget) {
+					t.Fatalf("err = %v", err)
+				}
+				if req.MaxTokens != original || p.APIKey != opencode.PublicKey {
+					t.Fatalf("request or provider changed")
+				}
+			})
+		}
+	})
+}
+
+func TestOpencodeMessagesBudgetScopeIsolation(t *testing.T) {
+	p := opencodeTestProvider()
+	got := prepareOpencodeMessagesBudget(t, p, openaiCodec, []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}]}`), "qwen3.6-plus")
+	assertNoRecognizedReasoningControls(t, got)
+	if got["max_tokens"] != float64(4096) {
+		t.Fatalf("no-intent cap = %v", got["max_tokens"])
+	}
+
+	adaptive := prepareOpencodeMessagesBudget(t, p, openaiCodec, []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`), "claude-opus-4-6")
+	th, _ := adaptive["thinking"].(map[string]any)
+	if th["type"] != "adaptive" || adaptive["max_tokens"] != float64(128) {
+		t.Fatalf("adaptive = thinking:%+v max:%v", th, adaptive["max_tokens"])
+	}
+
+	chat := prepareOpencodeMessagesBudget(t, p, openaiCodec, []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`), "glm-5.3")
+	if chat["reasoning_effort"] != "high" || chat["max_tokens"] != float64(8) {
+		t.Fatalf("chat dialect = %#v", chat)
+	}
+	responsesBody := prepareOpencodeMessagesBudget(t, p, responsesCodec, []byte(`{"model":"combo","reasoning":{"effort":"max"},"max_output_tokens":8,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`), "gpt-5.4")
+	if responsesBody["max_output_tokens"] != float64(8) {
+		t.Fatalf("responses cap = %v", responsesBody["max_output_tokens"])
+	}
+
+	claude := &domain.Provider{Protocol: domain.ProtocolAnthropic, ReasoningDialect: domain.ReasoningClaude}
+	req := decodeOpencodeIngress(t, anthropicCodec, []byte(`{"model":"combo","max_tokens":1000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":4096}}`), "claude-sonnet-4-5")
+	encoded, err := anthropicCodec.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := finalizeEncodedBody(encoded, req, anthropicCodec, claude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var other map[string]any
+	if err := json.Unmarshal(out, &other); err != nil {
+		t.Fatal(err)
+	}
+	if other["max_tokens"] == float64(1000) {
+		t.Fatalf("anthropic explicit cap restored: %#v", other)
+	}
+}
+
+func TestOpencodeMessagesBudgetHTTPLifecycle(t *testing.T) {
+	hits := 0
+	var lastBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		lastBody, _ = io.ReadAll(r.Body)
+		var got map[string]any
+		if err := json.Unmarshal(lastBody, &got); err != nil {
+			t.Errorf("upstream json: %v body=%s", err, lastBody)
+		} else {
+			th, _ := got["thinking"].(map[string]any)
+			budget, _ := th["budget_tokens"].(float64)
+			cap, _ := got["max_tokens"].(float64)
+			spec, ok := opencode.Lookup(opencode.Tier(opencode.ZenBaseURL), fmt.Sprint(got["model"]))
+			if !ok || th["type"] != "enabled" || budget <= 0 || budget >= cap || cap > float64(spec.Output) {
+				t.Errorf("invalid upstream body: %s", lastBody)
+			}
+		}
+		if r.Header.Get("Accept") == "text/event-stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, anthropicSSE)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	cases := []struct {
+		name   string
+		model  string
+		path   string
+		body   string
+		status int
+		stream bool
+		budget int
+		cap    int
+	}{
+		{name: "chat-valid", model: "qwen3.6-plus", path: "/v1/chat/completions", status: 200, budget: 32768, cap: 40000, body: `{"model":"%s","reasoning_effort":"high","max_tokens":40000,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "chat-alias", model: "qwen3.6-plus", path: "/v1/chat/completions", status: 200, stream: true, budget: 32768, cap: 40000, body: `{"model":"%s","stream":true,"reasoning_effort":"high","max_completion_tokens":40000,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "responses-max", model: "qwen3.6-plus", path: "/v1/responses", status: 200, budget: 65535, cap: 65536, body: `{"model":"%s","reasoning":{"effort":"max"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "responses-max-stream", model: "qwen3.6-plus", path: "/v1/responses", status: 200, stream: true, budget: 65535, cap: 65536, body: `{"model":"%s","stream":true,"reasoning":{"effort":"max"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "anthropic-opus", model: "claude-opus-4-5", path: "/v1/messages", status: 200, budget: 16000, cap: 32000, body: `{"model":"%s","max_tokens":32000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000}}`},
+		{name: "anthropic-opus-stream", model: "claude-opus-4-5", path: "/v1/messages", status: 200, stream: true, budget: 16000, cap: 32000, body: `{"model":"%s","stream":true,"max_tokens":32000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000}}`},
+		{name: "opus41-omitted", model: "claude-opus-4-1", path: "/v1/chat/completions", status: 200, budget: 31999, cap: 32000, body: `{"model":"%s","reasoning_effort":"max","messages":[{"role":"user","content":"hi"}]}`},
+		{name: "opus41-omitted-stream", model: "claude-opus-4-1", path: "/v1/messages", status: 200, stream: true, budget: 31999, cap: 32000, body: `{"model":"%s","stream":true,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"max"}}`},
+		{name: "chat-equal", model: "qwen3.6-plus", path: "/v1/chat/completions", status: 400, body: `{"model":"%s","reasoning_effort":"high","max_tokens":32768,"messages":[{"role":"user","content":"private conversation"}]}`},
+		{name: "chat-equal-stream", model: "qwen3.6-plus", path: "/v1/chat/completions", status: 400, stream: true, body: `{"model":"%s","stream":true,"reasoning_effort":"high","max_tokens":32768,"messages":[{"role":"user","content":"private conversation"}]}`},
+		{name: "responses-over", model: "claude-opus-4-5", path: "/v1/responses", status: 400, body: `{"model":"%s","reasoning":{"effort":"high"},"max_output_tokens":64001,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"private conversation"}]}]}`},
+		{name: "responses-over-stream", model: "claude-opus-4-5", path: "/v1/responses", status: 400, stream: true, body: `{"model":"%s","stream":true,"reasoning":{"effort":"high"},"max_output_tokens":64001,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"private conversation"}]}]}`},
+		{name: "anthropic-equal", model: "claude-opus-4-5", path: "/v1/messages", status: 400, body: `{"model":"%s","max_tokens":16000,"messages":[{"role":"user","content":"private conversation"}],"thinking":{"type":"enabled","budget_tokens":1000}}`},
+		{name: "anthropic-equal-stream", model: "claude-opus-4-5", path: "/v1/messages", status: 400, stream: true, body: `{"model":"%s","stream":true,"max_tokens":16000,"messages":[{"role":"user","content":"private conversation"}],"thinking":{"type":"enabled","budget_tokens":1000}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: tc.name, Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: tc.model, Enabled: true}}}); err != nil {
+				t.Fatal(err)
+			}
+			before := hits
+			req, err := http.NewRequest(http.MethodPost, ts.URL+tc.path, strings.NewReader(fmt.Sprintf(tc.body, tc.name)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+key.Token)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+			}
+			if tc.status == http.StatusBadRequest {
+				if hits != before {
+					t.Fatalf("upstream hits %d, want %d", hits, before)
+				}
+				if resp.Header.Get("Content-Type") != "application/json" {
+					t.Fatalf("content-type = %q", resp.Header.Get("Content-Type"))
+				}
+				assertIngressErrorEnvelope(t, tc.path, out, "invalid_request_error")
+				if bytes.Contains(out, []byte("private conversation")) || bytes.Contains(out, []byte("data:")) || bytes.Contains(out, []byte("event:")) {
+					t.Fatalf("error leaked request text or SSE: %s", out)
+				}
+				return
+			}
+			if hits != before+1 {
+				t.Fatalf("hits=%d before=%d", hits, before)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(lastBody, &got); err != nil {
+				t.Fatal(err)
+			}
+			assertOpencodeBudget(t, got, tc.budget, tc.cap)
+			if tc.stream && !bytes.Contains(out, []byte("data:")) {
+				t.Fatalf("stream response missing SSE: %s", out)
+			}
+		})
+	}
+}
+
+func TestOpencodeMessagesFinalizerFailureStays500(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.Error(w, "unreachable", http.StatusBadGateway)
+	}))
+	t.Cleanup(upstream.Close)
+	provider := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
+	real := backendCodecFor(provider.Protocol, provider.BaseURL, "qwen3.6-plus")
+	proxy := New(newTestStore(t), nil)
+	prep := &attachmentPrep{}
+
+	t.Run("unary", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":40000,"messages":[{"role":"user","content":"private conversation"}]}`)
+		assertOpencodeFinalizer500(t, proxy, provider, real, prep, false, body, &hits)
+	})
+	t.Run("stream", func(t *testing.T) {
+		body := []byte(`{"model":"combo","stream":true,"reasoning_effort":"high","max_tokens":40000,"messages":[{"role":"user","content":"private conversation"}]}`)
+		assertOpencodeFinalizer500(t, proxy, provider, real, prep, true, body, &hits)
+	})
+}
+
+func assertOpencodeFinalizer500(t *testing.T, proxy *Proxy, provider *domain.Provider, real codec, prep *attachmentPrep, stream bool, body []byte, hits *int) {
+	t.Helper()
+	backend := real
+	backend.encodeRequest = func(*ir.Request) ([]byte, error) {
+		return []byte("{"), nil
+	}
+	rec := harlog.New("finalizer")
+	ctx := WithTraceInfo(context.Background(), &TraceInfo{RequestID: "finalizer", HAR: rec})
+	w := httptest.NewRecorder()
+	res := &reqResult{status: http.StatusOK}
+	before := *hits
+	var got attemptResult
+	if stream {
+		got = proxy.streamTranslated(w, ctx, res, openaiCodec, backend, provider, "qwen3.6-plus", body, prep)
+	} else {
+		got = proxy.serveTranslated(w, ctx, res, openaiCodec, backend, provider, "qwen3.6-plus", body, prep)
+	}
+	if got.status != http.StatusInternalServerError || got.errType != "api_error" || got.retry || got.written || got.failed {
+		t.Fatalf("attempt = %+v", got)
+	}
+	if got.errMsg != "failed to finalize upstream request" {
+		t.Fatalf("message = %q", got.errMsg)
+	}
+	if *hits != before {
+		t.Fatalf("upstream hits = %d, want %d", *hits, before)
+	}
+	if _, entries := rec.Stats(); entries != 0 {
+		t.Fatalf("HAR entries = %d, want 0", entries)
+	}
+	if w.Code != http.StatusOK || w.Body.Len() != 0 {
+		t.Fatalf("handler committed status=%d body=%s", w.Code, w.Body.Bytes())
+	}
+	envelope := openaiCodec.encodeError(got.errMsg, got.errType)
+	assertIngressErrorEnvelope(t, "/v1/chat/completions", envelope, "api_error")
+	if bytes.Contains(envelope, []byte("private conversation")) || bytes.Contains(envelope, []byte("unexpected end of JSON")) {
+		t.Fatalf("envelope leaked request or malformed body: %s", envelope)
+	}
+}
+
+func prepareOpencodeMessagesBudget(t *testing.T, p *domain.Provider, ingress codec, body []byte, model string) map[string]any {
+	t.Helper()
+	req := decodeOpencodeIngress(t, ingress, body, model)
+	backend := backendCodecFor(p.Protocol, p.BaseURL, model)
+	encoded, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := finalizeEncodedBody(encoded, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func decodeOpencodeIngress(t *testing.T, ingress codec, body []byte, model string) *ir.Request {
+	t.Helper()
+	req, err := ingress.decodeRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured := thinking.Capture(body); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
+	applyUpstreamModel(req, model)
+	return req
+}
+
+func assertOpencodeBudget(t *testing.T, got map[string]any, budget, cap int) {
+	t.Helper()
+	th, _ := got["thinking"].(map[string]any)
+	if th["type"] != "enabled" || th["budget_tokens"] != float64(budget) {
+		t.Fatalf("thinking = %+v, want budget %d", th, budget)
+	}
+	if got["max_tokens"] != float64(cap) {
+		t.Fatalf("max_tokens = %v, want %d", got["max_tokens"], cap)
+	}
+}
+
+func assertIngressErrorEnvelope(t *testing.T, path string, body []byte, errType string) {
+	t.Helper()
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	errObj, _ := got["error"].(map[string]any)
+	if path == "/v1/messages" {
+		if got["type"] != "error" || errObj["type"] != errType || errObj["message"] == "" {
+			t.Fatalf("anthropic envelope = %s", body)
+		}
+		return
+	}
+	if errObj["type"] != errType || errObj["message"] == "" || errObj["code"] != nil {
+		t.Fatalf("openai envelope = %s", body)
+	}
+	if path == "/v1/responses" && errObj["param"] != nil {
+		t.Fatalf("responses envelope = %s", body)
 	}
 }

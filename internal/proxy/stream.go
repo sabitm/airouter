@@ -11,6 +11,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/observability"
+	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/cursor"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
@@ -319,6 +320,9 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	// Provider-aware reasoning finalization before protocol prepare/signing.
 	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, provider)
 	if err != nil {
+		if errors.Is(err, errOpencodeThinkingBudget) {
+			return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
+		}
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
 	}
 	upstreamBody, err = p.prepareUpstreamRequestFor(ctx, backend, provider, req, upstreamBody)
@@ -778,7 +782,7 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	// Grok omits none/auto instead of upgrading them. The encoder already wrote
 	// a transport-default effort, so ApplyWire must still strip that field.
 	if eff == nil && caps.RequiredDefault == "" && dialect != domain.ReasoningGrok {
-		return body, nil
+		return reconcileOpencodeMessagesBudget(body, req, backend, provider)
 	}
 	out, err := thinking.ApplyWireForTier(backend.id, body, req.Model, eff, provider.Protocol, dialect, tier)
 	if err != nil {
@@ -790,7 +794,98 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 			return nil, err
 		}
 	}
-	return out, nil
+	return reconcileOpencodeMessagesBudget(out, req, backend, provider)
+}
+
+// errOpencodeThinkingBudget rejects an enabled OpenCode Messages budget that
+// cannot fit the caller's explicit cap or the selected catalog output ceiling.
+// The budget itself is not remapped.
+var errOpencodeThinkingBudget = errors.New("thinking budget exceeds max_tokens or model output limit")
+
+// reconcileOpencodeMessagesBudget runs only after the OpenCode writer has
+// selected the final budget. An explicit positive IR cap is preserved and is
+// never clamped or raised. A generated cap starts from the encoded value, or
+// the Anthropic default when that value is absent, and may grow for 1024 tokens
+// of headroom. Only that generated cap is clamped to the catalog ceiling.
+// The final budget, request, and provider are not changed.
+func reconcileOpencodeMessagesBudget(body []byte, req *ir.Request, backend codec, provider *domain.Provider) ([]byte, error) {
+	if provider == nil || provider.Protocol != domain.ProtocolOpencode || backend.id != codecOpencodeMessages || req == nil {
+		return body, nil
+	}
+	spec, ok := opencode.Lookup(opencode.Tier(provider.BaseURL), req.Model)
+	if !ok {
+		return body, nil
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+	budget, enabled := opencodeMessagesEnabledBudget(doc["thinking"])
+	if !enabled || budget <= 0 {
+		return body, nil
+	}
+	encodedCap, capIsNumber := positiveJSONInt(doc["max_tokens"])
+	cap := encodedCap
+	if req.MaxTokens > 0 {
+		// The generic encoder may already have raised max_tokens. The IR value is
+		// the caller cap and must not be silently changed.
+		cap = req.MaxTokens
+	} else {
+		if cap <= 0 {
+			cap = anthropic.DefaultMaxTokens
+		}
+		need := budget + 1024
+		if spec.Output > 0 && need > spec.Output {
+			need = spec.Output
+		}
+		if cap < need {
+			cap = need
+		}
+		// A generated cap above the selected ceiling is clamped. An explicit cap is not.
+		if spec.Output > 0 && cap > spec.Output {
+			cap = spec.Output
+		}
+	}
+	if budget >= cap || (spec.Output > 0 && cap > spec.Output) {
+		return nil, errOpencodeThinkingBudget
+	}
+	if capIsNumber && cap == encodedCap {
+		return body, nil
+	}
+	encoded, err := json.Marshal(cap)
+	if err != nil {
+		return nil, err
+	}
+	doc["max_tokens"] = encoded
+	return json.Marshal(doc)
+}
+
+func opencodeMessagesEnabledBudget(raw json.RawMessage) (int, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false
+	}
+	var thinkingObj struct {
+		Type         string          `json:"type"`
+		BudgetTokens json.RawMessage `json:"budget_tokens"`
+	}
+	if err := json.Unmarshal(raw, &thinkingObj); err != nil {
+		return 0, false
+	}
+	if thinkingObj.Type != "enabled" {
+		return 0, false
+	}
+	return positiveJSONInt(thinkingObj.BudgetTokens)
+}
+
+func positiveJSONInt(raw json.RawMessage) (int, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // protocolForCodec maps a codec id to a domain protocol for caps resolution.
