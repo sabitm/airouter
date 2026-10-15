@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/opencode"
 )
 
 func TestParseSuffix(t *testing.T) {
@@ -702,6 +703,183 @@ func TestApplyWireOpencodeCatalog(t *testing.T) {
 	if _, ok := m["thinking"]; ok {
 		t.Fatalf("toggle-only model wrote thinking: %s", none)
 	}
+}
+
+func TestOpencodeMiniMaxToggleCaps(t *testing.T) {
+	zenFree, ok := opencode.Lookup("zen", "minimax-m3-free")
+	if !ok || !OpencodeMiniMaxToggle(zenFree) {
+		t.Fatalf("zen free spec = %+v ok=%v", zenFree, ok)
+	}
+	goM3, ok := opencode.Lookup("go", "minimax-m3")
+	if !ok || !OpencodeMiniMaxToggle(goM3) {
+		t.Fatalf("go spec = %+v ok=%v", goM3, ok)
+	}
+	zenChat, ok := opencode.Lookup("zen", "minimax-m3")
+	if !ok || OpencodeMiniMaxToggle(zenChat) {
+		t.Fatalf("zen chat spec selected: %+v ok=%v", zenChat, ok)
+	}
+	for _, model := range []string{"minimax-m3", "minimax-m3-free-extra", "minimax-m3-pro", "qwen3.6-plus"} {
+		caps := CapsFor(model, domain.ProtocolOpencode, domain.ReasoningOpencode)
+		if caps.Format == FormatMiniMax {
+			t.Fatalf("%s caps = %+v", model, caps)
+		}
+	}
+	freeCaps := OpencodeCaps(zenFree, true)
+	goCaps := OpencodeCaps(goM3, true)
+	if !freeCaps.Reasoning || !freeCaps.CanDisable || freeCaps.Format != FormatMiniMax || freeCaps.MaxOutput != 32000 {
+		t.Fatalf("free caps = %+v", freeCaps)
+	}
+	if !goCaps.Reasoning || !goCaps.CanDisable || goCaps.Format != FormatMiniMax || goCaps.MaxOutput != 131072 {
+		t.Fatalf("go caps = %+v", goCaps)
+	}
+	chatCaps := OpencodeCaps(zenChat, true)
+	if chatCaps.Reasoning || chatCaps.Format != FormatNone {
+		t.Fatalf("zen chat caps = %+v", chatCaps)
+	}
+	for _, model := range []string{"glm-4.7", "glm-4.7-free", "kimi-k2.5", "qwen3.6-plus", "minimax-m2.5-free"} {
+		spec, ok := opencode.Lookup("zen", model)
+		if !ok || OpencodeMiniMaxToggle(spec) {
+			t.Fatalf("%s selected: %+v ok=%v", model, spec, ok)
+		}
+	}
+}
+
+func TestApplyWireOpencodeMiniMaxToggle(t *testing.T) {
+	cases := []struct {
+		name    string
+		model   string
+		tier    string
+		raw     string
+		suffix  string
+		want    string
+		written bool
+	}{
+		{name: "thinking adaptive", model: "minimax-m3-free", raw: `{"thinking":{"type":"adaptive"}}`, want: "adaptive", written: true},
+		{name: "thinking enabled", model: "minimax-m3", tier: "go", raw: `{"thinking":{"type":"enabled"}}`, want: "adaptive", written: true},
+		{name: "thinking disabled", model: "minimax-m3", tier: "go", raw: `{"thinking":{"type":"disabled"}}`, want: "disabled", written: true},
+		{name: "enable thinking true", model: "minimax-m3-free", raw: `{"enable_thinking":true}`, want: "adaptive", written: true},
+		{name: "enable thinking false", model: "minimax-m3", tier: "go", raw: `{"enable_thinking":false}`, want: "disabled", written: true},
+		{name: "reasoning effort high", model: "minimax-m3-free", raw: `{"reasoning_effort":"high"}`, want: "adaptive", written: true},
+		{name: "reasoning effort none", model: "minimax-m3-free", raw: `{"reasoning_effort":"none"}`, want: "disabled", written: true},
+		{name: "responses effort off", model: "minimax-m3", tier: "go", raw: `{"reasoning":{"effort":"off"}}`, want: "disabled", written: true},
+		{name: "positive budget", model: "minimax-m3", tier: "go", raw: `{"thinking":{"type":"enabled","budget_tokens":1000}}`, want: "adaptive", written: true},
+		{name: "output effort conflicts disabled", model: "minimax-m3-free", raw: `{"output_config":{"effort":"high"},"thinking":{"type":"disabled","budget_tokens":1000}}`, want: "disabled", written: true},
+		{name: "effort conflicts enable false", model: "minimax-m3", tier: "go", raw: `{"reasoning_effort":"high","enable_thinking":false}`, want: "disabled", written: true},
+		{name: "suffix high preserves body disable", model: "minimax-m3", tier: "go", raw: `{"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}`, suffix: "(high)", want: "disabled", written: true},
+		{name: "suffix none disables enabled body", model: "minimax-m3-free", raw: `{"enable_thinking":true,"reasoning_effort":"high"}`, suffix: "(none)", want: "disabled", written: true},
+		{name: "suffix off disables enabled body", model: "minimax-m3", tier: "go", raw: `{"thinking":{"type":"enabled"}}`, suffix: "(off)", want: "disabled", written: true},
+		{name: "auto no enable", model: "minimax-m3-free", raw: `{"reasoning_effort":"auto"}`, written: false},
+		{name: "auto with enable", model: "minimax-m3", tier: "go", raw: `{"reasoning_effort":"auto","enable_thinking":true}`, want: "adaptive", written: true},
+		{name: "zen chat ignores positive body", model: "minimax-m3", raw: `{"reasoning_effort":"high","enable_thinking":true}`, written: false},
+		{name: "lookalike ignores positive body", model: "minimax-m3-pro", tier: "go", raw: `{"reasoning_effort":"high","enable_thinking":true}`, written: false},
+		{name: "other toggle ignores positive body", model: "glm-4.7", raw: `{"reasoning_effort":"high","enable_thinking":true}`, written: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := miniMaxRawBody(t, tc.raw)
+			captured := Capture(raw)
+			base, suffixCfg := ParseSuffix(tc.model + tc.suffix)
+			if base != tc.model {
+				t.Fatalf("suffix base = %s, want %s", base, tc.model)
+			}
+			out, err := ApplyWireForTier("anth-msg", raw, base, Merge(captured, suffixCfg), domain.ProtocolOpencode, domain.ReasoningOpencode, tc.tier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["model"] != tc.model {
+				t.Fatalf("model = %v, want %s", got["model"], tc.model)
+			}
+			th, _ := got["thinking"].(map[string]any)
+			if !tc.written {
+				if _, ok := got["thinking"]; ok {
+					t.Fatalf("thinking = %#v", got["thinking"])
+				}
+				return
+			}
+			if len(th) != 1 || th["type"] != tc.want {
+				t.Fatalf("thinking = %#v, want type %s", th, tc.want)
+			}
+			for _, field := range []string{"reasoning_effort", "enable_thinking", "thinking_budget", "reasoning"} {
+				if _, ok := got[field]; ok {
+					t.Fatalf("%s leaked: %#v", field, got[field])
+				}
+			}
+			oc, _ := got["output_config"].(map[string]any)
+			if len(oc) != 1 || oc["format"] == nil {
+				t.Fatalf("output_config = %#v", oc)
+			}
+		})
+	}
+
+	assistant := []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"done"}],"enable_thinking":true}`)
+	out, err := ApplyWireForTier("anth-msg", assistant, "minimax-m3", Capture(assistant), domain.ProtocolOpencode, domain.ReasoningOpencode, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["thinking"]; ok || got["enable_thinking"] != nil {
+		t.Fatalf("assistant-final wrote controls: %s", out)
+	}
+
+	noIntentRaw := []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}]}`)
+	if Capture(noIntentRaw) != nil {
+		t.Fatal("no-intent body captured controls")
+	}
+	noIntent, err := ApplyWireForTier("anth-msg", noIntentRaw, "minimax-m3-free", nil, domain.ProtocolOpencode, domain.ReasoningOpencode, "zen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = map[string]any{}
+	if err := json.Unmarshal(noIntent, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["thinking"]; ok || got["output_config"] != nil {
+		t.Fatalf("no intent wrote controls: %s", noIntent)
+	}
+}
+
+func miniMaxRawBody(t *testing.T, controls string) []byte {
+	t.Helper()
+	var extra map[string]any
+	if err := json.Unmarshal([]byte(controls), &extra); err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{
+		"model":    "combo",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"output_config": map[string]any{
+			"format": map[string]any{"type": "json_object"},
+		},
+		"thinking": map[string]any{"vendor": "keep"},
+	}
+	for key, value := range extra {
+		switch key {
+		case "output_config":
+			oc := body["output_config"].(map[string]any)
+			for nestedKey, nested := range value.(map[string]any) {
+				oc[nestedKey] = nested
+			}
+		case "thinking":
+			thinkingObj := body["thinking"].(map[string]any)
+			for nestedKey, nested := range value.(map[string]any) {
+				thinkingObj[nestedKey] = nested
+			}
+		default:
+			body[key] = value
+		}
+	}
+	out, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
 
 func TestApplyWireOpencodeQwen38FlashEffort(t *testing.T) {

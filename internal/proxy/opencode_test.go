@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1279,7 +1280,580 @@ func TestOpencodeGoCatalogSelectsGoRow(t *testing.T) {
 	if got["model"] != "minimax-m3" {
 		t.Fatalf("model = %v", got["model"])
 	}
-	assertNoRecognizedReasoningControls(t, got)
+	th, _ := got["thinking"].(map[string]any)
+	if th["type"] != "adaptive" || th["budget_tokens"] != nil || len(th) != 1 {
+		t.Fatalf("thinking = %#v", th)
+	}
+	for _, field := range []string{"reasoning_effort", "enable_thinking", "thinking_budget", "reasoning"} {
+		if _, ok := got[field]; ok {
+			t.Fatalf("%s leaked: %#v", field, got[field])
+		}
+	}
+	if oc, ok := got["output_config"].(map[string]any); ok {
+		if _, has := oc["effort"]; has {
+			t.Fatalf("output_config.effort leaked: %#v", oc)
+		}
+	}
+}
+
+func TestOpencodeMiniMaxToggleMatrix(t *testing.T) {
+	ingresses := []struct {
+		name string
+		c    codec
+		body string
+	}{
+		{name: "chat", c: openaiCodec, body: `{"model":"combo","reasoning_effort":"%s","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Find one record","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]}`},
+		{name: "responses", c: responsesCodec, body: `{"model":"combo","reasoning":{"effort":"%s"},"max_output_tokens":%d,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "anthropic", c: anthropicCodec, body: `{"model":"combo","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"%s"},"output_config":{"effort":"high","format":{"type":"json_object"}}}`},
+	}
+	targets := []struct {
+		name  string
+		base  string
+		model string
+		free  bool
+	}{
+		{name: "zen-free", base: opencode.ZenBaseURL, model: "minimax-m3-free", free: true},
+		{name: "go", base: opencode.GoBaseURL, model: "minimax-m3"},
+	}
+	intents := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "enable", value: "high", want: "adaptive"},
+		{name: "disable", value: "none", want: "disabled"},
+	}
+	for _, target := range targets {
+		for _, ingress := range ingresses {
+			for _, intent := range intents {
+				for _, cap := range []int{128, 100000} {
+					for _, stream := range []bool{false, true} {
+						name := fmt.Sprintf("%s/%s/%s/cap%d/stream%v", target.name, ingress.name, intent.name, cap, stream)
+						t.Run(name, func(t *testing.T) {
+							body := miniMaxIngressBody(ingress.body, ingress.name == "anthropic", intent.value, cap)
+							got := prepareMiniMaxToggle(t, target.base, target.model, ingress.c, body, stream)
+							assertMiniMaxToggle(t, got, target.model, intent.want, cap, stream)
+							if ingress.name == "chat" {
+								assertMiniMaxCallerTool(t, got, target.free)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+
+	rawCases := []struct {
+		name   string
+		model  string
+		base   string
+		raw    string
+		want   string
+		stream bool
+	}{
+		{name: "zen enable_thinking true", model: "minimax-m3-free", base: opencode.ZenBaseURL, raw: `"enable_thinking":true`, want: "adaptive"},
+		{name: "go enable_thinking false", model: "minimax-m3", base: opencode.GoBaseURL, raw: `"enable_thinking":false`, want: "disabled", stream: true},
+		{name: "zen thinking adaptive", model: "minimax-m3-free", base: opencode.ZenBaseURL, raw: `"thinking":{"type":"adaptive","budget_tokens":1000}`, want: "adaptive"},
+		{name: "go thinking disabled", model: "minimax-m3", base: opencode.GoBaseURL, raw: `"thinking":{"type":"disabled"}`, want: "disabled"},
+		{name: "zen responses effort low", model: "minimax-m3-free", base: opencode.ZenBaseURL, raw: `"reasoning":{"effort":"low"}`, want: "adaptive", stream: true},
+		{name: "go responses effort off", model: "minimax-m3", base: opencode.GoBaseURL, raw: `"reasoning":{"effort":"off"}`, want: "disabled"},
+		{name: "zen output effort conflicts disabled", model: "minimax-m3-free", base: opencode.ZenBaseURL, raw: `"output_config":{"effort":"high","format":{"type":"json_object"}},"thinking":{"type":"disabled"}`, want: "disabled"},
+		{name: "go effort conflicts enable false", model: "minimax-m3", base: opencode.GoBaseURL, raw: `"reasoning_effort":"high","enable_thinking":false`, want: "disabled", stream: true},
+		{name: "zen positive budget", model: "minimax-m3-free", base: opencode.ZenBaseURL, raw: `"thinking_budget":2048,"enable_thinking":true`, want: "adaptive"},
+		{name: "go auto no enable", model: "minimax-m3", base: opencode.GoBaseURL, raw: `"reasoning_effort":"auto"`, want: ""},
+		{name: "zen auto with enable", model: "minimax-m3-free", base: opencode.ZenBaseURL, raw: `"reasoning_effort":"auto","enable_thinking":true`, want: "adaptive", stream: true},
+	}
+	for _, tc := range rawCases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"combo","max_tokens":128,%s,"messages":[{"role":"user","content":"hi"}]}`, tc.raw))
+			got := prepareMiniMaxToggle(t, tc.base, tc.model, openaiCodec, body, tc.stream)
+			if tc.want == "" {
+				assertNoRecognizedReasoningControls(t, got)
+				if _, ok := got["stream"]; ok {
+					t.Fatalf("auto wrote stream: %#v", got["stream"])
+				}
+				return
+			}
+			assertMiniMaxToggle(t, got, tc.model, tc.want, 128, tc.stream)
+		})
+	}
+
+	suffixCases := []struct {
+		name     string
+		model    string
+		base     string
+		suffix   string
+		body     string
+		want     string
+		freeTool bool
+	}{
+		{
+			name:   "go body disable survives high suffix",
+			model:  "minimax-m3",
+			base:   opencode.GoBaseURL,
+			suffix: "(high)",
+			body:   `{"model":"combo","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"output_config":{"effort":"high","format":{"type":"json_object"}}}`,
+			want:   "disabled",
+		},
+		{
+			name:     "zen body disable survives high suffix",
+			model:    "minimax-m3-free",
+			base:     opencode.ZenBaseURL,
+			suffix:   "(high)",
+			body:     `{"model":"combo","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"enable_thinking":false,"output_config":{"effort":"high"},"tools":[{"type":"function","function":{"name":"lookup","description":"Find one record","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]}`,
+			want:     "disabled",
+			freeTool: true,
+		},
+		{
+			name:   "go none suffix disables enabled body",
+			model:  "minimax-m3",
+			base:   opencode.GoBaseURL,
+			suffix: "(none)",
+			body:   `{"model":"combo","max_tokens":128,"reasoning_effort":"high","enable_thinking":true,"messages":[{"role":"user","content":"hi"}]}`,
+			want:   "disabled",
+		},
+		{
+			name:   "zen off suffix disables enabled body",
+			model:  "minimax-m3-free",
+			base:   opencode.ZenBaseURL,
+			suffix: "(off)",
+			body:   `{"model":"combo","max_output_tokens":128,"reasoning":{"effort":"low"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`,
+			want:   "disabled",
+		},
+	}
+	for _, tc := range suffixCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ingress := openaiCodec
+			if strings.Contains(tc.body, "max_output_tokens") {
+				ingress = responsesCodec
+			} else if strings.Contains(tc.body, `"thinking"`) {
+				ingress = anthropicCodec
+			}
+			got := prepareMiniMaxToggle(t, tc.base, tc.model+tc.suffix, ingress, []byte(tc.body), false)
+			assertMiniMaxToggle(t, got, tc.model, tc.want, 128, false)
+			if tc.freeTool {
+				assertMiniMaxCallerTool(t, got, true)
+			}
+		})
+	}
+
+	t.Run("zen chat unchanged", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		got := prepareOpencodeTranslated(t, openaiCodec, body, "minimax-m3")
+		assertNoRecognizedReasoningControls(t, got)
+		if got["max_tokens"] != float64(128) {
+			t.Fatalf("cap = %v", got["max_tokens"])
+		}
+	})
+
+	t.Run("no intent", func(t *testing.T) {
+		for _, target := range targets {
+			p := opencodeTestProvider()
+			p.BaseURL = target.base
+			body := []byte(`{"model":"combo","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+			req := decodeOpencodeIngress(t, openaiCodec, body, target.model)
+			backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+			encoded, err := backend.encodeRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var encodedBody map[string]any
+			if err := json.Unmarshal(encoded, &encodedBody); err != nil {
+				t.Fatal(err)
+			}
+			got := prepareOpencodeTranslatedOn(t, p, openaiCodec, body, target.model)
+			assertNoRecognizedReasoningControls(t, got)
+			if got["max_tokens"] != encodedBody["max_tokens"] || got["max_tokens"] != float64(128) {
+				t.Fatalf("%s no-intent cap = %v encoded %v", target.name, got["max_tokens"], encodedBody["max_tokens"])
+			}
+		}
+	})
+
+	t.Run("assistant final", func(t *testing.T) {
+		p := opencodeTestProvider()
+		p.BaseURL = opencode.GoBaseURL
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"done"}]}`)
+		req := decodeOpencodeIngress(t, openaiCodec, body, "minimax-m3")
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded, err := backend.encodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var encodedBody map[string]any
+		if err := json.Unmarshal(encoded, &encodedBody); err != nil {
+			t.Fatal(err)
+		}
+		got := prepareOpencodeTranslatedOn(t, p, openaiCodec, body, "minimax-m3")
+		assertNoRecognizedReasoningControls(t, got)
+		if got["max_tokens"] != encodedBody["max_tokens"] || req.MaxTokens != 128 {
+			t.Fatalf("assistant cap = %v encoded %v", got["max_tokens"], encodedBody["max_tokens"])
+		}
+	})
+
+	t.Run("raised cap restored", func(t *testing.T) {
+		p := opencodeTestProvider()
+		p.BaseURL = opencode.GoBaseURL
+		req := &ir.Request{
+			Model:     "minimax-m3",
+			MaxTokens: 128,
+			Stream:    true,
+			Thinking:  &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+			Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		}
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded := []byte(`{"model":"minimax-m3","max_tokens":8192,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"thinking":{"type":"enabled","budget_tokens":4096},"metadata":{"keep":true}}`)
+		out, err := finalizeEncodedBody(encoded, req, backend, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		assertMiniMaxToggle(t, got, "minimax-m3", "adaptive", 128, true)
+		meta, _ := got["metadata"].(map[string]any)
+		if meta["keep"] != true || req.MaxTokens != 128 || p.APIKey != opencode.PublicKey {
+			t.Fatalf("restore changed state: %#v", got)
+		}
+	})
+
+	t.Run("omitted cap unchanged", func(t *testing.T) {
+		p := opencodeTestProvider()
+		p.BaseURL = opencode.GoBaseURL
+		body := []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+		req := decodeOpencodeIngress(t, openaiCodec, body, "minimax-m3")
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded, err := backend.encodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var encodedBody map[string]any
+		if err := json.Unmarshal(encoded, &encodedBody); err != nil {
+			t.Fatal(err)
+		}
+		out, err := finalizeEncodedBody(encoded, req, backend, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["max_tokens"] != encodedBody["max_tokens"] || req.MaxTokens != 0 {
+			t.Fatalf("omitted cap = %v encoded %v ir %d", got["max_tokens"], encodedBody["max_tokens"], req.MaxTokens)
+		}
+		th, _ := got["thinking"].(map[string]any)
+		if th["type"] != "adaptive" {
+			t.Fatalf("omitted thinking = %#v", th)
+		}
+	})
+}
+
+func miniMaxIngressBody(format string, anthropicFirst bool, value string, cap int) []byte {
+	if anthropicFirst {
+		typ := "enabled"
+		if value == "none" {
+			typ = "disabled"
+		}
+		return []byte(fmt.Sprintf(format, cap, typ))
+	}
+	return []byte(fmt.Sprintf(format, value, cap))
+}
+
+func prepareMiniMaxToggle(t *testing.T, base, model string, ingress codec, body []byte, stream bool) map[string]any {
+	t.Helper()
+	rawInput := append([]byte(nil), body...)
+	p := opencodeTestProvider()
+	p.BaseURL = base
+	p.APIKey = "synthetic-opencode-key"
+	req, err := ingress.decodeRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured := thinking.Capture(body); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
+	applyUpstreamModel(req, model)
+	if stream {
+		req.Stream = true
+	}
+	reqBefore := snapshotIR(t, req)
+	providerBefore := snapshotProvider(t, p)
+	backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+	if backend.id != codecOpencodeMessages {
+		t.Fatalf("codec = %s", backend.id)
+	}
+	encoded, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := finalizeEncodedBody(encoded, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = New(nil, nil).prepareUpstreamRequestFor(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, req, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, rawInput) {
+		t.Fatal("processing changed caller input")
+	}
+	if !reflect.DeepEqual(snapshotIR(t, req), reqBefore) || !reflect.DeepEqual(snapshotProvider(t, p), providerBefore) {
+		t.Fatal("processing changed request or provider")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func snapshotIR(t *testing.T, req *ir.Request) *ir.Request {
+	t.Helper()
+	if req == nil {
+		return nil
+	}
+	out := *req
+	out.Messages = cloneMessages(req.Messages)
+	out.StopSequences = append([]string(nil), req.StopSequences...)
+	out.Tools = cloneTools(req.Tools)
+	if req.Temperature != nil {
+		v := *req.Temperature
+		out.Temperature = &v
+	}
+	if req.TopP != nil {
+		v := *req.TopP
+		out.TopP = &v
+	}
+	if req.ToolChoice != nil {
+		v := *req.ToolChoice
+		out.ToolChoice = &v
+	}
+	if req.Thinking != nil {
+		v := *req.Thinking
+		out.Thinking = &v
+	}
+	return &out
+}
+
+func cloneMessages(in []ir.Message) []ir.Message {
+	if in == nil {
+		return nil
+	}
+	out := make([]ir.Message, len(in))
+	for i := range in {
+		out[i] = ir.Message{Role: in[i].Role, Content: cloneBlocks(in[i].Content)}
+	}
+	return out
+}
+
+func cloneBlocks(in []ir.ContentBlock) []ir.ContentBlock {
+	if in == nil {
+		return nil
+	}
+	out := make([]ir.ContentBlock, len(in))
+	for i := range in {
+		out[i] = in[i]
+		out[i].ToolInput = append(json.RawMessage(nil), in[i].ToolInput...)
+		out[i].ToolResult = cloneBlocks(in[i].ToolResult)
+		if in[i].Image != nil {
+			v := *in[i].Image
+			out[i].Image = &v
+		}
+		if in[i].File != nil {
+			v := *in[i].File
+			out[i].File = &v
+		}
+	}
+	return out
+}
+
+func cloneTools(in []ir.Tool) []ir.Tool {
+	if in == nil {
+		return nil
+	}
+	out := make([]ir.Tool, len(in))
+	for i := range in {
+		out[i] = in[i]
+		out[i].Parameters = append(json.RawMessage(nil), in[i].Parameters...)
+	}
+	return out
+}
+
+func snapshotProvider(t *testing.T, p *domain.Provider) *domain.Provider {
+	t.Helper()
+	if p == nil {
+		return nil
+	}
+	out := *p
+	out.Tags = append([]string(nil), p.Tags...)
+	if p.OAuthCreds != nil {
+		v := *p.OAuthCreds
+		if p.OAuthCreds.ExtraAuthParams != nil {
+			v.ExtraAuthParams = make(map[string]string, len(p.OAuthCreds.ExtraAuthParams))
+			for key, value := range p.OAuthCreds.ExtraAuthParams {
+				v.ExtraAuthParams[key] = value
+			}
+		}
+		out.OAuthCreds = &v
+	}
+	return &out
+}
+
+func assertMiniMaxCallerTool(t *testing.T, got map[string]any, free bool) {
+	t.Helper()
+	tools, _ := got["tools"].([]any)
+	var caller map[string]any
+	decoys := map[string]bool{}
+	for _, item := range tools {
+		tool, _ := item.(map[string]any)
+		name, _ := tool["name"].(string)
+		switch name {
+		case "lookup":
+			caller = tool
+		case "bash", "glob", "grep", "read":
+			decoys[name] = true
+		default:
+			t.Fatalf("unexpected tool %q", name)
+		}
+	}
+	if caller == nil {
+		t.Fatal("caller tool missing")
+	}
+	if caller["description"] != "Find one record" {
+		t.Fatalf("caller description = %#v", caller["description"])
+	}
+	schema, _ := caller["input_schema"].(map[string]any)
+	props, _ := schema["properties"].(map[string]any)
+	required, _ := schema["required"].([]any)
+	if schema["type"] != "object" || props["q"] == nil || len(required) != 1 || required[0] != "q" {
+		t.Fatalf("caller schema = %#v", caller["input_schema"])
+	}
+	if _, ok := caller["parameters"]; ok || caller["type"] != nil {
+		t.Fatalf("caller kept Chat envelope: %#v", caller)
+	}
+	if !free {
+		if len(tools) != 1 || len(decoys) != 0 {
+			t.Fatalf("paid tools = %#v", tools)
+		}
+		return
+	}
+	if len(tools) != 5 || len(decoys) != 4 {
+		t.Fatalf("free tools = %#v", tools)
+	}
+}
+
+func assertMiniMaxToggle(t *testing.T, got map[string]any, model, typ string, cap int, stream bool) {
+	t.Helper()
+	if got["model"] != model || got["max_tokens"] != float64(cap) {
+		t.Fatalf("model/cap = %v/%v, want %s/%d", got["model"], got["max_tokens"], model, cap)
+	}
+	gotStream, _ := got["stream"].(bool)
+	if gotStream != stream {
+		t.Fatalf("stream = %v, want %v", gotStream, stream)
+	}
+	th, _ := got["thinking"].(map[string]any)
+	if th["type"] != typ || len(th) != 1 {
+		t.Fatalf("thinking = %#v, want type %s", th, typ)
+	}
+	for _, field := range []string{"reasoning_effort", "enable_thinking", "thinking_budget", "reasoning"} {
+		if _, ok := got[field]; ok {
+			t.Fatalf("%s present: %#v", field, got[field])
+		}
+	}
+	if oc, ok := got["output_config"].(map[string]any); ok {
+		if _, has := oc["effort"]; has {
+			t.Fatalf("effort leaked: %#v", oc)
+		}
+	}
+}
+
+func TestOpencodeMiniMaxToggleHTTP(t *testing.T) {
+	hits := 0
+	var lastBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		lastBody, _ = io.ReadAll(r.Body)
+		if r.Header.Get("Accept") == "text/event-stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, anthropicSSE)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Name: "go", BaseURL: opencode.GoBaseURL, APIKey: "go-key", Protocol: domain.ProtocolOpencode}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		clone := r.Clone(r.Context())
+		clone.URL.Scheme = "http"
+		clone.URL.Host = strings.TrimPrefix(upstream.URL, "http://")
+		clone.RequestURI = ""
+		return http.DefaultTransport.RoundTrip(clone)
+	})
+	px.streamClient.Transport = px.client.Transport
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	cases := []struct {
+		name   string
+		path   string
+		body   string
+		stream bool
+		want   string
+		cap    int
+	}{
+		{name: "chat-enable", path: "/v1/chat/completions", stream: false, want: "adaptive", cap: 128, body: `{"model":"%s","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "chat-disable-stream", path: "/v1/chat/completions", stream: true, want: "disabled", cap: 100000, body: `{"model":"%s","stream":true,"reasoning_effort":"none","max_tokens":100000,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "responses-disable", path: "/v1/responses", stream: false, want: "disabled", cap: 128, body: `{"model":"%s","reasoning":{"effort":"off"},"max_output_tokens":128,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "anthropic-enable-stream", path: "/v1/messages", stream: true, want: "adaptive", cap: 100000, body: `{"model":"%s","stream":true,"max_tokens":100000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":4096},"output_config":{"effort":"high"}}`},
+		{name: "anthropic-disable", path: "/v1/messages", stream: false, want: "disabled", cap: 128, body: `{"model":"%s","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"output_config":{"effort":"high","format":{"type":"json_object"}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: tc.name, Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "minimax-m3", Enabled: true}}}); err != nil {
+				t.Fatal(err)
+			}
+			before := hits
+			req, err := http.NewRequest(http.MethodPost, ts.URL+tc.path, strings.NewReader(fmt.Sprintf(tc.body, tc.name)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+key.Token)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+			}
+			if hits != before+1 {
+				t.Fatalf("hits=%d before=%d", hits, before)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(lastBody, &got); err != nil {
+				t.Fatal(err)
+			}
+			assertMiniMaxToggle(t, got, "minimax-m3", tc.want, tc.cap, tc.stream)
+			if strings.Contains(string(lastBody), "go-key") || strings.Contains(string(lastBody), "private") {
+				t.Fatalf("body leaked credential or private text: %s", lastBody)
+			}
+		})
+	}
 }
 
 func effortOf(t *testing.T, body map[string]any) any {

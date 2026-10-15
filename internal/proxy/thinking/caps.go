@@ -341,6 +341,15 @@ func OpencodeCaps(spec opencode.ModelSpec, ok bool) Caps {
 		}
 		return Caps{Reasoning: false, CanDisable: true, Format: FormatNone, MaxOutput: out}
 	}
+	if OpencodeMiniMaxToggle(spec) {
+		return Caps{
+			Reasoning:  true,
+			CanDisable: true,
+			Format:     FormatMiniMax,
+			MaxOutput:  spec.Output,
+			Levels:     []string{"none", "thinking"},
+		}
+	}
 	format := FormatOpenAI
 	switch spec.SDK {
 	case "openai":

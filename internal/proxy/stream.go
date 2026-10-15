@@ -786,7 +786,11 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 		if err != nil {
 			return nil, err
 		}
-		return restoreOpencodeQwenEffortCap(body, req, backend, provider)
+		body, err = restoreOpencodeQwenEffortCap(body, req, backend, provider)
+		if err != nil {
+			return nil, err
+		}
+		return restoreOpencodeMiniMaxToggleCap(body, req, backend, provider)
 	}
 	out, err := thinking.ApplyWireForTier(backend.id, body, req.Model, eff, provider.Protocol, dialect, tier)
 	if err != nil {
@@ -802,7 +806,11 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	if err != nil {
 		return nil, err
 	}
-	return restoreOpencodeQwenEffortCap(out, req, backend, provider)
+	out, err = restoreOpencodeQwenEffortCap(out, req, backend, provider)
+	if err != nil {
+		return nil, err
+	}
+	return restoreOpencodeMiniMaxToggleCap(out, req, backend, provider)
 }
 
 // errOpencodeThinkingBudget rejects an enabled OpenCode Messages budget that
@@ -890,6 +898,64 @@ func restoreOpencodeQwenEffortCap(body []byte, req *ir.Request, backend codec, p
 	}
 	doc["max_tokens"] = encoded
 	return json.Marshal(doc)
+}
+
+// restoreOpencodeMiniMaxToggleCap restores a positive caller cap after the
+// generic encoder changes max_tokens. It runs only for the final thinking
+// toggle on the selected MiniMax Messages rows. Other shapes stay unchanged.
+func restoreOpencodeMiniMaxToggleCap(body []byte, req *ir.Request, backend codec, provider *domain.Provider) ([]byte, error) {
+	if !miniMaxToggleFinal(body, req, backend, provider) {
+		return body, nil
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+	encodedCap, capIsNumber := positiveJSONInt(doc["max_tokens"])
+	if capIsNumber && encodedCap == req.MaxTokens {
+		return body, nil
+	}
+	encoded, err := json.Marshal(req.MaxTokens)
+	if err != nil {
+		return nil, err
+	}
+	doc["max_tokens"] = encoded
+	return json.Marshal(doc)
+}
+
+func miniMaxToggleFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
+	if provider == nil || provider.Protocol != domain.ProtocolOpencode || backend.id != codecOpencodeMessages || req == nil || req.MaxTokens <= 0 {
+		return false
+	}
+	spec, ok := opencode.Lookup(opencode.Tier(provider.BaseURL), req.Model)
+	if !ok || !thinking.OpencodeMiniMaxToggle(spec) {
+		return false
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil || !miniMaxToggleThinking(doc) {
+		return false
+	}
+	return true
+}
+
+func miniMaxToggleThinking(doc map[string]json.RawMessage) bool {
+	raw := doc["thinking"]
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var thinkingObj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &thinkingObj); err != nil || len(thinkingObj) != 1 {
+		return false
+	}
+	typ := thinkingObj["type"]
+	if len(typ) == 0 || typ[0] != '"' {
+		return false
+	}
+	var value string
+	if err := json.Unmarshal(typ, &value); err != nil {
+		return false
+	}
+	return value == "adaptive" || value == "disabled"
 }
 
 func qwenEffortOnlyFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
