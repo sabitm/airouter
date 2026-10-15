@@ -14,12 +14,15 @@ const (
 	AnthropicEffortEnabled    AnthropicEffortShape = "enabled"
 	AnthropicEffortAdaptive   AnthropicEffortShape = "adaptive"
 	AnthropicEffortSummarized AnthropicEffortShape = "summarized"
+	// AnthropicEffortOnly is output_config.effort without a thinking block.
+	// OpenCode CLI v1.19.0 returns {effort} for this Anthropic SDK shape.
+	AnthropicEffortOnly AnthropicEffortShape = "effort"
 )
 
 // AnthropicEffort reports the official effort body for an Anthropic model id.
 // Opus 4.5 uses enabled plus a fixed budget. 4.6 uses adaptive. Claude 4.7+
-// uses adaptive with summarized display. Other ids, including non-Claude
-// Anthropic rows, send no effort field.
+// uses adaptive with summarized display. qwen3.8-flash uses effort only.
+// Other ids, including other non-Claude Anthropic rows, send no effort field.
 func AnthropicEffort(model string) AnthropicEffortShape {
 	id := strings.ToLower(model)
 	if strings.Contains(id, "opus-4-5") || strings.Contains(id, "opus-4.5") {
@@ -30,6 +33,9 @@ func AnthropicEffort(model string) AnthropicEffortShape {
 	}
 	if anthropicAdaptive46(id) {
 		return AnthropicEffortAdaptive
+	}
+	if NormalizeModelID(id) == "qwen3.8-flash" {
+		return AnthropicEffortOnly
 	}
 	return AnthropicEffortNone
 }

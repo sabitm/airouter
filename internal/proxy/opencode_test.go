@@ -1003,7 +1003,252 @@ func TestOpencodeAnthropicEffortShapes(t *testing.T) {
 	}
 
 	flash := prepare("qwen3.8-flash")
-	assertNoRecognizedReasoningControls(t, flash)
+	if effortOf(t, flash) != "xhigh" {
+		t.Fatalf("qwen3.8-flash effort = %v, want xhigh", effortOf(t, flash))
+	}
+	if _, ok := flash["thinking"]; ok {
+		t.Fatalf("qwen3.8-flash wrote thinking: %+v", flash["thinking"])
+	}
+	if _, ok := flash["reasoning_effort"]; ok {
+		t.Fatalf("qwen3.8-flash wrote reasoning_effort: %v", flash["reasoning_effort"])
+	}
+}
+
+func TestOpencodeQwen38FlashEffortBothTiers(t *testing.T) {
+	ingresses := []struct {
+		name       string
+		c          codec
+		body       string
+		completion bool
+	}{
+		{name: "chat", c: openaiCodec, body: `{"model":"combo","reasoning_effort":"%s","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Find one record","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]}`},
+		{name: "chat-completion", c: openaiCodec, completion: true, body: `{"model":"combo","reasoning_effort":"%s","max_completion_tokens":%d,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "responses", c: responsesCodec, body: `{"model":"combo","reasoning":{"effort":"%s"},"max_output_tokens":%d,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "anthropic", c: anthropicCodec, body: `{"model":"combo","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000},"output_config":{"effort":"%s"}}`},
+	}
+	providers := []struct {
+		name string
+		base string
+	}{
+		{name: "zen", base: opencode.ZenBaseURL},
+		{name: "go", base: opencode.GoBaseURL},
+	}
+	efforts := []struct {
+		in   string
+		want string
+	}{
+		{in: "low", want: "low"},
+		{in: "medium", want: "medium"},
+		{in: "xhigh", want: "xhigh"},
+		{in: "high", want: "xhigh"},
+	}
+	caps := []int{128, 100000}
+	for _, provider := range providers {
+		for _, ingress := range ingresses {
+			for _, effort := range efforts {
+				for _, cap := range caps {
+					for _, stream := range []bool{false, true} {
+						name := fmt.Sprintf("%s/%s/%s/cap%d/stream%v", provider.name, ingress.name, effort.in, cap, stream)
+						t.Run(name, func(t *testing.T) {
+							body := qwenIngressBody(ingress.body, ingress.name == "anthropic", effort.in, cap)
+							got, req, prov := prepareQwen38Flash(t, provider.base, ingress.c, body, stream)
+							assertQwenEffortOnly(t, got, effort.want, cap, stream)
+							if req.MaxTokens != cap || req.Model != "qwen3.8-flash" || req.Stream != stream || prov.APIKey != opencode.PublicKey {
+								t.Fatalf("state req=%+v key=%s", req, prov.APIKey)
+							}
+							if ingress.name == "chat" {
+								assertQwenTool(t, got)
+							}
+							if ingress.completion {
+								if _, ok := got["max_completion_tokens"]; ok {
+									t.Fatalf("completion alias survived: %#v", got["max_completion_tokens"])
+								}
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+
+	t.Run("lowered generic cap restored", func(t *testing.T) {
+		p := opencodeTestProvider()
+		req := &ir.Request{
+			Model:     "qwen3.8-flash",
+			MaxTokens: 128,
+			Stream:    true,
+			Thinking:  &ir.Thinking{Mode: ir.ThinkingLevel, Level: "low"},
+			Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		}
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded := []byte(`{"model":"qwen3.8-flash","max_tokens":64,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"thinking":{"type":"enabled","budget_tokens":1024},"metadata":{"keep":true}}`)
+		out := finalizeAndPrepareQwen(t, p, req, backend, encoded)
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		assertQwenEffortOnly(t, got, "low", 128, true)
+		meta, _ := got["metadata"].(map[string]any)
+		if meta["keep"] != true || req.MaxTokens != 128 || p.APIKey != opencode.PublicKey {
+			t.Fatalf("lowered restore changed state: %#v req=%d", got, req.MaxTokens)
+		}
+	})
+
+	t.Run("no-intent", func(t *testing.T) {
+		p := opencodeTestProvider()
+		body := []byte(`{"model":"combo","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		req := decodeOpencodeIngress(t, openaiCodec, body, "qwen3.8-flash")
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded, err := backend.encodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var encodedBody map[string]any
+		if err := json.Unmarshal(encoded, &encodedBody); err != nil {
+			t.Fatal(err)
+		}
+		got := prepareOpencodeTranslatedOn(t, p, openaiCodec, body, "qwen3.8-flash")
+		assertNoRecognizedReasoningControls(t, got)
+		if got["max_tokens"] != encodedBody["max_tokens"] || got["max_tokens"] != float64(128) {
+			t.Fatalf("no-intent cap = %v, encoded %v", got["max_tokens"], encodedBody["max_tokens"])
+		}
+	})
+
+	t.Run("assistant-final", func(t *testing.T) {
+		p := opencodeTestProvider()
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"done"}]}`)
+		req := decodeOpencodeIngress(t, openaiCodec, body, "qwen3.8-flash")
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded, err := backend.encodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var encodedBody map[string]any
+		if err := json.Unmarshal(encoded, &encodedBody); err != nil {
+			t.Fatal(err)
+		}
+		got := prepareOpencodeTranslatedOn(t, p, openaiCodec, body, "qwen3.8-flash")
+		assertNoRecognizedReasoningControls(t, got)
+		if got["max_tokens"] != encodedBody["max_tokens"] || req.MaxTokens != 128 {
+			t.Fatalf("assistant-final cap = %v, encoded %v", got["max_tokens"], encodedBody["max_tokens"])
+		}
+	})
+
+	t.Run("omitted cap follows encoded cap", func(t *testing.T) {
+		for _, base := range []string{opencode.ZenBaseURL, opencode.GoBaseURL} {
+			p := opencodeTestProvider()
+			p.BaseURL = base
+			body := []byte(`{"model":"combo","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`)
+			req := decodeOpencodeIngress(t, openaiCodec, body, "qwen3.8-flash")
+			backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+			encoded, err := backend.encodeRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var encodedBody map[string]any
+			if err := json.Unmarshal(encoded, &encodedBody); err != nil {
+				t.Fatal(err)
+			}
+			out := finalizeAndPrepareQwen(t, p, req, backend, encoded)
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["max_tokens"] != encodedBody["max_tokens"] || req.MaxTokens != 0 {
+				t.Fatalf("%s omitted cap = %v, encoded %v, ir %d", base, got["max_tokens"], encodedBody["max_tokens"], req.MaxTokens)
+			}
+			if effortOf(t, got) != "low" || got["thinking"] != nil {
+				t.Fatalf("%s omitted shape = %#v", base, got)
+			}
+		}
+	})
+}
+
+func qwenIngressBody(format string, anthropicFirst bool, effort string, cap int) []byte {
+	if anthropicFirst {
+		return []byte(fmt.Sprintf(format, cap, effort))
+	}
+	return []byte(fmt.Sprintf(format, effort, cap))
+}
+
+func prepareQwen38Flash(t *testing.T, base string, ingress codec, body []byte, stream bool) (map[string]any, *ir.Request, *domain.Provider) {
+	t.Helper()
+	p := opencodeTestProvider()
+	p.BaseURL = base
+	req := decodeOpencodeIngress(t, ingress, body, "qwen3.8-flash")
+	if stream {
+		req.Stream = true
+	}
+	backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+	if backend.id != codecOpencodeMessages {
+		t.Fatalf("codec = %s", backend.id)
+	}
+	encoded, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := finalizeAndPrepareQwen(t, p, req, backend, encoded)
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	return got, req, p
+}
+
+func finalizeAndPrepareQwen(t *testing.T, p *domain.Provider, req *ir.Request, backend codec, encoded []byte) []byte {
+	t.Helper()
+	out, err := finalizeEncodedBody(encoded, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = New(nil, nil).prepareUpstreamRequestFor(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, req, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func assertQwenEffortOnly(t *testing.T, got map[string]any, effort string, cap int, stream bool) {
+	t.Helper()
+	if got["model"] != "qwen3.8-flash" || got["max_tokens"] != float64(cap) {
+		t.Fatalf("model/cap = %v/%v, want qwen3.8-flash/%d", got["model"], got["max_tokens"], cap)
+	}
+	if gotStream, _ := got["stream"].(bool); gotStream != stream {
+		t.Fatalf("stream = %v, want %v", gotStream, stream)
+	}
+	if effortOf(t, got) != effort {
+		t.Fatalf("effort = %v, want %s", effortOf(t, got), effort)
+	}
+	for _, field := range []string{"thinking", "reasoning_effort", "enable_thinking", "thinking_budget", "reasoning"} {
+		if _, ok := got[field]; ok {
+			t.Fatalf("%s present: %#v", field, got[field])
+		}
+	}
+	oc, _ := got["output_config"].(map[string]any)
+	if len(oc) != 1 {
+		t.Fatalf("output_config = %#v", got["output_config"])
+	}
+}
+
+func assertQwenTool(t *testing.T, got map[string]any) {
+	t.Helper()
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v", got["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["name"] != "lookup" || tool["description"] != "Find one record" {
+		t.Fatalf("tool identity = %#v", tool)
+	}
+	schema, _ := tool["input_schema"].(map[string]any)
+	props, _ := schema["properties"].(map[string]any)
+	required, _ := schema["required"].([]any)
+	if schema["type"] != "object" || props["q"] == nil || len(required) != 1 || required[0] != "q" {
+		t.Fatalf("tool schema = %#v", tool["input_schema"])
+	}
+	if _, ok := tool["parameters"]; ok || tool["type"] != nil {
+		t.Fatalf("tool kept Chat envelope: %#v", tool)
+	}
 }
 
 func TestOpencodeGoCatalogSelectsGoRow(t *testing.T) {

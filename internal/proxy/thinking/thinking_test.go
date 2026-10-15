@@ -647,6 +647,9 @@ func TestCapsForOpencodeCatalog(t *testing.T) {
 		{"kimi-k3", true, FormatOpenAI, false},
 		{"muse-spark-1.2", true, FormatOpenAIResponses, false},
 		{"gpt-5.4", true, FormatOpenAIResponses, true},
+		{"qwen3.8-flash", true, FormatClaudeAdaptive, false},
+		{"alibaba/qwen3.8-flash", true, FormatClaudeAdaptive, false},
+		{"qwen3.8-flash-next", false, FormatNone, true},
 		{"unknown-model", false, FormatNone, true},
 	}
 	for _, tc := range cases {
@@ -698,6 +701,107 @@ func TestApplyWireOpencodeCatalog(t *testing.T) {
 	}
 	if _, ok := m["thinking"]; ok {
 		t.Fatalf("toggle-only model wrote thinking: %s", none)
+	}
+}
+
+func TestApplyWireOpencodeQwen38FlashEffort(t *testing.T) {
+	body := []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low","enable_thinking":true,"thinking":{"type":"enabled","budget_tokens":1000},"output_config":{"effort":"low","format":{"type":"json_object"}}}`)
+	cases := []struct {
+		model string
+		level string
+		want  string
+	}{
+		{"qwen3.8-flash", "low", "low"},
+		{"qwen3.8-flash", "medium", "medium"},
+		{"qwen3.8-flash", "xhigh", "xhigh"},
+		{"qwen3.8-flash", "high", "xhigh"},
+		{"alibaba/qwen3.8-flash", "high", "xhigh"},
+	}
+	for _, tc := range cases {
+		out, err := ApplyWire("oai-chat", body, tc.model, &Config{Mode: ModeLevel, Level: tc.level}, domain.ProtocolOpencode, domain.ReasoningOpencode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(out, &m); err != nil {
+			t.Fatal(err)
+		}
+		oc, _ := m["output_config"].(map[string]any)
+		if oc["effort"] != tc.want {
+			t.Fatalf("%s %s effort = %v, want %s; body=%s", tc.model, tc.level, oc["effort"], tc.want, out)
+		}
+		if _, ok := m["thinking"]; ok {
+			t.Fatalf("%s wrote thinking: %s", tc.model, out)
+		}
+		if _, ok := m["reasoning_effort"]; ok {
+			t.Fatalf("%s wrote reasoning_effort: %s", tc.model, out)
+		}
+		if _, ok := m["enable_thinking"]; ok {
+			t.Fatalf("%s wrote enable_thinking: %s", tc.model, out)
+		}
+		if _, ok := m["reasoning"]; ok {
+			t.Fatalf("%s wrote reasoning: %s", tc.model, out)
+		}
+		format, _ := oc["format"].(map[string]any)
+		if format["type"] != "json_object" {
+			t.Fatalf("%s lost output_config sibling: %s", tc.model, out)
+		}
+	}
+
+	for _, model := range []string{"qwen3.8-max", "qwen3.8-flash-next", "unknown-model"} {
+		out, err := ApplyWire("oai-chat", body, model, &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpencode, domain.ReasoningOpencode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(out, &m); err != nil {
+			t.Fatal(err)
+		}
+		if oc, ok := m["output_config"].(map[string]any); ok {
+			if _, has := oc["effort"]; has {
+				t.Fatalf("%s wrote effort: %s", model, out)
+			}
+		}
+		if _, ok := m["thinking"]; ok {
+			t.Fatalf("%s wrote thinking: %s", model, out)
+		}
+		if _, ok := m["reasoning_effort"]; ok {
+			t.Fatalf("%s wrote reasoning_effort: %s", model, out)
+		}
+	}
+
+	noIntent, err := ApplyWire("oai-chat", []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}]}`), "qwen3.8-flash", nil, domain.ProtocolOpencode, domain.ReasoningOpencode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plain map[string]any
+	if err := json.Unmarshal(noIntent, &plain); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := plain["output_config"]; ok {
+		t.Fatalf("no intent wrote output_config: %s", noIntent)
+	}
+	if _, ok := plain["thinking"]; ok {
+		t.Fatalf("no intent wrote thinking: %s", noIntent)
+	}
+
+	suffix, err := FinalizeBody([]byte(`{"model":"qwen3.8-flash(high)","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`), "qwen3.8-flash(high)", "oai-chat", domain.ProtocolOpencode, domain.ReasoningOpencode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var suffixBody map[string]any
+	if err := json.Unmarshal(suffix, &suffixBody); err != nil {
+		t.Fatal(err)
+	}
+	if suffixBody["model"] != "qwen3.8-flash" {
+		t.Fatalf("suffix model = %v", suffixBody["model"])
+	}
+	oc, _ := suffixBody["output_config"].(map[string]any)
+	if oc["effort"] != "xhigh" {
+		t.Fatalf("suffix effort = %v, want xhigh; body=%s", oc["effort"], suffix)
+	}
+	if _, ok := suffixBody["thinking"]; ok {
+		t.Fatalf("suffix wrote thinking: %s", suffix)
 	}
 }
 

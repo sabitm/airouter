@@ -782,7 +782,11 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	// Grok omits none/auto instead of upgrading them. The encoder already wrote
 	// a transport-default effort, so ApplyWire must still strip that field.
 	if eff == nil && caps.RequiredDefault == "" && dialect != domain.ReasoningGrok {
-		return reconcileOpencodeMessagesBudget(body, req, backend, provider)
+		body, err := reconcileOpencodeMessagesBudget(body, req, backend, provider)
+		if err != nil {
+			return nil, err
+		}
+		return restoreOpencodeQwenEffortCap(body, req, backend, provider)
 	}
 	out, err := thinking.ApplyWireForTier(backend.id, body, req.Model, eff, provider.Protocol, dialect, tier)
 	if err != nil {
@@ -794,7 +798,11 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 			return nil, err
 		}
 	}
-	return reconcileOpencodeMessagesBudget(out, req, backend, provider)
+	out, err = reconcileOpencodeMessagesBudget(out, req, backend, provider)
+	if err != nil {
+		return nil, err
+	}
+	return restoreOpencodeQwenEffortCap(out, req, backend, provider)
 }
 
 // errOpencodeThinkingBudget rejects an enabled OpenCode Messages budget that
@@ -858,6 +866,69 @@ func reconcileOpencodeMessagesBudget(body []byte, req *ir.Request, backend codec
 	}
 	doc["max_tokens"] = encoded
 	return json.Marshal(doc)
+}
+
+// restoreOpencodeQwenEffortCap restores a positive caller cap after the generic
+// encoder changes max_tokens for temporary budget thinking. It runs only on the
+// final OpenCode Messages effort-only shape for the exact catalog model. An
+// omitted or nonpositive IR cap, and every other shape, stays unchanged.
+func restoreOpencodeQwenEffortCap(body []byte, req *ir.Request, backend codec, provider *domain.Provider) ([]byte, error) {
+	if !qwenEffortOnlyFinal(body, req, backend, provider) {
+		return body, nil
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+	encodedCap, capIsNumber := positiveJSONInt(doc["max_tokens"])
+	if capIsNumber && encodedCap == req.MaxTokens {
+		return body, nil
+	}
+	encoded, err := json.Marshal(req.MaxTokens)
+	if err != nil {
+		return nil, err
+	}
+	doc["max_tokens"] = encoded
+	return json.Marshal(doc)
+}
+
+func qwenEffortOnlyFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
+	if provider == nil || provider.Protocol != domain.ProtocolOpencode || backend.id != codecOpencodeMessages || req == nil || req.MaxTokens <= 0 {
+		return false
+	}
+	tier := opencode.Tier(provider.BaseURL)
+	spec, ok := opencode.Lookup(tier, req.Model)
+	if !ok || opencode.NormalizeModelID(req.Model) != "qwen3.8-flash" || opencode.AnthropicEffort(spec.ID) != opencode.AnthropicEffortOnly {
+		return false
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil || !effortOnlyOutputConfig(doc) {
+		return false
+	}
+	return true
+}
+
+func effortOnlyOutputConfig(doc map[string]json.RawMessage) bool {
+	if len(doc["thinking"]) > 0 && string(doc["thinking"]) != "null" {
+		return false
+	}
+	raw := doc["output_config"]
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var oc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &oc); err != nil || len(oc) != 1 {
+		return false
+	}
+	effort := oc["effort"]
+	if len(effort) == 0 || effort[0] != '"' {
+		return false
+	}
+	var value string
+	if err := json.Unmarshal(effort, &value); err != nil || strings.TrimSpace(value) == "" {
+		return false
+	}
+	return true
 }
 
 func opencodeMessagesEnabledBudget(raw json.RawMessage) (int, bool) {

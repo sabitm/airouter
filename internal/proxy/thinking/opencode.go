@@ -60,18 +60,22 @@ func writeAnthropicEffort(m map[string]any, spec opencode.ModelSpec, effort stri
 	switch shape {
 	case opencode.AnthropicEffortNone:
 		return
+	case opencode.AnthropicEffortOnly:
+		// v1.19 effort fallback writes no thinking block.
 	case opencode.AnthropicEffortEnabled:
 		thinking := map[string]any{"type": "enabled"}
 		if budget := opencode.Opus45BudgetTokens(spec.Output); budget > 0 {
 			thinking["budget_tokens"] = budget
 		}
 		m["thinking"] = mergeObject(m["thinking"], thinking)
-	default:
+	case opencode.AnthropicEffortAdaptive, opencode.AnthropicEffortSummarized:
 		thinking := map[string]any{"type": "adaptive"}
 		if shape == opencode.AnthropicEffortSummarized {
 			thinking["display"] = "summarized"
 		}
 		m["thinking"] = mergeObject(m["thinking"], thinking)
+	default:
+		return
 	}
 	oc, _ := m["output_config"].(map[string]any)
 	if oc == nil {

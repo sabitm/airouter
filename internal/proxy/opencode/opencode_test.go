@@ -20,7 +20,11 @@ func TestAnthropicEffortShapes(t *testing.T) {
 		{"claude-opus-4-7", AnthropicEffortSummarized},
 		{"claude-fable-5", AnthropicEffortSummarized},
 		{"claude-opus-4-20250514", AnthropicEffortNone},
-		{"qwen3.8-flash", AnthropicEffortNone},
+		{"qwen3.8-flash", AnthropicEffortOnly},
+		{"alibaba/qwen3.8-flash", AnthropicEffortOnly},
+		{"qwen3.8-flash(high)", AnthropicEffortOnly},
+		{"qwen3.8-max", AnthropicEffortNone},
+		{"qwen3.8-flash-next", AnthropicEffortNone},
 	}
 	for _, tc := range cases {
 		if got := AnthropicEffort(tc.model); got != tc.want {
