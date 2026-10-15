@@ -152,6 +152,10 @@ type Request struct {
 	Tools         []Tool
 	ToolChoice    *ToolChoice
 	Thinking      *Thinking
+	// PromptCacheKey is the caller's explicit Responses prompt-cache key.
+	// Nil means absent or null; a non-nil pointer preserves an explicit empty
+	// string. It is body field intent, never session identity.
+	PromptCacheKey *string
 }
 
 type StopReason string

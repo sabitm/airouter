@@ -1633,6 +1633,10 @@ func snapshotIR(t *testing.T, req *ir.Request) *ir.Request {
 		v := *req.Thinking
 		out.Thinking = &v
 	}
+	if req.PromptCacheKey != nil {
+		v := *req.PromptCacheKey
+		out.PromptCacheKey = &v
+	}
 	return &out
 }
 
@@ -2549,5 +2553,335 @@ func assertIngressErrorEnvelope(t *testing.T, path string, body []byte, errType 
 	}
 	if path == "/v1/responses" && errObj["param"] != nil {
 		t.Fatalf("responses envelope = %s", body)
+	}
+}
+
+// prepareTranslatedPipeline runs the complete ingress -> IR -> backend ->
+// finalize -> prepare path so tests can assert the wire body a backend
+// receives. ctx carries the trace and any captured caller identity.
+func prepareTranslatedPipeline(t *testing.T, px *Proxy, p *domain.Provider, ingress codec, rawBody []byte, upstreamModel string, ctx context.Context) map[string]any {
+	t.Helper()
+	req, err := ingress.decodeRequest(rawBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured := thinking.Capture(rawBody); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
+	applyUpstreamModel(req, upstreamModel)
+	backend := backendCodecFor(p.Protocol, p.BaseURL, upstreamModel)
+	encoded, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalized, err := finalizeEncodedBody(encoded, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := px.prepareUpstreamRequestFor(ctx, backend, p, req, finalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// prepareTranslatedWithIdentity attaches OpenCode caller identity captured from
+// rawBody and h, then runs the complete pipeline.
+func prepareTranslatedWithIdentity(t *testing.T, px *Proxy, p *domain.Provider, ingress codec, rawBody []byte, upstreamModel string, h http.Header) (map[string]any, *TraceInfo) {
+	t.Helper()
+	trace := &TraceInfo{}
+	ctx := WithTraceInfo(context.Background(), trace)
+	ctx = withOpencodeRequest(ctx, "test-nonce", h, rawBody)
+	return prepareTranslatedPipeline(t, px, p, ingress, rawBody, upstreamModel, ctx), trace
+}
+
+// A Responses ingress prompt_cache_key survives every supported OpenCode
+// Responses destination, including free-tier rewrites and muse-spark patches.
+// The explicit caller session header stays independent of the body key.
+func TestOpencodeResponsesPromptCacheKeyPreserved(t *testing.T) {
+	const headerSession = "ses_0123456789abABCDEFGHIJKLMN"
+	cases := []struct {
+		name  string
+		base  string
+		model string
+		free  bool
+		key   string
+	}{
+		{name: "zen paid gpt", base: opencode.ZenBaseURL, model: "gpt-5.6-luna", key: "cache-zen-paid"},
+		{name: "zen free muse spark", base: opencode.ZenBaseURL, model: "muse-spark-1.3-contributor-free", free: true, key: "cache-zen-free"},
+		{name: "go paid muse spark", base: opencode.GoBaseURL, model: "muse-spark-1.2-contributor", key: "cache-go"},
+	}
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				p := opencodeTestProvider()
+				p.BaseURL = tc.base
+				backend := backendCodecFor(p.Protocol, p.BaseURL, tc.model)
+				if backend.id != "opencode-responses" {
+					t.Fatalf("backend codec = %q, want opencode-responses", backend.id)
+				}
+				body := fmt.Sprintf(`{"model":"combo","stream":%t,"input":"hi","prompt_cache_key":%q}`, stream, tc.key)
+				h := http.Header{}
+				h.Set("x-opencode-session", headerSession)
+				got, trace := prepareTranslatedWithIdentity(t, New(nil, nil), p, responsesCodec, []byte(body), tc.model, h)
+				if got["prompt_cache_key"] != tc.key {
+					t.Fatalf("prepared key = %#v, want %q", got["prompt_cache_key"], tc.key)
+				}
+				if got["model"] != tc.model || got["stream"] != stream {
+					t.Fatalf("model/stream = %#v/%#v", got["model"], got["stream"])
+				}
+				if trace.OpencodeSessionID != headerSession {
+					t.Fatalf("session = %q, want header session %q", trace.OpencodeSessionID, headerSession)
+				}
+				if tc.free {
+					// Free preparation injects decoy tools and forces a choice.
+					if _, ok := got["tools"]; !ok {
+						t.Fatalf("free preparation did not inject decoy tools: %v", got)
+					}
+					if got["tool_choice"] != "none" {
+						t.Fatalf("free tool_choice = %#v, want none", got["tool_choice"])
+					}
+				}
+			})
+		}
+	}
+}
+
+// Reusing one Proxy across keyed and unkeyed requests must not persist or
+// generate a key: the field comes only from the current caller body.
+func TestOpencodeResponsesPromptCacheKeyNoStateBleed(t *testing.T) {
+	p := opencodeTestProvider()
+	px := New(nil, nil)
+	prepare := func(body string) map[string]any {
+		t.Helper()
+		got, _ := prepareTranslatedWithIdentity(t, px, p, responsesCodec, []byte(body), "gpt-5.6-luna", http.Header{})
+		return got
+	}
+	first := prepare(`{"model":"combo","input":"hi","prompt_cache_key":"first-key"}`)
+	if first["prompt_cache_key"] != "first-key" {
+		t.Fatalf("first key = %#v", first["prompt_cache_key"])
+	}
+	second := prepare(`{"model":"combo","input":"hi","prompt_cache_key":"second-key"}`)
+	if second["prompt_cache_key"] != "second-key" {
+		t.Fatalf("second key = %#v", second["prompt_cache_key"])
+	}
+	third := prepare(`{"model":"combo","input":"hi"}`)
+	if _, ok := third["prompt_cache_key"]; ok {
+		t.Fatalf("omitted key gained a value: %v", third)
+	}
+}
+
+// IR prompt_cache_key must not appear in Chat or Anthropic/Messages encoding,
+// and Responses ingress must not leak it into OpenCode Chat/Messages backends.
+func TestPromptCacheKeyDoesNotLeakBeyondResponses(t *testing.T) {
+	key := "responses-only-key"
+	req := &ir.Request{
+		Model:          "m",
+		MaxTokens:      16,
+		Messages:       []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		PromptCacheKey: &key,
+	}
+	for _, c := range []struct {
+		name   string
+		encode func(*ir.Request) ([]byte, error)
+	}{
+		{name: "openai chat", encode: openaiCodec.encodeRequest},
+		{name: "anthropic messages", encode: anthropicCodec.encodeRequest},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out, err := c.encode(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := got["prompt_cache_key"]; ok {
+				t.Fatalf("%s encoder leaked the key: %s", c.name, out)
+			}
+		})
+	}
+
+	backends := []struct {
+		name  string
+		base  string
+		model string
+	}{
+		{name: "opencode chat", base: opencode.ZenBaseURL, model: "deepseek-v4-pro"},
+		{name: "opencode messages", base: opencode.GoBaseURL, model: "minimax-m3"},
+	}
+	for _, tc := range backends {
+		t.Run(tc.name, func(t *testing.T) {
+			p := opencodeTestProvider()
+			p.BaseURL = tc.base
+			wantCodec := backendCodecFor(p.Protocol, p.BaseURL, tc.model).id
+			if wantCodec != "opencode-chat" && wantCodec != "opencode-messages" {
+				t.Fatalf("backend codec = %q", wantCodec)
+			}
+			body := `{"model":"combo","input":"hi","prompt_cache_key":"responses-only-key"}`
+			got, _ := prepareTranslatedWithIdentity(t, New(nil, nil), p, responsesCodec, []byte(body), tc.model, http.Header{})
+			if _, ok := got["prompt_cache_key"]; ok {
+				t.Fatalf("%s leaked the Responses key: %v", wantCodec, got)
+			}
+		})
+	}
+}
+
+// Chat/Messages ingress never create a Responses prompt_cache_key, even when
+// the caller sends an explicit session. Chat ingress fields are not decoded in
+// this change, so a Chat prompt_cache_key also stays out of the backend body.
+func TestNonResponsesIngressDoesNotCreatePromptCacheKey(t *testing.T) {
+	cases := []struct {
+		name    string
+		ingress codec
+		body    string
+	}{
+		{name: "chat field dropped", ingress: openaiCodec, body: `{"model":"combo","messages":[{"role":"user","content":"hi"}],"prompt_cache_key":"chat-ingress-key"}`},
+		{name: "chat session only", ingress: openaiCodec, body: `{"model":"combo","messages":[{"role":"user","content":"hi"}],"metadata":{"user_id":"chat-session"}}`},
+		{name: "messages session only", ingress: anthropicCodec, body: `{"model":"combo","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"metadata":{"user_id":"messages-session"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := opencodeTestProvider()
+			got, trace := prepareTranslatedWithIdentity(t, New(nil, nil), p, tc.ingress, []byte(tc.body), "gpt-5.6-luna", http.Header{})
+			if _, ok := got["prompt_cache_key"]; ok {
+				t.Fatalf("Responses backend gained a key from %s ingress: %v", tc.ingress.id, got)
+			}
+			if !opencode.IsNativeSessionID(trace.OpencodeSessionID) {
+				t.Fatalf("session identity missing for %s ingress: %q", tc.ingress.id, trace.OpencodeSessionID)
+			}
+		})
+	}
+}
+
+// Codex keeps its generated, tenant-scoped cache key even when the caller sent
+// an explicit Responses prompt_cache_key. The explicit value may act as captured
+// identity input but must not become the raw body field or session_id header.
+func TestCodexScopedKeyBeatsExplicitResponsesKey(t *testing.T) {
+	const explicit = "client-raw-key"
+	raw := []byte(`{"model":"combo","input":"hi","prompt_cache_key":"client-raw-key"}`)
+	p := &domain.Provider{Name: "codex", Protocol: domain.ProtocolOpenAICodex}
+	backend := backendCodecFor(p.Protocol, "", "gpt-5.3-codex")
+	if backend.id != "oai-codex" {
+		t.Fatalf("backend codec = %q, want oai-codex", backend.id)
+	}
+	req, err := responsesCodec.decodeRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.PromptCacheKey == nil || *req.PromptCacheKey != explicit {
+		t.Fatalf("decoded IR key = %v", req.PromptCacheKey)
+	}
+	encoded, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(explicit)) {
+		t.Fatalf("codex encoder forwarded the explicit key: %s", encoded)
+	}
+	finalized, err := finalizeEncodedBody(encoded, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := &TraceInfo{}
+	ctx := WithTraceInfo(context.Background(), trace)
+	ctx = withCodexRequest(ctx, "tenant-x", http.Header{}, raw)
+	out, err := New(nil, nil).prepareUpstreamRequestFor(ctx, backend, p, req, finalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Key string `json:"prompt_cache_key"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Key == "" || got.Key == explicit {
+		t.Fatalf("resolved codex key = %q", got.Key)
+	}
+	if trace.CodexSessionID != got.Key {
+		t.Fatalf("trace session %q != body key %q", trace.CodexSessionID, got.Key)
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, "https://example.invalid/responses", bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyCodexHeaders(httpReq, p, ctx)
+	if httpReq.Header.Get("session_id") != got.Key {
+		t.Fatalf("session_id = %q, want %q", httpReq.Header.Get("session_id"), got.Key)
+	}
+}
+
+// The generic public Responses codec stays independent of OpenCode: an explicit
+// key survives, and a missing key is never generated.
+func TestPublicResponsesPromptCacheKeyPreserved(t *testing.T) {
+	p := &domain.Provider{Name: "public", Protocol: domain.ProtocolOpenAIResponses}
+	backend := backendCodecFor(p.Protocol, "", "gpt-5.6-luna")
+	if backend.id != "oai-responses" {
+		t.Fatalf("backend codec = %q, want oai-responses", backend.id)
+	}
+	for _, stream := range []bool{false, true} {
+		body := fmt.Sprintf(`{"model":"combo","stream":%t,"input":"hi","prompt_cache_key":"public-key"}`, stream)
+		trace := &TraceInfo{}
+		ctx := WithTraceInfo(context.Background(), trace)
+		got := prepareTranslatedPipeline(t, New(nil, nil), p, responsesCodec, []byte(body), "gpt-5.6-luna", ctx)
+		if got["prompt_cache_key"] != "public-key" {
+			t.Fatalf("stream=%t prepared key = %#v", stream, got["prompt_cache_key"])
+		}
+	}
+	got := prepareTranslatedPipeline(t, New(nil, nil), p, responsesCodec, []byte(`{"model":"combo","input":"hi"}`), "gpt-5.6-luna", WithTraceInfo(context.Background(), &TraceInfo{}))
+	if _, ok := got["prompt_cache_key"]; ok {
+		t.Fatalf("missing key was generated: %v", got)
+	}
+}
+
+// The explicit key must not alias across snapshots or make preparation mutate
+// the caller bytes, the request, or the provider.
+func TestPromptCacheKeyProcessingKeepsInputsUnchanged(t *testing.T) {
+	p := opencodeTestProvider()
+	raw := []byte(`{"model":"combo","input":"hi","prompt_cache_key":"cache-immutable"}`)
+	rawCopy := append([]byte(nil), raw...)
+	req, err := responsesCodec.decodeRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured := thinking.Capture(raw); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
+	applyUpstreamModel(req, "gpt-5.6-luna")
+	reqBefore := snapshotIR(t, req)
+	providerBefore := snapshotProvider(t, p)
+	backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+	encoded, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalized, err := finalizeEncodedBody(encoded, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithTraceInfo(context.Background(), &TraceInfo{})
+	ctx = withOpencodeRequest(ctx, "test-nonce", http.Header{}, raw)
+	out, err := New(nil, nil).prepareUpstreamRequestFor(ctx, backend, p, req, finalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, rawCopy) {
+		t.Fatal("processing changed the caller body")
+	}
+	if !reflect.DeepEqual(snapshotIR(t, req), reqBefore) || !reflect.DeepEqual(snapshotProvider(t, p), providerBefore) {
+		t.Fatal("processing changed the request or provider")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["prompt_cache_key"] != "cache-immutable" {
+		t.Fatalf("prepared key = %#v", got["prompt_cache_key"])
 	}
 }

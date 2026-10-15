@@ -16,11 +16,12 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		return nil, fmt.Errorf("responses: decode request: %w", err)
 	}
 	out := &ir.Request{
-		Model:       req.Model,
-		System:      req.Instructions,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stream:      req.Stream,
+		Model:          req.Model,
+		System:         req.Instructions,
+		Temperature:    req.Temperature,
+		TopP:           req.TopP,
+		Stream:         req.Stream,
+		PromptCacheKey: req.PromptCacheKey,
 	}
 	if req.MaxOutputTokens != nil {
 		out.MaxTokens = *req.MaxOutputTokens
@@ -194,6 +195,9 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	}
 	if req.TopP != nil {
 		out["top_p"] = *req.TopP
+	}
+	if req.PromptCacheKey != nil {
+		out["prompt_cache_key"] = *req.PromptCacheKey
 	}
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))

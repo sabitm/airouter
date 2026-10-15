@@ -20,6 +20,9 @@ type request struct {
 	Tools           []tool          `json:"tools"`
 	ToolChoice      json.RawMessage `json:"tool_choice"` // string or object
 	Reasoning       *respReasoning  `json:"reasoning"`
+	// PromptCacheKey is explicit caller intent. Nil when absent or null; the
+	// wire value is kept verbatim, including an empty string.
+	PromptCacheKey *string `json:"prompt_cache_key"`
 }
 
 type respReasoning struct {
