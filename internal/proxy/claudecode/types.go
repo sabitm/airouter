@@ -59,6 +59,9 @@ type wireBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+	// CacheControl is kept raw so the cloak remarshal preserves a caller's
+	// explicit marker without interpreting it. Decoys never set it.
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 type wireSource struct {
@@ -72,10 +75,11 @@ type wireSource struct {
 // (web_search_*, etc.) which require an exact reserved name and must never be
 // suffixed; client tools carry no Type and get the _ide suffix when cloaking.
 type wireTool struct {
-	Type        string          `json:"type,omitempty"`
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	Type         string          `json:"type,omitempty"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 type wireToolChoice struct {

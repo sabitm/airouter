@@ -61,6 +61,11 @@ type anthBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"` // string or []anthBlock
 	IsError   bool            `json:"is_error,omitempty"`
+
+	// CacheControl is kept raw so a malformed excluded or nested marker cannot
+	// fail the whole block-array decode. Only request.go validates and converts
+	// it, and only at eligible request positions.
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 func thinkingText(s *string) string {
@@ -82,9 +87,17 @@ type anthSource struct {
 }
 
 type anthTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
+}
+
+// anthCacheControl is the wire shape of one canonical explicit cache hint. An
+// empty TTL is omitted so a marker without one re-emits without one.
+type anthCacheControl struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
 }
 
 type anthToolChoice struct {

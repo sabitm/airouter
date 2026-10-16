@@ -1,7 +1,9 @@
 package anthropic
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"airouter/internal/domain"
@@ -30,10 +32,15 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		Stream:        req.Stream,
 	}
 	for _, t := range req.Tools {
+		cc, err := cacheControlFromRaw(t.CacheControl)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: decode request: tool cache_control: %w", err)
+		}
 		out.Tools = append(out.Tools, ir.Tool{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  t.InputSchema,
+			Name:         t.Name,
+			Description:  t.Description,
+			Parameters:   t.InputSchema,
+			CacheControl: cc,
 		})
 	}
 	if req.ToolChoice != nil {
@@ -44,7 +51,11 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		if m.Role == "assistant" {
 			role = ir.RoleAssistant
 		}
-		out.Messages = append(out.Messages, ir.Message{Role: role, Content: decodeBlocks(m.Content)})
+		content, err := decodeRequestBlocks(m.Content)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: decode request: message content cache_control: %w", err)
+		}
+		out.Messages = append(out.Messages, ir.Message{Role: role, Content: content})
 	}
 	var thType string
 	var budget int
@@ -60,21 +71,41 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 	return out, nil
 }
 
-// decodeBlocks parses a message content field (string or []anthBlock) to IR.
+// decodeBlocks parses a message content field (string or []anthBlock) to IR
+// without cache hints. It is the nested-context decoder for tool_result
+// content: a hint there is dropped, never hoisted, because the canonical
+// tool-result blocks have no hint slot.
 func decodeBlocks(raw json.RawMessage) []ir.ContentBlock {
+	out, _ := decodeBlocksHints(raw, false)
+	return out
+}
+
+// decodeRequestBlocks parses one top-level request message content value. It
+// captures and validates explicit cache_control hints on the eligible block
+// kinds. A malformed supported-position marker returns an error so the request
+// is rejected instead of the message silently disappearing.
+func decodeRequestBlocks(raw json.RawMessage) ([]ir.ContentBlock, error) {
+	return decodeBlocksHints(raw, true)
+}
+
+// decodeBlocksHints is the shared string-or-array content decoder. withHints
+// enables request-side hint capture; excluded block kinds and nested tool_result
+// content never carry a hint. Malformed non-array content still decodes to no
+// blocks without an error, preserving the legacy behavior.
+func decodeBlocksHints(raw json.RawMessage, withHints bool) ([]ir.ContentBlock, error) {
 	if len(raw) == 0 {
-		return nil
+		return nil, nil
 	}
 	if raw[0] == '"' {
 		var s string
 		if json.Unmarshal(raw, &s) == nil && s != "" {
-			return []ir.ContentBlock{{Type: ir.BlockText, Text: s}}
+			return []ir.ContentBlock{{Type: ir.BlockText, Text: s}}, nil
 		}
-		return nil
+		return nil, nil
 	}
 	var blocks []anthBlock
 	if json.Unmarshal(raw, &blocks) != nil {
-		return nil
+		return nil, nil
 	}
 	var out []ir.ContentBlock
 	for _, b := range blocks {
@@ -88,29 +119,92 @@ func decodeBlocks(raw json.RawMessage) []ir.ContentBlock {
 		case "redacted_thinking":
 			out = append(out, ir.ContentBlock{Type: ir.BlockRedactedReasoning, RedactedData: b.Data})
 		case "text":
-			out = append(out, ir.ContentBlock{Type: ir.BlockText, Text: b.Text})
+			cc, err := decodeCacheHint(b.CacheControl, withHints)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ir.ContentBlock{Type: ir.BlockText, Text: b.Text, CacheControl: cc})
 		case "image":
-			out = append(out, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromSource(b.Source)})
+			cc, err := decodeCacheHint(b.CacheControl, withHints)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromSource(b.Source), CacheControl: cc})
 		case "document":
-			out = append(out, ir.ContentBlock{Type: ir.BlockFile, File: fileFromDocument(b)})
+			cc, err := decodeCacheHint(b.CacheControl, withHints)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ir.ContentBlock{Type: ir.BlockFile, File: fileFromDocument(b), CacheControl: cc})
 		case "tool_use":
+			cc, err := decodeCacheHint(b.CacheControl, withHints)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, ir.ContentBlock{
-				Type:      ir.BlockToolUse,
-				ToolID:    b.ID,
-				ToolName:  b.Name,
-				ToolInput: b.Input,
+				Type:         ir.BlockToolUse,
+				ToolID:       b.ID,
+				ToolName:     b.Name,
+				ToolInput:    b.Input,
+				CacheControl: cc,
 			})
 		case "tool_result":
+			cc, err := decodeCacheHint(b.CacheControl, withHints)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, ir.ContentBlock{
-				Type:       ir.BlockToolResult,
-				ToolUseID:  b.ToolUseID,
-				IsError:    b.IsError,
-				ToolResult: decodeBlocks(b.Content),
+				Type:         ir.BlockToolResult,
+				ToolUseID:    b.ToolUseID,
+				IsError:      b.IsError,
+				ToolResult:   decodeBlocks(b.Content),
+				CacheControl: cc,
 			})
 		}
 	}
-	return out
+	return out, nil
 }
+
+// decodeCacheHint converts a wire marker only where the canonical request IR
+// models one. Every excluded context passes enabled false and drops the value
+// without validation, so a malformed excluded marker cannot fail the decode.
+func decodeCacheHint(raw json.RawMessage, enabled bool) (*ir.CacheControl, error) {
+	if !enabled {
+		return nil, nil
+	}
+	return cacheControlFromRaw(raw)
+}
+
+// cacheControlFromRaw converts one wire cache_control value to the canonical
+// hint. Absent and JSON null are nil. A present marker must be a JSON object
+// with type exactly "ephemeral" and, when ttl is present and non-null, ttl
+// exactly "5m" or "1h". Unknown object keys are ignored. Errors never echo
+// caller values.
+func cacheControlFromRaw(raw json.RawMessage) (*ir.CacheControl, error) {
+	if len(raw) == 0 || bytes.Equal(raw, nullJSON) {
+		return nil, nil
+	}
+	var wire struct {
+		Type *string `json:"type"`
+		TTL  *string `json:"ttl"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, errors.New("cache_control is malformed")
+	}
+	if wire.Type == nil || *wire.Type != "ephemeral" {
+		return nil, errors.New(`cache_control.type must be "ephemeral"`)
+	}
+	cc := &ir.CacheControl{Type: "ephemeral"}
+	if wire.TTL != nil {
+		if *wire.TTL != "5m" && *wire.TTL != "1h" {
+			return nil, errors.New(`cache_control.ttl must be "5m" or "1h"`)
+		}
+		cc.TTL = *wire.TTL
+	}
+	return cc, nil
+}
+
+var nullJSON = []byte("null")
 
 // EncodeRequest renders the IR as an Anthropic Messages request. Used when
 // Anthropic is the backend format.
@@ -141,9 +235,10 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 	}
 	for _, t := range req.Tools {
 		out.Tools = append(out.Tools, anthTool{
-			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: t.Parameters,
+			Name:         t.Name,
+			Description:  t.Description,
+			InputSchema:  t.Parameters,
+			CacheControl: cacheControlRaw(t.CacheControl),
 		})
 	}
 	if req.ToolChoice != nil {
@@ -216,7 +311,22 @@ func applyThinking(out *messagesRequest, req *ir.Request, protocol domain.Protoc
 	}
 }
 
+// encodeBlocks renders top-level request content blocks, including explicit
+// caller cache hints on the eligible block kinds.
 func encodeBlocks(blocks []ir.ContentBlock) []anthBlock {
+	return encodeBlocksHints(blocks, true)
+}
+
+// encodeToolResultBlocks renders nested tool_result content. Hints are always
+// suppressed: a nested IR hint is dropped, never hoisted onto the outer block.
+func encodeToolResultBlocks(blocks []ir.ContentBlock) []anthBlock {
+	return encodeBlocksHints(blocks, false)
+}
+
+// encodeBlocksHints renders blocks. A hint is emitted only when hints are
+// allowed and the block kind has a request-side marker slot; reasoning and
+// redacted reasoning never emit one even when the IR was hand-built with it.
+func encodeBlocksHints(blocks []ir.ContentBlock, hints bool) []anthBlock {
 	out := make([]anthBlock, 0, len(blocks))
 	for _, b := range blocks {
 		switch b.Type {
@@ -225,14 +335,14 @@ func encodeBlocks(blocks []ir.ContentBlock) []anthBlock {
 		case ir.BlockRedactedReasoning:
 			out = append(out, anthBlock{Type: "redacted_thinking", Data: b.RedactedData})
 		case ir.BlockText:
-			out = append(out, anthBlock{Type: "text", Text: b.Text})
+			out = append(out, anthBlock{Type: "text", Text: b.Text, CacheControl: cacheHintRaw(b.CacheControl, hints)})
 		case ir.BlockImage:
-			out = append(out, anthBlock{Type: "image", Source: sourceFromImage(b.Image)})
+			out = append(out, anthBlock{Type: "image", Source: sourceFromImage(b.Image), CacheControl: cacheHintRaw(b.CacheControl, hints)})
 		case ir.BlockFile:
 			// Only PDF documents are representable on Anthropic. Non-PDF files are
 			// skipped here; preflight must reject incompatible targets before encode.
 			if isPDFDocument(b.File) {
-				blk := anthBlock{Type: "document", Source: sourceFromFile(b.File), Title: b.File.Filename}
+				blk := anthBlock{Type: "document", Source: sourceFromFile(b.File), Title: b.File.Filename, CacheControl: cacheHintRaw(b.CacheControl, hints)}
 				out = append(out, blk)
 			}
 		case ir.BlockToolUse:
@@ -240,11 +350,32 @@ func encodeBlocks(blocks []ir.ContentBlock) []anthBlock {
 			if len(input) == 0 {
 				input = json.RawMessage("{}")
 			}
-			out = append(out, anthBlock{Type: "tool_use", ID: b.ToolID, Name: b.ToolName, Input: input})
+			out = append(out, anthBlock{Type: "tool_use", ID: b.ToolID, Name: b.ToolName, Input: input, CacheControl: cacheHintRaw(b.CacheControl, hints)})
 		case ir.BlockToolResult:
-			content, _ := json.Marshal(encodeBlocks(b.ToolResult))
-			out = append(out, anthBlock{Type: "tool_result", ToolUseID: b.ToolUseID, IsError: b.IsError, Content: content})
+			content, _ := json.Marshal(encodeToolResultBlocks(b.ToolResult))
+			out = append(out, anthBlock{Type: "tool_result", ToolUseID: b.ToolUseID, IsError: b.IsError, Content: content, CacheControl: cacheHintRaw(b.CacheControl, hints)})
 		}
 	}
 	return out
+}
+
+// cacheHintRaw converts a canonical hint to wire bytes only at an allowed
+// position. An empty TTL is omitted so a caller marker with no ttl round-trips
+// without an implicit one.
+func cacheHintRaw(cc *ir.CacheControl, enabled bool) json.RawMessage {
+	if !enabled || cc == nil {
+		return nil
+	}
+	return cacheControlRaw(cc)
+}
+
+func cacheControlRaw(cc *ir.CacheControl) json.RawMessage {
+	if cc == nil {
+		return nil
+	}
+	raw, err := json.Marshal(anthCacheControl{Type: cc.Type, TTL: cc.TTL})
+	if err != nil {
+		return nil
+	}
+	return raw
 }

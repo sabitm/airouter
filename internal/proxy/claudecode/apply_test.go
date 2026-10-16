@@ -326,20 +326,20 @@ func TestMessagesBodyPreservesExercisedEncoderFields(t *testing.T) {
 		TopP:          ptrFloat(0.9),
 		StopSequences: []string{"END"},
 		Stream:        true,
-		Tools:         []ir.Tool{{Name: "search", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		Tools:         []ir.Tool{{Name: "search", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`), CacheControl: cacheControlHint("5m")}},
 		ToolChoice:    &ir.ToolChoice{Type: ir.ToolChoiceTool, Name: "search"},
 		System:        "sys",
 		Messages: []ir.Message{
 			{Role: ir.RoleUser, Content: []ir.ContentBlock{
-				{Type: ir.BlockText, Text: "hi"},
-				{Type: ir.BlockImage, Image: &ir.Image{Data: "aW1n", MediaType: "image/png"}},
-				{Type: ir.BlockFile, File: &ir.File{Filename: "report.pdf", MediaType: "application/pdf", Data: "Zm9v"}},
+				{Type: ir.BlockText, Text: "hi", CacheControl: cacheControlHint("1h")},
+				{Type: ir.BlockImage, Image: &ir.Image{Data: "aW1n", MediaType: "image/png"}, CacheControl: cacheControlHint("5m")},
+				{Type: ir.BlockFile, File: &ir.File{Filename: "report.pdf", MediaType: "application/pdf", Data: "Zm9v"}, CacheControl: cacheControlHint("1h")},
 			}},
 			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
-				{Type: ir.BlockToolUse, ToolID: "t1", ToolName: "search", ToolInput: json.RawMessage(`{"q":"x"}`)},
+				{Type: ir.BlockToolUse, ToolID: "t1", ToolName: "search", ToolInput: json.RawMessage(`{"q":"x"}`), CacheControl: cacheControlHint("5m")},
 			}},
 			{Role: ir.RoleUser, Content: []ir.ContentBlock{
-				{Type: ir.BlockToolResult, ToolUseID: "t1", IsError: true, ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "err"}}},
+				{Type: ir.BlockToolResult, ToolUseID: "t1", IsError: true, CacheControl: cacheControlHint("1h"), ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "err"}}},
 			}},
 		},
 		Thinking: &ir.Thinking{Mode: ir.ThinkingLevel, Level: "medium"},
@@ -450,6 +450,123 @@ func join(path, key string) string {
 }
 
 func ptrFloat(f float64) *float64 { return &f }
+
+func cacheControlHint(ttl string) *ir.CacheControl {
+	return &ir.CacheControl{Type: "ephemeral", TTL: ttl}
+}
+
+// TestApplyOAuthCloakingPreservesCacheControl forces the cloak block remarshal
+// with an assistant text plus tool_use message and checks caller markers, tool
+// suffixing, choice/history pairing, and unmarked decoys. Synthetic token only.
+func TestApplyOAuthCloakingPreservesCacheControl(t *testing.T) {
+	req := &ir.Request{
+		Model:     "claude-sonnet-4.6",
+		MaxTokens: 1000,
+		Tools: []ir.Tool{
+			{Name: "search", Description: "Find one record", Parameters: json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}`), CacheControl: cacheControlHint("5m")},
+			{Name: "Read", Description: "read a file", Parameters: json.RawMessage(`{"type":"object"}`), CacheControl: cacheControlHint("1h")},
+		},
+		ToolChoice: &ir.ToolChoice{Type: ir.ToolChoiceTool, Name: "search"},
+		Messages: []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "answer", CacheControl: cacheControlHint("1h")},
+				{Type: ir.BlockToolUse, ToolID: "t1", ToolName: "search", ToolInput: json.RawMessage(`{"q":"x"}`), CacheControl: cacheControlHint("5m")},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "t1", CacheControl: cacheControlHint("5m"), ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "result", CacheControl: cacheControlHint("1h")}}},
+			}},
+		},
+	}
+	m := encodeCloaked(t, req)
+
+	if len(m.Tools) != 2+len(DecoyTools) {
+		t.Fatalf("tools = %d, want 2 caller + %d decoys", len(m.Tools), len(DecoyTools))
+	}
+	if m.Tools[0].Name != "search"+ToolSuffix || string(m.Tools[0].CacheControl) != `{"type":"ephemeral","ttl":"5m"}` {
+		t.Fatalf("caller tool 0 not cloaked with marker: %+v", m.Tools[0])
+	}
+	if m.Tools[1].Name != "Read"+ToolSuffix || string(m.Tools[1].CacheControl) != `{"type":"ephemeral","ttl":"1h"}` {
+		t.Fatalf("caller tool 1 not cloaked with marker: %+v", m.Tools[1])
+	}
+	if m.Tools[0].Description != "Find one record" || string(m.Tools[0].InputSchema) != `{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}` {
+		t.Fatalf("caller tool metadata changed: %+v", m.Tools[0])
+	}
+	for _, d := range m.Tools[2:] {
+		if len(d.CacheControl) != 0 {
+			t.Fatalf("decoy %q carries cache_control", d.Name)
+		}
+	}
+	if m.ToolChoice == nil || m.ToolChoice.Name != "search"+ToolSuffix {
+		t.Fatalf("tool_choice not rewritten with history: %+v", m.ToolChoice)
+	}
+
+	var assistant []wireBlock
+	mustJSON(t, m.Messages[0].Content, &assistant)
+	if len(assistant) != 2 {
+		t.Fatalf("assistant blocks = %d", len(assistant))
+	}
+	if assistant[0].Type != "text" || assistant[0].Text != "answer" || string(assistant[0].CacheControl) != `{"type":"ephemeral","ttl":"1h"}` {
+		t.Fatalf("assistant text marker lost: %+v", assistant[0])
+	}
+	if assistant[1].Type != "tool_use" || assistant[1].Name != "search"+ToolSuffix || assistant[1].ID != "t1" || string(assistant[1].CacheControl) != `{"type":"ephemeral","ttl":"5m"}` {
+		t.Fatalf("assistant tool_use marker or rename lost: %+v", assistant[1])
+	}
+
+	var user []wireBlock
+	mustJSON(t, m.Messages[1].Content, &user)
+	if len(user) != 1 || user[0].Type != "tool_result" || user[0].ToolUseID != "t1" {
+		t.Fatalf("outer tool_result changed: %+v", user)
+	}
+	if string(user[0].CacheControl) != `{"type":"ephemeral","ttl":"5m"}` {
+		t.Fatalf("outer tool_result marker lost: %+v", user[0])
+	}
+	if strings.Contains(string(user[0].Content), "cache_control") {
+		t.Fatalf("nested tool_result content gained a marker: %s", user[0].Content)
+	}
+}
+
+// TestApplyOAuthCloakingCacheControlNoOpForAPIKey keeps the non-OAuth path
+// byte-identical even when the body carries markers.
+func TestApplyOAuthCloakingCacheControlNoOpForAPIKey(t *testing.T) {
+	req := &ir.Request{
+		Model:     "claude-sonnet-4.6",
+		MaxTokens: 1000,
+		Tools:     []ir.Tool{{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`), CacheControl: cacheControlHint("5m")}},
+		Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi", CacheControl: cacheControlHint("1h")}}}},
+	}
+	body, err := anthropic.EncodeRequestClaudeCode(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := ApplyOAuthCloaking(body, "sk-ant-api03-synthetic", "sess", "seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != string(body) {
+		t.Fatalf("apikey token changed a body with markers:\n got  %s\n want %s", out, body)
+	}
+}
+
+// TestApplyOAuthCloakingCacheControlWithoutTools keeps top-level block markers
+// when no tool forces a content remarshal, and adds no decoys.
+func TestApplyOAuthCloakingCacheControlWithoutTools(t *testing.T) {
+	req := &ir.Request{
+		Model:     "claude-sonnet-4.6",
+		MaxTokens: 1000,
+		Messages: []ir.Message{
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi", CacheControl: cacheControlHint("1h")}}},
+		},
+	}
+	m := encodeCloaked(t, req)
+	if len(m.Tools) != 0 {
+		t.Fatalf("no-tools cloak injected %d tools", len(m.Tools))
+	}
+	var blocks []wireBlock
+	mustJSON(t, m.Messages[0].Content, &blocks)
+	if len(blocks) != 1 || string(blocks[0].CacheControl) != `{"type":"ephemeral","ttl":"1h"}` {
+		t.Fatalf("marker lost without tool remarshal: %+v", blocks)
+	}
+}
 
 func toolNames(tools []wireTool) []string {
 	out := make([]string, 0, len(tools))

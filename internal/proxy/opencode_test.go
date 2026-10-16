@@ -15,9 +15,13 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/harlog"
+	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/openai"
 	"airouter/internal/proxy/opencode"
+	"airouter/internal/proxy/qoder"
+	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/thinking"
 )
 
@@ -1668,6 +1672,10 @@ func cloneBlocks(in []ir.ContentBlock) []ir.ContentBlock {
 			v := *in[i].File
 			out[i].File = &v
 		}
+		if in[i].CacheControl != nil {
+			v := *in[i].CacheControl
+			out[i].CacheControl = &v
+		}
 	}
 	return out
 }
@@ -1680,6 +1688,10 @@ func cloneTools(in []ir.Tool) []ir.Tool {
 	for i := range in {
 		out[i] = in[i]
 		out[i].Parameters = append(json.RawMessage(nil), in[i].Parameters...)
+		if in[i].CacheControl != nil {
+			v := *in[i].CacheControl
+			out[i].CacheControl = &v
+		}
 	}
 	return out
 }
@@ -2883,5 +2895,392 @@ func TestPromptCacheKeyProcessingKeepsInputsUnchanged(t *testing.T) {
 	}
 	if got["prompt_cache_key"] != "cache-immutable" {
 		t.Fatalf("prepared key = %#v", got["prompt_cache_key"])
+	}
+}
+
+type anthropicCacheCase struct {
+	name  string
+	base  string
+	model string
+	free  bool
+}
+
+func anthCacheHint(ttl string) *ir.CacheControl {
+	return &ir.CacheControl{Type: "ephemeral", TTL: ttl}
+}
+
+// prepareAnthropicCachePipeline mirrors serveTranslated for an Anthropic ingress
+// request: decode, capture thinking intent, apply the upstream model, encode
+// with the resolved OpenCode Messages backend, finalize, and prepare. It
+// snapshots the caller bytes, IR, and provider before the transforming steps
+// and fails if any changed. The returned raw bytes are the exact upstream body.
+func prepareAnthropicCachePipeline(t *testing.T, p *domain.Provider, ingress codec, rawBody []byte, upstreamModel string, stream bool) (map[string]any, []byte) {
+	t.Helper()
+	rawInput := append([]byte(nil), rawBody...)
+	req, err := ingress.decodeRequest(rawBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured := thinking.Capture(rawBody); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
+	applyUpstreamModel(req, upstreamModel)
+	req.Stream = stream
+	reqBefore := snapshotIR(t, req)
+	providerBefore := snapshotProvider(t, p)
+	backend := backendCodecFor(p.Protocol, p.BaseURL, upstreamModel)
+	if backend.id != codecOpencodeMessages {
+		t.Fatalf("backend codec = %q, want opencode-messages", backend.id)
+	}
+	encoded, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalized, err := finalizeEncodedBody(encoded, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithTraceInfo(context.Background(), &TraceInfo{})
+	out, err := New(nil, nil).prepareUpstreamRequestFor(ctx, backend, p, req, finalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rawBody, rawInput) {
+		t.Fatal("processing changed the caller body")
+	}
+	if !reflect.DeepEqual(snapshotIR(t, req), reqBefore) || !reflect.DeepEqual(snapshotProvider(t, p), providerBefore) {
+		t.Fatal("processing changed the request or provider")
+	}
+	var got map[string]any
+	dec := json.NewDecoder(bytes.NewReader(out))
+	dec.UseNumber()
+	if err := dec.Decode(&got); err != nil {
+		t.Fatalf("prepared body invalid: %v (%s)", err, out)
+	}
+	return got, out
+}
+
+func mustMapAny(t *testing.T, path string, v any) map[string]any {
+	t.Helper()
+	m, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("%s: want object, got %T", path, v)
+	}
+	return m
+}
+
+func mustListAny(t *testing.T, path string, v any) []any {
+	t.Helper()
+	l, ok := v.([]any)
+	if !ok {
+		t.Fatalf("%s: want array, got %T", path, v)
+	}
+	return l
+}
+
+func requireMapMarker(t *testing.T, path string, v any, typ, ttl string) {
+	t.Helper()
+	m, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("%s: cache_control = %T, want object", path, v)
+	}
+	gotTTL, _ := m["ttl"].(string)
+	if m["type"] != typ || gotTTL != ttl {
+		t.Fatalf("%s: cache_control = %#v, want type %q ttl %q", path, m, typ, ttl)
+	}
+	if ttl == "" {
+		if _, has := m["ttl"]; has {
+			t.Fatalf("%s: empty ttl emitted: %#v", path, m)
+		}
+	}
+}
+
+func requireAbsentKey(t *testing.T, path string, m map[string]any, key string) {
+	t.Helper()
+	if _, ok := m[key]; ok {
+		t.Fatalf("%s: unexpected %q: %#v", path, key, m[key])
+	}
+}
+
+// TestOpencodeMessagesCacheControlPipeline covers the complete Anthropic
+// ingress path into the real OpenCode Messages encoder for paid Zen/Go rows and
+// the free Zen minimax row. Caller markers survive tool canonicalization and
+// decoy injection; decoys stay unmarked; names, schemas, descriptions, IDs, and
+// raw argument numbers are preserved.
+func TestOpencodeMessagesCacheControlPipeline(t *testing.T) {
+	const schema = `{"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"minimum":1}`
+	const requestFmt = `{
+	  "model":"combo","stream":%t,"max_tokens":4000,
+	  "system":"sys",
+	  "tools":[
+	    {"name":"lookup","description":"Find one record","input_schema":` + schema + `,"cache_control":{"type":"ephemeral","ttl":"5m"}},
+	    {"name":"Read","description":"read a file","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}
+	  ],
+	  "tool_choice":{"type":"tool","name":"lookup"},
+	  "messages":[
+	    {"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]},
+	    {"role":"assistant","content":[
+	      {"type":"thinking","thinking":"plan","signature":"s","cache_control":{"type":"ephemeral","ttl":"1h"}},
+	      {"type":"text","text":"answer","cache_control":{"type":"ephemeral","ttl":"5m"}},
+	      {"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"x","n":1.0},"cache_control":{"type":"ephemeral","ttl":"1h"}}
+	    ]},
+	    {"role":"user","content":[
+	      {"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"sunny","cache_control":{"type":"ephemeral","ttl":"1h"}}],"cache_control":{"type":"ephemeral","ttl":"5m"}},
+	      {"type":"text","text":"tail","cache_control":{"type":"ephemeral","ttl":"1h"}}
+	    ]}
+	  ]
+	}`
+	cases := []anthropicCacheCase{
+		{name: "zen-paid-claude", base: opencode.ZenBaseURL, model: "claude-sonnet-4-5"},
+		{name: "zen-paid-qwen", base: opencode.ZenBaseURL, model: "qwen3.6-plus"},
+		{name: "go-paid-minimax25", base: opencode.GoBaseURL, model: "minimax-m2.5"},
+		{name: "go-paid-minimax3", base: opencode.GoBaseURL, model: "minimax-m3"},
+		{name: "zen-free-minimax3", base: opencode.ZenBaseURL, model: "minimax-m3-free", free: true},
+	}
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				p := opencodeTestProvider()
+				p.BaseURL = tc.base
+				raw := []byte(fmt.Sprintf(requestFmt, stream))
+				got, out := prepareAnthropicCachePipeline(t, p, anthropicCodec, raw, tc.model, stream)
+				assertAnthropicCachePipeline(t, tc, stream, got, out)
+			})
+		}
+	}
+}
+
+func assertAnthropicCachePipeline(t *testing.T, tc anthropicCacheCase, stream bool, got map[string]any, out []byte) {
+	t.Helper()
+	if got["model"] != tc.model {
+		t.Fatalf("model = %#v, want %q", got["model"], tc.model)
+	}
+	if stream {
+		if got["stream"] != true {
+			t.Fatalf("stream = %#v, want true", got["stream"])
+		}
+	} else {
+		requireAbsentKey(t, "body", got, "stream")
+	}
+	// System stays a flat string; no system block hints.
+	if got["system"] != "sys" {
+		t.Fatalf("system = %#v, want flat string", got["system"])
+	}
+	if bytes.Count(out, []byte("cache_control")) != 7 {
+		t.Fatalf("marker count = %d, want 7 (nested and thinking markers dropped): %s", bytes.Count(out, []byte("cache_control")), out)
+	}
+
+	tools := mustListAny(t, "tools", got["tools"])
+	byName := map[string]map[string]any{}
+	for i, rawTool := range tools {
+		tool := mustMapAny(t, fmt.Sprintf("tools[%d]", i), rawTool)
+		name, _ := tool["name"].(string)
+		byName[name] = tool
+	}
+	lookup, ok := byName["lookup"]
+	if !ok {
+		t.Fatalf("caller tool lookup missing: %v", byName)
+	}
+	readName := "Read"
+	if tc.free {
+		readName = "read"
+	}
+	read, ok := byName[readName]
+	if !ok {
+		t.Fatalf("caller tool %q missing: %v", readName, byName)
+	}
+	requireMapMarker(t, "lookup tool", lookup["cache_control"], "ephemeral", "5m")
+	requireMapMarker(t, readName+" tool", read["cache_control"], "ephemeral", "1h")
+	if lookup["description"] != "Find one record" || read["description"] != "read a file" {
+		t.Fatalf("descriptions changed: %#v", byName)
+	}
+	lookupSchema := mustMapAny(t, "lookup schema", lookup["input_schema"])
+	props := mustMapAny(t, "lookup properties", lookupSchema["properties"])
+	if lookupSchema["type"] != "object" || props["q"] == nil || lookupSchema["minimum"] != json.Number("1") {
+		t.Fatalf("lookup schema changed: %#v", lookupSchema)
+	}
+	required := mustListAny(t, "lookup required", lookupSchema["required"])
+	if len(required) != 1 || required[0] != "q" {
+		t.Fatalf("lookup required changed: %#v", required)
+	}
+	if tc.free {
+		if len(tools) != 5 {
+			t.Fatalf("free tools = %d, want caller 2 + decoys 3", len(tools))
+		}
+		for _, name := range []string{"bash", "glob", "grep"} {
+			decoy, ok := byName[name]
+			if !ok {
+				t.Fatalf("free decoy %q missing: %v", name, byName)
+			}
+			requireAbsentKey(t, "decoy "+name, decoy, "cache_control")
+		}
+	} else if len(tools) != 2 {
+		t.Fatalf("paid tools = %d, want 2", len(tools))
+	}
+	choice := mustMapAny(t, "tool_choice", got["tool_choice"])
+	if choice["type"] != "tool" || choice["name"] != "lookup" {
+		t.Fatalf("tool_choice changed: %#v", choice)
+	}
+
+	messages := mustListAny(t, "messages", got["messages"])
+	if len(messages) != 3 {
+		t.Fatalf("messages = %d, want 3", len(messages))
+	}
+	user0 := mustListAny(t, "messages[0]", mustMapAny(t, "messages[0]", messages[0])["content"])
+	requireMapMarker(t, "user text", mustMapAny(t, "user text", user0[0])["cache_control"], "ephemeral", "")
+
+	assistant := mustListAny(t, "messages[1]", mustMapAny(t, "messages[1]", messages[1])["content"])
+	if len(assistant) != 3 {
+		t.Fatalf("assistant blocks = %d, want 3", len(assistant))
+	}
+	thinking := mustMapAny(t, "thinking", assistant[0])
+	if thinking["type"] != "thinking" || thinking["thinking"] != "plan" {
+		t.Fatalf("thinking changed: %#v", thinking)
+	}
+	requireAbsentKey(t, "thinking", thinking, "cache_control")
+	answer := mustMapAny(t, "assistant text", assistant[1])
+	if answer["text"] != "answer" {
+		t.Fatalf("assistant text changed: %#v", answer)
+	}
+	requireMapMarker(t, "assistant text", answer["cache_control"], "ephemeral", "5m")
+	toolUse := mustMapAny(t, "assistant tool_use", assistant[2])
+	if toolUse["id"] != "toolu_1" || toolUse["name"] != "lookup" {
+		t.Fatalf("tool_use identity changed: %#v", toolUse)
+	}
+	requireMapMarker(t, "assistant tool_use", toolUse["cache_control"], "ephemeral", "1h")
+
+	user1 := mustListAny(t, "messages[2]", mustMapAny(t, "messages[2]", messages[2])["content"])
+	outer := mustMapAny(t, "outer tool_result", user1[0])
+	if outer["type"] != "tool_result" || outer["tool_use_id"] != "toolu_1" {
+		t.Fatalf("outer tool_result changed: %#v", outer)
+	}
+	requireMapMarker(t, "outer tool_result", outer["cache_control"], "ephemeral", "5m")
+	nested := mustListAny(t, "nested content", outer["content"])
+	if len(nested) != 1 || mustMapAny(t, "nested text", nested[0])["text"] != "sunny" {
+		t.Fatalf("nested content changed: %#v", nested)
+	}
+	requireAbsentKey(t, "nested text", mustMapAny(t, "nested text", nested[0]), "cache_control")
+	tail := mustMapAny(t, "tail text", user1[1])
+	if tail["text"] != "tail" {
+		t.Fatalf("tail text changed: %#v", tail)
+	}
+	requireMapMarker(t, "tail text", tail["cache_control"], "ephemeral", "1h")
+
+	// Raw argument numbers survive the full pipeline as written by the caller.
+	rawAssistant := mustListAny(t, "raw messages[1]", mustMapAny(t, "raw messages[1]", mustListAny(t, "raw messages", got["messages"])[1])["content"])
+	rawInput := mustMapAny(t, "raw tool input", mustMapAny(t, "raw tool_use", rawAssistant[2])["input"])
+	if n, ok := rawInput["n"].(json.Number); !ok || n.String() != "1.0" {
+		t.Fatalf("raw argument number changed: %#v", rawInput["n"])
+	}
+}
+
+// TestAnthropicCacheControlInvalidHTTP drives the real mounted handler and
+// asserts a malformed supported-position marker yields an Anthropic 400 with
+// zero upstream contact and no caller text in the error.
+func TestAnthropicCacheControlInvalidHTTP(t *testing.T) {
+	const secret = "cache-secret-text-must-not-leak"
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Name: "p", BaseURL: upstream.URL, APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "qwen3.6-plus", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	body := fmt.Sprintf(`{"model":"default","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":%q,"cache_control":{"type":"ephemeral","ttl":"2m"}}]}]}`, secret)
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+key.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s, want 400", resp.StatusCode, out)
+	}
+	if hits != 0 {
+		t.Fatalf("upstream contacted %d time(s) for an invalid marker", hits)
+	}
+	assertIngressErrorEnvelope(t, "/v1/messages", out, "invalid_request_error")
+	if bytes.Contains(out, []byte(secret)) {
+		t.Fatalf("error leaked caller text: %s", out)
+	}
+}
+
+// TestCacheControlDoesNotLeakIntoOtherCodecs decodes an Anthropic request with
+// markers and encodes it with every non-Anthropic JSON backend. The known
+// reasoning writers re-marshal via generic maps, so this guards the invariant
+// that cache hints never become wire fields on those codecs. The Cursor encoder
+// is protobuf and has no cache hint field or shared code path; its output is
+// binary and is not string-scanned here.
+func TestCacheControlDoesNotLeakIntoOtherCodecs(t *testing.T) {
+	body := []byte(`{"model":"combo","max_tokens":16,
+	  "system":"sys",
+	  "tools":[{"name":"lookup","description":"d","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"5m"}}],
+	  "messages":[{"role":"user","content":[
+	    {"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}},
+	    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1n"},"cache_control":{"type":"ephemeral"}},
+	    {"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"r"}],"cache_control":{"type":"ephemeral","ttl":"5m"}}
+	  ]}]}`)
+	req, err := anthropicCodec.decodeRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoders := []struct {
+		name string
+		enc  func(*ir.Request) ([]byte, error)
+	}{
+		{"oai-chat", openai.EncodeRequest},
+		{"oai-responses", responses.EncodeRequest},
+		{"oai-codex", responses.EncodeCodexRequest},
+		{"kiro", kiro.EncodeRequest},
+		{"kiro-runtime", kiro.EncodeRuntimeRequest},
+		{"qoder", qoder.EncodeRequest},
+		{"antigravity", antigravity.EncodeRequest},
+	}
+	for _, e := range encoders {
+		raw, err := e.enc(req)
+		if err != nil {
+			t.Fatalf("%s: %v", e.name, err)
+		}
+		if bytes.Contains(raw, []byte("cache_control")) {
+			t.Fatalf("%s leaked cache_control: %s", e.name, raw)
+		}
+	}
+	// Ordinary text and tool semantics survive the translation.
+	chat, err := openai.EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(chat, []byte("hello")) || !bytes.Contains(chat, []byte("lookup")) {
+		t.Fatalf("chat semantics lost: %s", chat)
+	}
+	codex, err := responses.EncodeCodexRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(codex, []byte("hello")) {
+		t.Fatalf("codex semantics lost: %s", codex)
 	}
 }

@@ -53,6 +53,15 @@ type File struct {
 	ID        string // provider-owned file id; not portable across protocols
 }
 
+// CacheControl is one caller-supplied Anthropic prompt-cache hint. Type is
+// always "ephemeral"; TTL is "" when the caller did not state one, otherwise
+// "5m" or "1h". It is request intent only, never response or usage data, and
+// codecs that have no marker slot drop it; no codec ever synthesizes one.
+type CacheControl struct {
+	Type string
+	TTL  string
+}
+
 // ContentBlock is a tagged union over the block kinds. Only the fields relevant
 // to Type are meaningful.
 type ContentBlock struct {
@@ -61,6 +70,11 @@ type ContentBlock struct {
 	Text  string // BlockText or BlockReasoning. Empty thinking text is valid.
 	Image *Image // BlockImage
 	File  *File  // BlockFile
+
+	// CacheControl is an explicit caller cache marker. It is meaningful only on
+	// request blocks the target format represents. Reasoning and redacted
+	// reasoning never carry it.
+	CacheControl *CacheControl
 
 	// AnthropicSignature is the opaque Anthropic thinking signature. It is not
 	// an OpenAI encrypted_content value or a Gemini thought signature. Empty
@@ -88,9 +102,10 @@ type Message struct {
 }
 
 type Tool struct {
-	Name        string
-	Description string
-	Parameters  json.RawMessage // JSON schema
+	Name         string
+	Description  string
+	Parameters   json.RawMessage // JSON schema
+	CacheControl *CacheControl
 }
 
 type ToolChoiceType string
