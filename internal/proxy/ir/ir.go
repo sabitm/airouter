@@ -184,6 +184,14 @@ type Request struct {
 	// Nil means absent or null; a non-nil pointer preserves an explicit empty
 	// string. It is body field intent, never session identity.
 	PromptCacheKey *string
+	// Store is the caller's explicit Responses store intent. Nil means absent
+	// or null; a non-nil pointer preserves an explicit false. It is request
+	// intent only, never a retention or privacy guarantee.
+	Store *bool
+	// Include is the caller's explicit Responses include list. Nil means absent
+	// or null; a non-nil pointer preserves an explicit empty list. Entries keep
+	// caller order and are not filtered; unknown entries pass through.
+	Include *[]string
 }
 
 type StopReason string

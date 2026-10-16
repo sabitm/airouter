@@ -23,6 +23,11 @@ type request struct {
 	// PromptCacheKey is explicit caller intent. Nil when absent or null; the
 	// wire value is kept verbatim, including an empty string.
 	PromptCacheKey *string `json:"prompt_cache_key"`
+	// Store and Include are explicit caller intent. Include elements stay raw
+	// until validated, because decoding a JSON null element into a string
+	// silently yields "" instead of an error.
+	Store   *bool              `json:"store"`
+	Include *[]json.RawMessage `json:"include"`
 }
 
 type respReasoning struct {

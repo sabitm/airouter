@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -489,5 +491,105 @@ func TestPassthroughPreservesUnknownFields(t *testing.T) {
 	}
 	if u := string(fwd["user"]); u != `"u-123"` {
 		t.Errorf("user = %s, want \"u-123\" (unknown field must be preserved)", u)
+	}
+}
+
+// TestResponsesStoreIncludeInvalidHTTP drives the real mounted handler and
+// asserts malformed store/include yields a Responses 400 with zero upstream
+// contact for both a same-codec and a translated target. The error names the
+// field or index and never echoes caller content.
+func TestResponsesStoreIncludeInvalidHTTP(t *testing.T) {
+	const sentinel = "store-include-sentinel-must-not-leak"
+	cases := []struct {
+		name      string
+		members   string
+		wantField string
+		wantIndex string
+	}{
+		{name: "store string", members: `"store":"` + sentinel + `"`, wantField: "store"},
+		{name: "store number", members: `"store":1`, wantField: "store"},
+		{name: "store array", members: `"store":[]`, wantField: "store"},
+		{name: "include string", members: `"include":"` + sentinel + `"`, wantField: "include"},
+		{name: "include object", members: `"include":{}`, wantField: "include"},
+		{name: "include null element", members: `"include":["ok",null]`, wantField: "include", wantIndex: "include[1]"},
+		{name: "include object element", members: `"include":["ok",{"x":"` + sentinel + `"}]`, wantField: "include", wantIndex: "include[1]"},
+	}
+	for _, backend := range []domain.Protocol{domain.ProtocolOpenAIResponses, domain.ProtocolOpenAI} {
+		t.Run(string(backend), func(t *testing.T) {
+			var cap capturedUpstream
+			base, token := setup(t, backend, &cap)
+			for _, stream := range []bool{false, true} {
+				for _, tc := range cases {
+					t.Run(fmt.Sprintf("stream=%t/%s", stream, tc.name), func(t *testing.T) {
+						body := fmt.Sprintf(`{"model":"default","stream":%t,"input":"hi",%s}`, stream, tc.members)
+						resp, out := post(t, base+"/v1/responses", token, body)
+						if resp.StatusCode != http.StatusBadRequest {
+							t.Fatalf("status = %d body = %s, want 400", resp.StatusCode, out)
+						}
+						if cap.path != "" {
+							t.Fatalf("upstream contacted at %q for an invalid options request", cap.path)
+						}
+						assertIngressErrorEnvelope(t, "/v1/responses", out, "invalid_request_error")
+						if bytes.Contains(out, []byte(sentinel)) {
+							t.Fatalf("error leaked caller content: %s", out)
+						}
+						if !bytes.Contains(out, []byte(tc.wantField)) {
+							t.Fatalf("error %s does not name field %q", out, tc.wantField)
+						}
+						if tc.wantIndex != "" && !bytes.Contains(out, []byte(tc.wantIndex)) {
+							t.Fatalf("error %s does not name %q", out, tc.wantIndex)
+						}
+					})
+				}
+			}
+		})
+	}
+}
+
+// TestResponsesStoreIncludePassthrough verifies a same-codec Responses request
+// relays explicit, null, empty, duplicate, and unknown options unchanged apart
+// from the model rewrite.
+func TestResponsesStoreIncludePassthrough(t *testing.T) {
+	cases := []struct {
+		name    string
+		members string
+		wantRaw map[string]string
+	}{
+		{
+			name:    "store false and include values",
+			members: `"store":false,"include":["unknown.future","reasoning.encrypted_content","unknown.future"]`,
+			wantRaw: map[string]string{
+				"store":   "false",
+				"include": `["unknown.future","reasoning.encrypted_content","unknown.future"]`,
+			},
+		},
+		{name: "store true", members: `"store":true`, wantRaw: map[string]string{"store": "true"}},
+		{name: "store null", members: `"store":null`, wantRaw: map[string]string{"store": "null"}},
+		{name: "include empty", members: `"include":[]`, wantRaw: map[string]string{"include": "[]"}},
+		{name: "include null", members: `"include":null`, wantRaw: map[string]string{"include": "null"}},
+		{name: "unknown future field", members: `"future_option":{"x":1}`, wantRaw: map[string]string{"future_option": `{"x":1}`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cap capturedUpstream
+			base, token := setup(t, domain.ProtocolOpenAIResponses, &cap)
+			body := `{"model":"default","input":"hi",` + tc.members + `}`
+			resp, out := post(t, base+"/v1/responses", token, body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d body = %s, want 200", resp.StatusCode, out)
+			}
+			var fwd map[string]json.RawMessage
+			if err := json.Unmarshal(cap.body, &fwd); err != nil {
+				t.Fatalf("forwarded body not valid JSON: %s", cap.body)
+			}
+			if string(fwd["model"]) != `"real-model"` {
+				t.Fatalf("model = %s, want \"real-model\"", fwd["model"])
+			}
+			for key, want := range tc.wantRaw {
+				if string(fwd[key]) != want {
+					t.Fatalf("%s = %s, want %s (raw passthrough)", key, fwd[key], want)
+				}
+			}
+		})
 	}
 }

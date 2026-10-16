@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -471,6 +473,120 @@ func TestCodexFinalizeNormalizesUnsupportedMax(t *testing.T) {
 	reasoning, _ := got["reasoning"].(map[string]any)
 	if reasoning["effort"] != "xhigh" {
 		t.Fatalf("reasoning = %v, want xhigh; body=%s", reasoning, out)
+	}
+}
+
+// TestCodexIgnoresResponsesStoreInclude decodes a raw Responses request that
+// sets store and include, then runs the actual Codex encode/finalize/prepare
+// path. The Codex envelope must keep store=false, forward only its required
+// encrypted include when effort is not none, and keep the generated scoped
+// prompt_cache_key instead of the explicit raw key.
+func TestCodexIgnoresResponsesStoreInclude(t *testing.T) {
+	const (
+		explicitKey   = "client-raw-key"
+		customInclude = "custom.include.sentinel"
+	)
+	cases := []struct {
+		name        string
+		upstream    string
+		reasoning   string // raw JSON member, empty means absent
+		wantInclude bool
+	}{
+		{name: "high", upstream: "gpt-5.3-codex", reasoning: `,"reasoning":{"effort":"high"}`, wantInclude: true},
+		{name: "none native suffix", upstream: "gpt-5.3-codex-none", wantInclude: false},
+		{name: "none supported model", upstream: "gpt-5.6-luna", reasoning: `,"reasoning":{"effort":"none"}`, wantInclude: false},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, tc.name), func(t *testing.T) {
+				raw := []byte(fmt.Sprintf(`{"model":"combo","stream":%t,"input":"hi","store":true,"include":["%s","reasoning.encrypted_content"],"prompt_cache_key":"%s"%s}`, stream, customInclude, explicitKey, tc.reasoning))
+				req, err := responsesCodec.decodeRequest(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if req.Store == nil || !*req.Store {
+					t.Fatalf("decode lost store intent: %v", req.Store)
+				}
+				if req.Include == nil || len(*req.Include) != 2 || (*req.Include)[0] != customInclude {
+					t.Fatalf("decode lost include intent: %#v", req.Include)
+				}
+				applyUpstreamModel(req, tc.upstream)
+				backend := codexCodec
+				encoded, err := backend.encodeRequest(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Contains(encoded, []byte(customInclude)) {
+					t.Fatalf("encoder forwarded the caller include: %s", encoded)
+				}
+				var encodedFields map[string]json.RawMessage
+				if err := json.Unmarshal(encoded, &encodedFields); err != nil {
+					t.Fatal(err)
+				}
+				if string(encodedFields["store"]) != "false" {
+					t.Fatalf("encoded store = %s, want false", encodedFields["store"])
+				}
+				if tc.wantInclude {
+					if string(encodedFields["include"]) != `["reasoning.encrypted_content"]` {
+						t.Fatalf("encoded include = %s", encodedFields["include"])
+					}
+				} else if _, ok := encodedFields["include"]; ok {
+					t.Fatalf("none encoded include: %s", encodedFields["include"])
+				}
+
+				p := &domain.Provider{Name: "codex", Protocol: domain.ProtocolOpenAICodex}
+				finalized, err := finalizeEncodedBody(encoded, req, backend, p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				trace := &TraceInfo{}
+				ctx := WithTraceInfo(context.Background(), trace)
+				ctx = withCodexRequest(ctx, "tenant-x", http.Header{}, raw)
+				out, err := New(nil, nil).prepareUpstreamRequestFor(ctx, backend, p, req, finalized)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Contains(out, []byte(customInclude)) {
+					t.Fatalf("prepare forwarded the caller include: %s", out)
+				}
+				var got struct {
+					Stream  bool     `json:"stream"`
+					Store   *bool    `json:"store"`
+					Include []string `json:"include"`
+					Key     string   `json:"prompt_cache_key"`
+				}
+				if err := json.Unmarshal(out, &got); err != nil {
+					t.Fatal(err)
+				}
+				if got.Store == nil || *got.Store {
+					t.Fatalf("prepared store = %v, want false", got.Store)
+				}
+				if got.Stream != stream {
+					t.Fatalf("prepared stream = %v, want %v", got.Stream, stream)
+				}
+				if tc.wantInclude {
+					if !reflect.DeepEqual(got.Include, []string{"reasoning.encrypted_content"}) {
+						t.Fatalf("prepared include = %#v", got.Include)
+					}
+				} else if len(got.Include) != 0 {
+					t.Fatalf("prepared include = %#v, want omitted", got.Include)
+				}
+				if got.Key == "" || got.Key == explicitKey {
+					t.Fatalf("prepared key = %q, want a generated scoped key", got.Key)
+				}
+				if trace.CodexSessionID != got.Key {
+					t.Fatalf("trace session %q != body key %q", trace.CodexSessionID, got.Key)
+				}
+				httpReq, err := http.NewRequest(http.MethodPost, "https://example.invalid/responses", bytes.NewReader(out))
+				if err != nil {
+					t.Fatal(err)
+				}
+				applyCodexHeaders(httpReq, p, ctx)
+				if httpReq.Header.Get("session_id") != got.Key {
+					t.Fatalf("session_id = %q, want %q", httpReq.Header.Get("session_id"), got.Key)
+				}
+			})
+		}
 	}
 }
 

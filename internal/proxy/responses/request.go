@@ -22,6 +22,14 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		TopP:           req.TopP,
 		Stream:         req.Stream,
 		PromptCacheKey: req.PromptCacheKey,
+		Store:          req.Store,
+	}
+	if req.Include != nil {
+		include, err := decodeInclude(*req.Include)
+		if err != nil {
+			return nil, err
+		}
+		out.Include = include
 	}
 	if req.MaxOutputTokens != nil {
 		out.MaxTokens = *req.MaxOutputTokens
@@ -175,6 +183,23 @@ func decodeToolChoice(raw json.RawMessage) *ir.ToolChoice {
 	return &ir.ToolChoice{Type: ir.ToolChoiceTool, Name: obj.Name}
 }
 
+// decodeInclude validates each Responses include entry as a JSON string and
+// returns them in caller order. An invalid entry reports its index only; it
+// never echoes the caller's value.
+func decodeInclude(raws []json.RawMessage) (*[]string, error) {
+	out := make([]string, 0, len(raws))
+	for i, raw := range raws {
+		var v any
+		err := json.Unmarshal(raw, &v)
+		s, ok := v.(string)
+		if err != nil || !ok {
+			return nil, fmt.Errorf("responses: decode request: include[%d]: expected a JSON string", i)
+		}
+		out = append(out, s)
+	}
+	return &out, nil
+}
+
 // EncodeRequest renders the IR as an OpenAI Responses request body. Used when
 // Responses is the backend format. Tools are flattened (the Responses function
 // tool keeps name/description/parameters at the top level, unlike Chat).
@@ -198,6 +223,18 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	}
 	if req.PromptCacheKey != nil {
 		out["prompt_cache_key"] = *req.PromptCacheKey
+	}
+	if req.Store != nil {
+		out["store"] = *req.Store
+	}
+	if req.Include != nil {
+		// A non-nil pointer with a nil slice is an explicit empty list. Emit []
+		// from a local copy so the caller's IR is not normalized in place.
+		include := *req.Include
+		if include == nil {
+			include = []string{}
+		}
+		out["include"] = include
 	}
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))

@@ -1642,6 +1642,17 @@ func snapshotIR(t *testing.T, req *ir.Request) *ir.Request {
 		v := *req.PromptCacheKey
 		out.PromptCacheKey = &v
 	}
+	if req.Store != nil {
+		v := *req.Store
+		out.Store = &v
+	}
+	if req.Include != nil {
+		v := *req.Include
+		if v != nil {
+			v = append([]string{}, v...)
+		}
+		out.Include = &v
+	}
 	return &out
 }
 
@@ -1727,6 +1738,41 @@ func TestSnapshotIRDeepCopiesSystemBlocks(t *testing.T) {
 	}
 	if req.SystemBlocks[0].CacheControl == got.SystemBlocks[0].CacheControl {
 		t.Fatal("snapshot aliased the hint pointer")
+	}
+}
+
+// TestSnapshotIRDeepCopiesStoreInclude guards the pipeline snapshots: mutating
+// the live store bool or include slice after the snapshot must not alter the
+// copy, and nil versus non-nil empty include must stay distinguishable.
+func TestSnapshotIRDeepCopiesStoreInclude(t *testing.T) {
+	store := true
+	include := []string{"a", "b"}
+	req := &ir.Request{Model: "m", Store: &store, Include: &include}
+	got := snapshotIR(t, req)
+	*req.Store = false
+	include[0] = "mutated"
+	include = append(include, "extra")
+	if *got.Store != true {
+		t.Fatalf("snapshot aliased store: %v", *got.Store)
+	}
+	if !reflect.DeepEqual(*got.Include, []string{"a", "b"}) {
+		t.Fatalf("snapshot aliased include: %#v", *got.Include)
+	}
+	if got.Store == req.Store || got.Include == req.Include {
+		t.Fatal("snapshot reused pointer identity")
+	}
+
+	empty := []string{}
+	req = &ir.Request{Model: "m", Include: &empty}
+	got = snapshotIR(t, req)
+	if got.Include == nil || *got.Include == nil {
+		t.Fatal("snapshot collapsed a non-nil empty include")
+	}
+	var nilSlice []string
+	req = &ir.Request{Model: "m", Include: &nilSlice}
+	got = snapshotIR(t, req)
+	if got.Include == nil || *got.Include != nil {
+		t.Fatal("snapshot lost the nil include slice")
 	}
 }
 
@@ -2604,9 +2650,12 @@ func assertIngressErrorEnvelope(t *testing.T, path string, body []byte, errType 
 
 // prepareTranslatedPipeline runs the complete ingress -> IR -> backend ->
 // finalize -> prepare path so tests can assert the wire body a backend
-// receives. ctx carries the trace and any captured caller identity.
-func prepareTranslatedPipeline(t *testing.T, px *Proxy, p *domain.Provider, ingress codec, rawBody []byte, upstreamModel string, ctx context.Context) map[string]any {
+// receives. ctx carries the trace and any captured caller identity. It
+// snapshots the caller bytes, IR, and provider before the transforming steps
+// and fails if any changed. The returned raw bytes are the exact upstream body.
+func prepareTranslatedPipeline(t *testing.T, px *Proxy, p *domain.Provider, ingress codec, rawBody []byte, upstreamModel string, ctx context.Context) (map[string]any, []byte) {
 	t.Helper()
+	rawInput := append([]byte(nil), rawBody...)
 	req, err := ingress.decodeRequest(rawBody)
 	if err != nil {
 		t.Fatal(err)
@@ -2615,6 +2664,8 @@ func prepareTranslatedPipeline(t *testing.T, px *Proxy, p *domain.Provider, ingr
 		req.Thinking = thinking.ToIR(captured)
 	}
 	applyUpstreamModel(req, upstreamModel)
+	reqBefore := snapshotIR(t, req)
+	providerBefore := snapshotProvider(t, p)
 	backend := backendCodecFor(p.Protocol, p.BaseURL, upstreamModel)
 	encoded, err := backend.encodeRequest(req)
 	if err != nil {
@@ -2628,11 +2679,17 @@ func prepareTranslatedPipeline(t *testing.T, px *Proxy, p *domain.Provider, ingr
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !bytes.Equal(rawBody, rawInput) {
+		t.Fatal("processing changed the caller body")
+	}
+	if !reflect.DeepEqual(snapshotIR(t, req), reqBefore) || !reflect.DeepEqual(snapshotProvider(t, p), providerBefore) {
+		t.Fatal("processing changed the request or provider")
+	}
 	var got map[string]any
 	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatal(err)
+		t.Fatalf("prepared body invalid: %v (%s)", err, out)
 	}
-	return got
+	return got, out
 }
 
 // prepareTranslatedWithIdentity attaches OpenCode caller identity captured from
@@ -2642,7 +2699,8 @@ func prepareTranslatedWithIdentity(t *testing.T, px *Proxy, p *domain.Provider, 
 	trace := &TraceInfo{}
 	ctx := WithTraceInfo(context.Background(), trace)
 	ctx = withOpencodeRequest(ctx, "test-nonce", h, rawBody)
-	return prepareTranslatedPipeline(t, px, p, ingress, rawBody, upstreamModel, ctx), trace
+	got, _ := prepareTranslatedPipeline(t, px, p, ingress, rawBody, upstreamModel, ctx)
+	return got, trace
 }
 
 // A Responses ingress prompt_cache_key survives every supported OpenCode
@@ -2875,12 +2933,12 @@ func TestPublicResponsesPromptCacheKeyPreserved(t *testing.T) {
 		body := fmt.Sprintf(`{"model":"combo","stream":%t,"input":"hi","prompt_cache_key":"public-key"}`, stream)
 		trace := &TraceInfo{}
 		ctx := WithTraceInfo(context.Background(), trace)
-		got := prepareTranslatedPipeline(t, New(nil, nil), p, responsesCodec, []byte(body), "gpt-5.6-luna", ctx)
+		got, _ := prepareTranslatedPipeline(t, New(nil, nil), p, responsesCodec, []byte(body), "gpt-5.6-luna", ctx)
 		if got["prompt_cache_key"] != "public-key" {
 			t.Fatalf("stream=%t prepared key = %#v", stream, got["prompt_cache_key"])
 		}
 	}
-	got := prepareTranslatedPipeline(t, New(nil, nil), p, responsesCodec, []byte(`{"model":"combo","input":"hi"}`), "gpt-5.6-luna", WithTraceInfo(context.Background(), &TraceInfo{}))
+	got, _ := prepareTranslatedPipeline(t, New(nil, nil), p, responsesCodec, []byte(`{"model":"combo","input":"hi"}`), "gpt-5.6-luna", WithTraceInfo(context.Background(), &TraceInfo{}))
 	if _, ok := got["prompt_cache_key"]; ok {
 		t.Fatalf("missing key was generated: %v", got)
 	}
@@ -2929,6 +2987,256 @@ func TestPromptCacheKeyProcessingKeepsInputsUnchanged(t *testing.T) {
 	}
 	if got["prompt_cache_key"] != "cache-immutable" {
 		t.Fatalf("prepared key = %#v", got["prompt_cache_key"])
+	}
+}
+
+// TestOpencodeResponsesStoreIncludePreserved drives explicit Responses store
+// and include intent through the full OpenCode Responses pipeline for paid and
+// free models. Values stay exact, absent and null stay absent, and the
+// muse-spark and free-tier normalizers remain in force.
+func TestOpencodeResponsesStoreIncludePreserved(t *testing.T) {
+	const (
+		headerSession = "ses_0123456789abABCDEFGHIJKLMN"
+		promptKey     = "options-prompt-key"
+	)
+	trueValue, falseValue := true, false
+	optionCases := []struct {
+		name           string
+		members        string
+		wantStore      *bool
+		wantInclude    []string
+		wantIncludeSet bool
+	}{
+		{name: "missing", members: ""},
+		{name: "null", members: `,"store":null,"include":null`},
+		{name: "store true", members: `,"store":true`, wantStore: &trueValue},
+		{name: "store false", members: `,"store":false`, wantStore: &falseValue},
+		{name: "include empty", members: `,"include":[]`, wantIncludeSet: true, wantInclude: []string{}},
+		{name: "include nonempty", members: `,"include":["reasoning.encrypted_content","future.option",""]`, wantIncludeSet: true, wantInclude: []string{"reasoning.encrypted_content", "future.option", ""}},
+		{name: "combined", members: `,"store":false,"include":["a","a"]`, wantStore: &falseValue, wantIncludeSet: true, wantInclude: []string{"a", "a"}},
+	}
+	models := []struct {
+		name  string
+		base  string
+		model string
+		free  bool
+		spark bool
+	}{
+		{name: "zen paid gpt", base: opencode.ZenBaseURL, model: "gpt-5.6-luna"},
+		{name: "zen free muse", base: opencode.ZenBaseURL, model: "muse-spark-1.3-contributor-free", free: true, spark: true},
+		{name: "go paid muse", base: opencode.GoBaseURL, model: "muse-spark-1.2-contributor", spark: true},
+	}
+	for _, model := range models {
+		for _, stream := range []bool{false, true} {
+			for _, tc := range optionCases {
+				t.Run(fmt.Sprintf("%s/stream=%t/%s", model.name, stream, tc.name), func(t *testing.T) {
+					p := opencodeTestProvider()
+					p.BaseURL = model.base
+					backend := backendCodecFor(p.Protocol, p.BaseURL, model.model)
+					if backend.id != "opencode-responses" {
+						t.Fatalf("backend codec = %q, want opencode-responses", backend.id)
+					}
+					raw := []byte(fmt.Sprintf(`{"model":"combo","stream":%t,"input":"hi","prompt_cache_key":"%s","reasoning":{"effort":"max"},"max_output_tokens":4,"tools":[{"type":"function","name":"lookup","description":"d","parameters":{"type":"object","properties":{"q":{"type":"string"},"n":{"maximum":9007199254740993}},"required":["q"]}}]%s}`, stream, promptKey, tc.members))
+					h := http.Header{}
+					h.Set("x-opencode-session", headerSession)
+					trace := &TraceInfo{}
+					ctx := WithTraceInfo(context.Background(), trace)
+					ctx = withOpencodeRequest(ctx, "test-nonce", h, raw)
+					got, out := prepareTranslatedPipeline(t, New(nil, nil), p, responsesCodec, raw, model.model, ctx)
+
+					if got["model"] != model.model {
+						t.Fatalf("model = %#v, want %q", got["model"], model.model)
+					}
+					if got["stream"] != stream {
+						t.Fatalf("stream = %#v, want %t", got["stream"], stream)
+					}
+					if got["prompt_cache_key"] != promptKey {
+						t.Fatalf("prompt_cache_key = %#v, want %q", got["prompt_cache_key"], promptKey)
+					}
+					if trace.OpencodeSessionID != headerSession {
+						t.Fatalf("session = %q, want caller session %q", trace.OpencodeSessionID, headerSession)
+					}
+
+					var fields map[string]json.RawMessage
+					if err := json.Unmarshal(out, &fields); err != nil {
+						t.Fatal(err)
+					}
+					rawStore, hasStore := fields["store"]
+					if hasStore != (tc.wantStore != nil) {
+						t.Fatalf("store presence = %v, want %v; body=%s", hasStore, tc.wantStore != nil, out)
+					}
+					if hasStore && string(rawStore) != fmt.Sprintf("%t", *tc.wantStore) {
+						t.Fatalf("store = %s, want %v", rawStore, *tc.wantStore)
+					}
+					rawInclude, hasInclude := fields["include"]
+					if hasInclude != tc.wantIncludeSet {
+						t.Fatalf("include presence = %v, want %v; body=%s", hasInclude, tc.wantIncludeSet, out)
+					}
+					if hasInclude {
+						var values []string
+						if err := json.Unmarshal(rawInclude, &values); err != nil {
+							t.Fatalf("include = %s: %v", rawInclude, err)
+						}
+						if values == nil {
+							t.Fatalf("include = %s, want an array", rawInclude)
+						}
+						if !reflect.DeepEqual(values, tc.wantInclude) {
+							t.Fatalf("include = %#v, want %#v", values, tc.wantInclude)
+						}
+					}
+
+					reasoning := mustMapAny(t, "reasoning", got["reasoning"])
+					wantEffort := "max"
+					if model.spark {
+						wantEffort = "xhigh"
+					}
+					if reasoning["effort"] != wantEffort {
+						t.Fatalf("reasoning effort = %#v, want %q; body=%s", reasoning["effort"], wantEffort, out)
+					}
+					if model.spark && got["max_output_tokens"] != float64(16) {
+						t.Fatalf("muse-spark max_output_tokens = %#v, want 16", got["max_output_tokens"])
+					}
+
+					tools := mustListAny(t, "tools", got["tools"])
+					if model.free {
+						if len(tools) != 5 {
+							t.Fatalf("free tools = %d, want 5", len(tools))
+						}
+					} else if len(tools) != 1 {
+						t.Fatalf("paid tools = %d, want 1", len(tools))
+					}
+					if !bytes.Contains(out, []byte("9007199254740993")) {
+						t.Fatalf("raw tool schema number changed: %s", out)
+					}
+				})
+			}
+		}
+	}
+}
+
+// Reusing one Proxy across store/include variants must not persist or generate
+// intent: the fields come only from the current caller body.
+func TestOpencodeResponsesStoreIncludeNoStateBleed(t *testing.T) {
+	p := opencodeTestProvider()
+	px := New(nil, nil)
+	prepare := func(body string) map[string]any {
+		t.Helper()
+		got, _ := prepareTranslatedWithIdentity(t, px, p, responsesCodec, []byte(body), "gpt-5.6-luna", http.Header{})
+		return got
+	}
+	first := prepare(`{"model":"combo","input":"hi","store":true,"include":["first"]}`)
+	if first["store"] != true {
+		t.Fatalf("first store = %#v", first["store"])
+	}
+	if !reflect.DeepEqual(first["include"], []any{"first"}) {
+		t.Fatalf("first include = %#v", first["include"])
+	}
+	second := prepare(`{"model":"combo","input":"hi","store":false,"include":[]}`)
+	if second["store"] != false {
+		t.Fatalf("second store = %#v", second["store"])
+	}
+	if include, ok := second["include"].([]any); !ok || len(include) != 0 {
+		t.Fatalf("second include = %#v", second["include"])
+	}
+	third := prepare(`{"model":"combo","input":"hi"}`)
+	if _, ok := third["store"]; ok {
+		t.Fatalf("omitted store gained a value: %v", third)
+	}
+	if _, ok := third["include"]; ok {
+		t.Fatalf("omitted include gained a value: %v", third)
+	}
+	fourth := prepare(`{"model":"combo","input":"hi","store":null,"include":null}`)
+	if _, ok := fourth["store"]; ok {
+		t.Fatalf("null store gained a value: %v", fourth)
+	}
+	if _, ok := fourth["include"]; ok {
+		t.Fatalf("null include gained a value: %v", fourth)
+	}
+}
+
+// IR store/include must not appear in Chat or Anthropic encoding, and a
+// Chat/Messages ingress must not generate them for a Responses backend from
+// unknown raw fields or session metadata. Top-level keys are checked by JSON
+// key, not substring, because tool schemas may legitimately contain properties
+// named store or include.
+func TestStoreIncludeDoesNotLeakBeyondResponses(t *testing.T) {
+	store := true
+	include := []string{"responses-only.option"}
+	req := &ir.Request{
+		Model:     "m",
+		MaxTokens: 16,
+		Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		Store:     &store,
+		Include:   &include,
+	}
+	for _, c := range []struct {
+		name   string
+		encode func(*ir.Request) ([]byte, error)
+	}{
+		{name: "openai chat", encode: openaiCodec.encodeRequest},
+		{name: "anthropic messages", encode: anthropicCodec.encodeRequest},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out, err := c.encode(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := got["store"]; ok {
+				t.Fatalf("%s encoder leaked store: %s", c.name, out)
+			}
+			if _, ok := got["include"]; ok {
+				t.Fatalf("%s encoder leaked include: %s", c.name, out)
+			}
+		})
+	}
+
+	ingressCases := []struct {
+		name    string
+		ingress codec
+		body    string
+	}{
+		{
+			name:    "chat unknown fields",
+			ingress: openaiCodec,
+			body:    `{"model":"combo","messages":[{"role":"user","content":"hi"}],"store":true,"include":["x.option"],"metadata":{"user_id":"chat-session"}}`,
+		},
+		{
+			name:    "messages unknown fields",
+			ingress: anthropicCodec,
+			body:    `{"model":"combo","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"store":true,"include":["x.option"],"metadata":{"user_id":"messages-session"}}`,
+		},
+		{
+			name:    "chat tool schema names",
+			ingress: openaiCodec,
+			body:    `{"model":"combo","messages":[{"role":"user","content":"hi"}],"store":true,"include":["x.option"],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"store":{"type":"boolean"},"include":{"type":"string"}}}}}]}`,
+		},
+	}
+	for _, tc := range ingressCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := opencodeTestProvider()
+			got, _ := prepareTranslatedWithIdentity(t, New(nil, nil), p, tc.ingress, []byte(tc.body), "gpt-5.6-luna", http.Header{})
+			if _, ok := got["store"]; ok {
+				t.Fatalf("%s gained a top-level store: %v", tc.ingress.id, got)
+			}
+			if _, ok := got["include"]; ok {
+				t.Fatalf("%s gained a top-level include: %v", tc.ingress.id, got)
+			}
+			if tc.name == "chat tool schema names" {
+				tools, ok := got["tools"].([]any)
+				if !ok || len(tools) == 0 {
+					t.Fatalf("chat tool schema vanished: %v", got["tools"])
+				}
+				params := mustMapAny(t, "tools[0].parameters", mustMapAny(t, "tools[0]", tools[0])["parameters"])
+				props := mustMapAny(t, "tools[0].parameters.properties", params["properties"])
+				if props["store"] == nil || props["include"] == nil {
+					t.Fatalf("tool schema property names changed: %#v", props)
+				}
+			}
+		})
 	}
 }
 
