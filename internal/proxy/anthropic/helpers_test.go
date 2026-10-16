@@ -2,6 +2,8 @@ package anthropic
 
 import (
 	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 
 	"airouter/internal/proxy/ir"
@@ -72,6 +74,181 @@ func TestSystemToTextStripsBillingHeader(t *testing.T) {
 			got := systemToText(tc.raw)
 			if got != tc.want {
 				t.Fatalf("systemToText:\n got  %q\n want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecodeSystemPrefixMapping pins the byte-exact mapping of the anchored
+// billing/identity prefix onto ordered system text blocks. The removed prefix
+// may span blocks and split inside the billing marker or the identity opener;
+// consumed blocks drop with their hints, and a partial survivor keeps its hint.
+func TestDecodeSystemPrefixMapping(t *testing.T) {
+	const (
+		billing = "x-anthropic-billing-header: cc_version=2.1.177.01c; cc_entrypoint=cli; cch=256ac;"
+		opener  = "You are Claude Code, Anthropic's official CLI for Claude."
+		prompt  = "You are an interactive agent."
+	)
+	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
+	cc := func(ttl string) map[string]any {
+		m := map[string]any{"type": "ephemeral"}
+		if ttl != "" {
+			m["ttl"] = ttl
+		}
+		return m
+	}
+	marked := func(s string, ttl string) map[string]any {
+		m := text(s)
+		m["cache_control"] = cc(ttl)
+		return m
+	}
+	hint := func(ttl string) *ir.CacheControl { return &ir.CacheControl{Type: "ephemeral", TTL: ttl} }
+
+	cases := []struct {
+		name       string
+		raw        json.RawMessage
+		wantFlat   string
+		wantBlocks []ir.SystemBlock
+		wantErr    bool
+	}{
+		{
+			name:       "hints on later block with unmarked first",
+			raw:        mustJSONRaw([]map[string]any{text("sys one"), marked(" sys two", "1h")}),
+			wantFlat:   "sys one sys two",
+			wantBlocks: []ir.SystemBlock{{Text: "sys one"}, {Text: " sys two", CacheControl: hint("1h")}},
+		},
+		{
+			name:     "all ttl forms",
+			raw:      mustJSONRaw([]map[string]any{marked("a", ""), marked("b", ""), marked("c", "5m"), marked("d", "1h")}),
+			wantFlat: "abcd",
+			wantBlocks: []ir.SystemBlock{
+				{Text: "a", CacheControl: hint("")},
+				{Text: "b", CacheControl: hint("")},
+				{Text: "c", CacheControl: hint("5m")},
+				{Text: "d", CacheControl: hint("1h")},
+			},
+		},
+		{
+			name: "null ttl is absent ttl",
+			raw: mustJSONRaw([]map[string]any{
+				{"type": "text", "text": "a", "cache_control": map[string]any{"type": "ephemeral", "ttl": nil}},
+			}),
+			wantFlat:   "a",
+			wantBlocks: []ir.SystemBlock{{Text: "a", CacheControl: hint("")}},
+		},
+		{
+			name: "unknown non-text block marker ignored",
+			raw: mustJSONRaw([]map[string]any{
+				{"type": "image", "source": map[string]string{"type": "base64", "media_type": "image/png", "data": "aW1n"}, "cache_control": map[string]any{"type": 5}},
+				marked("kept", ""),
+			}),
+			wantFlat:   "kept",
+			wantBlocks: []ir.SystemBlock{{Text: "kept", CacheControl: hint("")}},
+		},
+		{
+			name:       "split inside billing header",
+			raw:        mustJSONRaw([]map[string]any{text(billing[:20]), marked(billing[20:]+opener+"\n"+prompt, "5m")}),
+			wantFlat:   prompt,
+			wantBlocks: []ir.SystemBlock{{Text: prompt, CacheControl: hint("5m")}},
+		},
+		{
+			name:       "split inside identity opener",
+			raw:        mustJSONRaw([]map[string]any{text(billing + opener[:15]), marked(opener[15:]+"\n"+prompt, "1h")}),
+			wantFlat:   prompt,
+			wantBlocks: []ir.SystemBlock{{Text: prompt, CacheControl: hint("1h")}},
+		},
+		{
+			name:       "boundary between trimmed spaces and opener",
+			raw:        mustJSONRaw([]map[string]any{text(billing), marked("   ", "5m"), marked(opener+"\n"+prompt, "1h")}),
+			wantFlat:   prompt,
+			wantBlocks: []ir.SystemBlock{{Text: prompt, CacheControl: hint("1h")}},
+		},
+		{
+			name:       "empty blocks included across prefix",
+			raw:        mustJSONRaw([]map[string]any{marked("", "5m"), text(billing), marked("", "1h"), marked(opener+"\n"+prompt, "1h")}),
+			wantFlat:   prompt,
+			wantBlocks: []ir.SystemBlock{{Text: prompt, CacheControl: hint("1h")}},
+		},
+		{
+			name:       "remainder in same consumed marked block keeps hint",
+			raw:        mustJSONRaw([]map[string]any{marked(billing+opener+"\n"+prompt, "1h")}),
+			wantFlat:   prompt,
+			wantBlocks: []ir.SystemBlock{{Text: prompt, CacheControl: hint("1h")}},
+		},
+		{
+			name:       "fully consumed marked block drops hint",
+			raw:        mustJSONRaw([]map[string]any{marked(billing, "5m"), text(opener + "\n" + prompt)}),
+			wantFlat:   prompt,
+			wantBlocks: []ir.SystemBlock{{Text: prompt}},
+		},
+		{
+			name:       "later incidental billing and opener mentions preserved",
+			raw:        mustJSONRaw([]map[string]any{text("keep " + billing + " " + opener)}),
+			wantFlat:   "keep " + billing + " " + opener,
+			wantBlocks: []ir.SystemBlock{{Text: "keep " + billing + " " + opener}},
+		},
+		{
+			name:       "multibyte around prefix stays byte aligned",
+			raw:        mustJSONRaw([]map[string]any{marked(billing+"日本", "5m"), text(opener + "\n語")}),
+			wantFlat:   "日本" + opener + "\n語",
+			wantBlocks: []ir.SystemBlock{{Text: "日本", CacheControl: hint("5m")}, {Text: opener + "\n語"}},
+		},
+		{
+			name:     "all prefix removed yields no blocks",
+			raw:      mustJSONRaw([]map[string]any{text(billing), text(opener + "\n")}),
+			wantFlat: "",
+		},
+		{
+			name:    "malformed marker errors without value leak",
+			raw:     mustJSONRaw([]map[string]any{{"type": "text", "text": "secret", "cache_control": map[string]any{"type": 5}}}),
+			wantErr: true,
+		},
+		{
+			name:    "wrong ttl errors",
+			raw:     mustJSONRaw([]map[string]any{{"type": "text", "text": "secret", "cache_control": cc("2m")}}),
+			wantErr: true,
+		},
+		{
+			name:     "string system has no blocks",
+			raw:      jsonString("plain"),
+			wantFlat: "plain",
+		},
+		{
+			name: "more than four markers not capped",
+			raw: mustJSONRaw([]map[string]any{
+				marked("1", ""), marked("2", "5m"), marked("3", "1h"), marked("4", ""), marked("5", "5m"),
+			}),
+			wantFlat: "12345",
+			wantBlocks: []ir.SystemBlock{
+				{Text: "1", CacheControl: hint("")},
+				{Text: "2", CacheControl: hint("5m")},
+				{Text: "3", CacheControl: hint("1h")},
+				{Text: "4", CacheControl: hint("")},
+				{Text: "5", CacheControl: hint("5m")},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			flat, blocks, err := decodeSystem(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("decode accepted malformed system hint")
+				}
+				if strings.Contains(err.Error(), "secret") {
+					t.Fatalf("error leaked caller text: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeSystem: %v", err)
+			}
+			if flat != tc.wantFlat {
+				t.Fatalf("flat = %q, want %q", flat, tc.wantFlat)
+			}
+			if !reflect.DeepEqual(blocks, tc.wantBlocks) {
+				t.Fatalf("blocks = %+v, want %+v", blocks, tc.wantBlocks)
 			}
 		})
 	}

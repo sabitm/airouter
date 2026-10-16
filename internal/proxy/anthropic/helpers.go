@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -24,27 +25,106 @@ const clientIdentityOpener = "You are Claude Code, Anthropic's official CLI for 
 // systemToText flattens the Anthropic system field (string or array of text
 // blocks) to plain text, stripping the smuggled billing-header marker and the
 // client identity opener so neither leaks Claude Code identity into translated
-// backend requests.
+// backend requests. A malformed supported system hint decodes to no text; the
+// request decoder rejects it before this lenient wrapper runs.
 func systemToText(raw json.RawMessage) string {
+	text, _, _ := decodeSystem(raw)
+	return text
+}
+
+// decodeSystem parses the Anthropic system field. It returns the legacy flat
+// text plus the ordered text blocks with validated cache hints. Flat text keeps
+// the exact concatenation and anchored prefix stripping of systemToText; the
+// blocks let the Anthropic encoder rebuild the caller's boundaries. A malformed
+// supported text-block hint fails the decode. Unknown block kinds are omitted
+// without reading their markers.
+func decodeSystem(raw json.RawMessage) (string, []ir.SystemBlock, error) {
 	if len(raw) == 0 {
-		return ""
+		return "", nil, nil
 	}
 	if raw[0] == '"' {
 		var s string
-		_ = json.Unmarshal(raw, &s)
-		return stripClientIdentity(s)
+		if json.Unmarshal(raw, &s) != nil {
+			return "", nil, nil
+		}
+		return stripClientIdentity(s), nil, nil
 	}
 	var blocks []anthBlock
 	if json.Unmarshal(raw, &blocks) != nil {
-		return ""
+		return "", nil, nil
 	}
-	var b strings.Builder
+	type systemText struct {
+		text string
+		cc   *ir.CacheControl
+	}
+	texts := make([]systemText, 0, len(blocks))
+	var full strings.Builder
 	for _, blk := range blocks {
-		if blk.Type == "text" {
-			b.WriteString(blk.Text)
+		if blk.Type != "text" {
+			continue
 		}
+		cc, err := cacheControlFromRaw(blk.CacheControl)
+		if err != nil {
+			return "", nil, fmt.Errorf("system cache_control: %w", err)
+		}
+		texts = append(texts, systemText{text: blk.Text, cc: cc})
+		full.WriteString(blk.Text)
 	}
-	return stripClientIdentity(b.String())
+	flat := stripClientIdentity(full.String())
+	// stripClientIdentity only removes a prefix, so the byte delta maps directly
+	// onto the concatenated text blocks: bytes before the delta belong to
+	// consumed blocks, the rest starts inside the first surviving block.
+	removed := full.Len() - len(flat)
+	out := make([]ir.SystemBlock, 0, len(texts))
+	for _, tb := range texts {
+		if removed > 0 {
+			if removed >= len(tb.text) {
+				removed -= len(tb.text)
+				continue
+			}
+			tb.text = tb.text[removed:]
+			removed = 0
+		}
+		// Empty text carries no prefix bytes and would make an emitted block
+		// invalid, so drop it rather than place it beside a marked survivor.
+		if tb.text == "" {
+			continue
+		}
+		out = append(out, ir.SystemBlock{Text: tb.text, CacheControl: tb.cc})
+	}
+	if len(out) == 0 {
+		return flat, nil, nil
+	}
+	return flat, out, nil
+}
+
+// systemBlocksForEncode returns the ordered wire blocks to emit when the IR
+// carries at least one surviving hint and the concatenated block text exactly
+// reproduces the flat System string. It returns nil when the flat string must
+// be used instead, so a changed System or a hand-built inconsistent IR never
+// resurrects stale structured data. Empty blocks are dropped so they cannot
+// place an invalid empty text block on the wire.
+func systemBlocksForEncode(req *ir.Request) []anthBlock {
+	if req == nil || req.System == "" || len(req.SystemBlocks) == 0 {
+		return nil
+	}
+	out := make([]anthBlock, 0, len(req.SystemBlocks))
+	var full strings.Builder
+	hasHint := false
+	for _, b := range req.SystemBlocks {
+		full.WriteString(b.Text)
+		if b.Text == "" {
+			continue
+		}
+		if b.CacheControl != nil {
+			hasHint = true
+		}
+		out = append(out, anthBlock{Type: "text", Text: b.Text, CacheControl: cacheControlRaw(b.CacheControl)})
+	}
+	if !hasHint || full.String() != req.System {
+		return nil
+	}
+	return out
 }
 
 func stripClientIdentity(s string) string {

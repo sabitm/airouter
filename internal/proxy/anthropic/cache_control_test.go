@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -464,6 +465,16 @@ func TestDecodeRequestRejectsInvalidCacheControl(t *testing.T) {
 				t.Fatalf("error leaked caller content: %v", err)
 			}
 		})
+		t.Run("system/"+tc.name, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"m","max_tokens":1,"system":[{"type":"text","text":%q,"cache_control":%s}],"messages":[]}`, secret, tc.marker))
+			_, err := DecodeRequest(body)
+			if err == nil {
+				t.Fatal("invalid system marker accepted")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error leaked caller content: %v", err)
+			}
+		})
 	}
 	// ttl:null is absence, not a wrong value.
 	t.Run("null ttl accepted", func(t *testing.T) {
@@ -481,11 +492,12 @@ func TestDecodeRequestRejectsInvalidCacheControl(t *testing.T) {
 
 // TestDecodeRequestCacheControlExcluded ensures a malformed marker in an
 // excluded context cannot fail the decode or swallow system text, thinking,
-// nested tool content, or attachments.
+// nested tool content, or attachments. System text markers are no longer
+// excluded: the valid system hint in the fixture is captured and asserted.
 func TestDecodeRequestCacheControlExcluded(t *testing.T) {
 	body := []byte(`{
 	  "model":"m","max_tokens":1,
-	  "system":[{"type":"text","text":"sys one","cache_control":{"type":5}},{"type":"text","text":" sys two"}],
+	  "system":[{"type":"text","text":"sys one","cache_control":{"type":"ephemeral","ttl":"1h"}},{"type":"text","text":" sys two"}],
 	  "messages":[
 	    {"role":"assistant","content":[
 	      {"type":"thinking","thinking":"think","signature":"s","cache_control":{"type":"ephemeral","ttl":"9h"}},
@@ -506,6 +518,9 @@ func TestDecodeRequestCacheControlExcluded(t *testing.T) {
 	}
 	if req.System != "sys one sys two" {
 		t.Fatalf("system text dropped: %q", req.System)
+	}
+	if len(req.SystemBlocks) != 2 || req.SystemBlocks[0].CacheControl == nil || req.SystemBlocks[0].CacheControl.TTL != "1h" || req.SystemBlocks[1].CacheControl != nil {
+		t.Fatalf("system blocks = %+v", req.SystemBlocks)
 	}
 	content := req.Messages[0].Content
 	if len(content) != 5 {
@@ -617,4 +632,355 @@ func TestDecodeRequestCacheControlUnknownKeys(t *testing.T) {
 	}
 	out := decodeWireOut(t, encoded)
 	requireMarker(t, "text", out.Messages[0].Content[0].CacheControl, "ephemeral", "1h")
+}
+
+// TestDecodeEncodeSystemCacheControl covers structured system arrays through
+// decode -> IR -> encode: later-block hints, all TTL forms, ordered boundaries
+// with unmarked neighbors, flat/structured consistency, and an exact re-decode
+// round trip.
+func TestDecodeEncodeSystemCacheControl(t *testing.T) {
+	body := []byte(`{"model":"m","max_tokens":16,
+	  "system":[
+	    {"type":"text","text":"sys one"},
+	    {"type":"text","text":" sys two","cache_control":{"type":"ephemeral"}},
+	    {"type":"text","text":" sys three","cache_control":{"type":"ephemeral","ttl":"5m"}},
+	    {"type":"text","text":" sys four","cache_control":{"type":"ephemeral","ttl":"1h"}},
+	    {"type":"text","text":" sys five","cache_control":null}
+	  ],
+	  "messages":[{"role":"user","content":"hi"}]}`)
+	req, err := DecodeRequest(body)
+	if err != nil {
+		t.Fatalf("DecodeRequest: %v", err)
+	}
+	const wantText = "sys one sys two sys three sys four sys five"
+	if req.System != wantText {
+		t.Fatalf("system = %q, want %q", req.System, wantText)
+	}
+	wantTTL := []struct {
+		hint bool
+		ttl  string
+	}{{false, ""}, {true, ""}, {true, "5m"}, {true, "1h"}, {false, ""}}
+	if len(req.SystemBlocks) != len(wantTTL) {
+		t.Fatalf("system blocks = %d, want %d", len(req.SystemBlocks), len(wantTTL))
+	}
+	for i, want := range wantTTL {
+		cc := req.SystemBlocks[i].CacheControl
+		if want.hint {
+			if cc == nil || cc.Type != "ephemeral" || cc.TTL != want.ttl {
+				t.Fatalf("block[%d] hint = %+v, want ephemeral/%s", i, cc, want.ttl)
+			}
+		} else if cc != nil {
+			t.Fatalf("block[%d] hint = %+v, want nil", i, cc)
+		}
+	}
+
+	encoded, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeRequest: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &top); err != nil {
+		t.Fatal(err)
+	}
+	var sys []wireBlockOut
+	if err := json.Unmarshal(top["system"], &sys); err != nil {
+		t.Fatalf("system not an array: %s", top["system"])
+	}
+	if len(sys) != len(wantTTL) {
+		t.Fatalf("encoded system blocks = %d, want %d", len(sys), len(wantTTL))
+	}
+	wantTexts := []string{"sys one", " sys two", " sys three", " sys four", " sys five"}
+	var joined strings.Builder
+	for i := range sys {
+		if sys[i].Type != "text" || sys[i].Text != wantTexts[i] {
+			t.Fatalf("block[%d] = %+v, want text %q", i, sys[i], wantTexts[i])
+		}
+		joined.WriteString(sys[i].Text)
+	}
+	if joined.String() != req.System {
+		t.Fatalf("encoded text %q != flat system %q", joined.String(), req.System)
+	}
+	requireNoMarker(t, "block[0]", sys[0].CacheControl)
+	requireMarker(t, "block[1]", sys[1].CacheControl, "ephemeral", "")
+	requireMarker(t, "block[2]", sys[2].CacheControl, "ephemeral", "5m")
+	requireMarker(t, "block[3]", sys[3].CacheControl, "ephemeral", "1h")
+	requireNoMarker(t, "block[4]", sys[4].CacheControl)
+	if bytes.Contains(encoded, []byte(`"ttl":""`)) {
+		t.Fatalf("empty ttl emitted: %s", encoded)
+	}
+
+	roundTrip, err := DecodeRequest(encoded)
+	if err != nil {
+		t.Fatalf("round-trip DecodeRequest: %v", err)
+	}
+	if roundTrip.System != req.System || !reflect.DeepEqual(roundTrip.SystemBlocks, req.SystemBlocks) {
+		t.Fatalf("round trip changed system: %q %+v", roundTrip.System, roundTrip.SystemBlocks)
+	}
+}
+
+// TestSystemCacheControlFlatFallbacks covers every case where the encoder must
+// drop structured blocks and use (or omit) the flat string instead.
+func TestSystemCacheControlFlatFallbacks(t *testing.T) {
+	t.Run("unmarked array encodes flat string", func(t *testing.T) {
+		body := []byte(`{"model":"m","max_tokens":1,"system":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"messages":[]}`)
+		req, err := DecodeRequest(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.System != "ab" || len(req.SystemBlocks) != 2 {
+			t.Fatalf("system = %q blocks = %+v", req.System, req.SystemBlocks)
+		}
+		encoded, err := EncodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requireFlatSystem(t, encoded, "ab")
+	})
+
+	t.Run("string input unchanged", func(t *testing.T) {
+		body := []byte(`{"model":"m","max_tokens":1,"system":"  keep  ","messages":[]}`)
+		req, err := DecodeRequest(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.System != "  keep  " || req.SystemBlocks != nil {
+			t.Fatalf("system = %q blocks = %+v", req.System, req.SystemBlocks)
+		}
+		encoded, err := EncodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requireFlatSystem(t, encoded, "  keep  ")
+	})
+
+	t.Run("all prefix stripped omits system", func(t *testing.T) {
+		body := []byte(`{"model":"m","max_tokens":1,"system":[{"type":"text","text":"x-anthropic-billing-header: a; b;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.\n"}],"messages":[]}`)
+		req, err := DecodeRequest(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.System != "" || req.SystemBlocks != nil {
+			t.Fatalf("system = %q blocks = %+v", req.System, req.SystemBlocks)
+		}
+		encoded, err := EncodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requireNoSystemKey(t, encoded)
+	})
+
+	t.Run("unknown non-text blocks omitted", func(t *testing.T) {
+		body := []byte(`{"model":"m","max_tokens":1,"system":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1n"},"cache_control":{"type":5}},{"type":"text","text":"kept","cache_control":{"type":"ephemeral"}}],"messages":[]}`)
+		req, err := DecodeRequest(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.System != "kept" || len(req.SystemBlocks) != 1 || req.SystemBlocks[0].CacheControl == nil {
+			t.Fatalf("system = %q blocks = %+v", req.System, req.SystemBlocks)
+		}
+	})
+
+	t.Run("empty marked block dropped", func(t *testing.T) {
+		body := []byte(`{"model":"m","max_tokens":1,"system":[{"type":"text","text":"","cache_control":{"type":"ephemeral","ttl":"5m"}},{"type":"text","text":"real","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[]}`)
+		req, err := DecodeRequest(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.System != "real" || len(req.SystemBlocks) != 1 || req.SystemBlocks[0].Text != "real" {
+			t.Fatalf("system = %q blocks = %+v", req.System, req.SystemBlocks)
+		}
+		encoded, err := EncodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := decodeWireOut(t, encoded)
+		var sys []wireBlockOut
+		if err := json.Unmarshal(out.System, &sys); err != nil {
+			t.Fatalf("system not an array: %s", out.System)
+		}
+		if len(sys) != 1 || sys[0].Text != "real" {
+			t.Fatalf("encoded blocks = %+v", sys)
+		}
+	})
+}
+
+func requireFlatSystem(t *testing.T, encoded []byte, want string) {
+	t.Helper()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &top); err != nil {
+		t.Fatalf("encoded invalid: %v", err)
+	}
+	raw, ok := top["system"]
+	if !ok {
+		t.Fatalf("system missing, want flat %q", want)
+	}
+	var got string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("system is not a string: %s", raw)
+	}
+	if got != want {
+		t.Fatalf("system = %q, want %q", got, want)
+	}
+	if bytes.Contains(encoded, []byte("cache_control")) {
+		t.Fatalf("flat system path emitted cache_control: %s", encoded)
+	}
+}
+
+func requireNoSystemKey(t *testing.T, encoded []byte) {
+	t.Helper()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &top); err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok := top["system"]; ok {
+		t.Fatalf("unexpected system: %s", raw)
+	}
+}
+
+// TestEncodeSystemBlocksGuard covers hand-built and mutated IR: the encoder
+// must emit the block array only for exactly matching text plus one surviving
+// hint, and must never mutate or reinterpret the input blocks.
+func TestEncodeSystemBlocksGuard(t *testing.T) {
+	hint := func(ttl string) *ir.CacheControl { return &ir.CacheControl{Type: "ephemeral", TTL: ttl} }
+	cases := []struct {
+		name string
+		req  *ir.Request
+		want string // compact JSON of the system field; "" means absent
+	}{
+		{
+			name: "matching hint wins",
+			req:  &ir.Request{Model: "m", MaxTokens: 1, System: "ab", SystemBlocks: []ir.SystemBlock{{Text: "a"}, {Text: "b", CacheControl: hint("1h")}}},
+			want: `[{"type":"text","text":"a"},{"type":"text","text":"b","cache_control":{"type":"ephemeral","ttl":"1h"}}]`,
+		},
+		{
+			name: "no hint uses flat",
+			req:  &ir.Request{Model: "m", MaxTokens: 1, System: "ab", SystemBlocks: []ir.SystemBlock{{Text: "a"}, {Text: "b"}}},
+			want: `"ab"`,
+		},
+		{
+			name: "mismatched flat uses flat without hints",
+			req:  &ir.Request{Model: "m", MaxTokens: 1, System: "xyz", SystemBlocks: []ir.SystemBlock{{Text: "a", CacheControl: hint("5m")}, {Text: "b"}}},
+			want: `"xyz"`,
+		},
+		{
+			name: "empty flat with stale blocks is omitted",
+			req:  &ir.Request{Model: "m", MaxTokens: 1, SystemBlocks: []ir.SystemBlock{{Text: "stale", CacheControl: hint("5m")}}},
+			want: "",
+		},
+		{
+			name: "nil blocks use flat",
+			req:  &ir.Request{Model: "m", MaxTokens: 1, System: "ab"},
+			want: `"ab"`,
+		},
+		{
+			name: "hint on empty block alone does not build an array",
+			req:  &ir.Request{Model: "m", MaxTokens: 1, System: "ab", SystemBlocks: []ir.SystemBlock{{Text: "", CacheControl: hint("5m")}, {Text: "ab"}}},
+			want: `"ab"`,
+		},
+		{
+			name: "empty block filtered from array",
+			req:  &ir.Request{Model: "m", MaxTokens: 1, System: "ab", SystemBlocks: []ir.SystemBlock{{Text: "a", CacheControl: hint("5m")}, {Text: ""}, {Text: "b", CacheControl: hint("1h")}}},
+			want: `[{"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"5m"}},{"type":"text","text":"b","cache_control":{"type":"ephemeral","ttl":"1h"}}]`,
+		},
+		{
+			name: "inconsistent concatenation uses flat",
+			req:  &ir.Request{Model: "m", MaxTokens: 1, System: "a", SystemBlocks: []ir.SystemBlock{{Text: "a"}, {Text: "b", CacheControl: hint("1h")}}},
+			want: `"a"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := cloneSystemBlocksForTest(tc.req.SystemBlocks)
+			ptrs := make([]*ir.CacheControl, len(tc.req.SystemBlocks))
+			for i := range tc.req.SystemBlocks {
+				ptrs[i] = tc.req.SystemBlocks[i].CacheControl
+			}
+			encoded, err := EncodeRequest(tc.req)
+			if err != nil {
+				t.Fatalf("EncodeRequest: %v", err)
+			}
+			var top map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &top); err != nil {
+				t.Fatal(err)
+			}
+			raw, ok := top["system"]
+			if tc.want == "" {
+				if ok {
+					t.Fatalf("system = %s, want absent", raw)
+				}
+			} else {
+				if !ok {
+					t.Fatalf("system missing, want %s", tc.want)
+				}
+				if got := compactRaw(t, raw); got != tc.want {
+					t.Fatalf("system = %s, want %s", got, tc.want)
+				}
+			}
+			if !reflect.DeepEqual(tc.req.SystemBlocks, before) {
+				t.Fatalf("encode mutated SystemBlocks: %+v -> %+v", before, tc.req.SystemBlocks)
+			}
+			for i := range tc.req.SystemBlocks {
+				if tc.req.SystemBlocks[i].CacheControl != ptrs[i] {
+					t.Fatalf("encode replaced hint pointer at block %d", i)
+				}
+			}
+		})
+	}
+}
+
+func cloneSystemBlocksForTest(in []ir.SystemBlock) []ir.SystemBlock {
+	if in == nil {
+		return nil
+	}
+	out := make([]ir.SystemBlock, len(in))
+	for i := range in {
+		out[i] = in[i]
+		if in[i].CacheControl != nil {
+			v := *in[i].CacheControl
+			out[i].CacheControl = &v
+		}
+	}
+	return out
+}
+
+// TestDecodeEncodeCacheControlNoMarkerCap keeps every explicit marker when the
+// caller supplies more than the four-breakpoint policy count. The proxy adds
+// no cap of its own.
+func TestDecodeEncodeCacheControlNoMarkerCap(t *testing.T) {
+	body := []byte(`{"model":"m","max_tokens":1,
+	  "system":[
+	    {"type":"text","text":"s1","cache_control":{"type":"ephemeral"}},
+	    {"type":"text","text":"s2","cache_control":{"type":"ephemeral","ttl":"5m"}},
+	    {"type":"text","text":"s3","cache_control":{"type":"ephemeral","ttl":"1h"}}
+	  ],
+	  "tools":[
+	    {"name":"t1","input_schema":{},"cache_control":{"type":"ephemeral"}},
+	    {"name":"t2","input_schema":{},"cache_control":{"type":"ephemeral","ttl":"5m"}},
+	    {"name":"t3","input_schema":{},"cache_control":{"type":"ephemeral","ttl":"1h"}}
+	  ],
+	  "messages":[{"role":"user","content":[
+	    {"type":"text","text":"m1","cache_control":{"type":"ephemeral"}},
+	    {"type":"text","text":"m2","cache_control":{"type":"ephemeral","ttl":"5m"}},
+	    {"type":"text","text":"m3","cache_control":{"type":"ephemeral","ttl":"1h"}}
+	  ]}]
+	}`)
+	req, err := DecodeRequest(body)
+	if err != nil {
+		t.Fatalf("DecodeRequest: %v", err)
+	}
+	if len(req.SystemBlocks) != 3 || len(req.Tools) != 3 || len(req.Messages[0].Content) != 3 {
+		t.Fatalf("decoded shapes = %d/%d/%d", len(req.SystemBlocks), len(req.Tools), len(req.Messages[0].Content))
+	}
+	for i, b := range req.SystemBlocks {
+		if b.CacheControl == nil {
+			t.Fatalf("system block %d lost hint", i)
+		}
+	}
+	encoded, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeRequest: %v", err)
+	}
+	if got := bytes.Count(encoded, []byte(`"cache_control"`)); got != 9 {
+		t.Fatalf("marker count = %d, want 9: %s", got, encoded)
+	}
 }

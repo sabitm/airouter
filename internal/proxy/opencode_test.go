@@ -1621,6 +1621,7 @@ func snapshotIR(t *testing.T, req *ir.Request) *ir.Request {
 	out.Messages = cloneMessages(req.Messages)
 	out.StopSequences = append([]string(nil), req.StopSequences...)
 	out.Tools = cloneTools(req.Tools)
+	out.SystemBlocks = cloneSystemBlocks(req.SystemBlocks)
 	if req.Temperature != nil {
 		v := *req.Temperature
 		out.Temperature = &v
@@ -1694,6 +1695,39 @@ func cloneTools(in []ir.Tool) []ir.Tool {
 		}
 	}
 	return out
+}
+
+func cloneSystemBlocks(in []ir.SystemBlock) []ir.SystemBlock {
+	if in == nil {
+		return nil
+	}
+	out := make([]ir.SystemBlock, len(in))
+	for i := range in {
+		out[i] = in[i]
+		if in[i].CacheControl != nil {
+			v := *in[i].CacheControl
+			out[i].CacheControl = &v
+		}
+	}
+	return out
+}
+
+// TestSnapshotIRDeepCopiesSystemBlocks guards the pipeline snapshots: a later
+// mutation of the live IR must not alter the captured copy.
+func TestSnapshotIRDeepCopiesSystemBlocks(t *testing.T) {
+	req := &ir.Request{
+		System:       "sys",
+		SystemBlocks: []ir.SystemBlock{{Text: "sys", CacheControl: anthCacheHint("1h")}},
+	}
+	got := snapshotIR(t, req)
+	req.SystemBlocks[0].Text = "mutated"
+	*req.SystemBlocks[0].CacheControl = ir.CacheControl{Type: "ephemeral", TTL: "5m"}
+	if got.SystemBlocks[0].Text != "sys" || got.SystemBlocks[0].CacheControl.TTL != "1h" {
+		t.Fatalf("snapshot aliased system blocks: %+v", got.SystemBlocks)
+	}
+	if req.SystemBlocks[0].CacheControl == got.SystemBlocks[0].CacheControl {
+		t.Fatal("snapshot aliased the hint pointer")
+	}
 }
 
 func snapshotProvider(t *testing.T, p *domain.Provider) *domain.Provider {
@@ -3174,6 +3208,108 @@ func assertAnthropicCachePipeline(t *testing.T, tc anthropicCacheCase, stream bo
 	}
 }
 
+// TestOpencodeMessagesSystemCacheControlPipeline drives a system block array
+// with an explicit hint through the complete Anthropic ingress path. Caller
+// tool and message markers stay additive, and free-tier decoys stay unmarked.
+func TestOpencodeMessagesSystemCacheControlPipeline(t *testing.T) {
+	const requestFmt = `{
+	  "model":"combo","stream":%t,"max_tokens":4000,
+	  "system":[
+	    {"type":"text","text":"sys one"},
+	    {"type":"text","text":" sys two","cache_control":{"type":"ephemeral","ttl":"1h"}}
+	  ],
+	  "tools":[
+	    {"name":"lookup","description":"Find one record","input_schema":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]},"cache_control":{"type":"ephemeral","ttl":"5m"}}
+	  ],
+	  "messages":[
+	    {"role":"user","content":[
+	      {"type":"text","text":"hello","cache_control":{"type":"ephemeral"}},
+	      {"type":"text","text":"tail","cache_control":{"type":"ephemeral","ttl":"5m"}}
+	    ]}
+	  ]
+	}`
+	cases := []anthropicCacheCase{
+		{name: "zen-paid-claude", base: opencode.ZenBaseURL, model: "claude-sonnet-4-5"},
+		{name: "go-paid-minimax3", base: opencode.GoBaseURL, model: "minimax-m3"},
+		{name: "zen-free-minimax3", base: opencode.ZenBaseURL, model: "minimax-m3-free", free: true},
+	}
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				p := opencodeTestProvider()
+				p.BaseURL = tc.base
+				raw := []byte(fmt.Sprintf(requestFmt, stream))
+				got, out := prepareAnthropicCachePipeline(t, p, anthropicCodec, raw, tc.model, stream)
+				if got["model"] != tc.model {
+					t.Fatalf("model = %#v, want %q", got["model"], tc.model)
+				}
+				if stream {
+					if got["stream"] != true {
+						t.Fatalf("stream = %#v, want true", got["stream"])
+					}
+				} else {
+					requireAbsentKey(t, "body", got, "stream")
+				}
+
+				sys := mustListAny(t, "system", got["system"])
+				if len(sys) != 2 {
+					t.Fatalf("system blocks = %d, want 2", len(sys))
+				}
+				first := mustMapAny(t, "system[0]", sys[0])
+				if first["type"] != "text" || first["text"] != "sys one" {
+					t.Fatalf("system[0] = %#v", first)
+				}
+				requireAbsentKey(t, "system[0]", first, "cache_control")
+				second := mustMapAny(t, "system[1]", sys[1])
+				if second["type"] != "text" || second["text"] != " sys two" {
+					t.Fatalf("system[1] = %#v", second)
+				}
+				requireMapMarker(t, "system[1]", second["cache_control"], "ephemeral", "1h")
+
+				tools := mustListAny(t, "tools", got["tools"])
+				if len(tools) == 0 {
+					t.Fatal("tools missing")
+				}
+				lookup := mustMapAny(t, "tools[0]", tools[0])
+				if lookup["name"] != "lookup" {
+					t.Fatalf("caller tool renamed: %#v", lookup["name"])
+				}
+				requireMapMarker(t, "lookup tool", lookup["cache_control"], "ephemeral", "5m")
+				props := mustMapAny(t, "lookup properties", mustMapAny(t, "lookup schema", lookup["input_schema"])["properties"])
+				if props["q"] == nil {
+					t.Fatalf("lookup schema changed: %#v", lookup["input_schema"])
+				}
+				for i := 1; i < len(tools); i++ {
+					requireAbsentKey(t, fmt.Sprintf("decoy tool[%d]", i), mustMapAny(t, fmt.Sprintf("tools[%d]", i), tools[i]), "cache_control")
+				}
+
+				messages := mustListAny(t, "messages", got["messages"])
+				if len(messages) != 1 {
+					t.Fatalf("messages = %d, want 1", len(messages))
+				}
+				blocks := mustListAny(t, "messages[0]", mustMapAny(t, "messages[0]", messages[0])["content"])
+				if len(blocks) != 2 {
+					t.Fatalf("message blocks = %d, want 2", len(blocks))
+				}
+				hello := mustMapAny(t, "hello", blocks[0])
+				if hello["text"] != "hello" {
+					t.Fatalf("hello = %#v", hello)
+				}
+				requireMapMarker(t, "hello", hello["cache_control"], "ephemeral", "")
+				tail := mustMapAny(t, "tail", blocks[1])
+				if tail["text"] != "tail" {
+					t.Fatalf("tail = %#v", tail)
+				}
+				requireMapMarker(t, "tail", tail["cache_control"], "ephemeral", "5m")
+
+				if got := bytes.Count(out, []byte("cache_control")); got != 4 {
+					t.Fatalf("marker count = %d, want 4: %s", got, out)
+				}
+			})
+		}
+	}
+}
+
 // TestAnthropicCacheControlInvalidHTTP drives the real mounted handler and
 // asserts a malformed supported-position marker yields an Anthropic 400 with
 // zero upstream contact and no caller text in the error.
@@ -3205,26 +3341,46 @@ func TestAnthropicCacheControlInvalidHTTP(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	body := fmt.Sprintf(`{"model":"default","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":%q,"cache_control":{"type":"ephemeral","ttl":"2m"}}]}]}`, secret)
-	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
+	streamBody := fmt.Sprintf(`{"model":"default","stream":true,"max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":%q,"cache_control":{"type":"ephemeral","ttl":"2m"}}]}]}`, secret)
+	systemBody := fmt.Sprintf(`{"model":"default","max_tokens":16,"system":[{"type":"text","text":%q,"cache_control":{"type":"ephemeral","ttl":"2m"}}],"messages":[{"role":"user","content":"hi"}]}`, secret)
+	systemStreamBody := fmt.Sprintf(`{"model":"default","stream":true,"max_tokens":16,"system":[{"type":"text","text":%q,"cache_control":{"type":"ephemeral","ttl":"2m"}}],"messages":[{"role":"user","content":"hi"}]}`, secret)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"message marker", body},
+		{"message marker stream", streamBody},
+		{"system marker", systemBody},
+		{"system marker stream", systemStreamBody},
 	}
-	req.Header.Set("Authorization", "Bearer "+key.Token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d body = %s, want 400", resp.StatusCode, out)
-	}
-	if hits != 0 {
-		t.Fatalf("upstream contacted %d time(s) for an invalid marker", hits)
-	}
-	assertIngressErrorEnvelope(t, "/v1/messages", out, "invalid_request_error")
-	if bytes.Contains(out, []byte(secret)) {
-		t.Fatalf("error leaked caller text: %s", out)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := hits
+			req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+key.Token)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d body = %s, want 400", resp.StatusCode, out)
+			}
+			if hits != before {
+				t.Fatalf("upstream contacted %d time(s) for an invalid marker", hits-before)
+			}
+			assertIngressErrorEnvelope(t, "/v1/messages", out, "invalid_request_error")
+			if bytes.Contains(out, []byte(secret)) {
+				t.Fatalf("error leaked caller text: %s", out)
+			}
+			if bytes.Contains(out, []byte("data:")) || bytes.Contains(out, []byte("event:")) {
+				t.Fatalf("error leaked SSE: %s", out)
+			}
+		})
 	}
 }
 
@@ -3236,7 +3392,7 @@ func TestAnthropicCacheControlInvalidHTTP(t *testing.T) {
 // binary and is not string-scanned here.
 func TestCacheControlDoesNotLeakIntoOtherCodecs(t *testing.T) {
 	body := []byte(`{"model":"combo","max_tokens":16,
-	  "system":"sys",
+	  "system":[{"type":"text","text":"flat-system-text","cache_control":{"type":"ephemeral","ttl":"5m"}}],
 	  "tools":[{"name":"lookup","description":"d","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"5m"}}],
 	  "messages":[{"role":"user","content":[
 	    {"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}},
@@ -3246,6 +3402,9 @@ func TestCacheControlDoesNotLeakIntoOtherCodecs(t *testing.T) {
 	req, err := anthropicCodec.decodeRequest(body)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if req.System != "flat-system-text" || len(req.SystemBlocks) != 1 || req.SystemBlocks[0].CacheControl == nil {
+		t.Fatalf("system = %q blocks = %+v", req.System, req.SystemBlocks)
 	}
 	encoders := []struct {
 		name string
@@ -3276,11 +3435,31 @@ func TestCacheControlDoesNotLeakIntoOtherCodecs(t *testing.T) {
 	if !bytes.Contains(chat, []byte("hello")) || !bytes.Contains(chat, []byte("lookup")) {
 		t.Fatalf("chat semantics lost: %s", chat)
 	}
+	if !bytes.Contains(chat, []byte("flat-system-text")) {
+		t.Fatalf("chat dropped the flat system: %s", chat)
+	}
 	codex, err := responses.EncodeCodexRequest(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(codex, []byte("hello")) {
 		t.Fatalf("codex semantics lost: %s", codex)
+	}
+	if !bytes.Contains(codex, []byte("flat-system-text")) {
+		t.Fatalf("codex dropped the flat system: %s", codex)
+	}
+
+	// Stale structured blocks behind a changed flat string must not reach any
+	// non-Anthropic encoder; no other codec reads SystemBlocks.
+	req.System = "changed-flat-system"
+	req.SystemBlocks = []ir.SystemBlock{{Text: "stale-structured-text", CacheControl: anthCacheHint("1h")}}
+	for _, e := range encoders {
+		raw, err := e.enc(req)
+		if err != nil {
+			t.Fatalf("%s: %v", e.name, err)
+		}
+		if bytes.Contains(raw, []byte("stale-structured-text")) || bytes.Contains(raw, []byte("cache_control")) {
+			t.Fatalf("%s read stale structured system: %s", e.name, raw)
+		}
 	}
 }

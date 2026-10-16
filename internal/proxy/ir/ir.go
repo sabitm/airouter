@@ -62,6 +62,14 @@ type CacheControl struct {
 	TTL  string
 }
 
+// SystemBlock is one ordered Anthropic system text block. SystemBlocks exists
+// only when the ingress system value is a block array; Request.System remains
+// the flat concatenation every non-Anthropic consumer reads.
+type SystemBlock struct {
+	Text         string
+	CacheControl *CacheControl
+}
+
 // ContentBlock is a tagged union over the block kinds. Only the fields relevant
 // to Type are meaningful.
 type ContentBlock struct {
@@ -156,8 +164,13 @@ type Thinking struct {
 }
 
 type Request struct {
-	Model         string
-	System        string
+	Model  string
+	System string
+	// SystemBlocks preserves the ordered Anthropic system text blocks and their
+	// explicit cache hints from a block-array ingress. It is nil for a string
+	// system or a non-Anthropic ingress. The Anthropic encoder uses it only when
+	// at least one hint survives and the concatenated text equals System.
+	SystemBlocks  []SystemBlock
 	Messages      []Message
 	MaxTokens     int
 	Temperature   *float64

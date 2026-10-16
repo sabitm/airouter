@@ -22,9 +22,14 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("anthropic: decode request: %w", err)
 	}
+	system, systemBlocks, err := decodeSystem(req.System)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: decode request: %w", err)
+	}
 	out := &ir.Request{
 		Model:         req.Model,
-		System:        systemToText(req.System),
+		System:        system,
+		SystemBlocks:  systemBlocks,
 		MaxTokens:     req.MaxTokens,
 		Temperature:   req.Temperature,
 		TopP:          req.TopP,
@@ -230,7 +235,9 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 	if out.MaxTokens <= 0 {
 		out.MaxTokens = DefaultMaxTokens
 	}
-	if req.System != "" {
+	if blocks := systemBlocksForEncode(req); blocks != nil {
+		out.System, _ = json.Marshal(blocks)
+	} else if req.System != "" {
 		out.System, _ = json.Marshal(req.System)
 	}
 	for _, t := range req.Tools {

@@ -531,8 +531,12 @@ func TestApplyOAuthCloakingCacheControlNoOpForAPIKey(t *testing.T) {
 	req := &ir.Request{
 		Model:     "claude-sonnet-4.6",
 		MaxTokens: 1000,
-		Tools:     []ir.Tool{{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`), CacheControl: cacheControlHint("5m")}},
-		Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi", CacheControl: cacheControlHint("1h")}}}},
+		System:    "sys",
+		SystemBlocks: []ir.SystemBlock{
+			{Text: "sys", CacheControl: cacheControlHint("1h")},
+		},
+		Tools:    []ir.Tool{{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`), CacheControl: cacheControlHint("5m")}},
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi", CacheControl: cacheControlHint("1h")}}}},
 	}
 	body, err := anthropic.EncodeRequestClaudeCode(req)
 	if err != nil {
@@ -574,4 +578,105 @@ func toolNames(tools []wireTool) []string {
 		out = append(out, t.Name)
 	}
 	return out
+}
+
+// TestApplyOAuthCloakingPreservesSystemCacheControl forces the OAuth cloak
+// system-array path: the injected billing block is first and unmarked, and the
+// caller's ordered text blocks and hints survive the wireBlock remarshal.
+func TestApplyOAuthCloakingPreservesSystemCacheControl(t *testing.T) {
+	req := &ir.Request{
+		Model:     "claude-sonnet-4.6",
+		MaxTokens: 100,
+		System:    "sys one sys two",
+		SystemBlocks: []ir.SystemBlock{
+			{Text: "sys one"},
+			{Text: " sys two", CacheControl: cacheControlHint("1h")},
+		},
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+	}
+	body, err := anthropic.EncodeRequestClaudeCode(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloaked, err := ApplyOAuthCloaking(body, "sk-ant-oat-token", "sess-sys", "seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m messagesBody
+	if err := json.Unmarshal(cloaked, &m); err != nil {
+		t.Fatalf("cloaked body invalid: %v (%s)", err, cloaked)
+	}
+	var blocks []wireBlock
+	mustJSON(t, m.System, &blocks)
+	if len(blocks) != 3 {
+		t.Fatalf("system blocks = %d, want 3: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "text" || !strings.HasPrefix(blocks[0].Text, "x-anthropic-billing-header:") || len(blocks[0].CacheControl) != 0 {
+		t.Fatalf("billing block = %+v", blocks[0])
+	}
+	if blocks[1].Text != "sys one" || len(blocks[1].CacheControl) != 0 {
+		t.Fatalf("caller block 0 = %+v", blocks[1])
+	}
+	if blocks[2].Text != " sys two" || string(blocks[2].CacheControl) != `{"type":"ephemeral","ttl":"1h"}` {
+		t.Fatalf("caller block 1 = %+v", blocks[2])
+	}
+	if m.Metadata == nil || !strings.Contains(m.Metadata.UserID, "sess-sys") {
+		t.Fatalf("metadata session lost: %+v", m.Metadata)
+	}
+
+	// A second cloak pass must not duplicate the billing block or drop hints.
+	again, err := ApplyOAuthCloaking(cloaked, "sk-ant-oat-token", "sess-sys", "seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m2 messagesBody
+	if err := json.Unmarshal(again, &m2); err != nil {
+		t.Fatal(err)
+	}
+	var blocks2 []wireBlock
+	mustJSON(t, m2.System, &blocks2)
+	if len(blocks2) != 3 || string(blocks2[2].CacheControl) != `{"type":"ephemeral","ttl":"1h"}` {
+		t.Fatalf("re-cloak changed system: %+v", blocks2)
+	}
+}
+
+// TestApplyOAuthCloakingSystemWithoutHintsUsesString keeps the legacy path: an
+// unmarked system still encodes as a flat string before the cloak promotes it
+// to [billing, {text: string}].
+func TestApplyOAuthCloakingSystemWithoutHintsUsesString(t *testing.T) {
+	req := &ir.Request{
+		Model:        "claude-sonnet-4.6",
+		MaxTokens:    100,
+		System:       "plain sys",
+		SystemBlocks: []ir.SystemBlock{{Text: "plain sys"}},
+		Messages:     []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+	}
+	body, err := anthropic.EncodeRequestClaudeCode(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var sysText string
+	if err := json.Unmarshal(raw["system"], &sysText); err != nil {
+		t.Fatalf("unmarked system not a flat string: %s", raw["system"])
+	}
+	if sysText != "plain sys" {
+		t.Fatalf("system = %q", sysText)
+	}
+	cloaked, err := ApplyOAuthCloaking(body, "sk-ant-oat-token", "sess", "seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m messagesBody
+	if err := json.Unmarshal(cloaked, &m); err != nil {
+		t.Fatal(err)
+	}
+	var blocks []wireBlock
+	mustJSON(t, m.System, &blocks)
+	if len(blocks) != 2 || !strings.HasPrefix(blocks[0].Text, "x-anthropic-billing-header:") || blocks[1].Text != "plain sys" {
+		t.Fatalf("promoted system = %+v", blocks)
+	}
 }
