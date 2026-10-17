@@ -811,7 +811,7 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 		if err != nil {
 			return nil, err
 		}
-		body, err = restoreOpencodeQwenEffortCap(body, req, backend, provider)
+		body, err = restoreOpencodeQwenCap(body, req, backend, provider)
 		if err != nil {
 			return nil, err
 		}
@@ -831,7 +831,7 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	if err != nil {
 		return nil, err
 	}
-	out, err = restoreOpencodeQwenEffortCap(out, req, backend, provider)
+	out, err = restoreOpencodeQwenCap(out, req, backend, provider)
 	if err != nil {
 		return nil, err
 	}
@@ -901,12 +901,12 @@ func reconcileOpencodeMessagesBudget(body []byte, req *ir.Request, backend codec
 	return json.Marshal(doc)
 }
 
-// restoreOpencodeQwenEffortCap restores a positive caller cap after the generic
-// encoder changes max_tokens for temporary budget thinking. It runs only on the
-// final OpenCode Messages effort-only shape for the exact catalog model. An
-// omitted or nonpositive IR cap, and every other shape, stays unchanged.
-func restoreOpencodeQwenEffortCap(body []byte, req *ir.Request, backend codec, provider *domain.Provider) ([]byte, error) {
-	if !qwenEffortOnlyFinal(body, req, backend, provider) {
+// restoreOpencodeQwenCap restores a positive caller cap after the generic
+// encoder changes max_tokens. It runs only for the exact qwen3.8-flash final
+// effort-only or disabled shape. An omitted or nonpositive IR cap, and every
+// other shape, stays unchanged.
+func restoreOpencodeQwenCap(body []byte, req *ir.Request, backend codec, provider *domain.Provider) ([]byte, error) {
+	if !qwen38FlashFinal(body, req, backend, provider) {
 		return body, nil
 	}
 	var doc map[string]json.RawMessage
@@ -983,7 +983,7 @@ func miniMaxToggleThinking(doc map[string]json.RawMessage) bool {
 	return value == "adaptive" || value == "disabled"
 }
 
-func qwenEffortOnlyFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
+func qwen38FlashFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
 	if provider == nil || provider.Protocol != domain.ProtocolOpencode || backend.id != codecOpencodeMessages || req == nil || req.MaxTokens <= 0 {
 		return false
 	}
@@ -993,8 +993,37 @@ func qwenEffortOnlyFinal(body []byte, req *ir.Request, backend codec, provider *
 		return false
 	}
 	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil || !effortOnlyOutputConfig(doc) {
+	if err := json.Unmarshal(body, &doc); err != nil {
 		return false
+	}
+	return effortOnlyOutputConfig(doc) || qwenDisabledThinking(doc)
+}
+
+func qwenDisabledThinking(doc map[string]json.RawMessage) bool {
+	raw := doc["thinking"]
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var thinkingObj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &thinkingObj); err != nil || len(thinkingObj) != 1 {
+		return false
+	}
+	typ := thinkingObj["type"]
+	if len(typ) == 0 || typ[0] != '"' {
+		return false
+	}
+	var value string
+	if err := json.Unmarshal(typ, &value); err != nil || value != "disabled" {
+		return false
+	}
+	if oc, ok := doc["output_config"]; ok && len(oc) > 0 && string(oc) != "null" {
+		var output map[string]json.RawMessage
+		if err := json.Unmarshal(oc, &output); err != nil {
+			return false
+		}
+		if _, has := output["effort"]; has {
+			return false
+		}
 	}
 	return true
 }

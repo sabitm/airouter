@@ -29,10 +29,56 @@ func writeOpencode(m map[string]any, model string, cfg *Config, tier string) {
 		return
 	}
 	if len(spec.Efforts) > 0 {
+		// Exact qwen3.8-flash Anthropic rows accept an explicit disable that must
+		// not be rewritten as their lowest listed effort.
+		if opencodeQwen38FlashDisable(spec) && qwen38FlashDisableIntent(cfg) {
+			writeOpencodeQwen38FlashDisabled(m)
+			return
+		}
 		writeOpencodeEffort(m, spec, cfg)
 		return
 	}
 	writeOpencodeBudget(m, spec, cfg)
+}
+
+// opencodeQwen38FlashDisable selects only the exact Anthropic Messages rows.
+// Prefix, suffix, and neighboring model ids stay false.
+func opencodeQwen38FlashDisable(spec opencode.ModelSpec) bool {
+	return spec.SDK == "anthropic" && spec.ID == "qwen3.8-flash"
+}
+
+// qwen38FlashDisableIntent separates explicit enablement from intensity.
+// A positive effort remains effort unless enablement or a none/off suffix
+// explicitly disables thinking.
+func qwen38FlashDisableIntent(cfg *Config) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.Enable == EnableDisabled {
+		return true
+	}
+	switch cfg.Mode {
+	case ModeNone:
+		return true
+	case ModeLevel:
+		level := strings.ToLower(strings.TrimSpace(cfg.Level))
+		return level == "none" || level == "off"
+	default:
+		return false
+	}
+}
+
+// writeOpencodeQwen38FlashDisabled writes the pinned SDK disabled shape and
+// removes effort. output_config siblings survive through the existing finalizer.
+func writeOpencodeQwen38FlashDisabled(m map[string]any) {
+	m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "disabled"})
+	deleteThinkingBudget(m)
+	if oc, ok := m["output_config"].(map[string]any); ok {
+		delete(oc, "effort")
+		if len(oc) == 0 {
+			delete(m, "output_config")
+		}
+	}
 }
 
 func writeOpencodeEffort(m map[string]any, spec opencode.ModelSpec, cfg *Config) {

@@ -359,7 +359,7 @@ func OpencodeCaps(spec opencode.ModelSpec, ok bool) Caps {
 	}
 	return Caps{
 		Reasoning:  true,
-		CanDisable: opencodeLevelIn("none", spec.Efforts),
+		CanDisable: opencodeLevelIn("none", spec.Efforts) || opencodeQwen38FlashDisable(spec),
 		Format:     format,
 		Levels:     append([]string(nil), spec.Efforts...),
 		MaxOutput:  spec.Output,

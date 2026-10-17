@@ -648,8 +648,8 @@ func TestCapsForOpencodeCatalog(t *testing.T) {
 		{"kimi-k3", true, FormatOpenAI, false},
 		{"muse-spark-1.2", true, FormatOpenAIResponses, false},
 		{"gpt-5.4", true, FormatOpenAIResponses, true},
-		{"qwen3.8-flash", true, FormatClaudeAdaptive, false},
-		{"alibaba/qwen3.8-flash", true, FormatClaudeAdaptive, false},
+		{"qwen3.8-flash", true, FormatClaudeAdaptive, true},
+		{"alibaba/qwen3.8-flash", true, FormatClaudeAdaptive, true},
 		{"qwen3.8-flash-next", false, FormatNone, true},
 		{"unknown-model", false, FormatNone, true},
 	}
@@ -980,6 +980,170 @@ func TestApplyWireOpencodeQwen38FlashEffort(t *testing.T) {
 	}
 	if _, ok := suffixBody["thinking"]; ok {
 		t.Fatalf("suffix wrote thinking: %s", suffix)
+	}
+}
+
+func TestApplyWireOpencodeQwen38FlashDisable(t *testing.T) {
+	for _, tier := range []string{"", "zen", "go"} {
+		spec, ok := opencode.Lookup(tier, "qwen3.8-flash")
+		caps := OpencodeCaps(spec, ok)
+		if !ok || spec.SDK != "anthropic" || !caps.Reasoning || !caps.CanDisable || caps.Format != FormatClaudeAdaptive {
+			t.Fatalf("tier %q spec=%+v ok=%v caps=%+v", tier, spec, ok, caps)
+		}
+	}
+	cases := []struct {
+		name   string
+		model  string
+		tier   string
+		raw    string
+		suffix string
+		want   string
+	}{
+		{name: "reasoning none", model: "qwen3.8-flash", raw: `{"reasoning_effort":"none"}`, want: "disabled"},
+		{name: "reasoning off", model: "qwen3.8-flash", tier: "go", raw: `{"reasoning":{"effort":"off"}}`, want: "disabled"},
+		{name: "thinking disabled", model: "qwen3.8-flash", raw: `{"thinking":{"type":"disabled","budget_tokens":1000}}`, want: "disabled"},
+		{name: "enable thinking false", model: "alibaba/qwen3.8-flash", tier: "zen", raw: `{"enable_thinking":false}`, want: "disabled"},
+		{name: "disable beats effort", model: "qwen3.8-flash", tier: "go", raw: `{"reasoning_effort":"high","enable_thinking":false}`, want: "disabled"},
+		{name: "disable beats output effort", model: "qwen3.8-flash", raw: `{"output_config":{"effort":"xhigh"},"thinking":{"type":"disabled"}}`, want: "disabled"},
+		{name: "suffix high keeps body disable", model: "qwen3.8-flash", raw: `{"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}`, suffix: "(high)", want: "disabled"},
+		{name: "suffix none disables body effort", model: "qwen3.8-flash", tier: "zen", raw: `{"reasoning_effort":"high","enable_thinking":true}`, suffix: "(none)", want: "disabled"},
+		{name: "suffix off disables body effort", model: "qwen3.8-flash", tier: "go", raw: `{"reasoning":{"effort":"low"}}`, suffix: "(off)", want: "disabled"},
+		{name: "positive high stays effort", model: "qwen3.8-flash", raw: `{"reasoning_effort":"high"}`, want: "xhigh"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := qwenDisableRawBody(t, tc.raw)
+			captured := Capture(raw)
+			base, suffixCfg := ParseSuffix(tc.model + tc.suffix)
+			if base != tc.model {
+				t.Fatalf("suffix base = %s, want %s", base, tc.model)
+			}
+			out, err := ApplyWireForTier("anth-msg", raw, base, Merge(captured, suffixCfg), domain.ProtocolOpencode, domain.ReasoningOpencode, tc.tier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			// ApplyWire preserves the model argument. Normalization happens before it.
+			if got["model"] != tc.model {
+				t.Fatalf("model = %v, want %s", got["model"], tc.model)
+			}
+			assertQwen38FlashShape(t, got, tc.want)
+		})
+	}
+
+	for _, model := range []string{"qwen3.8-max", "qwen3.8-flash-next", "qwen3.6-plus", "unknown-model"} {
+		raw := qwenDisableRawBody(t, `{"reasoning_effort":"none","enable_thinking":false,"thinking":{"type":"disabled"}}`)
+		out, err := ApplyWire("oai-chat", raw, model, Capture(raw), domain.ProtocolOpencode, domain.ReasoningOpencode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := got["thinking"]; ok {
+			t.Fatalf("%s wrote thinking: %s", model, out)
+		}
+		if oc, ok := got["output_config"].(map[string]any); ok {
+			if _, has := oc["effort"]; has {
+				t.Fatalf("%s wrote effort: %s", model, out)
+			}
+		}
+	}
+
+	assistant := qwenDisableRawBody(t, `{"enable_thinking":false}`)
+	var assistantBody map[string]any
+	if err := json.Unmarshal(assistant, &assistantBody); err != nil {
+		t.Fatal(err)
+	}
+	assistantBody["messages"] = []any{
+		map[string]any{"role": "user", "content": "hi"},
+		map[string]any{"role": "assistant", "content": "done"},
+	}
+	assistant, err := json.Marshal(assistantBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := ApplyWireForTier("anth-msg", assistant, "qwen3.8-flash", Capture(assistant), domain.ProtocolOpencode, domain.ReasoningOpencode, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gated map[string]any
+	if err := json.Unmarshal(out, &gated); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gated["thinking"]; ok || gated["enable_thinking"] != nil {
+		t.Fatalf("assistant-final wrote controls: %s", out)
+	}
+}
+
+func qwenDisableRawBody(t *testing.T, controls string) []byte {
+	t.Helper()
+	var extra map[string]any
+	if err := json.Unmarshal([]byte(controls), &extra); err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{
+		"model":    "combo",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"output_config": map[string]any{
+			"format": map[string]any{"type": "json_object"},
+		},
+		"thinking": map[string]any{"vendor": "keep"},
+	}
+	for key, value := range extra {
+		switch key {
+		case "output_config":
+			oc := body["output_config"].(map[string]any)
+			for nestedKey, nested := range value.(map[string]any) {
+				oc[nestedKey] = nested
+			}
+		case "thinking":
+			thinkingObj := body["thinking"].(map[string]any)
+			for nestedKey, nested := range value.(map[string]any) {
+				thinkingObj[nestedKey] = nested
+			}
+		default:
+			body[key] = value
+		}
+	}
+	out, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func assertQwen38FlashShape(t *testing.T, got map[string]any, want string) {
+	t.Helper()
+	for _, field := range []string{"reasoning_effort", "enable_thinking", "thinking_budget", "reasoning"} {
+		if _, ok := got[field]; ok {
+			t.Fatalf("%s leaked: %#v", field, got[field])
+		}
+	}
+	oc, _ := got["output_config"].(map[string]any)
+	format, _ := oc["format"].(map[string]any)
+	if format["type"] != "json_object" {
+		t.Fatalf("output_config sibling lost: %#v", oc)
+	}
+	if want == "disabled" {
+		th, _ := got["thinking"].(map[string]any)
+		if len(th) != 1 || th["type"] != "disabled" {
+			t.Fatalf("thinking = %#v, want type disabled", th)
+		}
+		if _, has := oc["effort"]; has {
+			t.Fatalf("disabled wrote effort: %#v", oc)
+		}
+		return
+	}
+	if _, ok := got["thinking"]; ok {
+		t.Fatalf("positive effort wrote thinking: %#v", got["thinking"])
+	}
+	if oc["effort"] != want {
+		t.Fatalf("effort = %v, want %s", oc["effort"], want)
 	}
 }
 

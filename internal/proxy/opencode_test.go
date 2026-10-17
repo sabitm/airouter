@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1184,12 +1185,24 @@ func qwenIngressBody(format string, anthropicFirst bool, effort string, cap int)
 
 func prepareQwen38Flash(t *testing.T, base string, ingress codec, body []byte, stream bool) (map[string]any, *ir.Request, *domain.Provider) {
 	t.Helper()
+	got, _, req, p := prepareQwen38FlashRaw(t, base, ingress, body, stream)
+	return got, req, p
+}
+
+// prepareQwen38FlashRaw runs the complete Qwen pipeline and returns the exact
+// outgoing bytes. Snapshots are independent copies taken before decode and
+// before encode, then compared after the complete finalizer and prepare path.
+func prepareQwen38FlashRaw(t *testing.T, base string, ingress codec, body []byte, stream bool) (map[string]any, []byte, *ir.Request, *domain.Provider) {
+	t.Helper()
+	rawInput := append([]byte(nil), body...)
 	p := opencodeTestProvider()
 	p.BaseURL = base
 	req := decodeOpencodeIngress(t, ingress, body, "qwen3.8-flash")
 	if stream {
 		req.Stream = true
 	}
+	reqBefore := snapshotIR(t, req)
+	providerBefore := snapshotProvider(t, p)
 	backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
 	if backend.id != codecOpencodeMessages {
 		t.Fatalf("codec = %s", backend.id)
@@ -1199,24 +1212,47 @@ func prepareQwen38Flash(t *testing.T, base string, ingress codec, body []byte, s
 		t.Fatal(err)
 	}
 	out := finalizeAndPrepareQwen(t, p, req, backend, encoded)
+	if !bytes.Equal(body, rawInput) {
+		t.Fatal("processing changed the caller body")
+	}
+	if !reflect.DeepEqual(snapshotIR(t, req), reqBefore) || !reflect.DeepEqual(snapshotProvider(t, p), providerBefore) {
+		t.Fatal("processing changed the request or provider")
+	}
 	var got map[string]any
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatal(err)
 	}
-	return got, req, p
+	return got, out, req, p
 }
 
 func finalizeAndPrepareQwen(t *testing.T, p *domain.Provider, req *ir.Request, backend codec, encoded []byte) []byte {
 	t.Helper()
-	out, err := finalizeEncodedBody(encoded, req, backend, p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err = New(nil, nil).prepareUpstreamRequestFor(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, req, out)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, out := finalizeAndPrepareQwenObserved(t, p, req, backend, encoded)
 	return out
+}
+
+// finalizeAndPrepareQwenObserved snapshots the caller IR, provider, and encoded
+// bytes before the finalizer. The copies are independent of the live values.
+func finalizeAndPrepareQwenObserved(t *testing.T, p *domain.Provider, req *ir.Request, backend codec, encoded []byte) ([]byte, []byte) {
+	t.Helper()
+	encodedInput := append([]byte(nil), encoded...)
+	reqBefore := snapshotIR(t, req)
+	providerBefore := snapshotProvider(t, p)
+	finalized, err := finalizeEncodedBody(encoded, req, backend, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := New(nil, nil).prepareUpstreamRequestFor(WithTraceInfo(context.Background(), &TraceInfo{}), backend, p, req, finalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encoded, encodedInput) {
+		t.Fatal("processing changed the encoded body")
+	}
+	if !reflect.DeepEqual(snapshotIR(t, req), reqBefore) || !reflect.DeepEqual(snapshotProvider(t, p), providerBefore) {
+		t.Fatal("processing changed the request or provider")
+	}
+	return finalized, out
 }
 
 func assertQwenEffortOnly(t *testing.T, got map[string]any, effort string, cap int, stream bool) {
@@ -1259,6 +1295,732 @@ func assertQwenTool(t *testing.T, got map[string]any) {
 	}
 	if _, ok := tool["parameters"]; ok || tool["type"] != nil {
 		t.Fatalf("tool kept Chat envelope: %#v", tool)
+	}
+}
+
+func TestOpencodeQwen38FlashDisableBothTiers(t *testing.T) {
+	ingresses := []struct {
+		name       string
+		c          codec
+		body       string
+		completion bool
+	}{
+		{name: "chat", c: openaiCodec, body: `{"model":"combo","reasoning_effort":"%s","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Find one record","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}}]}`},
+		{name: "chat-completion", c: openaiCodec, completion: true, body: `{"model":"combo","reasoning_effort":"%s","max_completion_tokens":%d,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "responses", c: responsesCodec, body: `{"model":"combo","reasoning":{"effort":"%s"},"max_output_tokens":%d,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "anthropic", c: anthropicCodec, body: `{"model":"combo","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000},"output_config":{"effort":"%s"}}`},
+	}
+	providers := []struct {
+		name string
+		base string
+	}{
+		{name: "zen", base: opencode.ZenBaseURL},
+		{name: "go", base: opencode.GoBaseURL},
+	}
+	disables := []struct {
+		in string
+	}{
+		{in: "none"},
+		{in: "off"},
+	}
+	caps := []int{128, 100000}
+	for _, provider := range providers {
+		for _, ingress := range ingresses {
+			for _, disable := range disables {
+				for _, cap := range caps {
+					for _, stream := range []bool{false, true} {
+						name := fmt.Sprintf("%s/%s/%s/cap%d/stream%v", provider.name, ingress.name, disable.in, cap, stream)
+						t.Run(name, func(t *testing.T) {
+							body := qwenIngressBody(ingress.body, ingress.name == "anthropic", disable.in, cap)
+							got, req, prov := prepareQwen38Flash(t, provider.base, ingress.c, body, stream)
+							assertQwenDisabled(t, got, cap, stream)
+							if req.MaxTokens != cap || req.Model != "qwen3.8-flash" || req.Stream != stream || prov.APIKey != opencode.PublicKey {
+								t.Fatalf("state req=%+v key=%s", req, prov.APIKey)
+							}
+							if ingress.name == "chat" {
+								assertQwenIntegerTool(t, got)
+							}
+							if ingress.completion {
+								if _, ok := got["max_completion_tokens"]; ok {
+									t.Fatalf("completion alias survived: %#v", got["max_completion_tokens"])
+								}
+							}
+							if ingress.name == "anthropic" && got["output_config"] != nil {
+								t.Fatalf("anthropic effort-only output_config survived: %#v", got["output_config"])
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+
+	t.Run("chat thinking disabled", func(t *testing.T) {
+		body := []byte(`{"model":"combo","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled","budget_tokens":1000}}`)
+		got, req, _ := prepareQwen38Flash(t, opencode.ZenBaseURL, openaiCodec, body, true)
+		assertQwenDisabled(t, got, 128, true)
+		if req.MaxTokens != 128 || got["output_config"] != nil {
+			t.Fatalf("output_config = %#v req=%+v", got["output_config"], req)
+		}
+	})
+
+	t.Run("anthropic thinking disabled", func(t *testing.T) {
+		body := []byte(`{"model":"combo","max_tokens":100000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled","budget_tokens":1000},"output_config":{"effort":"high"}}`)
+		got, _, _ := prepareQwen38Flash(t, opencode.GoBaseURL, anthropicCodec, body, false)
+		assertQwenDisabled(t, got, 100000, false)
+	})
+
+	t.Run("enable thinking false", func(t *testing.T) {
+		for _, base := range []string{opencode.ZenBaseURL, opencode.GoBaseURL} {
+			body := []byte(`{"model":"combo","enable_thinking":false,"max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+			got, req, prov := prepareQwen38Flash(t, base, openaiCodec, body, false)
+			assertQwenDisabled(t, got, 128, false)
+			if req.MaxTokens != 128 || prov.APIKey != opencode.PublicKey {
+				t.Fatalf("state req=%+v key=%s", req, prov.APIKey)
+			}
+		}
+	})
+
+	t.Run("disable beats positive effort", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"high","enable_thinking":false,"max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		got, _, _ := prepareQwen38Flash(t, opencode.GoBaseURL, openaiCodec, body, true)
+		assertQwenDisabled(t, got, 128, true)
+	})
+
+	t.Run("suffix high keeps body disable", func(t *testing.T) {
+		body := []byte(`{"model":"combo","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"output_config":{"effort":"xhigh","format":{"type":"json_object"}}}`)
+		p := opencodeTestProvider()
+		req := decodeOpencodeIngress(t, anthropicCodec, body, "qwen3.8-flash(high)")
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded, err := backend.encodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := finalizeAndPrepareQwen(t, p, req, backend, encoded)
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		assertQwenDisabled(t, got, 128, false)
+		if req.Model != "qwen3.8-flash" || req.MaxTokens != 128 {
+			t.Fatalf("suffix mutated request: %+v", req)
+		}
+	})
+
+	t.Run("suffix none disables positive body", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		got := prepareOpencodeTranslated(t, openaiCodec, body, "qwen3.8-flash(none)")
+		assertQwenDisabled(t, got, 128, false)
+	})
+
+	t.Run("lowered generic cap restored", func(t *testing.T) {
+		p := opencodeTestProvider()
+		req := &ir.Request{
+			Model:     "qwen3.8-flash",
+			MaxTokens: 128,
+			Stream:    true,
+			Thinking:  &ir.Thinking{Mode: ir.ThinkingNone, Enable: ir.ThinkingEnableDisabled},
+			Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		}
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded := []byte(`{"model":"qwen3.8-flash","max_tokens":64,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"thinking":{"type":"enabled","budget_tokens":1024},"metadata":{"keep":true}}`)
+		out := finalizeAndPrepareQwen(t, p, req, backend, encoded)
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		assertQwenDisabled(t, got, 128, true)
+		meta, _ := got["metadata"].(map[string]any)
+		if meta["keep"] != true || req.MaxTokens != 128 || p.APIKey != opencode.PublicKey {
+			t.Fatalf("lowered restore changed state: %#v req=%d", got, req.MaxTokens)
+		}
+	})
+
+	t.Run("positive effort unchanged", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		got, req, _ := prepareQwen38Flash(t, opencode.GoBaseURL, openaiCodec, body, false)
+		assertQwenEffortOnly(t, got, "xhigh", 128, false)
+		if req.Thinking == nil || req.Thinking.Mode != ir.ThinkingLevel || req.Thinking.Level != "high" {
+			t.Fatalf("positive IR = %+v", req.Thinking)
+		}
+	})
+
+	t.Run("neighbors unchanged", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"none","enable_thinking":false,"max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		for _, model := range []string{"qwen3.8-max", "qwen3.8-flash-next"} {
+			got := prepareOpencodeTranslated(t, openaiCodec, body, model)
+			assertNoRecognizedReasoningControls(t, got)
+			if got["max_tokens"] != float64(128) {
+				t.Fatalf("%s cap = %v", model, got["max_tokens"])
+			}
+		}
+		// qwen3.6-plus remains budget-only. none still maps to its positive budget,
+		// which cannot fit this caller cap. The new disable must not change that row.
+		req, err := openaiCodec.decodeRequest(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if captured := thinking.Capture(body); captured != nil {
+			req.Thinking = thinking.ToIR(captured)
+		}
+		applyUpstreamModel(req, "qwen3.6-plus")
+		p := opencodeTestProvider()
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded, err := backend.encodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := finalizeEncodedBody(encoded, req, backend, p); err == nil || !errors.Is(err, errOpencodeThinkingBudget) {
+			t.Fatalf("qwen3.6-plus error = %v, want budget rejection", err)
+		}
+	})
+}
+
+func TestOpencodeQwen38FlashDisableHTTP(t *testing.T) {
+	hits := 0
+	var lastBody []byte
+	var lastURL string
+	var lastMethod string
+	var lastAccept string
+	var lastAuth string
+	var lastAPIKey string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		lastBody, _ = io.ReadAll(r.Body)
+		lastURL = r.URL.String()
+		lastMethod = r.Method
+		lastAccept = r.Header.Get("Accept")
+		lastAuth = r.Header.Get("Authorization")
+		lastAPIKey = r.Header.Get("x-api-key")
+		if r.Header.Get("Accept") == "text/event-stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, anthropicSSE)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	px := New(st, nil)
+	px.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		clone := r.Clone(r.Context())
+		clone.URL.Scheme = "http"
+		clone.URL.Host = strings.TrimPrefix(upstream.URL, "http://")
+		clone.RequestURI = ""
+		return http.DefaultTransport.RoundTrip(clone)
+	})
+	px.streamClient.Transport = px.client.Transport
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	providers := []struct {
+		name    string
+		base    string
+		apiKey  string
+		wantKey string
+	}{
+		{name: "zen", base: opencode.ZenBaseURL, apiKey: opencode.PublicKey, wantKey: opencode.PublicKey},
+		{name: "go", base: opencode.GoBaseURL, apiKey: "go-key", wantKey: "go-key"},
+	}
+	cases := []struct {
+		name   string
+		path   string
+		stream bool
+		cap    int
+		body   string
+	}{
+		{name: "chat-none", path: "/v1/chat/completions", cap: 128, body: `{"model":"%s","reasoning_effort":"none","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Find one record","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}}]}`},
+		{name: "chat-off-stream", path: "/v1/chat/completions", stream: true, cap: 100000, body: `{"model":"%s","stream":true,"reasoning_effort":"off","max_completion_tokens":100000,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "chat-thinking-disabled", path: "/v1/chat/completions", cap: 128, body: `{"model":"%s","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled","budget_tokens":1000}}`},
+		{name: "chat-enable-false-stream", path: "/v1/chat/completions", stream: true, cap: 100000, body: `{"model":"%s","stream":true,"enable_thinking":false,"reasoning_effort":"high","max_tokens":100000,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "responses-off", path: "/v1/responses", cap: 128, body: `{"model":"%s","reasoning":{"effort":"off"},"max_output_tokens":128,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "responses-none-stream", path: "/v1/responses", stream: true, cap: 100000, body: `{"model":"%s","stream":true,"reasoning":{"effort":"none"},"max_output_tokens":100000,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "anthropic-disabled", path: "/v1/messages", cap: 128, body: `{"model":"%s","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled","budget_tokens":1000},"output_config":{"effort":"high"}}`},
+		{name: "anthropic-effort-none-stream", path: "/v1/messages", stream: true, cap: 100000, body: `{"model":"%s","stream":true,"max_tokens":100000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000},"output_config":{"effort":"none"}}`},
+	}
+	for _, provider := range providers {
+		prov := &domain.Provider{Name: provider.name, BaseURL: provider.base, APIKey: provider.apiKey, Protocol: domain.ProtocolOpencode}
+		if err := st.CreateProvider(ctx, prov); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range cases {
+			t.Run(provider.name+"/"+tc.name, func(t *testing.T) {
+				if err := st.CreateCombo(ctx, &domain.Combo{Name: provider.name + "-" + tc.name, Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "qwen3.8-flash", Enabled: true}}}); err != nil {
+					t.Fatal(err)
+				}
+				before := hits
+				req, err := http.NewRequest(http.MethodPost, ts.URL+tc.path, strings.NewReader(fmt.Sprintf(tc.body, provider.name+"-"+tc.name)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Authorization", "Bearer "+key.Token)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				out, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+				}
+				if hits != before+1 || lastMethod != http.MethodPost || !strings.HasSuffix(lastURL, "/messages") {
+					t.Fatalf("upstream hits=%d method=%s url=%s", hits-before, lastMethod, lastURL)
+				}
+				if lastAuth != "Bearer "+provider.wantKey || lastAPIKey != "" || strings.Contains(string(lastBody), key.Token) || strings.Contains(string(lastBody), provider.wantKey) {
+					t.Fatalf("auth forwarding mismatch")
+				}
+				if tc.stream {
+					if lastAccept != "text/event-stream" || !bytes.Contains(out, []byte("data:")) {
+						t.Fatalf("stream accept=%q response=%s", lastAccept, out)
+					}
+				}
+				var got map[string]any
+				if err := json.Unmarshal(lastBody, &got); err != nil {
+					t.Fatal(err)
+				}
+				assertQwenDisabled(t, got, tc.cap, tc.stream)
+				if tc.name == "chat-none" {
+					assertQwenIntegerTool(t, got)
+				}
+				if tc.name == "chat-thinking-disabled" && got["output_config"] != nil {
+					t.Fatalf("output_config = %#v", got["output_config"])
+				}
+			})
+		}
+
+		t.Run(provider.name+"/state-isolation", func(t *testing.T) {
+			comboName := provider.name + "-isolation"
+			if err := st.CreateCombo(ctx, &domain.Combo{Name: comboName, Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "qwen3.8-flash", Enabled: true}}}); err != nil {
+				t.Fatal(err)
+			}
+			disabledBody := fmt.Sprintf(`{"model":%q,"reasoning_effort":"none","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`, comboName)
+			req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(disabledBody))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+key.Token)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("disabled status=%d body=%s", resp.StatusCode, out)
+			}
+			var disabled map[string]any
+			if err := json.Unmarshal(lastBody, &disabled); err != nil {
+				t.Fatal(err)
+			}
+			assertQwenDisabled(t, disabled, 128, false)
+
+			plainBody := fmt.Sprintf(`{"model":%q,"max_tokens":128,"messages":[{"role":"user","content":"next"}]}`, comboName)
+			req, err = http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(plainBody))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+key.Token)
+			resp, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("plain status=%d body=%s", resp.StatusCode, out)
+			}
+			var plain map[string]any
+			if err := json.Unmarshal(lastBody, &plain); err != nil {
+				t.Fatal(err)
+			}
+			assertNoRecognizedReasoningControls(t, plain)
+			if plain["model"] != "qwen3.8-flash" || plain["max_tokens"] != float64(128) || plain["stream"] != nil {
+				t.Fatalf("plain request = %#v", plain)
+			}
+			assertQwenDisabled(t, disabled, 128, false)
+		})
+	}
+}
+
+func TestOpencodeQwen38FlashDisableHistoryAndSchema(t *testing.T) {
+	const large = "9007199254740993"
+	args := `{"id":` + large + `}`
+	schema := `{"type":"object","properties":{"id":{"type":"integer","minimum":` + large + `},"nested":{"type":"object","properties":{"n":{"const":` + large + `}}}},"required":["id"]}`
+	ingresses := []struct {
+		name string
+		c    codec
+		body string
+	}{
+		{
+			name: "chat",
+			c:    openaiCodec,
+			body: `{"model":"combo","reasoning_effort":"none","max_tokens":128,"tool_choice":{"type":"function","function":{"name":"lookup"}},"messages":[` +
+				`{"role":"user","content":"history-user-1"},` +
+				`{"role":"assistant","content":"history-assistant-text","tool_calls":[{"id":"call-history-1","type":"function","function":{"name":"lookup","arguments":` + strconv.Quote(args) + `}}]},` +
+				`{"role":"tool","tool_call_id":"call-history-1","content":"history-tool-result"},` +
+				`{"role":"user","content":"history-user-final"}` +
+				`],"tools":[{"type":"function","function":{"name":"lookup","description":"Find one record","parameters":` + schema + `}}]}`,
+		},
+		{
+			name: "responses",
+			c:    responsesCodec,
+			body: `{"model":"combo","reasoning":{"effort":"off"},"max_output_tokens":128,"tool_choice":{"type":"function","name":"lookup"},"input":[` +
+				`{"type":"message","role":"user","content":[{"type":"input_text","text":"history-user-1"}]},` +
+				`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"history-assistant-text"}]},` +
+				`{"type":"function_call","call_id":"call-history-1","name":"lookup","arguments":` + strconv.Quote(args) + `},` +
+				`{"type":"function_call_output","call_id":"call-history-1","output":"history-tool-result"},` +
+				`{"type":"message","role":"user","content":[{"type":"input_text","text":"history-user-final"}]}` +
+				`],"tools":[{"type":"function","name":"lookup","description":"Find one record","parameters":` + schema + `}]}`,
+		},
+		{
+			name: "anthropic",
+			c:    anthropicCodec,
+			body: `{"model":"combo","max_tokens":128,"thinking":{"type":"disabled"},"tool_choice":{"type":"tool","name":"lookup"},"messages":[` +
+				`{"role":"user","content":[{"type":"text","text":"history-user-1"}]},` +
+				`{"role":"assistant","content":[{"type":"text","text":"history-assistant-text"},{"type":"tool_use","id":"call-history-1","name":"lookup","input":` + args + `}]},` +
+				`{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-history-1","content":[{"type":"text","text":"history-tool-result"}]}]},` +
+				`{"role":"user","content":[{"type":"text","text":"history-user-final"}]}` +
+				`],"tools":[{"name":"lookup","description":"Find one record","input_schema":` + schema + `}]}`,
+		},
+	}
+	providers := []struct {
+		name string
+		base string
+		key  string
+	}{
+		{name: "zen", base: opencode.ZenBaseURL, key: opencode.PublicKey},
+		{name: "go", base: opencode.GoBaseURL, key: "go-history-key"},
+	}
+	for _, provider := range providers {
+		for _, ingress := range ingresses {
+			for _, stream := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream%v", provider.name, ingress.name, stream), func(t *testing.T) {
+					got, raw, req, prov := prepareQwen38FlashRaw(t, provider.base, ingress.c, []byte(ingress.body), stream)
+					prov.APIKey = provider.key
+					if prov.APIKey != provider.key || req.Model != "qwen3.8-flash" || req.Stream != stream {
+						t.Fatalf("caller state changed: key=%s req=%+v", prov.APIKey, req)
+					}
+					assertQwenDisabled(t, got, 128, stream)
+					assertQwenExactHistory(t, got, large)
+					assertExactJSONNumber(t, raw, []string{"tools", "0", "input_schema", "properties", "id", "minimum"}, large)
+					assertExactJSONNumber(t, raw, []string{"tools", "0", "input_schema", "properties", "nested", "properties", "n", "const"}, large)
+					assertExactJSONNumber(t, raw, []string{"messages", "1", "content", "1", "input", "id"}, large)
+				})
+			}
+		}
+	}
+
+	t.Run("http raw body", func(t *testing.T) {
+		var captured []byte
+		hits := 0
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			captured, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"msg","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+		}))
+		t.Cleanup(upstream.Close)
+		st := newTestStore(t)
+		ctx := context.Background()
+		key, err := st.NewAccessKey(ctx, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		mux := http.NewServeMux()
+		px := New(st, nil)
+		px.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			clone := r.Clone(r.Context())
+			clone.URL.Scheme = "http"
+			clone.URL.Host = strings.TrimPrefix(upstream.URL, "http://")
+			clone.RequestURI = ""
+			return http.DefaultTransport.RoundTrip(clone)
+		})
+		px.streamClient.Transport = px.client.Transport
+		px.Mount(mux)
+		ts := httptest.NewServer(mux)
+		t.Cleanup(ts.Close)
+		prov := &domain.Provider{Name: "go-history", BaseURL: opencode.GoBaseURL, APIKey: "go-history-key", Protocol: domain.ProtocolOpencode}
+		if err := st.CreateProvider(ctx, prov); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.CreateCombo(ctx, &domain.Combo{Name: "history-combo", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: "qwen3.8-flash", Enabled: true}}}); err != nil {
+			t.Fatal(err)
+		}
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(strings.Replace(ingresses[0].body, `"model":"combo"`, `"model":"history-combo"`, 1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key.Token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || hits != 1 {
+			t.Fatalf("status=%d hits=%d body=%s", resp.StatusCode, hits, out)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(captured, &got); err != nil {
+			t.Fatal(err)
+		}
+		assertQwenDisabled(t, got, 128, false)
+		assertQwenExactHistory(t, got, large)
+		assertExactJSONNumber(t, captured, []string{"tools", "0", "input_schema", "properties", "id", "minimum"}, large)
+		assertExactJSONNumber(t, captured, []string{"messages", "1", "content", "1", "input", "id"}, large)
+	})
+
+	t.Run("exact number assertion rejects rounded json", func(t *testing.T) {
+		rounded := []byte(`{"tools":[{"input_schema":{"properties":{"id":{"minimum":9007199254740992}}}}]}`)
+		err := exactJSONNumberError(rounded, []string{"tools", "0", "input_schema", "properties", "id", "minimum"}, large)
+		if err == nil {
+			t.Fatal("rounded integer passed the exact assertion")
+		}
+	})
+}
+
+func TestOpencodeQwen38FlashOutputConfigBoundary(t *testing.T) {
+	const large = "9007199254740993"
+	encoded := []byte(`{"model":"qwen3.8-flash","max_tokens":64,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"boundary-user"}]}],"thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"effort":"xhigh","format":{"type":"json_object"},"raw":{"n":` + large + `},"flag":true},"metadata":{"keep":` + large + `}}`)
+	p := opencodeTestProvider()
+	p.BaseURL = opencode.GoBaseURL
+	p.APIKey = "boundary-key"
+	req := &ir.Request{
+		Model:     "qwen3.8-flash",
+		MaxTokens: 128,
+		Stream:    true,
+		Thinking:  &ir.Thinking{Mode: ir.ThinkingNone, Enable: ir.ThinkingEnableDisabled},
+		Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "boundary-user"}}}},
+	}
+	backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+	finalized, out := finalizeAndPrepareQwenObserved(t, p, req, backend, encoded)
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	assertQwenDisabled(t, got, 128, true)
+	oc, _ := got["output_config"].(map[string]any)
+	format, _ := oc["format"].(map[string]any)
+	raw, _ := oc["raw"].(map[string]any)
+	if _, has := oc["effort"]; has || format["type"] != "json_object" || oc["flag"] != true || raw["n"] != float64(9007199254740992) {
+		t.Fatalf("disabled output_config = %#v", oc)
+	}
+	meta, _ := got["metadata"].(map[string]any)
+	if meta["keep"] != float64(9007199254740992) || p.APIKey != "boundary-key" || req.MaxTokens != 128 {
+		t.Fatalf("boundary siblings/state = %#v key=%s cap=%d", got, p.APIKey, req.MaxTokens)
+	}
+	assertExactJSONNumber(t, out, []string{"output_config", "raw", "n"}, large)
+	assertExactJSONNumber(t, out, []string{"metadata", "keep"}, large)
+	assertExactJSONNumber(t, finalized, []string{"output_config", "raw", "n"}, large)
+
+	positive := &ir.Request{
+		Model:     "qwen3.8-flash",
+		MaxTokens: 128,
+		Thinking:  &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+		Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "boundary-user"}}}},
+	}
+	encodedPositive := []byte(`{"model":"qwen3.8-flash","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"boundary-user"}]}],"output_config":{"effort":"low","format":{"type":"json_object"},"raw":{"n":` + large + `}}}`)
+	finalizedPositive, outPositive := finalizeAndPrepareQwenObserved(t, p, positive, backend, encodedPositive)
+	var gotPositive map[string]any
+	if err := json.Unmarshal(outPositive, &gotPositive); err != nil {
+		t.Fatal(err)
+	}
+	// A sibling makes this body fail the effort-only predicate, so the generic
+	// cap restore does not run. The test checks sibling survival, not restore.
+	if gotPositive["max_tokens"] != float64(64) || effortOf(t, gotPositive) != "xhigh" || gotPositive["thinking"] != nil {
+		t.Fatalf("positive boundary = %#v", gotPositive)
+	}
+	positiveConfig, _ := gotPositive["output_config"].(map[string]any)
+	positiveFormat, _ := positiveConfig["format"].(map[string]any)
+	if positiveFormat["type"] != "json_object" {
+		t.Fatalf("positive sibling lost: %#v", gotPositive["output_config"])
+	}
+	assertExactJSONNumber(t, outPositive, []string{"output_config", "raw", "n"}, large)
+	assertExactJSONNumber(t, finalizedPositive, []string{"output_config", "raw", "n"}, large)
+
+	encodedRestore := []byte(`{"model":"qwen3.8-flash","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"boundary-user"}]}],"output_config":{"effort":"low"}}`)
+	restoreReq := &ir.Request{
+		Model:     "qwen3.8-flash",
+		MaxTokens: 128,
+		Thinking:  &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+		Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "boundary-user"}}}},
+	}
+	_, restored := finalizeAndPrepareQwenObserved(t, p, restoreReq, backend, encodedRestore)
+	var gotRestore map[string]any
+	if err := json.Unmarshal(restored, &gotRestore); err != nil {
+		t.Fatal(err)
+	}
+	assertQwenEffortOnly(t, gotRestore, "xhigh", 128, false)
+}
+
+func assertQwenExactHistory(t *testing.T, got map[string]any, large string) {
+	t.Helper()
+	messages, _ := got["messages"].([]any)
+	if len(messages) != 4 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	want := []struct {
+		role string
+		text string
+	}{
+		{role: "user", text: "history-user-1"},
+		{role: "assistant", text: "history-assistant-text"},
+		{role: "user", text: "history-tool-result"},
+		{role: "user", text: "history-user-final"},
+	}
+	for i, message := range want {
+		gotMessage, _ := messages[i].(map[string]any)
+		content, _ := gotMessage["content"].([]any)
+		text := ""
+		if len(content) > 0 {
+			block, _ := content[0].(map[string]any)
+			text, _ = block["text"].(string)
+			if text == "" {
+				nested, _ := block["content"].([]any)
+				if len(nested) == 1 {
+					nestedBlock, _ := nested[0].(map[string]any)
+					text, _ = nestedBlock["text"].(string)
+				}
+			}
+		}
+		if gotMessage["role"] != message.role || text != message.text {
+			t.Fatalf("message %d = %#v", i, gotMessage)
+		}
+	}
+	assistant, _ := messages[1].(map[string]any)
+	assistantContent, _ := assistant["content"].([]any)
+	if len(assistantContent) != 2 {
+		t.Fatalf("assistant content = %#v", assistantContent)
+	}
+	call, _ := assistantContent[1].(map[string]any)
+	input, _ := call["input"].(map[string]any)
+	if call["type"] != "tool_use" || call["id"] != "call-history-1" || call["name"] != "lookup" || input["id"] != float64(9007199254740992) {
+		t.Fatalf("tool call = %#v", call)
+	}
+	resultMessage, _ := messages[2].(map[string]any)
+	resultContent, _ := resultMessage["content"].([]any)
+	if len(resultContent) != 1 {
+		t.Fatalf("tool result = %#v", resultContent)
+	}
+	result, _ := resultContent[0].(map[string]any)
+	nested, _ := result["content"].([]any)
+	nestedText := ""
+	if len(nested) == 1 {
+		block, _ := nested[0].(map[string]any)
+		nestedText, _ = block["text"].(string)
+	}
+	if result["type"] != "tool_result" || result["tool_use_id"] != "call-history-1" || nestedText != "history-tool-result" {
+		t.Fatalf("tool result block = %#v", result)
+	}
+
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v", tools)
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["name"] != "lookup" || tool["description"] != "Find one record" || tool["type"] != nil || tool["parameters"] != nil {
+		t.Fatalf("tool = %#v", tool)
+	}
+	schema, _ := tool["input_schema"].(map[string]any)
+	props, _ := schema["properties"].(map[string]any)
+	id, _ := props["id"].(map[string]any)
+	nestedSchema, _ := props["nested"].(map[string]any)
+	nestedProps, _ := nestedSchema["properties"].(map[string]any)
+	n, _ := nestedProps["n"].(map[string]any)
+	required, _ := schema["required"].([]any)
+	if schema["type"] != "object" || id["type"] != "integer" || id["minimum"] != float64(9007199254740992) || nestedSchema["type"] != "object" || n["const"] != float64(9007199254740992) || len(required) != 1 || required[0] != "id" {
+		t.Fatalf("schema = %#v", schema)
+	}
+	choice, _ := got["tool_choice"].(map[string]any)
+	if choice["type"] != "tool" || choice["name"] != "lookup" {
+		t.Fatalf("tool_choice = %#v", got["tool_choice"])
+	}
+}
+
+func assertExactJSONNumber(t *testing.T, raw []byte, path []string, want string) {
+	t.Helper()
+	if err := exactJSONNumberError(raw, path, want); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func exactJSONNumberError(raw []byte, path []string, want string) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var got map[string]any
+	if err := dec.Decode(&got); err != nil {
+		return err
+	}
+	cur := any(got)
+	for _, key := range path {
+		switch node := cur.(type) {
+		case map[string]any:
+			cur = node[key]
+		case []any:
+			index, err := strconv.Atoi(key)
+			if err != nil || index < 0 || index >= len(node) {
+				return fmt.Errorf("path %v missing index %s", path, key)
+			}
+			cur = node[index]
+		default:
+			return fmt.Errorf("path %v stopped at %T", path, cur)
+		}
+	}
+	number, ok := cur.(json.Number)
+	if !ok || number.String() != want {
+		return fmt.Errorf("path %v = %#v, want exact %s", path, cur, want)
+	}
+	return nil
+}
+
+func assertQwenDisabled(t *testing.T, got map[string]any, cap int, stream bool) {
+	t.Helper()
+	if got["model"] != "qwen3.8-flash" || got["max_tokens"] != float64(cap) {
+		t.Fatalf("model/cap = %v/%v, want qwen3.8-flash/%d", got["model"], got["max_tokens"], cap)
+	}
+	if gotStream, _ := got["stream"].(bool); gotStream != stream {
+		t.Fatalf("stream = %v, want %v", gotStream, stream)
+	}
+	th, _ := got["thinking"].(map[string]any)
+	if len(th) != 1 || th["type"] != "disabled" {
+		t.Fatalf("thinking = %#v, want type disabled", th)
+	}
+	for _, field := range []string{"reasoning_effort", "enable_thinking", "thinking_budget", "reasoning"} {
+		if _, ok := got[field]; ok {
+			t.Fatalf("%s present: %#v", field, got[field])
+		}
+	}
+	if oc, ok := got["output_config"].(map[string]any); ok {
+		if _, has := oc["effort"]; has {
+			t.Fatalf("effort present: %#v", oc)
+		}
+	}
+}
+
+func assertQwenIntegerTool(t *testing.T, got map[string]any) {
+	t.Helper()
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v", got["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["name"] != "lookup" || tool["description"] != "Find one record" {
+		t.Fatalf("tool identity = %#v", tool)
+	}
+	schema, _ := tool["input_schema"].(map[string]any)
+	props, _ := schema["properties"].(map[string]any)
+	id, _ := props["id"].(map[string]any)
+	required, _ := schema["required"].([]any)
+	if schema["type"] != "object" || id["type"] != "integer" || len(required) != 1 || required[0] != "id" {
+		t.Fatalf("tool schema = %#v", tool["input_schema"])
 	}
 }
 
