@@ -3137,6 +3137,871 @@ func TestOpencodeMessagesReconcilesFinalThinkingBudget(t *testing.T) {
 	})
 }
 
+func TestOpencodeExplicitBudgetProtocolGate(t *testing.T) {
+	const largeInteger = "9007199254740993"
+	models := []string{"claude-haiku-4-5", "claude-opus-4-1", "claude-sonnet-4", "claude-sonnet-4-5"}
+	ingresses := []struct {
+		name string
+		c    codec
+	}{
+		{"chat", openaiCodec},
+		{"responses", responsesCodec},
+		{"anthropic", anthropicCodec},
+	}
+	for _, model := range models {
+		for _, ingress := range ingresses {
+			for _, stream := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", model, ingress.name, stream), func(t *testing.T) {
+					provider := &domain.Provider{Protocol: domain.ProtocolAnthropic, ReasoningDialect: domain.ReasoningOpencode, APIKey: "k"}
+					raw := explicitBudgetIngress(t, ingress.c, model, 8192, 16000, stream, largeInteger)
+					got, out := prepareExplicitBudget(t, provider, ingress.c, raw, model)
+					wantBudget := 32000
+					if model == "claude-opus-4-1" {
+						// The existing OpenCode high preset is half the catalog output limit.
+						wantBudget = 16000
+					}
+					assertExactEnabledBudget(t, out, wantBudget, 16000)
+					assertExplicitBudgetPayload(t, got, out, model, largeInteger, stream, ingress.c.id == anthropicCodec.id)
+				})
+			}
+		}
+	}
+
+	t.Run("opencode protocol keeps exact budget", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		raw := explicitBudgetIngress(t, anthropicCodec, "claude-sonnet-4-5", 8192, 16000, false, largeInteger)
+		_, out := prepareExplicitBudget(t, provider, anthropicCodec, raw, "claude-sonnet-4-5")
+		assertExactEnabledBudget(t, out, 8192, 16000)
+	})
+	t.Run("opencode protocol rejects invalid exact budget", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		invalid := []struct {
+			name   string
+			budget int
+			cap    int
+		}{
+			{"below minimum", 1023, 16000},
+			{"at output ceiling", 64000, 0},
+			{"above caller cap", 8192, 8000},
+		}
+		for _, tc := range invalid {
+			t.Run(tc.name, func(t *testing.T) {
+				raw := explicitBudgetIngress(t, anthropicCodec, "claude-sonnet-4-5", tc.budget, tc.cap, true, largeInteger)
+				err := explicitBudgetFinalizeError(t, provider, anthropicCodec, raw, "claude-sonnet-4-5")
+				if !errors.Is(err, thinking.ErrOpencodeExplicitBudget) {
+					t.Fatalf("err = %v", err)
+				}
+			})
+		}
+	})
+	t.Run("non-opencode protocol does not validate exact budget", func(t *testing.T) {
+		provider := &domain.Provider{Protocol: domain.ProtocolAnthropic, ReasoningDialect: domain.ReasoningOpencode, APIKey: "k"}
+		raw := explicitBudgetIngress(t, openaiCodec, "claude-sonnet-4-5", 1023, 16000, false, largeInteger)
+		got, out := prepareExplicitBudget(t, provider, openaiCodec, raw, "claude-sonnet-4-5")
+		assertExactEnabledBudget(t, out, 32000, 16000)
+		if _, ok := got["thinking"].(map[string]any); !ok {
+			t.Fatal("preset budget missing")
+		}
+	})
+	t.Run("opencode protocol keeps non-opencode dialect", func(t *testing.T) {
+		provider := &domain.Provider{Protocol: domain.ProtocolOpencode, ReasoningDialect: domain.ReasoningClaude, BaseURL: opencode.ZenBaseURL, APIKey: "k"}
+		raw := explicitBudgetIngress(t, anthropicCodec, "claude-sonnet-4-5", 8192, 16000, false, largeInteger)
+		_, out := prepareExplicitBudget(t, provider, anthropicCodec, raw, "claude-sonnet-4-5")
+		assertExactEnabledBudget(t, out, 8192, 16000)
+	})
+}
+
+func TestOpencodeExplicitNumericBudget(t *testing.T) {
+	const largeInteger = "9007199254740993"
+	models := []struct {
+		id      string
+		ceiling int
+	}{
+		{"claude-haiku-4-5", 64000},
+		{"claude-opus-4-1", 32000},
+		{"claude-sonnet-4", 64000},
+		{"claude-sonnet-4-5", 64000},
+	}
+	ingresses := []struct {
+		name string
+		c    codec
+	}{
+		{"chat", openaiCodec},
+		{"responses", responsesCodec},
+		{"anthropic", anthropicCodec},
+	}
+	for _, model := range models {
+		for _, ingress := range ingresses {
+			for _, stream := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", model.id, ingress.name, stream), func(t *testing.T) {
+					provider := opencodeTestProvider()
+					raw := explicitBudgetIngress(t, ingress.c, model.id, 8192, 16000, stream, largeInteger)
+					got, out := prepareExplicitBudget(t, provider, ingress.c, raw, model.id)
+					assertExactEnabledBudget(t, out, 8192, 16000)
+					assertExplicitBudgetPayload(t, got, out, model.id, largeInteger, stream, ingress.c.id == anthropicCodec.id)
+				})
+			}
+		}
+	}
+
+	t.Run("vendor prefix and generic encoder clamp", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		raw := explicitBudgetIngress(t, anthropicCodec, "anthropic/claude-sonnet-4-5", 8192, 16000, false, largeInteger)
+		_, out := prepareExplicitBudget(t, provider, anthropicCodec, raw, "anthropic/claude-sonnet-4-5")
+		assertExactEnabledBudget(t, out, 8192, 16000)
+		if !bytes.Contains(out, []byte(`"model":"anthropic/claude-sonnet-4-5"`)) {
+			t.Fatalf("model changed: %s", out)
+		}
+
+		req := &ir.Request{
+			Model:     "claude-sonnet-4-5",
+			MaxTokens: 16000,
+			Thinking:  &ir.Thinking{Mode: ir.ThinkingBudget, Budget: 8192, Enable: ir.ThinkingEnableEnabled, BudgetSet: true},
+			Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		}
+		backend := backendCodecFor(provider.Protocol, provider.BaseURL, req.Model)
+		encoded := []byte(`{"model":"claude-sonnet-4-5","max_tokens":9216,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"thinking":{"type":"enabled","budget_tokens":4096}}`)
+		finalized, err := finalizeEncodedBody(encoded, req, backend, provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertExactEnabledBudget(t, finalized, 8192, 16000)
+		if req.MaxTokens != 16000 || req.Thinking.Budget != 8192 {
+			t.Fatal("finalizer changed request")
+		}
+	})
+
+	t.Run("anthropic body forms and suffix", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		forms := []struct {
+			name   string
+			body   string
+			model  string
+			budget int
+			cap    int
+		}{
+			{"enabled", `{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192}}`, "claude-sonnet-4-5", 8192, 16000},
+			{"adaptive", `{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive","budget_tokens":8192}}`, "claude-sonnet-4", 8192, 16000},
+			{"enable field", `{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}],"enable_thinking":true,"thinking_budget":8192}`, "claude-haiku-4-5", 8192, 16000},
+			{"suffix", `{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}]}`, "claude-opus-4-1(8192)", 8192, 16000},
+		}
+		for _, tc := range forms {
+			t.Run(tc.name, func(t *testing.T) {
+				_, out := prepareExplicitBudget(t, provider, anthropicCodec, []byte(tc.body), tc.model)
+				assertExactEnabledBudget(t, out, tc.budget, tc.cap)
+				if strings.Contains(string(out), "(") {
+					t.Fatalf("suffix remained on wire model: %s", out)
+				}
+			})
+		}
+	})
+
+	t.Run("range boundaries", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		valid := []struct {
+			name   string
+			model  string
+			budget int
+			cap    int
+		}{
+			{"minimum", "claude-sonnet-4-5", 1024, 2048},
+			{"ceiling minus one", "claude-opus-4-1", 31999, 0},
+			{"ceiling minus one explicit", "claude-haiku-4-5", 63999, 64000},
+		}
+		for _, tc := range valid {
+			t.Run(tc.name, func(t *testing.T) {
+				raw := explicitBudgetIngress(t, openaiCodec, tc.model, tc.budget, tc.cap, false, largeInteger)
+				_, out := prepareExplicitBudget(t, provider, openaiCodec, raw, tc.model)
+				wantCap := tc.cap
+				if wantCap == 0 {
+					wantCap = 32000
+				}
+				assertExactEnabledBudget(t, out, tc.budget, wantCap)
+			})
+		}
+		invalid := []struct {
+			name   string
+			model  string
+			budget int
+			cap    int
+		}{
+			{"below minimum", "claude-sonnet-4-5", 1023, 16000},
+			{"ceiling", "claude-opus-4-1", 32000, 0},
+			{"above ceiling", "claude-sonnet-4", 64001, 0},
+			{"budget equals cap", "claude-sonnet-4-5", 8192, 8192},
+			{"budget above cap", "claude-haiku-4-5", 8192, 8000},
+			{"cap above ceiling", "claude-opus-4-1", 8192, 32001},
+		}
+		for _, tc := range invalid {
+			t.Run(tc.name, func(t *testing.T) {
+				raw := explicitBudgetIngress(t, responsesCodec, tc.model, tc.budget, tc.cap, true, largeInteger)
+				err := explicitBudgetFinalizeError(t, provider, responsesCodec, raw, tc.model)
+				if !errors.Is(err, thinking.ErrOpencodeExplicitBudget) {
+					t.Fatalf("err = %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("suffix and effort replace numeric budget", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		for _, suffix := range []string{"(high)", "(max)", "(auto)", "(none)"} {
+			t.Run(suffix, func(t *testing.T) {
+				raw := []byte(`{"model":"combo","max_tokens":64000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192},"output_config":{"effort":"low","format":{"type":"json_object"}}}`)
+				got, out := prepareExplicitBudget(t, provider, anthropicCodec, raw, "claude-sonnet-4-5"+suffix)
+				switch suffix {
+				case "(high)", "(none)":
+					// none cannot disable this row, so the existing policy upgrades it
+					// to the lowest listed level. Both map to the high preset.
+					assertExactEnabledBudget(t, out, 32000, 64000)
+				case "(max)":
+					assertExactEnabledBudget(t, out, 63999, 64000)
+				case "(auto)":
+					if _, ok := got["thinking"]; ok {
+						t.Fatalf("%s wrote thinking: %s", suffix, out)
+					}
+					if got["max_tokens"] != float64(64000) {
+						t.Fatalf("cap = %v", got["max_tokens"])
+					}
+				}
+			})
+		}
+		raw := []byte(`{"model":"combo","max_tokens":64000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192},"output_config":{"effort":"max"}}`)
+		_, out := prepareExplicitBudget(t, provider, anthropicCodec, raw, "claude-sonnet-4-5")
+		assertExactEnabledBudget(t, out, 63999, 64000)
+	})
+
+	t.Run("assistant final does not reject or emit", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		raw := []byte(`{"model":"combo","max_tokens":512,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"done"}],"thinking":{"type":"enabled","budget_tokens":1023}}`)
+		got, out := prepareExplicitBudget(t, provider, anthropicCodec, raw, "claude-sonnet-4-5")
+		if _, ok := got["thinking"]; ok {
+			t.Fatalf("assistant-final emitted thinking: %s", out)
+		}
+		if got["max_tokens"] != float64(512) {
+			t.Fatalf("assistant-final cap = %v", got["max_tokens"])
+		}
+	})
+
+	t.Run("scope stays outside the four rows", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		lookalikes := []string{"anthropic/claude-sonnet-4-5-extra", "claude-sonnet-4-5-extra", "claude-sonnet-4.5", "unknown-model"}
+		for _, model := range lookalikes {
+			t.Run(model, func(t *testing.T) {
+				raw := explicitBudgetIngress(t, openaiCodec, model, 8192, 16000, false, largeInteger)
+				got, out := prepareExplicitBudget(t, provider, openaiCodec, raw, model)
+				if _, ok := got["thinking"]; ok {
+					t.Fatalf("lookalike wrote thinking: %s", out)
+				}
+			})
+		}
+		goProvider := opencodeTestProvider()
+		goProvider.BaseURL = opencode.GoBaseURL
+		raw := explicitBudgetIngress(t, anthropicCodec, "claude-sonnet-4-5", 8192, 16000, false, largeInteger)
+		got, out := prepareExplicitBudget(t, goProvider, anthropicCodec, raw, "claude-sonnet-4-5")
+		if _, ok := got["thinking"]; ok {
+			t.Fatalf("Go row wrote thinking: %s", out)
+		}
+
+		claude := &domain.Provider{Protocol: domain.ProtocolAnthropic, ReasoningDialect: domain.ReasoningClaude, APIKey: "k"}
+		err := explicitBudgetFinalizeError(t, claude, anthropicCodec, raw, "claude-sonnet-4-5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		other := prepareOpencodeMessagesBudget(t, provider, openaiCodec, []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":40000,"messages":[{"role":"user","content":"hi"}]}`), "qwen3.6-plus")
+		assertOpencodeBudget(t, other, 32768, 40000)
+	})
+
+	t.Run("nonpositive and malformed body stays existing", func(t *testing.T) {
+		provider := opencodeTestProvider()
+		bodies := []string{
+			`{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":0}}`,
+			`{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":-5}}`,
+			`{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}],"enable_thinking":true,"thinking_budget":"8192"}`,
+		}
+		for _, body := range bodies {
+			got, out := prepareExplicitBudget(t, provider, anthropicCodec, []byte(body), "claude-sonnet-4-5")
+			if _, ok := got["thinking"]; ok {
+				t.Fatalf("nonpositive or nonnumeric body wrote thinking: %s", out)
+			}
+		}
+		// Existing Capture truncates a fractional JSON number. This is not a new
+		// validation guarantee, and the truncated positive value stays exact.
+		fractional := []byte(`{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}],"enable_thinking":true,"thinking_budget":8192.5}`)
+		_, fractionalOut := prepareExplicitBudget(t, provider, anthropicCodec, fractional, "claude-sonnet-4-5")
+		assertExactEnabledBudget(t, fractionalOut, 8192, 16000)
+		if _, err := anthropicCodec.decodeRequest([]byte(`{"model":"combo","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192.5}}`)); err == nil {
+			t.Fatal("fractional budget_tokens decoded")
+		}
+		suffix, out := prepareExplicitBudget(t, provider, openaiCodec, []byte(`{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}]}`), "claude-sonnet-4-5(0)")
+		if _, ok := suffix["thinking"]; ok {
+			t.Fatalf("zero suffix wrote thinking: %s", out)
+		}
+	})
+}
+
+func TestOpencodeExplicitNumericBudgetHTTP(t *testing.T) {
+	hits := map[string]int{}
+	var mu sync.Mutex
+	var lastBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		lastBody, _ = io.ReadAll(r.Body)
+		mu.Unlock()
+		if r.Header.Get("Accept") == "text/event-stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, anthropicSSE)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg","type":"message","role":"assistant","model":"up","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	first := &domain.Provider{Name: "first", BaseURL: upstream.URL + "/first", APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
+	second := &domain.Provider{Name: "second", BaseURL: upstream.URL + "/second", APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
+	if err := st.CreateProvider(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := New(st, nil)
+	mux := http.NewServeMux()
+	proxy.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	paths := []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"}
+	models := []string{"claude-haiku-4-5", "claude-opus-4-1", "claude-sonnet-4", "claude-sonnet-4-5"}
+	for _, path := range paths {
+		for _, model := range models {
+			for _, stream := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", path, model, stream), func(t *testing.T) {
+					combo := fmt.Sprintf("ok-%s-%t-%s", model, stream, strings.Trim(path, "/"))
+					if err := st.CreateCombo(ctx, &domain.Combo{Name: combo, Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+						{ProviderID: first.ID, UpstreamModel: model, Enabled: true},
+						{ProviderID: second.ID, UpstreamModel: model, Enabled: true},
+					}}); err != nil {
+						t.Fatal(err)
+					}
+					body := explicitBudgetHTTPBody(path, combo, 8192, 16000, stream)
+					resp, out := postWithHeaders(t, ts.URL+path, key.Token, body, nil)
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if hits["/first/messages"] != 1 || len(hits) != 1 {
+						t.Fatalf("hits=%v", hits)
+					}
+					clear(hits)
+					assertExactEnabledBudget(t, lastBody, 8192, 16000)
+				})
+			}
+		}
+	}
+
+	invalidPaths := []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"}
+	proxy.penalizeProvider(first.ID)
+	proxy.penalizeProvider(second.ID)
+	for _, path := range invalidPaths {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("invalid%s/stream=%t", path, stream), func(t *testing.T) {
+				combo := fmt.Sprintf("bad-%t-%s", stream, strings.Trim(path, "/"))
+				if err := st.CreateCombo(ctx, &domain.Combo{Name: combo, Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+					{ProviderID: first.ID, UpstreamModel: "claude-sonnet-4-5", Enabled: true},
+					{ProviderID: second.ID, UpstreamModel: "claude-sonnet-4-5", Enabled: true},
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				beforeFirst := backoffSkips(proxy, first.ID)
+				beforeSecond := backoffSkips(proxy, second.ID)
+				resp, out := postWithHeaders(t, ts.URL+path, key.Token, explicitBudgetInvalidHTTPBody(path, combo, stream), nil)
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+				}
+				assertIngressErrorEnvelope(t, path, out, "invalid_request_error")
+				if bytes.Contains(out, []byte("private conversation")) || bytes.Contains(out, []byte("data:")) {
+					t.Fatalf("error leaked payload or SSE: %s", out)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if len(hits) != 0 {
+					t.Fatalf("invalid request contacted upstream: %v", hits)
+				}
+				// orderTargets consumes one existing skip credit from each target
+				// before the finalizer rejects the request. A zero credit stays zero.
+				// The rejection adds no failure and does not raise either credit.
+				if failures := backoffFailures(proxy, first.ID); failures != 1 {
+					t.Fatalf("first failures = %d, want 1", failures)
+				}
+				if failures := backoffFailures(proxy, second.ID); failures != 1 {
+					t.Fatalf("second failures = %d, want 1", failures)
+				}
+				if skips := backoffSkips(proxy, first.ID); skips != consumedSkipCredit(beforeFirst) {
+					t.Fatalf("first skips = %d, want %d", skips, consumedSkipCredit(beforeFirst))
+				}
+				if skips := backoffSkips(proxy, second.ID); skips != consumedSkipCredit(beforeSecond) {
+					t.Fatalf("second skips = %d, want %d", skips, consumedSkipCredit(beforeSecond))
+				}
+			})
+		}
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "plain", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: first.ID, UpstreamModel: "claude-sonnet-4-5", Enabled: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	resp, out := postWithHeaders(t, ts.URL+"/v1/messages", key.Token, `{"model":"plain","max_tokens":128,"messages":[{"role":"user","content":"plain-hi"}]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("plain status=%d body=%s", resp.StatusCode, out)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if bytes.Contains(lastBody, []byte("budget_tokens")) || bytes.Contains(lastBody, []byte("private conversation")) || !bytes.Contains(lastBody, []byte("plain-hi")) {
+		t.Fatalf("plain request inherited state: %s", lastBody)
+	}
+}
+
+func consumedSkipCredit(before int) int {
+	if before <= 0 {
+		return 0
+	}
+	return before - 1
+}
+
+func backoffFailures(p *Proxy, providerID int64) int {
+	p.boMu.Lock()
+	defer p.boMu.Unlock()
+	st := p.bo[providerID]
+	if st == nil {
+		return 0
+	}
+	return st.failures
+}
+
+func prepareExplicitBudget(t *testing.T, provider *domain.Provider, ingress codec, raw []byte, model string) (map[string]any, []byte) {
+	t.Helper()
+	got, out := prepareTranslatedPipeline(t, New(nil, nil), provider, ingress, raw, model, WithTraceInfo(context.Background(), &TraceInfo{}))
+	return got, out
+}
+
+func explicitBudgetFinalizeError(t *testing.T, provider *domain.Provider, ingress codec, raw []byte, model string) error {
+	t.Helper()
+	rawInput := append([]byte(nil), raw...)
+	req, err := ingress.decodeRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured := thinking.Capture(raw); captured != nil {
+		req.Thinking = thinking.ToIR(captured)
+	}
+	applyUpstreamModel(req, model)
+	backend := backendCodecFor(provider.Protocol, provider.BaseURL, model)
+	reqBefore := snapshotIR(t, req)
+	providerBefore := snapshotProvider(t, provider)
+	encoded, err := backend.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = finalizeEncodedBody(encoded, req, backend, provider)
+	if !bytes.Equal(raw, rawInput) || !reflect.DeepEqual(snapshotIR(t, req), reqBefore) || !reflect.DeepEqual(snapshotProvider(t, provider), providerBefore) {
+		t.Fatal("rejected request changed caller state")
+	}
+	return err
+}
+
+func explicitBudgetIngress(t *testing.T, ingress codec, model string, budget, cap int, stream bool, large string) []byte {
+	t.Helper()
+	_ = model
+	switch ingress.id {
+	case openaiCodec.id:
+		body := map[string]any{
+			"model":       "combo",
+			"messages":    explicitBudgetChatHistory(large),
+			"thinking":    map[string]any{"type": "enabled", "budget_tokens": budget},
+			"user":        "caller-user",
+			"metadata":    map[string]any{"n": json.RawMessage(large)},
+			"tools":       explicitBudgetTools(large),
+			"tool_choice": "auto",
+		}
+		if stream {
+			body["stream"] = true
+		}
+		if cap > 0 {
+			body["max_tokens"] = cap
+		}
+		out, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	case responsesCodec.id:
+		body := map[string]any{
+			"model":    "combo",
+			"input":    explicitBudgetResponsesInput(large),
+			"thinking": map[string]any{"type": "enabled", "budget_tokens": budget},
+			"metadata": map[string]any{"n": json.RawMessage(large)},
+			"tools":    explicitBudgetResponsesTools(large),
+		}
+		if stream {
+			body["stream"] = true
+		}
+		if cap > 0 {
+			body["max_output_tokens"] = cap
+		}
+		out, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	default:
+		body := map[string]any{
+			"model":    "combo",
+			"messages": explicitBudgetHistory(large),
+			"thinking": map[string]any{"type": "enabled", "budget_tokens": budget},
+			"tools":    explicitBudgetAnthropicTools(large),
+		}
+		if stream {
+			body["stream"] = true
+		}
+		if cap > 0 {
+			body["max_tokens"] = cap
+		}
+		out, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+}
+
+func explicitBudgetTools(large string) []any {
+	return []any{map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name": "lookup", "description": "find",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"n": map[string]any{"type": "integer", "maximum": json.RawMessage(large)},
+				},
+			},
+		},
+	}}
+}
+
+func explicitBudgetResponsesTools(large string) []any {
+	return []any{map[string]any{
+		"type": "function", "name": "lookup", "description": "find",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"n": map[string]any{"type": "integer", "maximum": json.RawMessage(large)},
+			},
+		},
+	}}
+}
+
+func explicitBudgetAnthropicTools(large string) []any {
+	return []any{map[string]any{
+		"name": "lookup", "description": "find",
+		"input_schema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"n": map[string]any{"type": "integer", "maximum": json.RawMessage(large)},
+			},
+		},
+	}}
+}
+
+func explicitBudgetResponsesInput(large string) []any {
+	return []any{
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "first"}}},
+		map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "calling"}}},
+		map[string]any{"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": explicitBudgetCallArguments(large)},
+		map[string]any{"type": "function_call_output", "call_id": "call-1", "output": "result-1"},
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "final-user"}}},
+	}
+}
+
+func explicitBudgetChatHistory(large string) []any {
+	return []any{
+		map[string]any{"role": "user", "content": "first"},
+		map[string]any{"role": "assistant", "content": "calling", "tool_calls": []any{
+			map[string]any{"id": "call-1", "type": "function", "function": map[string]any{
+				"name": "lookup", "arguments": explicitBudgetCallArguments(large),
+			}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "call-1", "content": "result-1"},
+		map[string]any{"role": "user", "content": "final-user"},
+	}
+}
+
+func explicitBudgetHistory(large string) []any {
+	return []any{
+		map[string]any{"role": "user", "content": "first"},
+		map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": "calling"},
+			map[string]any{"type": "tool_use", "id": "call-1", "name": "lookup", "input": explicitBudgetAnthropicInput(large)},
+		}},
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "call-1", "content": "result-1"},
+			map[string]any{"type": "text", "text": "final-user"},
+		}},
+	}
+}
+
+func explicitBudgetCallArguments(large string) string {
+	return `{"q":"exact","n":` + large + `}`
+}
+
+func explicitBudgetAnthropicInput(large string) json.RawMessage {
+	return json.RawMessage(explicitBudgetCallArguments(large))
+}
+
+func explicitBudgetInvalidHTTPBody(path, model string, stream bool) string {
+	streamField := ""
+	if stream {
+		streamField = `,"stream":true`
+	}
+	switch path {
+	case "/v1/responses":
+		return fmt.Sprintf(`{"model":%q%s,"max_output_tokens":16000,"input":"private conversation","thinking":{"type":"enabled","budget_tokens":64001}}`, model, streamField)
+	case "/v1/messages":
+		return fmt.Sprintf(`{"model":%q%s,"max_tokens":8192,"messages":[{"role":"user","content":"private conversation"}],"thinking":{"type":"enabled","budget_tokens":8192}}`, model, streamField)
+	default:
+		return fmt.Sprintf(`{"model":%q%s,"max_tokens":16000,"messages":[{"role":"user","content":"private conversation"}],"thinking":{"type":"enabled","budget_tokens":1023}}`, model, streamField)
+	}
+}
+
+func explicitBudgetHTTPBody(path, model string, budget, cap int, stream bool) string {
+	switch path {
+	case "/v1/responses":
+		streamField := ""
+		if stream {
+			streamField = `,"stream":true`
+		}
+		return fmt.Sprintf(`{"model":%q%s,"max_output_tokens":%d,"input":"hi","thinking":{"type":"enabled","budget_tokens":%d}}`, model, streamField, cap, budget)
+	case "/v1/messages":
+		streamField := ""
+		if stream {
+			streamField = `,"stream":true`
+		}
+		return fmt.Sprintf(`{"model":%q%s,"max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":%d}}`, model, streamField, cap, budget)
+	default:
+		streamField := ""
+		if stream {
+			streamField = `,"stream":true`
+		}
+		return fmt.Sprintf(`{"model":%q%s,"max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":%d}}`, model, streamField, cap, budget)
+	}
+}
+
+func assertExactEnabledBudget(t *testing.T, body []byte, budget, cap int) {
+	t.Helper()
+	var doc map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&doc); err != nil {
+		t.Fatal(err)
+	}
+	var thinkingObj map[string]json.RawMessage
+	if err := json.Unmarshal(doc["thinking"], &thinkingObj); err != nil {
+		t.Fatalf("thinking raw = %s", doc["thinking"])
+	}
+	if string(thinkingObj["type"]) != `"enabled"` || string(thinkingObj["budget_tokens"]) != strconv.Itoa(budget) {
+		t.Fatalf("thinking raw = %s, want budget %d", doc["thinking"], budget)
+	}
+	if string(doc["max_tokens"]) != strconv.Itoa(cap) {
+		t.Fatalf("max_tokens raw = %s, want %d", doc["max_tokens"], cap)
+	}
+}
+
+func assertExplicitBudgetPayload(t *testing.T, got map[string]any, raw []byte, model, large string, stream, groupedFinal bool) {
+	t.Helper()
+	if got["model"] != model {
+		t.Fatalf("model = %v", got["model"])
+	}
+	if stream && got["stream"] != true {
+		t.Fatalf("stream = %v, want true", got["stream"])
+	}
+	if !stream && got["stream"] != nil {
+		t.Fatalf("stream = %v, want omitted", got["stream"])
+	}
+	doc := decodeJSONNumberObject(t, raw)
+	assertExplicitBudgetTool(t, doc, large)
+	messages, ok := doc["messages"].([]any)
+	wantMessages := 4
+	if groupedFinal {
+		wantMessages = 3
+	}
+	if !ok || len(messages) != wantMessages {
+		t.Fatalf("messages = %#v, want %d canonical groups", doc["messages"], wantMessages)
+	}
+	assertMessageText(t, messages[0], "user", "first")
+	assertToolUse(t, messages[1], "call-1", "lookup", large)
+	if groupedFinal {
+		assertToolResultAndText(t, messages[2], "call-1", "result-1", "final-user")
+		return
+	}
+	assertToolResult(t, messages[2], "call-1", "result-1")
+	assertMessageText(t, messages[3], "user", "final-user")
+}
+
+func decodeJSONNumberObject(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+func assertJSONNumberAt(t *testing.T, root any, want string, path ...any) {
+	t.Helper()
+	cur := root
+	for _, step := range path {
+		switch key := step.(type) {
+		case string:
+			obj, ok := cur.(map[string]any)
+			if !ok {
+				t.Fatalf("path %v reached %#v, want object", path, cur)
+			}
+			cur = obj[key]
+		case int:
+			arr, ok := cur.([]any)
+			if !ok || key < 0 || key >= len(arr) {
+				t.Fatalf("path %v reached %#v, want index %d", path, cur, key)
+			}
+			cur = arr[key]
+		default:
+			t.Fatalf("bad path step %v", step)
+		}
+	}
+	n, ok := cur.(json.Number)
+	if !ok || n.String() != want {
+		t.Fatalf("path %v = %#v, want json.Number %s", path, cur, want)
+	}
+}
+
+func assertMessageText(t *testing.T, raw any, role, text string) {
+	t.Helper()
+	msg, ok := raw.(map[string]any)
+	if !ok || msg["role"] != role {
+		t.Fatalf("message = %#v, want role %s", raw, role)
+	}
+	blocks, ok := msg["content"].([]any)
+	if !ok || len(blocks) != 1 {
+		t.Fatalf("content = %#v, want one text block", msg["content"])
+	}
+	block, _ := blocks[0].(map[string]any)
+	if block["type"] != "text" || block["text"] != text {
+		t.Fatalf("text block = %#v, want %s", block, text)
+	}
+}
+
+func assertExplicitBudgetTool(t *testing.T, doc map[string]any, large string) {
+	t.Helper()
+	tools, ok := doc["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %#v, want one declared tool", doc["tools"])
+	}
+	tool, ok := tools[0].(map[string]any)
+	if !ok || tool["name"] != "lookup" || tool["description"] != "find" {
+		t.Fatalf("tool = %#v, want lookup/find", tools[0])
+	}
+	schema, ok := tool["input_schema"].(map[string]any)
+	if !ok || schema["type"] != "object" || len(schema) != 2 {
+		t.Fatalf("input_schema = %#v, want object type and properties", tool["input_schema"])
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok || len(properties) != 1 {
+		t.Fatalf("properties = %#v, want only n", schema["properties"])
+	}
+	n, ok := properties["n"].(map[string]any)
+	if !ok || n["type"] != "integer" || len(n) != 2 {
+		t.Fatalf("n schema = %#v, want integer maximum", properties["n"])
+	}
+	assertJSONNumberAt(t, doc, large, "tools", 0, "input_schema", "properties", "n", "maximum")
+}
+
+func assertToolUse(t *testing.T, raw any, id, name, large string) {
+	t.Helper()
+	msg, ok := raw.(map[string]any)
+	if !ok || msg["role"] != "assistant" || len(msg) != 2 {
+		t.Fatalf("assistant = %#v", raw)
+	}
+	blocks, ok := msg["content"].([]any)
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("assistant content = %#v, want text then tool_use", msg["content"])
+	}
+	text, ok := blocks[0].(map[string]any)
+	if !ok || text["type"] != "text" || text["text"] != "calling" || len(text) != 2 {
+		t.Fatalf("assistant text = %#v, want calling", blocks[0])
+	}
+	call, ok := blocks[1].(map[string]any)
+	if !ok || call["type"] != "tool_use" || call["id"] != id || call["name"] != name || len(call) != 4 {
+		t.Fatalf("tool_use = %#v, want %s %s", blocks[1], id, name)
+	}
+	input, ok := call["input"].(map[string]any)
+	if !ok || input["q"] != "exact" || len(input) != 2 {
+		t.Fatalf("tool input = %#v, want q and exact n", call["input"])
+	}
+	n, ok := input["n"].(json.Number)
+	if !ok || n.String() != large {
+		t.Fatalf("tool input n = %#v, want json.Number %s", input["n"], large)
+	}
+}
+
+func assertToolResultAndText(t *testing.T, raw any, id, result, text string) {
+	t.Helper()
+	msg, ok := raw.(map[string]any)
+	if !ok || msg["role"] != "user" {
+		t.Fatalf("grouped final message = %#v", raw)
+	}
+	blocks, ok := msg["content"].([]any)
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("grouped content = %#v, want tool_result then text", msg["content"])
+	}
+	assertToolResult(t, map[string]any{"role": "user", "content": []any{blocks[0]}}, id, result)
+	gotText, _ := blocks[1].(map[string]any)
+	if gotText["type"] != "text" || gotText["text"] != text {
+		t.Fatalf("final text = %#v, want %s", gotText, text)
+	}
+}
+
+func assertToolResult(t *testing.T, raw any, id, result string) {
+	t.Helper()
+	msg, ok := raw.(map[string]any)
+	if !ok || msg["role"] != "user" {
+		t.Fatalf("tool result message = %#v", raw)
+	}
+	blocks, ok := msg["content"].([]any)
+	if !ok || len(blocks) != 1 {
+		t.Fatalf("tool result content = %#v, want one tool_result", msg["content"])
+	}
+	gotResult, _ := blocks[0].(map[string]any)
+	if gotResult["type"] != "tool_result" || gotResult["tool_use_id"] != id {
+		t.Fatalf("tool_result = %#v, want id %s", gotResult, id)
+	}
+	content, ok := gotResult["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("tool_result content = %#v, want one text block", gotResult["content"])
+	}
+	nested, _ := content[0].(map[string]any)
+	if nested["type"] != "text" || nested["text"] != result {
+		t.Fatalf("tool_result text = %#v, want %s", nested, result)
+	}
+}
+
 func TestOpencodeMessagesBudgetScopeIsolation(t *testing.T) {
 	p := opencodeTestProvider()
 	got := prepareOpencodeMessagesBudget(t, p, openaiCodec, []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}]}`), "qwen3.6-plus")

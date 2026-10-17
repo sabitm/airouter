@@ -3,11 +3,61 @@ package thinking
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/opencode"
 )
+
+func TestOpencodeExplicitBudgetPreservesNumber(t *testing.T) {
+	body := []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192}}`)
+	out, err := ApplyWireForTier("anth-msg", body, "claude-sonnet-4-5", Capture(body), domain.ProtocolOpencode, domain.ReasoningOpencode, "zen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	th, _ := got["thinking"].(map[string]any)
+	if th["type"] != "enabled" || th["budget_tokens"] != float64(8192) {
+		t.Fatalf("thinking = %#v, want enabled budget 8192", th)
+	}
+}
+
+func TestOpencodeExplicitBudgetRequiresOpencodeProtocol(t *testing.T) {
+	body := []byte(`{"model":"combo","max_tokens":16000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192}}`)
+	cases := []struct {
+		name     string
+		protocol domain.Protocol
+		dialect  domain.ReasoningDialect
+		want     int
+	}{
+		{name: "anthropic dialect", protocol: domain.ProtocolAnthropic, dialect: domain.ReasoningOpencode, want: 32000},
+		{name: "openai protocol", protocol: domain.ProtocolOpenAI, dialect: domain.ReasoningOpencode, want: 32000},
+		{name: "opencode protocol", protocol: domain.ProtocolOpencode, dialect: domain.ReasoningOpencode, want: 8192},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ApplyWireForTier("anth-msg", body, "claude-sonnet-4-5", Capture(body), tc.protocol, tc.dialect, "zen")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc map[string]json.RawMessage
+			if err := json.Unmarshal(out, &doc); err != nil {
+				t.Fatal(err)
+			}
+			var thinkingObj map[string]json.RawMessage
+			if err := json.Unmarshal(doc["thinking"], &thinkingObj); err != nil {
+				t.Fatal(err)
+			}
+			if string(thinkingObj["type"]) != `"enabled"` || string(thinkingObj["budget_tokens"]) != strconv.Itoa(tc.want) {
+				t.Fatalf("thinking = %s, want enabled budget %d", doc["thinking"], tc.want)
+			}
+		})
+	}
+}
 
 func TestParseSuffix(t *testing.T) {
 	cases := []struct {

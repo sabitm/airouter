@@ -302,7 +302,7 @@ func ApplyWireForTier(formatID string, body []byte, model string, cfg *Config, p
 		stripClineControls(m)
 	}
 	if dialect == domain.ReasoningOpencode {
-		writeOpencode(m, model, cfg, tier)
+		writeOpencode(m, model, cfg, tier, protocol)
 		return json.Marshal(m)
 	}
 	if cfg != nil {

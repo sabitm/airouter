@@ -1,8 +1,10 @@
 package thinking
 
 import (
+	"errors"
 	"strings"
 
+	"airouter/internal/domain"
 	"airouter/internal/proxy/opencode"
 )
 
@@ -10,7 +12,7 @@ import (
 // nothing. Google rows write nothing: native thinkingConfig is deferred.
 // An effort list wins over toggle and budget. Only the selected MiniMax M3
 // Messages rows write a thinking toggle; other toggle-only rows write nothing.
-func writeOpencode(m map[string]any, model string, cfg *Config, tier string) {
+func writeOpencode(m map[string]any, model string, cfg *Config, tier string, protocol domain.Protocol) {
 	if cfg == nil {
 		return
 	}
@@ -38,7 +40,7 @@ func writeOpencode(m map[string]any, model string, cfg *Config, tier string) {
 		writeOpencodeEffort(m, spec, cfg)
 		return
 	}
-	writeOpencodeBudget(m, spec, cfg)
+	writeOpencodeBudget(m, spec, cfg, protocol)
 }
 
 // opencodeQwen38FlashDisable selects only the exact Anthropic Messages rows.
@@ -221,7 +223,13 @@ func deleteThinkingBudget(m map[string]any) {
 	delete(thinking, "budget_tokens")
 }
 
-func writeOpencodeBudget(m map[string]any, spec opencode.ModelSpec, cfg *Config) {
+func writeOpencodeBudget(m map[string]any, spec opencode.ModelSpec, cfg *Config, protocol domain.Protocol) {
+	if budget, ok := opencodeExplicitBudget(spec, cfg, protocol); ok {
+		// The caller number is the wire budget. LevelFor would replace it with a
+		// high/max preset before the finalizer can keep or reject it.
+		m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "enabled", "budget_tokens": budget})
+		return
+	}
 	level := LevelFor(cfg)
 	if cfg.Mode == ModeNone {
 		level = "none"
@@ -234,4 +242,63 @@ func writeOpencodeBudget(m map[string]any, spec opencode.ModelSpec, cfg *Config)
 		return
 	}
 	m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "enabled", "budget_tokens": budget})
+}
+
+// ErrOpencodeExplicitBudget is a static range rejection for an effective
+// positive numeric budget on an exact budget-only Messages row. It carries no
+// request payload. The proxy maps it to the same HTTP 400 as a budget that
+// cannot fit the caller cap or catalog ceiling.
+var ErrOpencodeExplicitBudget = errors.New("thinking budget exceeds max_tokens or model output limit")
+
+// opencodeExplicitBudget returns a positive ModeBudget value only for the four
+// Zen Anthropic Messages rows that are budget-only. Effort rows, Go rows, and
+// nonpositive budgets stay on the existing preset or omission path.
+func opencodeExplicitBudget(spec opencode.ModelSpec, cfg *Config, protocol domain.Protocol) (int, bool) {
+	// Exact numeric preservation is an OpenCode protocol behavior. The same
+	// catalog row on another protocol keeps the preexisting high/max preset.
+	if protocol != domain.ProtocolOpencode || cfg == nil || cfg.Mode != ModeBudget || cfg.Budget <= 0 || !opencodeBudgetOnlyRow(spec) {
+		return 0, false
+	}
+	return cfg.Budget, true
+}
+
+func opencodeBudgetOnlyRow(spec opencode.ModelSpec) bool {
+	if spec.SDK != "anthropic" || !spec.Budget || len(spec.Efforts) > 0 || spec.Toggle {
+		return false
+	}
+	switch spec.ID {
+	case "claude-haiku-4-5", "claude-opus-4-1", "claude-sonnet-4", "claude-sonnet-4-5":
+		return true
+	default:
+		return false
+	}
+}
+
+// OpencodeExplicitBudgetInvalid reports whether the effective numeric budget
+// is outside the selected row. BudgetSet alone is not a budget. A nonpositive
+// ModeBudget value is existing omission, not a new range error. The caller
+// must apply the same final-user gate as the writer before calling this.
+func OpencodeExplicitBudgetInvalid(spec opencode.ModelSpec, cfg *Config, maxTokens int) bool {
+	budget, ok := opencodeExplicitBudget(spec, cfg, domain.ProtocolOpencode)
+	if !ok {
+		return false
+	}
+	minimum := spec.BudgetMin
+	if minimum <= 0 {
+		minimum = 1024
+	}
+	if budget < minimum {
+		return true
+	}
+	ceiling := spec.Output
+	if ceiling <= 0 {
+		return true
+	}
+	if budget >= ceiling {
+		return true
+	}
+	if maxTokens > 0 && (budget >= maxTokens || maxTokens > ceiling) {
+		return true
+	}
+	return false
 }

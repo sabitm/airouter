@@ -772,7 +772,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	}
 	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, provider)
 	if err != nil {
-		if errors.Is(err, errOpencodeThinkingBudget) {
+		if opencodeBudgetError(err) {
 			return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 		}
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")

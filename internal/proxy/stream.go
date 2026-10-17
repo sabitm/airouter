@@ -320,7 +320,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	// Provider-aware reasoning finalization before protocol prepare/signing.
 	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, provider)
 	if err != nil {
-		if errors.Is(err, errOpencodeThinkingBudget) {
+		if opencodeBudgetError(err) {
 			return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 		}
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
@@ -817,6 +817,9 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 		}
 		return restoreOpencodeMiniMaxToggleCap(body, req, backend, provider)
 	}
+	if err := rejectOpencodeExplicitBudget(req, backend, provider, eff); err != nil {
+		return nil, err
+	}
 	out, err := thinking.ApplyWireForTier(backend.id, body, req.Model, eff, provider.Protocol, dialect, tier)
 	if err != nil {
 		return nil, err
@@ -840,8 +843,38 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 
 // errOpencodeThinkingBudget rejects an enabled OpenCode Messages budget that
 // cannot fit the caller's explicit cap or the selected catalog output ceiling.
-// The budget itself is not remapped.
+// The budget itself is not remapped. An out-of-range explicit numeric budget
+// uses the same static sentinel so both paths stay HTTP 400 without a payload.
 var errOpencodeThinkingBudget = errors.New("thinking budget exceeds max_tokens or model output limit")
+
+func opencodeBudgetError(err error) bool {
+	return errors.Is(err, errOpencodeThinkingBudget) || errors.Is(err, thinking.ErrOpencodeExplicitBudget)
+}
+
+// rejectOpencodeExplicitBudget validates the effective numeric budget before
+// the writer runs. It uses the same catalog, protocol, codec, and final-user
+// gates as the writer. A suffix or effort that replaces ModeBudget is not
+// validated here, and an assistant-final body does not acquire a range error.
+func rejectOpencodeExplicitBudget(req *ir.Request, backend codec, provider *domain.Provider, eff *thinking.Config) error {
+	if provider == nil || provider.Protocol != domain.ProtocolOpencode || provider.Reasoning() != domain.ReasoningOpencode || backend.id != codecOpencodeMessages || req == nil || eff == nil {
+		return nil
+	}
+	if !opencodeRequestEndsWithUser(req) {
+		return nil
+	}
+	spec, ok := opencode.Lookup(opencode.Tier(provider.BaseURL), req.Model)
+	if !ok || !thinking.OpencodeExplicitBudgetInvalid(spec, eff, req.MaxTokens) {
+		return nil
+	}
+	return thinking.ErrOpencodeExplicitBudget
+}
+
+func opencodeRequestEndsWithUser(req *ir.Request) bool {
+	if req == nil || len(req.Messages) == 0 {
+		return false
+	}
+	return req.Messages[len(req.Messages)-1].Role == ir.RoleUser
+}
 
 // reconcileOpencodeMessagesBudget runs only after the OpenCode writer has
 // selected the final budget. An explicit positive IR cap is preserved and is
