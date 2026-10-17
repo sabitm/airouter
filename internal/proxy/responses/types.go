@@ -5,7 +5,11 @@
 // response decode, and stream decode.
 package responses
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
 
 // --- request ---
 
@@ -62,6 +66,40 @@ type inputItem struct {
 type reasoningSummary struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+	// TextSet reports that the wire object carried a non-null "text" field,
+	// including an explicit empty string. Absent text is a placeholder, not
+	// proof that a retained part is empty.
+	TextSet bool `json:"-"`
+}
+
+// UnmarshalJSON rejects a null or non-object summary entry. A null entry would
+// otherwise decode as an empty part and silently reinterpret malformed opaque
+// state as absent fields. Supported fields keep their JSON type and presence.
+func (p *reasoningSummary) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return fmt.Errorf("responses: reasoning summary entry must be an object")
+	}
+	var raw struct {
+		Type json.RawMessage `json:"type"`
+		Text json.RawMessage `json:"text"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	p.Type, p.Text, p.TextSet = "", "", false
+	if !isNullish(raw.Type) {
+		if err := json.Unmarshal(raw.Type, &p.Type); err != nil {
+			return err
+		}
+	}
+	if !isNullish(raw.Text) {
+		if err := json.Unmarshal(raw.Text, &p.Text); err != nil {
+			return err
+		}
+		p.TextSet = true
+	}
+	return nil
 }
 
 type contentPart struct {

@@ -693,3 +693,95 @@ func TestCodexEncodeFinalizeAutoAndUltra(t *testing.T) {
 		})
 	}
 }
+
+// TestCodexEnvelopeHistoryScopedKey verifies the Codex wire envelope at once:
+// store is forced false, include keeps only the effective encrypted-reasoning
+// entry, the history input bytes survive preparation exactly, and the generated
+// cache key is the same in the body, the session_id header, and the trace even
+// when the caller sent a conflicting envelope.
+func TestCodexEnvelopeHistoryScopedKey(t *testing.T) {
+	raw := []byte(`{"model":"combo","stream":true,"input":[` +
+		`{"type":"reasoning","id":"rs_hist","status":"completed","encrypted_content":"cipher-hist","summary":[{"type":"summary_text","text":"prior chain"}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]},` +
+		`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prior answer"}]}` +
+		`],"store":true,"include":["custom.include.sentinel"],"prompt_cache_key":"caller-key","reasoning":{"effort":"high"}}`)
+	req, err := responsesCodec.decodeRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Include == nil || len(*req.Include) != 1 || (*req.Include)[0] != "custom.include.sentinel" {
+		t.Fatalf("decode lost include intent: %#v", req.Include)
+	}
+	applyUpstreamModel(req, "gpt-5.3-codex")
+	before := snapshotIR(t, req)
+	p := &domain.Provider{Name: "codex", Protocol: domain.ProtocolOpenAICodex}
+	encoded, err := codexCodec.encodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("custom.include.sentinel")) {
+		t.Fatalf("encoder forwarded the caller include: %s", encoded)
+	}
+	finalized, err := finalizeEncodedBody(encoded, req, codexCodec, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := &TraceInfo{}
+	ctx := WithTraceInfo(context.Background(), trace)
+	h := http.Header{}
+	h.Set("session_id", "conflicting-header-session")
+	h.Set("prompt_cache_key", "conflicting-header-key")
+	ctx = withCodexRequest(ctx, "tenant-x", h, raw)
+	out, err := New(nil, nil).prepareUpstreamRequestFor(ctx, codexCodec, p, req, finalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(snapshotIR(t, req), before) {
+		t.Fatal("codex preparation mutated the decoded request")
+	}
+	var encFields, outFields struct {
+		Input   json.RawMessage `json:"input"`
+		Store   *bool           `json:"store"`
+		Include []string        `json:"include"`
+		Key     string          `json:"prompt_cache_key"`
+	}
+	if err := json.Unmarshal(encoded, &encFields); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &outFields); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encFields.Input, outFields.Input) {
+		t.Fatalf("history changed during preparation:\n%s\n%s", encFields.Input, outFields.Input)
+	}
+	if outFields.Store == nil || *outFields.Store {
+		t.Fatalf("prepared store = %v, want false", outFields.Store)
+	}
+	if !reflect.DeepEqual(outFields.Include, []string{"reasoning.encrypted_content"}) {
+		t.Fatalf("prepared include = %#v", outFields.Include)
+	}
+	if outFields.Key == "" || outFields.Key == "caller-key" || outFields.Key == "conflicting-header-key" {
+		t.Fatalf("prepared key = %q, want a generated scoped key", outFields.Key)
+	}
+	if trace.CodexSessionID != outFields.Key {
+		t.Fatalf("trace key %q != body key %q", trace.CodexSessionID, outFields.Key)
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, "https://example.invalid/responses", bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyCodexHeaders(httpReq, p, ctx)
+	if got := httpReq.Header.Get("session_id"); got != outFields.Key {
+		t.Fatalf("session_id = %q, want %q", got, outFields.Key)
+	}
+	var input []map[string]any
+	if err := json.Unmarshal(outFields.Input, &input); err != nil {
+		t.Fatal(err)
+	}
+	if len(input) != 3 {
+		t.Fatalf("input items = %d", len(input))
+	}
+	if input[0]["id"] != "rs_hist" || input[0]["encrypted_content"] != "cipher-hist" {
+		t.Fatalf("reasoning history lost state: %#v", input[0])
+	}
+}

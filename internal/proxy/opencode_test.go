@@ -3,15 +3,20 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"airouter/internal/domain"
 	"airouter/internal/harlog"
@@ -22,6 +27,7 @@ import (
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
+	"airouter/internal/proxy/sse"
 	"airouter/internal/proxy/thinking"
 )
 
@@ -1688,6 +1694,9 @@ func cloneBlocks(in []ir.ContentBlock) []ir.ContentBlock {
 			v := *in[i].CacheControl
 			out[i].CacheControl = &v
 		}
+		if in[i].ResponsesReasoning != nil {
+			out[i].ResponsesReasoning = in[i].ResponsesReasoning.Clone()
+		}
 	}
 	return out
 }
@@ -2655,6 +2664,15 @@ func assertIngressErrorEnvelope(t *testing.T, path string, body []byte, errType 
 // and fails if any changed. The returned raw bytes are the exact upstream body.
 func prepareTranslatedPipeline(t *testing.T, px *Proxy, p *domain.Provider, ingress codec, rawBody []byte, upstreamModel string, ctx context.Context) (map[string]any, []byte) {
 	t.Helper()
+	return prepareTranslatedPipelineWith(t, px, p, ingress, rawBody, upstreamModel, ctx, false)
+}
+
+// prepareTranslatedPipelineWith is prepareTranslatedPipeline plus the
+// serveTranslated transport override: when forceStreamOnly is set and the
+// selected backend is stream-only, req.Stream is forced true before encoding,
+// exactly as the unary serve path does. Paid backends keep the caller value.
+func prepareTranslatedPipelineWith(t *testing.T, px *Proxy, p *domain.Provider, ingress codec, rawBody []byte, upstreamModel string, ctx context.Context, forceStreamOnly bool) (map[string]any, []byte) {
+	t.Helper()
 	rawInput := append([]byte(nil), rawBody...)
 	req, err := ingress.decodeRequest(rawBody)
 	if err != nil {
@@ -2664,9 +2682,12 @@ func prepareTranslatedPipeline(t *testing.T, px *Proxy, p *domain.Provider, ingr
 		req.Thinking = thinking.ToIR(captured)
 	}
 	applyUpstreamModel(req, upstreamModel)
+	backend := backendCodecFor(p.Protocol, p.BaseURL, upstreamModel)
+	if forceStreamOnly && backend.streamOnly {
+		req.Stream = true
+	}
 	reqBefore := snapshotIR(t, req)
 	providerBefore := snapshotProvider(t, p)
-	backend := backendCodecFor(p.Protocol, p.BaseURL, upstreamModel)
 	encoded, err := backend.encodeRequest(req)
 	if err != nil {
 		t.Fatal(err)
@@ -3768,6 +3789,1102 @@ func TestCacheControlDoesNotLeakIntoOtherCodecs(t *testing.T) {
 		}
 		if bytes.Contains(raw, []byte("stale-structured-text")) || bytes.Contains(raw, []byte("cache_control")) {
 			t.Fatalf("%s read stale structured system: %s", e.name, raw)
+		}
+	}
+}
+
+func TestSnapshotIRClonesResponsesReasoning(t *testing.T) {
+	enc := "enc"
+	req := &ir.Request{Model: "m", Messages: []ir.Message{{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+		{
+			Type: ir.BlockReasoning, Text: "chain",
+			ResponsesReasoning: &ir.ResponsesReasoning{
+				ID: "rs_1", Status: "completed", EncryptedContent: &enc,
+				Summary: []ir.ReasoningSummaryPart{{Type: "summary_text", Text: "chain"}},
+			},
+			ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "nested"}},
+		},
+	}}}}
+	snap := snapshotIR(t, req)
+	orig := req.Messages[0].Content[0].ResponsesReasoning
+	cp := snap.Messages[0].Content[0].ResponsesReasoning
+	if cp == nil || cp == orig {
+		t.Fatalf("snapshot aliased reasoning pointer: %+v", cp)
+	}
+	orig.ID = "mutated-id"
+	orig.Status = "mutated-status"
+	*orig.EncryptedContent = "mutated-cipher"
+	orig.Summary[0].Text = "mutated-summary"
+	orig.Summary = append(orig.Summary, ir.ReasoningSummaryPart{Type: "summary_text", Text: "extra"})
+	req.Messages[0].Content[0].ToolResult[0].Text = "mutated-nested"
+	if cp.ID != "rs_1" || cp.Status != "completed" || cp.EncryptedContent == nil || *cp.EncryptedContent != "enc" {
+		t.Fatalf("snapshot metadata aliased: %+v", cp)
+	}
+	if len(cp.Summary) != 1 || cp.Summary[0].Text != "chain" {
+		t.Fatalf("snapshot summary aliased: %+v", cp.Summary)
+	}
+	if snap.Messages[0].Content[0].ToolResult[0].Text != "nested" {
+		t.Fatalf("nested tool result aliased: %+v", snap.Messages[0].Content[0].ToolResult)
+	}
+}
+
+// opencodeTierUpstream records one upstream request and replies in the family
+// and transport the request asked for. Tests reach it through a transport that
+// dials this server for the official OpenCode host names, so codec and tier
+// selection run against the real base URLs without network access.
+type opencodeTierUpstream struct {
+	hits    atomic.Int64
+	path    string
+	host    string
+	auth    string
+	ua      string
+	session string
+	body    map[string]any
+}
+
+func (u *opencodeTierUpstream) handler(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u.hits.Add(1)
+		u.path = r.URL.Path
+		u.host = r.Host
+		u.auth = r.Header.Get("Authorization")
+		u.ua = r.Header.Get("User-Agent")
+		u.session = r.Header.Get("x-opencode-session")
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		u.body = body
+		if strings.HasSuffix(r.URL.Path, "/responses") {
+			if stream, _ := u.body["stream"].(bool); stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(responsesReasoningSuccessSSE))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(routingResponsesUpstreamBody))
+			return
+		}
+		if stream, _ := u.body["stream"].(bool); stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+				"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+				"data: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}
+}
+
+func setupOpencodeTierProxy(t *testing.T, base, model, apiKey string) (*opencodeTierUpstream, string, string) {
+	t.Helper()
+	up := &opencodeTierUpstream{}
+	server := httptest.NewTLSServer(up.handler(t))
+	t.Cleanup(server.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Name: "opencode", BaseURL: base, APIKey: apiKey, Protocol: domain.ProtocolOpencode}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	combo := &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: prov.ID, UpstreamModel: model, Enabled: true},
+	}}
+	if err := st.CreateCombo(ctx, combo); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	px := New(st, nil)
+	// Every official OpenCode host dials the local TLS test server.
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return net.Dial(network, strings.TrimPrefix(server.URL, "https://"))
+		},
+	}
+	px.client = &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	px.streamClient = &http.Client{Transport: tr}
+	mux := http.NewServeMux()
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return up, ts.URL, key.Token
+}
+
+// TestOpencodeTierHTTPLifecycle runs the real ingress -> IR -> OpenCode
+// encode/finalize/prepare path over local HTTP for Zen paid, Zen free, and Go,
+// with the client stream flag both off (normal unary or forced stream-to-unary)
+// and on (SSE). Each case sends two requests through the same proxy and checks
+// the second body does not inherit the first request's state.
+func TestOpencodeTierHTTPLifecycle(t *testing.T) {
+	cases := []struct {
+		name     string
+		base     string
+		model    string
+		apiKey   string
+		free     bool
+		endpoint string
+		prefix   string
+	}{
+		{"zen paid chat", opencode.ZenBaseURL, "deepseek-v4-pro", "sk-zen", false, "/chat/completions", "/inference/v1"},
+		{"zen paid responses", opencode.ZenBaseURL, "gpt-5.6-luna", "sk-zen", false, "/responses", "/inference/v1"},
+		{"zen free chat", opencode.ZenBaseURL, "deepseek-v4-flash-free", opencode.PublicKey, true, "/chat/completions", "/inference/v1"},
+		{"zen free responses", opencode.ZenBaseURL, "muse-spark-1.3-contributor-free", opencode.PublicKey, true, "/responses", "/inference/v1"},
+		{"go paid chat", opencode.GoBaseURL, "glm-5", "sk-go", false, "/chat/completions", "/zen/go/v1"},
+		{"go paid responses", opencode.GoBaseURL, "muse-spark-1.2-contributor", "sk-go", false, "/responses", "/zen/go/v1"},
+	}
+	const tools = `"tools":[{"type":"function","name":"Read","parameters":{"type":"object","properties":{}}}]`
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				up, clientBase, token := setupOpencodeTierProxy(t, tc.base, tc.model, tc.apiKey)
+				first := fmt.Sprintf(`{"model":"default","stream":%t,"input":"hi","prompt_cache_key":"key-one",%s}`, stream, tools)
+				resp, out := post(t, clientBase+"/v1/responses", token, first)
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+				}
+				if !strings.Contains(string(out), "ok") {
+					t.Fatalf("response lost text: %s", out)
+				}
+				if stream {
+					if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+						t.Fatalf("stream content type = %q", ct)
+					}
+				} else if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+					t.Fatalf("unary content type = %q", ct)
+				}
+				if up.host != "opencode.ai" {
+					t.Fatalf("host = %q", up.host)
+				}
+				if up.path != tc.prefix+tc.endpoint {
+					t.Fatalf("path = %q want %q", up.path, tc.prefix+tc.endpoint)
+				}
+				if up.auth != "Bearer "+tc.apiKey {
+					t.Fatalf("auth = %q", up.auth)
+				}
+				if !strings.HasPrefix(up.ua, "opencode/") {
+					t.Fatalf("user agent = %q", up.ua)
+				}
+				if up.session == "" {
+					t.Fatal("missing x-opencode-session header")
+				}
+				if !tc.free {
+					streamVal, _ := up.body["stream"].(bool)
+					if streamVal != stream {
+						t.Fatalf("upstream stream = %v, want %v", up.body["stream"], stream)
+					}
+				} else if streamVal, _ := up.body["stream"].(bool); !streamVal {
+					t.Fatalf("free stream-only target did not force stream: %#v", up.body["stream"])
+				}
+				toolName := func() string {
+					list, _ := up.body["tools"].([]any)
+					if len(list) == 0 {
+						t.Fatalf("preparation lost tools: %#v", up.body)
+					}
+					first := mustMapAny(t, "tools[0]", list[0])
+					if tc.endpoint == "/responses" {
+						name, _ := first["name"].(string)
+						return name
+					}
+					name, _ := mustMapAny(t, "tools[0].function", first["function"])["name"].(string)
+					return name
+				}
+				if tc.free {
+					if got := toolName(); got != "read" {
+						t.Fatalf("free canonical tool name = %q", got)
+					}
+					if list, _ := up.body["tools"].([]any); len(list) < 2 {
+						t.Fatalf("free preparation injected no decoys: %#v", up.body["tools"])
+					}
+				} else if got := toolName(); got != "Read" {
+					t.Fatalf("paid tool name = %q, want caller spelling", got)
+				}
+				if tc.endpoint == "/responses" {
+					if up.body["prompt_cache_key"] != "key-one" {
+						t.Fatalf("responses key = %#v", up.body["prompt_cache_key"])
+					}
+				} else if _, ok := up.body["prompt_cache_key"]; ok {
+					t.Fatalf("chat backend gained a responses-only key: %#v", up.body)
+				}
+
+				second := fmt.Sprintf(`{"model":"default","stream":%t,"input":"hi",%s}`, stream, tools)
+				resp2, out2 := post(t, clientBase+"/v1/responses", token, second)
+				if resp2.StatusCode != http.StatusOK {
+					t.Fatalf("second status=%d body=%s", resp2.StatusCode, out2)
+				}
+				if !strings.Contains(string(out2), "ok") {
+					t.Fatalf("second response lost text: %s", out2)
+				}
+				rawBody, _ := json.Marshal(up.body)
+				if strings.Contains(string(rawBody), "key-one") {
+					t.Fatalf("second request inherited prior key: %s", rawBody)
+				}
+				if up.hits.Load() != 2 {
+					t.Fatalf("upstream hits = %d, want 2", up.hits.Load())
+				}
+			})
+		}
+	}
+}
+
+func respStrPtr(s string) *string { return &s }
+
+func assertRawString(t *testing.T, path string, raw json.RawMessage, want string) {
+	t.Helper()
+	if len(raw) == 0 {
+		t.Fatalf("%s: field absent, want %q", path, want)
+	}
+	var got string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	if got != want {
+		t.Fatalf("%s = %q, want %q", path, got, want)
+	}
+}
+
+// assertOptionalRawString checks exact presence: a non-nil want must be present
+// with that exact value (including the empty string); a nil want must be absent.
+func assertOptionalRawString(t *testing.T, path string, raw json.RawMessage, want *string) {
+	t.Helper()
+	if want == nil {
+		if len(raw) != 0 {
+			t.Fatalf("%s = %s, want absent", path, raw)
+		}
+		return
+	}
+	assertRawString(t, path, raw, *want)
+}
+
+// opencodeEncryptedHistoryBody returns a Responses request whose input carries
+// the complete mixed history: an opaque reasoning item with ordered summary
+// parts including an empty part, assistant text, a function_call, its
+// function_call_output, and a trailing user turn. Tool parameters keep a nested
+// value and a large integer literal so preparation can be checked exactly.
+func opencodeEncryptedHistoryBody(stream bool) string {
+	return fmt.Sprintf(`{"model":"default","stream":%t,"prompt_cache_key":"caller-cache-key","store":false,"include":["reasoning.encrypted_content","custom.include"],"reasoning":{"effort":"max"},"max_output_tokens":4,"tools":[{"type":"function","name":"Read","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer","default":9007199254740993},"nested":{"type":"object","properties":{"deep":{"type":"integer","const":9007199254740993}}}},"required":["path"]}}],"input":[{"type":"reasoning","id":"rs_hist","status":"completed","encrypted_content":"cipher-hist","summary":[{"type":"summary_text","text":"part-one"},{"type":"summary_text","text":""},{"type":"summary_text","text":"part-three"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant-answer"}]},{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"path\":\"/tmp/x\",\"limit\":9007199254740993}"},{"type":"function_call_output","call_id":"call_1","output":"tool-output-value"},{"type":"message","role":"user","content":[{"type":"input_text","text":"final-user"}]}]}`, stream)
+}
+
+// TestOpencodeResponsesEncryptedHistoryPrepareMatrix drives the full
+// ingress -> IR -> OpenCode Responses encode -> finalize -> prepare path for
+// the paid Zen, free Zen muse, and Go muse Responses rows and both client
+// stream flags. It checks real codec selection (opencode-responses, not the
+// generic oai-responses), the forced stream:true for the free stream-only row,
+// and the whole supported history after preparation: order, item IDs, status,
+// ciphertext, ordered summary parts including an empty part, tool schema with a
+// nested value and a large integer literal, store/include/cache intent, and the
+// independent caller session.
+func TestOpencodeResponsesEncryptedHistoryPrepareMatrix(t *testing.T) {
+	const headerSession = "ses_0123456789abABCDEFGHIJKLMN"
+	cases := []struct {
+		name  string
+		base  string
+		model string
+		free  bool
+		spark bool
+	}{
+		{name: "zen paid responses", base: opencode.ZenBaseURL, model: "gpt-5.6-luna"},
+		{name: "zen free muse responses", base: opencode.ZenBaseURL, model: "muse-spark-1.3-contributor-free", free: true, spark: true},
+		{name: "go paid muse responses", base: opencode.GoBaseURL, model: "muse-spark-1.2-contributor", spark: true},
+	}
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				p := opencodeTestProvider()
+				p.BaseURL = tc.base
+				backend := backendCodecFor(p.Protocol, p.BaseURL, tc.model)
+				if backend.id != "opencode-responses" {
+					t.Fatalf("backend codec = %q, want opencode-responses", backend.id)
+				}
+				if backend.id == responsesCodec.id {
+					t.Fatalf("OpenCode backend reused the generic Responses id %q", backend.id)
+				}
+				if backend.streamOnly != tc.free {
+					t.Fatalf("streamOnly = %v, want %v", backend.streamOnly, tc.free)
+				}
+				h := http.Header{}
+				h.Set("x-opencode-session", headerSession)
+				raw := []byte(opencodeEncryptedHistoryBody(stream))
+				trace := &TraceInfo{}
+				ctx := WithTraceInfo(context.Background(), trace)
+				ctx = withOpencodeRequest(ctx, "test-nonce", h, raw)
+				_, out := prepareTranslatedPipelineWith(t, New(nil, nil), p, responsesCodec, raw, tc.model, ctx, true)
+
+				var got map[string]any
+				dec := json.NewDecoder(bytes.NewReader(out))
+				dec.UseNumber()
+				if err := dec.Decode(&got); err != nil {
+					t.Fatalf("prepared body invalid: %v", err)
+				}
+				wantStream := stream || tc.free
+				if got["stream"] != wantStream {
+					t.Fatalf("prepared stream = %#v, want %v", got["stream"], wantStream)
+				}
+				if got["model"] != tc.model {
+					t.Fatalf("prepared model = %#v", got["model"])
+				}
+				if store, ok := got["store"].(bool); !ok || store {
+					t.Fatalf("prepared store = %#v, want explicit false", got["store"])
+				}
+				if !reflect.DeepEqual(got["include"], []any{"reasoning.encrypted_content", "custom.include"}) {
+					t.Fatalf("prepared include = %#v", got["include"])
+				}
+				if got["prompt_cache_key"] != "caller-cache-key" {
+					t.Fatalf("prepared key = %#v", got["prompt_cache_key"])
+				}
+				wantEffort := "max"
+				wantMax := int64(4)
+				if tc.spark {
+					wantEffort = "xhigh"
+					wantMax = 16
+				}
+				if effort := mustMapAny(t, "reasoning", got["reasoning"])["effort"]; effort != wantEffort {
+					t.Fatalf("reasoning effort = %#v, want %q", effort, wantEffort)
+				}
+				maxRaw, ok := got["max_output_tokens"].(json.Number)
+				if !ok {
+					t.Fatalf("max_output_tokens = %#v", got["max_output_tokens"])
+				}
+				if n, _ := maxRaw.Int64(); n != wantMax {
+					t.Fatalf("max_output_tokens = %s, want %d", maxRaw, wantMax)
+				}
+				if trace.OpencodeSessionID != headerSession {
+					t.Fatalf("session = %q, want %q", trace.OpencodeSessionID, headerSession)
+				}
+
+				wantName := "Read"
+				tools := mustListAny(t, "tools", got["tools"])
+				if tc.free {
+					wantName = "read"
+					if len(tools) != 4 {
+						t.Fatalf("free tools = %d, want caller plus 3 decoys", len(tools))
+					}
+				} else if len(tools) != 1 {
+					t.Fatalf("paid tools = %d, want 1", len(tools))
+				}
+				caller := false
+				for _, item := range tools {
+					if mustMapAny(t, "tools[]", item)["name"] == wantName {
+						caller = true
+					}
+				}
+				if !caller {
+					t.Fatalf("prepared tools lost %q: %#v", wantName, tools)
+				}
+				if !bytes.Contains(out, []byte("9007199254740993")) {
+					t.Fatalf("prepared tool schema rounded or dropped the large integer: %s", out)
+				}
+				assertPreparedToolLargeInteger(t, out, wantName)
+				assertPreparedEncryptedHistory(t, out, wantName)
+			})
+		}
+	}
+}
+
+// TestOpencodeResponsesEncryptedHistoryOpaqueVariants pins the exact opaque
+// presence variants through the real OpenCode Responses pipeline: non-empty and
+// explicit empty ciphertext, absent and null ciphertext, absent status and ID,
+// and nil, empty, and empty-part summary arrays. The prepare helper also checks
+// that the caller bytes, IR, and provider are unchanged.
+func TestOpencodeResponsesEncryptedHistoryOpaqueVariants(t *testing.T) {
+	cases := []struct {
+		name      string
+		reasoning string
+		wantID    *string
+		wantStat  *string
+		wantEnc   *string
+		wantTexts []string
+	}{
+		{
+			name:      "cipher and ordered parts",
+			reasoning: `{"type":"reasoning","id":"rs_a","status":"completed","encrypted_content":"cipher","summary":[{"type":"summary_text","text":"one"},{"type":"summary_text","text":""},{"type":"summary_text","text":"three"}]}`,
+			wantID:    respStrPtr("rs_a"),
+			wantStat:  respStrPtr("completed"),
+			wantEnc:   respStrPtr("cipher"),
+			wantTexts: []string{"one", "", "three"},
+		},
+		{
+			name:      "explicit empty cipher",
+			reasoning: `{"type":"reasoning","id":"rs_b","status":"in_progress","encrypted_content":"","summary":[]}`,
+			wantID:    respStrPtr("rs_b"),
+			wantStat:  respStrPtr("in_progress"),
+			wantEnc:   respStrPtr(""),
+			wantTexts: []string{},
+		},
+		{
+			name:      "absent cipher",
+			reasoning: `{"type":"reasoning","id":"rs_c","status":"completed","summary":[{"type":"summary_text","text":"only"}]}`,
+			wantID:    respStrPtr("rs_c"),
+			wantStat:  respStrPtr("completed"),
+			wantEnc:   nil,
+			wantTexts: []string{"only"},
+		},
+		{
+			name:      "null cipher and null summary",
+			reasoning: `{"type":"reasoning","id":"rs_d","encrypted_content":null,"summary":null}`,
+			wantID:    respStrPtr("rs_d"),
+			wantStat:  nil,
+			wantEnc:   nil,
+			wantTexts: nil,
+		},
+		{
+			name:      "empty summary text part only",
+			reasoning: `{"type":"reasoning","id":"rs_e","status":"completed","encrypted_content":"c","summary":[{"type":"summary_text","text":""}]}`,
+			wantID:    respStrPtr("rs_e"),
+			wantStat:  respStrPtr("completed"),
+			wantEnc:   respStrPtr("c"),
+			wantTexts: []string{""},
+		},
+		{
+			name:      "no id no status",
+			reasoning: `{"type":"reasoning","encrypted_content":"c","summary":[]}`,
+			wantID:    nil,
+			wantStat:  nil,
+			wantEnc:   respStrPtr("c"),
+			wantTexts: []string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := opencodeTestProvider()
+			body := []byte(fmt.Sprintf(`{"model":"combo","input":[%s]}`, tc.reasoning))
+			_, out := prepareTranslatedPipelineWith(t, New(nil, nil), p, responsesCodec, body, "gpt-5.6-luna", WithTraceInfo(context.Background(), &TraceInfo{}), true)
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(out, &fields); err != nil {
+				t.Fatal(err)
+			}
+			var items []map[string]json.RawMessage
+			if err := json.Unmarshal(fields["input"], &items); err != nil {
+				t.Fatal(err)
+			}
+			if len(items) != 1 {
+				t.Fatalf("history items = %d, want 1: %s", len(items), fields["input"])
+			}
+			assertRawString(t, "type", items[0]["type"], "reasoning")
+			assertOptionalRawString(t, "id", items[0]["id"], tc.wantID)
+			assertOptionalRawString(t, "status", items[0]["status"], tc.wantStat)
+			assertOptionalRawString(t, "encrypted_content", items[0]["encrypted_content"], tc.wantEnc)
+			var summary []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(items[0]["summary"], &summary); err != nil {
+				t.Fatal(err)
+			}
+			if len(summary) != len(tc.wantTexts) {
+				t.Fatalf("summary = %#v, want %d parts", summary, len(tc.wantTexts))
+			}
+			for i, want := range tc.wantTexts {
+				if summary[i].Type != "summary_text" || summary[i].Text != want {
+					t.Fatalf("summary[%d] = %#v, want type summary_text text %q", i, summary[i], want)
+				}
+			}
+		})
+	}
+}
+
+// TestSnapshotIRClonesResponsesReasoningEmptyVariants guards the pipeline
+// snapshots for the opaque presence variants: absent, nil encrypted, explicit
+// empty encrypted, nil versus non-nil empty summary, and an empty summary part.
+func TestSnapshotIRClonesResponsesReasoningEmptyVariants(t *testing.T) {
+	empty := "cipher-empty"
+	nilSummary := &ir.ResponsesReasoning{ID: "rs_nil", EncryptedContent: &empty}
+	explicitEmpty := &ir.ResponsesReasoning{Summary: []ir.ReasoningSummaryPart{}}
+	req := &ir.Request{Model: "m", Messages: []ir.Message{{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+		{Type: ir.BlockReasoning, Text: "no-state"},
+		{Type: ir.BlockReasoning, Text: "nil-summary", ResponsesReasoning: nilSummary},
+		{Type: ir.BlockReasoning, Text: "empty-summary", ResponsesReasoning: explicitEmpty},
+		{Type: ir.BlockReasoning, Text: "empty-part", ResponsesReasoning: &ir.ResponsesReasoning{
+			ID: "rs_part", EncryptedContent: respStrPtr(""), Summary: []ir.ReasoningSummaryPart{{Type: "summary_text", Text: ""}},
+		}},
+	}}}}
+	snap := snapshotIR(t, req)
+	blocks := snap.Messages[0].Content
+	if blocks[0].ResponsesReasoning != nil {
+		t.Fatalf("nil reasoning was snapshotted as non-nil: %+v", blocks[0].ResponsesReasoning)
+	}
+	if blocks[1].ResponsesReasoning == nil || blocks[1].ResponsesReasoning == nilSummary || blocks[1].ResponsesReasoning.EncryptedContent == nil || *blocks[1].ResponsesReasoning.EncryptedContent != "cipher-empty" {
+		t.Fatalf("encrypted pointer aliased or lost: %+v", blocks[1].ResponsesReasoning)
+	}
+	if blocks[2].ResponsesReasoning == nil || len(blocks[2].ResponsesReasoning.Summary) != 0 {
+		t.Fatalf("empty summary did not stay empty: %+v", blocks[2].ResponsesReasoning)
+	}
+	if blocks[3].ResponsesReasoning == nil || blocks[3].ResponsesReasoning.EncryptedContent == nil || *blocks[3].ResponsesReasoning.EncryptedContent != "" {
+		t.Fatalf("explicit empty ciphertext lost: %+v", blocks[3].ResponsesReasoning)
+	}
+	if blocks[3].ResponsesReasoning.Summary == nil || len(blocks[3].ResponsesReasoning.Summary) != 1 || blocks[3].ResponsesReasoning.Summary[0].Text != "" {
+		t.Fatalf("empty summary part lost: %+v", blocks[3].ResponsesReasoning.Summary)
+	}
+	// Mutate the live state through every shared reference and confirm the
+	// snapshot does not observe any of it. Clone collapses a non-nil empty
+	// summary slice to nil, which is wire-equivalent because encoding emits an
+	// empty array for both, so the live slice is still checked for aliasing.
+	live := req.Messages[0].Content
+	*live[1].ResponsesReasoning.EncryptedContent = "mutated"
+	live[2].ResponsesReasoning.Summary = append(live[2].ResponsesReasoning.Summary, ir.ReasoningSummaryPart{Type: "summary_text", Text: "added"})
+	*live[3].ResponsesReasoning.EncryptedContent = "mutated"
+	live[3].ResponsesReasoning.Summary[0].Text = "mutated"
+	if *blocks[1].ResponsesReasoning.EncryptedContent != "cipher-empty" {
+		t.Fatal("snapshot observed a live encrypted mutation")
+	}
+	if len(blocks[2].ResponsesReasoning.Summary) != 0 {
+		t.Fatal("snapshot observed a live summary append")
+	}
+	if *blocks[3].ResponsesReasoning.EncryptedContent != "" || blocks[3].ResponsesReasoning.Summary[0].Text != "" {
+		t.Fatal("snapshot observed a live empty-state mutation")
+	}
+}
+
+// opencodeHistoryUpstream records every translated upstream request the proxy
+// makes in the encrypted-history HTTP matrix. Requests run one after another,
+// but the mutex keeps the race detector honest.
+type opencodeHistoryUpstream struct {
+	mu       sync.Mutex
+	bodies   []map[string]any
+	raw      [][]byte
+	hosts    []string
+	paths    []string
+	sessions []string
+	auths    []string
+}
+
+func (u *opencodeHistoryUpstream) record(r *http.Request) []byte {
+	raw, _ := io.ReadAll(r.Body)
+	var body map[string]any
+	_ = json.Unmarshal(raw, &body)
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.bodies = append(u.bodies, body)
+	u.raw = append(u.raw, raw)
+	u.hosts = append(u.hosts, r.Host)
+	u.paths = append(u.paths, r.URL.Path)
+	u.sessions = append(u.sessions, r.Header.Get("x-opencode-session"))
+	u.auths = append(u.auths, r.Header.Get("Authorization"))
+	return raw
+}
+
+func (u *opencodeHistoryUpstream) last() ([]byte, map[string]any) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.raw[len(u.raw)-1], u.bodies[len(u.bodies)-1]
+}
+
+func (u *opencodeHistoryUpstream) count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return len(u.raw)
+}
+
+func opencodeHistoryUnaryBody(toolName string) string {
+	return `{"id":"resp_up","model":"m","status":"completed","output":[` +
+		`{"id":"rs_resp","type":"reasoning","status":"completed","encrypted_content":"cipher-resp","summary":[{"type":"summary_text","text":"resp-part-one"},{"type":"summary_text","text":""},{"type":"summary_text","text":"resp-part-three"}]},` +
+		`{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"resp-ok"}]},` +
+		`{"id":"fc_resp","type":"function_call","status":"completed","call_id":"call_resp","name":` + jsonString(toolName) + `,"arguments":"{\"path\":\"/tmp/y\",\"limit\":9007199254740993}"}` +
+		`],"usage":{"input_tokens":3,"output_tokens":2}}`
+}
+
+func opencodeHistorySSEBody(toolName string) string {
+	reasoning := `{"id":"rs_resp","type":"reasoning","status":"completed","encrypted_content":"cipher-resp","summary":[{"type":"summary_text","text":"resp-part-one"},{"type":"summary_text","text":""},{"type":"summary_text","text":"resp-part-three"}]}`
+	message := `{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"resp-ok"}]}`
+	call := `{"id":"fc_resp","type":"function_call","status":"completed","call_id":"call_resp","name":` + jsonString(toolName) + `,"arguments":"{\"path\":\"/tmp/y\",\"limit\":9007199254740993}"}`
+	return joinSSE(
+		"event: response.created\ndata: "+`{"type":"response.created","response":{"id":"resp_up","model":"m","status":"in_progress","output":[]}}`,
+		"event: response.output_item.done\ndata: "+`{"type":"response.output_item.done","output_index":0,"item":`+reasoning+`}`,
+		"event: response.output_text.delta\ndata: "+`{"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"delta":"resp-ok"}`,
+		"event: response.output_item.added\ndata: "+`{"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_resp","name":`+jsonString(toolName)+`,"arguments":""}}`,
+		"event: response.function_call_arguments.delta\ndata: "+`{"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"path\":\"/tmp/y\",\"limit\":9007199254740993}"}`,
+		"event: response.completed\ndata: "+`{"type":"response.completed","response":{"id":"resp_up","model":"m","status":"completed","output":[`+reasoning+`,`+message+`,`+call+`],"usage":{"input_tokens":3,"output_tokens":2}}}`,
+	)
+}
+
+func opencodeHistoryPlainUnaryBody() string {
+	return `{"id":"resp_plain","model":"m","status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"plain-ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`
+}
+
+func opencodeHistoryPlainSSEBody() string {
+	return joinSSE(
+		"event: response.created\ndata: "+`{"type":"response.created","response":{"id":"resp_plain","model":"m","status":"in_progress","output":[]}}`,
+		"event: response.output_text.delta\ndata: "+`{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"plain-ok"}`,
+		"event: response.completed\ndata: "+`{"type":"response.completed","response":{"id":"resp_plain","model":"m","status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"plain-ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}}`,
+	)
+}
+
+// historyRequestHasOpaque reports whether the upstream request still carries an
+// opaque reasoning item. The plain isolation turn has none, so its mock response
+// must not call a tool (a free-tier decoy call would be rejected).
+func historyRequestHasOpaque(body map[string]any) bool {
+	items, _ := body["input"].([]any)
+	for _, item := range items {
+		m, _ := item.(map[string]any)
+		if m["type"] == "reasoning" {
+			return true
+		}
+	}
+	return false
+}
+
+func setupOpencodeHistoryProxy(t *testing.T, base, model, apiKey, toolName string) (*opencodeHistoryUpstream, string, string) {
+	t.Helper()
+	up := &opencodeHistoryUpstream{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := up.record(r)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		withTool := historyRequestHasOpaque(body)
+		if stream, _ := body["stream"].(bool); stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			if withTool {
+				_, _ = w.Write([]byte(opencodeHistorySSEBody(toolName)))
+			} else {
+				_, _ = w.Write([]byte(opencodeHistoryPlainSSEBody()))
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if withTool {
+			_, _ = w.Write([]byte(opencodeHistoryUnaryBody(toolName)))
+		} else {
+			_, _ = w.Write([]byte(opencodeHistoryPlainUnaryBody()))
+		}
+	}))
+	t.Cleanup(server.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Name: "opencode", BaseURL: base, APIKey: apiKey, Protocol: domain.ProtocolOpencode}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	combo := &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: prov.ID, UpstreamModel: model, Enabled: true},
+	}}
+	if err := st.CreateCombo(ctx, combo); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	px := New(st, nil)
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return net.Dial(network, strings.TrimPrefix(server.URL, "https://"))
+		},
+	}
+	px.client = &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	px.streamClient = &http.Client{Transport: tr}
+	mux := http.NewServeMux()
+	px.Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return up, ts.URL, key.Token
+}
+
+func postWithHeaders(t *testing.T, url, token, body string, h http.Header) (*http.Response, []byte) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	for k, vs := range h {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp, out
+}
+
+// assertPreparedEncryptedHistory checks the full decoded history on a prepared
+// upstream body: item order, reasoning ID/status/ciphertext, ordered summary
+// parts including an empty part, assistant text, function_call name and
+// arguments, function_call_output, and the trailing user turn.
+func assertPreparedEncryptedHistory(t *testing.T, out []byte, functionCallName string) {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(out, &fields); err != nil {
+		t.Fatal(err)
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(fields["input"], &items); err != nil {
+		t.Fatalf("prepared input: %v", err)
+	}
+	if len(items) != 5 {
+		t.Fatalf("history items = %d, want 5: %s", len(items), fields["input"])
+	}
+	assertRawString(t, "input[0].type", items[0]["type"], "reasoning")
+	assertRawString(t, "input[0].id", items[0]["id"], "rs_hist")
+	assertRawString(t, "input[0].status", items[0]["status"], "completed")
+	assertRawString(t, "input[0].encrypted_content", items[0]["encrypted_content"], "cipher-hist")
+	var summary []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(items[0]["summary"], &summary); err != nil {
+		t.Fatal(err)
+	}
+	if len(summary) != 3 || summary[0].Text != "part-one" || summary[1].Text != "" || summary[2].Text != "part-three" {
+		t.Fatalf("summary = %#v", summary)
+	}
+	assertRawString(t, "input[1].type", items[1]["type"], "message")
+	assertRawString(t, "input[1].role", items[1]["role"], "assistant")
+	if !bytes.Contains(items[1]["content"], []byte("assistant-answer")) {
+		t.Fatalf("assistant text lost: %s", items[1]["content"])
+	}
+	assertRawString(t, "input[2].type", items[2]["type"], "function_call")
+	assertRawString(t, "input[2].call_id", items[2]["call_id"], "call_1")
+	assertRawString(t, "input[2].name", items[2]["name"], functionCallName)
+	var args string
+	if err := json.Unmarshal(items[2]["arguments"], &args); err != nil {
+		t.Fatal(err)
+	}
+	if args != `{"path":"/tmp/x","limit":9007199254740993}` {
+		t.Fatalf("function_call arguments = %q", args)
+	}
+	assertRawString(t, "input[3].type", items[3]["type"], "function_call_output")
+	assertRawString(t, "input[3].call_id", items[3]["call_id"], "call_1")
+	assertRawString(t, "input[3].output", items[3]["output"], "tool-output-value")
+	assertRawString(t, "input[4].type", items[4]["type"], "message")
+	assertRawString(t, "input[4].role", items[4]["role"], "user")
+	if !bytes.Contains(items[4]["content"], []byte("final-user")) {
+		t.Fatalf("final user text lost: %s", items[4]["content"])
+	}
+}
+
+// assertPreparedToolLargeInteger finds the caller tool by name and checks that
+// its nested object and both large integer literals survive preparation exactly.
+// It decodes with UseNumber so a float conversion would be caught as a changed
+// json.Number, independent of JSON key order.
+func assertPreparedToolLargeInteger(t *testing.T, raw []byte, toolName string) {
+	t.Helper()
+	var root struct {
+		Tools []map[string]json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range root.Tools {
+		var name string
+		if err := json.Unmarshal(tool["name"], &name); err != nil || name != toolName {
+			continue
+		}
+		dec := json.NewDecoder(bytes.NewReader(tool["parameters"]))
+		dec.UseNumber()
+		var params map[string]any
+		if err := dec.Decode(&params); err != nil {
+			t.Fatal(err)
+		}
+		props, _ := params["properties"].(map[string]any)
+		limit, _ := props["limit"].(map[string]any)
+		if n, ok := limit["default"].(json.Number); !ok || n.String() != "9007199254740993" {
+			t.Fatalf("limit.default = %#v, want json.Number 9007199254740993", limit["default"])
+		}
+		nested, _ := props["nested"].(map[string]any)
+		nestedProps, _ := nested["properties"].(map[string]any)
+		deep, _ := nestedProps["deep"].(map[string]any)
+		if n, ok := deep["const"].(json.Number); !ok || n.String() != "9007199254740993" {
+			t.Fatalf("nested deep const = %#v, want json.Number 9007199254740993", deep["const"])
+		}
+		return
+	}
+	t.Fatalf("prepared tool %q not found", toolName)
+}
+
+func assertHistoryReasoningItem(t *testing.T, path string, item map[string]json.RawMessage) {
+	t.Helper()
+	assertRawString(t, path+".type", item["type"], "reasoning")
+	assertRawString(t, path+".id", item["id"], "rs_resp")
+	assertRawString(t, path+".status", item["status"], "completed")
+	assertRawString(t, path+".encrypted_content", item["encrypted_content"], "cipher-resp")
+	var summary []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(item["summary"], &summary); err != nil {
+		t.Fatal(err)
+	}
+	if len(summary) != 3 || summary[0].Type != "summary_text" || summary[0].Text != "resp-part-one" || summary[1].Text != "" || summary[2].Text != "resp-part-three" {
+		t.Fatalf("%s.summary = %#v", path, summary)
+	}
+}
+
+// opencodeHistoryOutput returns the terminal output array from a unary client
+// response or from a stream's response.completed event.
+func opencodeHistoryOutput(t *testing.T, stream bool, body []byte) json.RawMessage {
+	t.Helper()
+	if !stream {
+		var obj struct {
+			Output json.RawMessage `json:"output"`
+		}
+		if err := json.Unmarshal(body, &obj); err != nil {
+			t.Fatalf("unary response: %v (%s)", err, body)
+		}
+		if len(obj.Output) == 0 {
+			t.Fatalf("unary response lost output: %s", body)
+		}
+		return obj.Output
+	}
+	reader := sse.NewReader(bytes.NewReader(body))
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var frame struct {
+			Type     string `json:"type"`
+			Response struct {
+				Output json.RawMessage `json:"output"`
+			} `json:"response"`
+		}
+		if json.Unmarshal(ev.Data, &frame) != nil {
+			continue
+		}
+		if frame.Type == "response.completed" && len(frame.Response.Output) > 0 {
+			return frame.Response.Output
+		}
+	}
+	t.Fatalf("stream lost response.completed output: %s", body)
+	return nil
+}
+
+// opencodeHistoryItemDoneItems collects the items from every
+// response.output_item.done frame in order.
+func opencodeHistoryItemDoneItems(t *testing.T, body []byte) []map[string]json.RawMessage {
+	t.Helper()
+	var items []map[string]json.RawMessage
+	reader := sse.NewReader(bytes.NewReader(body))
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var frame struct {
+			Type string          `json:"type"`
+			Item json.RawMessage `json:"item"`
+		}
+		if json.Unmarshal(ev.Data, &frame) != nil {
+			continue
+		}
+		if frame.Type != "response.output_item.done" {
+			continue
+		}
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(frame.Item, &item); err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+// opencodeHistoryReplayBody feeds the assistant output items from the first
+// response back as the next request input, then adds the tool result and a
+// follow-up user turn. It carries the same tool declaration and explicit
+// include/cache intent so the replay is a realistic continuation.
+func opencodeHistoryReplayBody(t *testing.T, stream bool, output json.RawMessage) string {
+	t.Helper()
+	var items []json.RawMessage
+	if err := json.Unmarshal(output, &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) < 3 {
+		t.Fatalf("first response output items = %d, want at least 3", len(items))
+	}
+	input := make([]json.RawMessage, 0, len(items)+2)
+	input = append(input, items...)
+	input = append(input,
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_resp","output":"tool-out"}`),
+		json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}`),
+	)
+	body := map[string]any{
+		"model":            "default",
+		"stream":           stream,
+		"input":            input,
+		"store":            false,
+		"include":          []string{"reasoning.encrypted_content"},
+		"prompt_cache_key": "replay-key",
+		"tools":            []map[string]any{{"type": "function", "name": "Read", "parameters": map[string]any{"type": "object", "properties": map[string]any{}}}},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// TestOpencodeTierEncryptedHistoryHTTPLifecycle drives the real ingress HTTP
+// path for the paid Zen, free Zen muse, and Go muse Responses rows and both
+// client stream flags. It sends an encrypted-history first turn, checks the
+// upstream wire body and the client response (unary or SSE, including the
+// output_item.done frame and final response.completed state), replays the
+// returned opaque output as the next turn to the same selected provider and
+// checks continuity is forwarded, then sends a plain turn through the same
+// Proxy and checks nothing was inherited.
+func TestOpencodeTierEncryptedHistoryHTTPLifecycle(t *testing.T) {
+	const headerSession = "ses_0123456789abABCDEFGHIJKLMN"
+	cases := []struct {
+		name     string
+		base     string
+		model    string
+		apiKey   string
+		toolName string
+		free     bool
+		prefix   string
+	}{
+		{"zen paid responses", opencode.ZenBaseURL, "gpt-5.6-luna", "sk-zen", "Read", false, "/inference/v1"},
+		{"zen free muse responses", opencode.ZenBaseURL, "muse-spark-1.3-contributor-free", opencode.PublicKey, "read", true, "/inference/v1"},
+		{"go paid muse responses", opencode.GoBaseURL, "muse-spark-1.2-contributor", "sk-go", "Read", false, "/zen/go/v1"},
+	}
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				up, clientBase, token := setupOpencodeHistoryProxy(t, tc.base, tc.model, tc.apiKey, tc.toolName)
+				h := http.Header{}
+				h.Set("x-opencode-session", headerSession)
+				resp, out := postWithHeaders(t, clientBase+"/v1/responses", token, opencodeEncryptedHistoryBody(stream), h)
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("first status=%d body=%s", resp.StatusCode, out)
+				}
+
+				// 1. The upstream received the complete supported history.
+				raw1, body1 := up.last()
+				if body1["model"] != tc.model {
+					t.Fatalf("upstream model = %#v, want %q", body1["model"], tc.model)
+				}
+				wantStream := stream || tc.free
+				if body1["stream"] != wantStream {
+					t.Fatalf("upstream stream = %#v, want %v", body1["stream"], wantStream)
+				}
+				if !bytes.Contains(raw1, []byte("9007199254740993")) {
+					t.Fatalf("upstream schema lost the large integer: %s", raw1)
+				}
+				assertPreparedToolLargeInteger(t, raw1, tc.toolName)
+				if store, ok := body1["store"].(bool); !ok || store {
+					t.Fatalf("upstream store = %#v, want explicit false", body1["store"])
+				}
+				if !reflect.DeepEqual(body1["include"], []any{"reasoning.encrypted_content", "custom.include"}) {
+					t.Fatalf("upstream include = %#v", body1["include"])
+				}
+				if body1["prompt_cache_key"] != "caller-cache-key" {
+					t.Fatalf("upstream cache key = %#v", body1["prompt_cache_key"])
+				}
+				assertPreparedEncryptedHistory(t, raw1, tc.toolName)
+				if tc.free {
+					if !bytes.Contains(raw1, []byte(`"name":"read"`)) {
+						t.Fatalf("free upstream did not canonicalize the caller tool: %s", raw1)
+					}
+				} else if !bytes.Contains(raw1, []byte(`"name":"Read"`)) {
+					t.Fatalf("paid upstream changed the caller tool: %s", raw1)
+				}
+				if up.hosts[0] != "opencode.ai" || up.paths[0] != tc.prefix+"/responses" {
+					t.Fatalf("upstream destination = %s%s", up.hosts[0], up.paths[0])
+				}
+				if up.sessions[0] != headerSession {
+					t.Fatalf("upstream session = %q, want %q", up.sessions[0], headerSession)
+				}
+				if up.auths[0] != "Bearer "+tc.apiKey {
+					t.Fatalf("upstream auth = %q", up.auths[0])
+				}
+
+				// 2. The client response carries the opaque reasoning item, readable
+				// summaries, text, and the restored function call.
+				output := opencodeHistoryOutput(t, stream, out)
+				var outputItems []map[string]json.RawMessage
+				if err := json.Unmarshal(output, &outputItems); err != nil {
+					t.Fatal(err)
+				}
+				if len(outputItems) != 3 {
+					t.Fatalf("client output items = %d, want reasoning, message, function_call: %s", len(outputItems), output)
+				}
+				assertHistoryReasoningItem(t, "output[0]", outputItems[0])
+				if outputItems[1]["type"] == nil || !bytes.Contains(outputItems[1]["content"], []byte("resp-ok")) {
+					t.Fatalf("client text lost: %s", outputItems[1])
+				}
+				assertRawString(t, "output[2].type", outputItems[2]["type"], "function_call")
+				assertRawString(t, "output[2].call_id", outputItems[2]["call_id"], "call_resp")
+				assertRawString(t, "output[2].name", outputItems[2]["name"], "Read")
+				if stream {
+					dones := opencodeHistoryItemDoneItems(t, out)
+					var doneReasoning map[string]json.RawMessage
+					for _, item := range dones {
+						if string(item["type"]) == `"reasoning"` {
+							doneReasoning = item
+						}
+					}
+					if doneReasoning == nil {
+						t.Fatalf("stream emitted no reasoning output_item.done: %s", out)
+					}
+					assertHistoryReasoningItem(t, "item.done[reasoning]", doneReasoning)
+				}
+
+				// 3. Replay the returned opaque state to the same provider/model and
+				// assert the continuity bytes are forwarded.
+				replay := opencodeHistoryReplayBody(t, stream, output)
+				resp2, out2 := postWithHeaders(t, clientBase+"/v1/responses", token, replay, nil)
+				if resp2.StatusCode != http.StatusOK {
+					t.Fatalf("replay status=%d body=%s", resp2.StatusCode, out2)
+				}
+				raw2, body2 := up.last()
+				if !bytes.Contains(raw2, []byte(`"encrypted_content":"cipher-resp"`)) || !bytes.Contains(raw2, []byte(`"id":"rs_resp"`)) {
+					t.Fatalf("replay did not forward continuity state: %s", raw2)
+				}
+				if bytes.Contains(raw2, []byte("cipher-hist")) {
+					t.Fatalf("replay retained the previous turn's ciphertext: %s", raw2)
+				}
+				if !bytes.Contains(raw2, []byte("resp-part-one")) || !bytes.Contains(raw2, []byte("resp-part-three")) {
+					t.Fatalf("replay lost summary boundaries: %s", raw2)
+				}
+				if body2["prompt_cache_key"] != "replay-key" {
+					t.Fatalf("replay key = %#v", body2["prompt_cache_key"])
+				}
+				if stream2, _ := body2["stream"].(bool); stream2 != wantStream {
+					t.Fatalf("replay upstream stream = %#v, want %v", body2["stream"], wantStream)
+				}
+
+				// 4. A plain request through the same Proxy must inherit nothing.
+				plain := fmt.Sprintf(`{"model":"default","stream":%t,"input":"plain-hi"}`, stream)
+				resp3, out3 := postWithHeaders(t, clientBase+"/v1/responses", token, plain, nil)
+				if resp3.StatusCode != http.StatusOK {
+					t.Fatalf("plain status=%d body=%s", resp3.StatusCode, out3)
+				}
+				raw3, body3 := up.last()
+				for _, leaked := range []string{"cipher-hist", "cipher-resp", "rs_hist", "rs_resp", "caller-cache-key", "custom.include", "assistant-answer", "final-user", "resp-ok"} {
+					if bytes.Contains(raw3, []byte(leaked)) {
+						t.Fatalf("plain request inherited %q: %s", leaked, raw3)
+					}
+				}
+				for _, key := range []string{"store", "include", "prompt_cache_key"} {
+					if _, ok := body3[key]; ok {
+						t.Fatalf("plain request inherited option %q: %s", key, raw3)
+					}
+				}
+				var plainItems []map[string]json.RawMessage
+				var plainFields map[string]json.RawMessage
+				if err := json.Unmarshal(raw3, &plainFields); err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(plainFields["input"], &plainItems); err != nil {
+					t.Fatal(err)
+				}
+				if len(plainItems) != 1 || !bytes.Contains(plainItems[0]["content"], []byte("plain-hi")) {
+					t.Fatalf("plain input not isolated: %s", plainFields["input"])
+				}
+				if up.count() != 3 {
+					t.Fatalf("upstream hits = %d, want 3", up.count())
+				}
+			})
 		}
 	}
 }

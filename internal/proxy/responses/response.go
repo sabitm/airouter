@@ -94,13 +94,41 @@ type respUsage struct {
 }
 
 type respOutputItem struct {
-	ID        string              `json:"id"`
-	Type      string              `json:"type"` // message | reasoning | function_call
-	Content   []respOutputContent `json:"content"`
-	Summary   []reasoningSummary  `json:"summary"`
-	CallID    string              `json:"call_id"`
-	Name      string              `json:"name"`
-	Arguments string              `json:"arguments"`
+	ID         string              `json:"id"`
+	Type       string              `json:"type"` // message | reasoning | function_call
+	Content    []respOutputContent `json:"content"`
+	Summary    []reasoningSummary  `json:"summary"`
+	SummarySet bool                `json:"-"`
+	CallID     string              `json:"call_id"`
+	Name       string              `json:"name"`
+	Arguments  string              `json:"arguments"`
+	// EncryptedContent is provider-owned opaque state. A missing or null field
+	// and an explicit empty string stay distinct through the pointer.
+	EncryptedContent *string `json:"encrypted_content"`
+	Status           string  `json:"status"`
+}
+
+// UnmarshalJSON records whether the summary array was present and non-null so a
+// complete terminal item can tell an absent placeholder from an explicit array.
+// Content presence is read directly: an explicit empty array decodes non-nil
+// while an absent or null field stays nil.
+func (it *respOutputItem) UnmarshalJSON(data []byte) error {
+	type plain respOutputItem
+	var raw struct {
+		plain
+		Summary json.RawMessage `json:"summary"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*it = respOutputItem(raw.plain)
+	it.SummarySet = !isNullish(raw.Summary)
+	if it.SummarySet {
+		if err := json.Unmarshal(raw.Summary, &it.Summary); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type respOutputContent struct {
@@ -127,11 +155,9 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 	for _, it := range resp.Output {
 		switch it.Type {
 		case "reasoning":
-			for _, summary := range it.Summary {
-				if summary.Text != "" {
-					out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockReasoning, Text: summary.Text})
-				}
-			}
+			// One structured block per item, in output order, even when the
+			// readable projection is empty. Encrypted bytes stay in the envelope.
+			out.Content = append(out.Content, reasoningBlock(it.ID, reasoningSummaryParts(it.Summary), it.EncryptedContent, it.Status))
 		case "message":
 			var text strings.Builder
 			for _, c := range it.Content {
@@ -221,28 +247,19 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// buildOutput groups text blocks into a single assistant message item and emits
-// each tool_use block as a function_call item, preserving order.
+// buildOutput renders IR content blocks as Responses output items. Relative
+// block order is preserved: consecutive text blocks form one message item, and
+// a reasoning or function_call block flushes the pending message first. Exactly
+// one reasoning item is emitted per structured reasoning block; readable
+// summaries come only from Summary (or the legacy Text field), never from
+// opaque provider state.
 func buildOutput(blocks []ir.ContentBlock) []map[string]any {
 	var output []map[string]any
-	for _, b := range blocks {
-		if b.Type == ir.BlockReasoning && b.Text != "" {
-			// Readable summary only. Do not copy Anthropic signatures into
-			// encrypted_content or invent a signature for unsigned reasoning.
-			output = append(output, map[string]any{
-				"type": "reasoning", "id": ir.NewID("rs_"),
-				"summary": []any{map[string]any{"type": "summary_text", "text": b.Text}},
-			})
-		}
-		// BlockRedactedReasoning is omitted. Its data is not summary text.
-	}
 	var textParts []map[string]any
-	for _, b := range blocks {
-		if b.Type == ir.BlockText {
-			textParts = append(textParts, map[string]any{"type": "output_text", "text": b.Text, "annotations": []any{}})
+	flushText := func() {
+		if len(textParts) == 0 {
+			return
 		}
-	}
-	if len(textParts) > 0 {
 		output = append(output, map[string]any{
 			"type":    "message",
 			"id":      ir.NewID("msg_"),
@@ -250,9 +267,26 @@ func buildOutput(blocks []ir.ContentBlock) []map[string]any {
 			"role":    "assistant",
 			"content": textParts,
 		})
+		textParts = nil
 	}
 	for _, b := range blocks {
-		if b.Type == ir.BlockToolUse {
+		switch b.Type {
+		case ir.BlockReasoning:
+			if b.ResponsesReasoning != nil {
+				flushText()
+				output = append(output, reasoningOutputItem(b.ResponsesReasoning, b.Text, true))
+				continue
+			}
+			if b.Text != "" {
+				// Readable summary only. Do not copy Anthropic signatures into
+				// encrypted_content or invent a signature for unsigned reasoning.
+				flushText()
+				output = append(output, reasoningOutputItem(nil, b.Text, true))
+			}
+		case ir.BlockText:
+			textParts = append(textParts, map[string]any{"type": "output_text", "text": b.Text, "annotations": []any{}})
+		case ir.BlockToolUse:
+			flushText()
 			args := string(b.ToolInput)
 			if args == "" {
 				args = "{}"
@@ -266,6 +300,8 @@ func buildOutput(blocks []ir.ContentBlock) []map[string]any {
 				"arguments": args,
 			})
 		}
+		// BlockRedactedReasoning is omitted. Its data is not summary text.
 	}
+	flushText()
 	return output
 }

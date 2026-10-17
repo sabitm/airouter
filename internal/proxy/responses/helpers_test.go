@@ -452,8 +452,8 @@ func TestSyncCodexReasoningInclude(t *testing.T) {
 func TestToolResultBlocks(t *testing.T) {
 	png := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
 	cases := []struct {
-		name string
-		raw  json.RawMessage
+		name  string
+		raw   json.RawMessage
 		check func(*testing.T, []ir.ContentBlock)
 	}{
 		{

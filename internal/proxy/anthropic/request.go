@@ -338,6 +338,12 @@ func encodeBlocksHints(blocks []ir.ContentBlock, hints bool) []anthBlock {
 	for _, b := range blocks {
 		switch b.Type {
 		case ir.BlockReasoning:
+			// An opaque-only Responses item has no readable summary. Do not turn
+			// it into an empty thinking block; a real Anthropic signature-only
+			// block still emits.
+			if b.ResponsesReasoning != nil && b.Text == "" && b.AnthropicSignature == "" {
+				continue
+			}
 			out = append(out, anthBlock{Type: "thinking", Thinking: thinkingPtr(b.Text), Signature: b.AnthropicSignature})
 		case ir.BlockRedactedReasoning:
 			out = append(out, anthBlock{Type: "redacted_thinking", Data: b.RedactedData})

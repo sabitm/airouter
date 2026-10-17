@@ -362,10 +362,10 @@ func TestCollectStreamResponseLimits(t *testing.T) {
 	}
 
 	t.Run("text at limit", func(t *testing.T) {
-		const limit = int64(128)
 		fallback := "m"
 		base := len(ir.NewID("resp_")) + len(fallback)
-		text := strings.Repeat("x", int(limit)-base)
+		text := strings.Repeat("x", 16)
+		limit := int64(base) + collectedBlockOverhead + int64(len(text))
 		resp, err := collectStreamResponseWithLimits(strings.NewReader(""), stream([]ir.StreamEvent{
 			{Kind: ir.EventTextDelta, Text: text},
 			{Kind: ir.EventFinish, StopReason: ir.StopEndTurn},

@@ -41,7 +41,11 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		out.Tools = append(out.Tools, ir.Tool{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
 	}
 	out.ToolChoice = decodeToolChoice(req.ToolChoice)
-	out.Messages = decodeInput(req.Input, &out.System)
+	msgs, err := decodeInput(req.Input, &out.System)
+	if err != nil {
+		return nil, err
+	}
+	out.Messages = msgs
 	if req.Reasoning != nil {
 		out.Thinking = thinking.ToIR(thinking.FromOpenAIEffort(req.Reasoning.Effort))
 	}
@@ -49,21 +53,24 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 }
 
 // decodeInput converts the Responses `input` (string or item array) to IR
-// messages. system/developer message items are folded into systemOut.
-func decodeInput(raw json.RawMessage, systemOut *string) []ir.Message {
+// messages. system/developer message items are folded into systemOut. Supported
+// reasoning fields are decoded strictly so malformed opaque state fails the
+// request instead of being dropped; every other item kind keeps its legacy
+// leniency.
+func decodeInput(raw json.RawMessage, systemOut *string) ([]ir.Message, error) {
 	if len(raw) == 0 {
-		return nil
+		return nil, nil
 	}
 	if raw[0] == '"' {
 		var s string
 		if json.Unmarshal(raw, &s) == nil && s != "" {
-			return []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: s}}}}
+			return []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: s}}}}, nil
 		}
-		return nil
+		return nil, nil
 	}
-	var items []inputItem
-	if json.Unmarshal(raw, &items) != nil {
-		return nil
+	var raws []json.RawMessage
+	if json.Unmarshal(raw, &raws) != nil {
+		return nil, nil
 	}
 
 	var msgs []ir.Message
@@ -79,14 +86,30 @@ func decodeInput(raw json.RawMessage, systemOut *string) []ir.Message {
 		msgs = append(msgs, ir.Message{Role: role, Content: []ir.ContentBlock{b}})
 	}
 
-	for _, it := range items {
-		switch it.Type {
-		case "reasoning":
-			for _, summary := range it.Summary {
-				if summary.Text != "" {
-					appendBlock(ir.RoleAssistant, ir.ContentBlock{Type: ir.BlockReasoning, Text: summary.Text})
-				}
+	for _, rawItem := range raws {
+		// A non-object or unclassifiable sibling preserves the legacy leniency of
+		// skipping that element. It must not discard reasoning state that was
+		// already decoded, and it must not hide a malformed reasoning item: those
+		// are decoded strictly below and return a payload-free error.
+		var head struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(rawItem, &head) != nil {
+			continue
+		}
+		if head.Type == "reasoning" {
+			block, err := decodeReasoningInputItem(rawItem)
+			if err != nil {
+				return nil, err
 			}
+			appendBlock(ir.RoleAssistant, block)
+			continue
+		}
+		var it inputItem
+		if json.Unmarshal(rawItem, &it) != nil {
+			continue
+		}
+		switch it.Type {
 		case "", "message":
 			if it.Role == "system" || it.Role == "developer" {
 				if s := contentToText(it.Content); s != "" {
@@ -119,7 +142,7 @@ func decodeInput(raw json.RawMessage, systemOut *string) []ir.Message {
 			})
 		}
 	}
-	return msgs
+	return msgs, nil
 }
 
 func decodeParts(raw json.RawMessage) []ir.ContentBlock {
@@ -278,26 +301,35 @@ func encodeInput(req *ir.Request) []map[string]any {
 	var items []map[string]any
 	for _, m := range req.Messages {
 		if m.Role == ir.RoleAssistant {
-			for _, b := range m.Content {
-				if b.Type == ir.BlockReasoning && b.Text != "" {
-					// Readable summary only. Anthropic signatures are not Responses
-					// encrypted_content, and redacted data is not emitted as text.
-					items = append(items, map[string]any{
-						"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": b.Text}},
-					})
+			// Consecutive assistant text blocks stay one message item. A
+			// reasoning or function_call block flushes the text first so the
+			// emitted items keep the IR content order.
+			var textParts []map[string]any
+			flushText := func() {
+				if len(textParts) == 0 {
+					return
 				}
-			}
-			var parts []map[string]any
-			for _, b := range m.Content {
-				if b.Type == ir.BlockText {
-					parts = append(parts, map[string]any{"type": "output_text", "text": b.Text, "annotations": []any{}})
-				}
-			}
-			if len(parts) > 0 {
-				items = append(items, map[string]any{"type": "message", "role": "assistant", "content": parts})
+				items = append(items, map[string]any{"type": "message", "role": "assistant", "content": textParts})
+				textParts = nil
 			}
 			for _, b := range m.Content {
-				if b.Type == ir.BlockToolUse {
+				switch b.Type {
+				case ir.BlockReasoning:
+					if b.ResponsesReasoning != nil {
+						flushText()
+						items = append(items, reasoningOutputItem(b.ResponsesReasoning, b.Text, false))
+						continue
+					}
+					if b.Text != "" {
+						// Readable summary only. Anthropic signatures are not Responses
+						// encrypted_content, and redacted data is not emitted as text.
+						flushText()
+						items = append(items, reasoningOutputItem(nil, b.Text, false))
+					}
+				case ir.BlockText:
+					textParts = append(textParts, map[string]any{"type": "output_text", "text": b.Text, "annotations": []any{}})
+				case ir.BlockToolUse:
+					flushText()
 					args := string(b.ToolInput)
 					if args == "" {
 						args = "{}"
@@ -307,6 +339,7 @@ func encodeInput(req *ir.Request) []map[string]any {
 					})
 				}
 			}
+			flushText()
 			continue
 		}
 		// user role: tool results first, then the user's text/image parts.

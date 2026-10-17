@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -39,6 +40,12 @@ const (
 	// and builder cost billed to the byte budget before a block is allocated.
 	// Updates to an existing block never bill it again.
 	collectedBlockOverhead = 128
+	// maxCollectedStreamReasoning bounds structured Responses reasoning items.
+	// Summary parts share the same flat overhead and are counted per part.
+	maxCollectedStreamReasoning      = 1024
+	maxCollectedStreamReasoningParts = 1024
+	collectedReasoningPartOverhead   = 128
+	collectedReasoningKeyOverhead    = 32
 )
 
 var (
@@ -533,6 +540,21 @@ func hasOpencodeTarget(targets []domain.ComboTarget) bool {
 	return false
 }
 
+// ambiguousResponsesRoute returns a message when compatible targets span more
+// than one provider or upstream model. Duplicate identical destinations are
+// allowed; every distinct provider ID or model makes replay unsafe.
+func ambiguousResponsesRoute(targets []domain.ComboTarget) string {
+	seen := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		key := strconv.FormatInt(t.ProviderID, 10) + "\x00" + t.UpstreamModel
+		seen[key] = true
+		if len(seen) > 1 {
+			return responsesStateAmbiguous
+		}
+	}
+	return ""
+}
+
 // emptyCandidateMessage distinguishes a combo with no enabled targets from
 // a combo whose enabled targets were all filtered. The second form is a 400.
 // Attachment and thinking reasons stay distinct when both filters apply.
@@ -540,19 +562,20 @@ func emptyCandidateMessage(combo *domain.Combo, prep *attachmentPrep, filterReas
 	if len(activeComboTargets(combo)) == 0 {
 		return "", false
 	}
-	if prep != nil && prep.hasAttachments() && prep.needsThinkingPreservation() {
+	if prep == nil {
+		return "", false
+	}
+	if prep.needsThinkingPreservation() || prep.needsResponsesPreservation() {
 		if filterReason != "" {
 			return filterReason, true
 		}
-		return thinkingHistoryNoProvider, true
-	}
-	if prep != nil && prep.needsThinkingPreservation() {
-		if filterReason != "" {
-			return filterReason, true
+		if prep.needsThinkingPreservation() {
+			return thinkingHistoryNoProvider, true
 		}
-		return thinkingHistoryNoProvider, true
+		return responsesStateNoProvider, true
 	}
-	if prep != nil && prep.hasAttachments() {
+	// Attachment-only incompatibility keeps its dedicated message envelope.
+	if prep.hasAttachments() {
 		msg := "attachment not supported by upstream: no compatible provider in combo"
 		if filterReason != "" {
 			msg = "attachment not supported by upstream: " + filterReason
@@ -588,7 +611,8 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 	var firstFilterReason string
 	needAttach := prep != nil && prep.hasAttachments()
 	needThink := prep != nil && prep.needsThinkingPreservation()
-	if needAttach || needThink {
+	needResponses := prep != nil && prep.needsResponsesPreservation()
+	if needAttach || needThink || needResponses {
 		compatible = make([]domain.ComboTarget, 0, len(enabled))
 		for _, t := range enabled {
 			backend := openaiCodec
@@ -602,6 +626,12 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 				reason = prep.checkCompatible(backend, translated)
 			}
 			if reason == "" && needThink {
+				reason = prep.checkThinking(backend)
+				if reason != "" {
+					event = "thinking_target_skipped"
+				}
+			}
+			if reason == "" && needResponses {
 				reason = prep.checkThinking(backend)
 				if reason != "" {
 					event = "thinking_target_skipped"
@@ -633,6 +663,14 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 
 	if len(compatible) == 0 {
 		return nil, firstFilterReason
+	}
+	// Provider-owned Responses state must reach exactly one provider/model.
+	// The check runs before health ordering so an ambiguous request consumes no
+	// backoff skip credit and contacts no upstream.
+	if needResponses {
+		if msg := ambiguousResponsesRoute(compatible); msg != "" {
+			return nil, msg
+		}
 	}
 	if len(compatible) == 1 {
 		return compatible, ""
@@ -771,8 +809,11 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	}
 	res.inTok = resp.Usage.InputTokens
 	res.outTok = resp.Usage.OutputTokens
-	if !preservesAnthropicThinking(ingress.id) && responseDropsOpaque(resp.Content) {
-		noteOpaqueOmission(res, observability.Logger(ctx, p.logger), ingress.id)
+	if responseDropsOpaque(resp.Content) {
+		noteAnthropicOmission(res, observability.Logger(ctx, p.logger), ingress.id)
+	}
+	if responseDropsResponsesOpaque(resp.Content) {
+		noteResponsesOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
 	out, err := ingress.encodeResponse(resp)
 	if err != nil {
@@ -824,8 +865,11 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	if backend.protocol == domain.ProtocolCursor {
 		applyCursorUsage(req, irResp, len(upstreamBody))
 	}
-	if !preservesAnthropicThinking(ingress.id) && responseDropsOpaque(irResp.Content) {
-		noteOpaqueOmission(res, observability.Logger(ctx, p.logger), ingress.id)
+	if responseDropsOpaque(irResp.Content) {
+		noteAnthropicOmission(res, observability.Logger(ctx, p.logger), ingress.id)
+	}
+	if responseDropsResponsesOpaque(irResp.Content) {
+		noteResponsesOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
 	out, err := ingress.encodeResponse(irResp)
 	if err != nil {
@@ -919,50 +963,418 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		*dst = value
 		return nil
 	}
-	appendTo := func(dst *strings.Builder, value string) error {
-		if err := reserve(len(value)); err != nil {
+	// Content blocks are appended in arrival order so reasoning, text, and tool
+	// items keep the wire order. Auxiliary bookkeeping only locates a block; it
+	// never regroups the final slice. Text accumulates in a builder so a
+	// fragmented stream does not reseat a growing string on every fragment.
+	// Every text block charges its overhead before allocation and the block
+	// count is bounded independently of the byte budget.
+	textBlock := -1
+	var textBuf strings.Builder
+	flushText := func() {
+		if textBlock < 0 {
+			return
+		}
+		resp.Content[textBlock].Text = textBuf.String()
+		textBuf.Reset()
+		textBlock = -1
+	}
+	plainBlocks := 0
+	appendText := func(text string) error {
+		// Legacy empty text events never create a block.
+		if text == "" {
+			return nil
+		}
+		if err := reserve(len(text)); err != nil {
 			return err
 		}
-		dst.WriteString(value)
+		if textBlock < 0 {
+			if plainBlocks >= maxCollectedStreamBlocks {
+				return errCollectedStreamResponseTooLarge
+			}
+			if err := reserve(collectedBlockOverhead); err != nil {
+				return err
+			}
+			resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText})
+			textBlock = len(resp.Content) - 1
+			plainBlocks++
+		}
+		textBuf.WriteString(text)
 		return nil
 	}
-	var text, reasoning strings.Builder
 	// Indexed thinking and redacted blocks keep their arrival order so an
 	// Anthropic-compatible unary rendering can replay signatures exactly.
 	// Unsigned empty lifecycle frames never create a block.
 	type thinkBlock struct {
+		blockIdx  int
 		text      strings.Builder
 		signature strings.Builder
 	}
-	type extraBlock struct {
-		redacted bool
-		data     string
-		think    *thinkBlock
-	}
 	thinking := map[int]*thinkBlock{}
-	var extras []*extraBlock
+	extraBlocks := 0
 	extraFor := func(index int) (*thinkBlock, error) {
 		if b := thinking[index]; b != nil {
 			return b, nil
 		}
-		if len(extras) >= maxCollectedStreamBlocks {
+		if extraBlocks >= maxCollectedStreamBlocks {
 			return nil, errCollectedStreamResponseTooLarge
 		}
 		if err := reserve(collectedBlockOverhead); err != nil {
 			return nil, err
 		}
-		b := &thinkBlock{}
+		flushText()
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockReasoning})
+		b := &thinkBlock{blockIdx: len(resp.Content) - 1}
 		thinking[index] = b
-		extras = append(extras, &extraBlock{think: b})
+		extraBlocks++
 		return b, nil
 	}
+	// Structured Responses reasoning binds both the source item ID and the
+	// streamed output index so an index-only delta and an ID-bearing done
+	// snapshot land on one item. Unkeyed deltas accumulate into one open plain
+	// segment; the next unidentified done claims it, and further unidentified
+	// done snapshots become distinct items instead of collapsing into one.
+	type collectedReasoningPart struct {
+		typ  string
+		text strings.Builder
+	}
+	type collectedReasoning struct {
+		blockIdx int
+		id       string
+		hasID    bool
+		index    int
+		hasIndex bool
+		// text retains legacy unindexed readable bytes in arrival order. parts
+		// retains structured Responses summary bytes keyed by explicit summary
+		// index, so a valid gap stream projects in canonical part order instead
+		// of arrival order. legacyParts counts snapshot parts charged for a
+		// legacy item that never allocates a parts slice.
+		text        strings.Builder
+		parts       []*collectedReasoningPart
+		structured  bool
+		legacyParts int
+		seen        *ir.ResponsesReasoning
+		complete    bool
+	}
+	reasoningByID := map[string]*collectedReasoning{}
+	reasoningByIndex := map[int]*collectedReasoning{}
+	reasoningItems := make([]*collectedReasoning, 0, 8)
+	reasoningCount := 0
+	// reasoningPartsAlloc counts live per-index parts across every item, so the
+	// collector stops at the same global part cap the Responses decoder uses.
+	// The retained snapshot clone charges its own part overhead separately.
+	reasoningPartsAlloc := 0
+	var plainReasoning *collectedReasoning
+	newReasoning := func() (*collectedReasoning, error) {
+		if reasoningCount >= maxCollectedStreamReasoning {
+			return nil, errCollectedStreamResponseTooLarge
+		}
+		if err := reserve(collectedBlockOverhead); err != nil {
+			return nil, err
+		}
+		flushText()
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockReasoning})
+		reasoningCount++
+		item := &collectedReasoning{blockIdx: len(resp.Content) - 1}
+		reasoningItems = append(reasoningItems, item)
+		return item, nil
+	}
+	bindReasoning := func(item *collectedReasoning, ev ir.StreamEvent) error {
+		if ev.ReasoningID != "" {
+			if item.hasID && item.id != ev.ReasoningID {
+				return ir.ProtocolError("conflicting reasoning item identity")
+			}
+			if other := reasoningByID[ev.ReasoningID]; other != nil && other != item {
+				return ir.ProtocolError("conflicting reasoning item identity")
+			}
+		}
+		if ev.ReasoningIndexSet {
+			if item.hasIndex && item.index != ev.ReasoningIndex {
+				return ir.ProtocolError("conflicting reasoning index")
+			}
+			if other := reasoningByIndex[ev.ReasoningIndex]; other != nil && other != item {
+				return ir.ProtocolError("conflicting reasoning index")
+			}
+		}
+		if ev.ReasoningID != "" && !item.hasID {
+			if err := reserve(len(ev.ReasoningID) + collectedReasoningKeyOverhead); err != nil {
+				return err
+			}
+			item.hasID = true
+			item.id = ev.ReasoningID
+			reasoningByID[ev.ReasoningID] = item
+		}
+		if ev.ReasoningIndexSet && !item.hasIndex {
+			if err := reserve(collectedReasoningKeyOverhead); err != nil {
+				return err
+			}
+			item.hasIndex = true
+			item.index = ev.ReasoningIndex
+			reasoningByIndex[ev.ReasoningIndex] = item
+		}
+		return nil
+	}
+	reasoningFor := func(ev ir.StreamEvent) (*collectedReasoning, error) {
+		if ev.ReasoningID != "" {
+			if item := reasoningByID[ev.ReasoningID]; item != nil {
+				if err := bindReasoning(item, ev); err != nil {
+					return nil, err
+				}
+				return item, nil
+			}
+		}
+		if ev.ReasoningIndexSet {
+			if item := reasoningByIndex[ev.ReasoningIndex]; item != nil {
+				if err := bindReasoning(item, ev); err != nil {
+					return nil, err
+				}
+				return item, nil
+			}
+		}
+		item, err := newReasoning()
+		if err != nil {
+			return nil, err
+		}
+		if err := bindReasoning(item, ev); err != nil {
+			return nil, err
+		}
+		return item, nil
+	}
+	plainReasoningFor := func() (*collectedReasoning, error) {
+		// Reuse the open legacy segment only while it is the tail. Interleaved
+		// text must not merge non-adjacent reasoning segments into one block.
+		if plainReasoning != nil && !plainReasoning.complete && plainReasoning.blockIdx == len(resp.Content)-1 {
+			return plainReasoning, nil
+		}
+		item, err := newReasoning()
+		if err != nil {
+			return nil, err
+		}
+		plainReasoning = item
+		return item, nil
+	}
+	// addReasoningText retains legacy unindexed readable bytes in arrival order.
+	addReasoningText := func(item *collectedReasoning, text string) error {
+		if text == "" {
+			return nil
+		}
+		if err := reserve(len(text)); err != nil {
+			return err
+		}
+		item.text.WriteString(text)
+		return nil
+	}
+	// structuredPart returns the summary part at index, allocating bounded
+	// placeholders for skipped indices. The overhead is charged before the slice
+	// grows and each allocated part is charged exactly once.
+	structuredPart := func(item *collectedReasoning, index int) (*collectedReasoningPart, error) {
+		if index < 0 || index >= maxCollectedStreamReasoningParts {
+			return nil, ir.ProtocolError("reasoning summary index out of range")
+		}
+		for len(item.parts) <= index {
+			if reasoningPartsAlloc >= maxCollectedStreamReasoningParts {
+				return nil, errCollectedStreamResponseTooLarge
+			}
+			if err := reserve(collectedReasoningPartOverhead); err != nil {
+				return nil, err
+			}
+			item.parts = append(item.parts, &collectedReasoningPart{})
+			reasoningPartsAlloc++
+		}
+		item.structured = true
+		return item.parts[index], nil
+	}
+	addStructuredReasoningText := func(item *collectedReasoning, index int, text string) error {
+		if text == "" {
+			return nil
+		}
+		part, err := structuredPart(item, index)
+		if err != nil {
+			return err
+		}
+		if err := reserve(len(text)); err != nil {
+			return err
+		}
+		part.text.WriteString(text)
+		return nil
+	}
+	// applyLegacyReasoningDone keeps the arrival-order prefix rule for an
+	// unindexed snapshot; the snapshot projection is already in part order.
+	applyLegacyReasoningDone := func(item *collectedReasoning, rr *ir.ResponsesReasoning) error {
+		if rr == nil {
+			return nil
+		}
+		if len(rr.Summary) > maxCollectedStreamReasoningParts {
+			return errCollectedStreamResponseTooLarge
+		}
+		want := rr.ReadableText()
+		retained := item.text.String()
+		switch {
+		case retained == want:
+		case strings.HasPrefix(want, retained):
+			if err := addReasoningText(item, want[len(retained):]); err != nil {
+				return err
+			}
+		default:
+			return ir.ProtocolError("conflicting reasoning summary")
+		}
+		if item.seen != nil && item.seen.Equal(rr) {
+			return nil
+		}
+		if len(rr.Summary) > item.legacyParts {
+			if err := reserve((len(rr.Summary) - item.legacyParts) * collectedReasoningPartOverhead); err != nil {
+				return err
+			}
+			item.legacyParts = len(rr.Summary)
+		}
+		if err := reserve(reasoningMetadataBytes(rr) - reasoningMetadataBytes(item.seen)); err != nil {
+			return err
+		}
+		// One charged clone is shared by the dedup check and the returned block.
+		// Keeping two copies would retain uncharged duplicate bytes.
+		item.seen = rr.Clone()
+		resp.Content[item.blockIdx].ResponsesReasoning = item.seen
+		item.complete = true
+		return nil
+	}
+	// applyStructuredReasoningDone reconciles a complete snapshot with the
+	// per-index parts retained from deltas. Every streamed part must be a prefix
+	// of the snapshot part at the same index, so a shrink or changed text fails.
+	// The canonical ordered snapshot replaces the collected parts for encoding.
+	applyStructuredReasoningDone := func(item *collectedReasoning, rr *ir.ResponsesReasoning) error {
+		if rr == nil {
+			return nil
+		}
+		if len(rr.Summary) > maxCollectedStreamReasoningParts {
+			return errCollectedStreamResponseTooLarge
+		}
+		if len(item.parts) > len(rr.Summary) {
+			return ir.ProtocolError("conflicting reasoning summary")
+		}
+		// An accepted snapshot may only grow. A later snapshot that shortens the
+		// canonical summary or rewrites an accepted part is a conflict even when
+		// no delta ever allocated that part.
+		if item.seen != nil {
+			if len(rr.Summary) < len(item.seen.Summary) {
+				return ir.ProtocolError("conflicting reasoning summary")
+			}
+			for i, prev := range item.seen.Summary {
+				snap := rr.Summary[i]
+				if prev.Type != "" && snap.Type != "" && prev.Type != snap.Type {
+					return ir.ProtocolError("conflicting reasoning summary")
+				}
+				if !strings.HasPrefix(snap.Text, prev.Text) {
+					return ir.ProtocolError("conflicting reasoning summary")
+				}
+			}
+		}
+		for i, part := range item.parts {
+			if part == nil {
+				continue
+			}
+			snap := rr.Summary[i]
+			// part.typ aliases the snapshot Type backing and is charged once as
+			// part of the retained clone below; it is not a second allocation.
+			if part.typ == "" {
+				part.typ = snap.Type
+			} else if snap.Type != "" && part.typ != snap.Type {
+				return ir.ProtocolError("conflicting reasoning summary")
+			}
+			if part.text.Len() == 0 {
+				continue
+			}
+			retained := part.text.String()
+			switch {
+			case retained == snap.Text:
+			case strings.HasPrefix(snap.Text, retained):
+				suffix := snap.Text[len(retained):]
+				if err := reserve(len(suffix)); err != nil {
+					return err
+				}
+				part.text.WriteString(suffix)
+			default:
+				return ir.ProtocolError("conflicting reasoning summary")
+			}
+		}
+		if item.seen != nil && item.seen.Equal(rr) {
+			return nil
+		}
+		// The retained clone is a distinct allocation from the live per-index
+		// parts: charge one slice slot and part struct for every summary part
+		// before cloning, so a final-only flood of empty parts cannot bypass the
+		// budget.
+		if err := reserve(reasoningSnapshotBytes(rr) - reasoningSnapshotBytes(item.seen)); err != nil {
+			return err
+		}
+		item.seen = rr.Clone()
+		resp.Content[item.blockIdx].ResponsesReasoning = item.seen
+		item.structured = true
+		item.complete = true
+		return nil
+	}
+	// reasoningProjectionLen is the readable byte count of the projection that
+	// will be retained on the block. It sums existing string lengths and does
+	// not build the copy. Opaque metadata is excluded.
+	reasoningProjectionLen := func(item *collectedReasoning) int {
+		if item.seen != nil {
+			n := 0
+			for _, part := range item.seen.Summary {
+				n += len(part.Text)
+			}
+			return n
+		}
+		if !item.structured {
+			return item.text.Len()
+		}
+		n := 0
+		for _, part := range item.parts {
+			if part == nil {
+				continue
+			}
+			n += part.text.Len()
+		}
+		return n
+	}
+	// collectedReasoningText returns one new charged readable projection. A
+	// complete snapshot is canonical. Structured parts join in summary-index
+	// order. Legacy bytes stay in arrival order. The caller reserves n before
+	// this builds the copy. Snapshot strings and live part strings stay charged
+	// independently and are not aliased by the returned string.
+	collectedReasoningText := func(item *collectedReasoning, n int) string {
+		if n == 0 {
+			return ""
+		}
+		if item.seen != nil {
+			var b strings.Builder
+			b.Grow(n)
+			for _, part := range item.seen.Summary {
+				b.WriteString(part.Text)
+			}
+			return b.String()
+		}
+		if !item.structured {
+			var b strings.Builder
+			b.Grow(n)
+			b.WriteString(item.text.String())
+			return b.String()
+		}
+		var b strings.Builder
+		b.Grow(n)
+		for _, part := range item.parts {
+			if part == nil {
+				continue
+			}
+			b.WriteString(part.text.String())
+		}
+		return b.String()
+	}
 	type toolBuf struct {
-		id   string
-		name string
-		args strings.Builder
+		blockIdx int
+		id       string
+		name     string
+		args     strings.Builder
 	}
 	tools := map[int]*toolBuf{}
-	var order []int
 	newTool := func(index int) (*toolBuf, error) {
 		if tb := tools[index]; tb != nil {
 			return tb, nil
@@ -970,9 +1382,10 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		if len(tools) >= maxTools {
 			return nil, errCollectedStreamTooManyTools
 		}
-		tb := &toolBuf{}
+		flushText()
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockToolUse})
+		tb := &toolBuf{blockIdx: len(resp.Content) - 1}
 		tools[index] = tb
-		order = append(order, index)
 		return tb, nil
 	}
 	sawEvent := false
@@ -1009,24 +1422,62 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			}
 			applyCollectedUsage(&resp.Usage, ev)
 		case ir.EventTextDelta:
-			if err := appendTo(&text, ev.Text); err != nil {
+			if err := appendText(ev.Text); err != nil {
 				return err
 			}
 		case ir.EventReasoningDelta:
-			if !ev.Indexed {
-				if err := appendTo(&reasoning, ev.Text); err != nil {
+			if ev.Indexed {
+				if ev.Text == "" {
+					break
+				}
+				b, err := extraFor(ev.Index)
+				if err != nil {
+					return err
+				}
+				if err := reserve(len(ev.Text)); err != nil {
+					return err
+				}
+				b.text.WriteString(ev.Text)
+				break
+			}
+			if ev.ReasoningID != "" || ev.ReasoningIndexSet {
+				item, err := reasoningFor(ev)
+				if err != nil {
+					return err
+				}
+				if err := addStructuredReasoningText(item, ev.SummaryIndex, ev.Text); err != nil {
 					return err
 				}
 				break
 			}
+			// Legacy unindexed deltas keep the old empty-event behavior: an
+			// empty fragment does not create a block.
 			if ev.Text == "" {
 				break
 			}
-			b, err := extraFor(ev.Index)
+			item, err := plainReasoningFor()
 			if err != nil {
 				return err
 			}
-			if err := appendTo(&b.text, ev.Text); err != nil {
+			if err := addReasoningText(item, ev.Text); err != nil {
+				return err
+			}
+		case ir.EventReasoningItemDone:
+			if ev.ReasoningID != "" || ev.ReasoningIndexSet {
+				item, err := reasoningFor(ev)
+				if err != nil {
+					return err
+				}
+				if err := applyStructuredReasoningDone(item, ev.Reasoning); err != nil {
+					return err
+				}
+				break
+			}
+			item, err := plainReasoningFor()
+			if err != nil {
+				return err
+			}
+			if err := applyLegacyReasoningDone(item, ev.Reasoning); err != nil {
 				return err
 			}
 		case ir.EventReasoningStart:
@@ -1037,12 +1488,11 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			if err != nil {
 				return err
 			}
-			if err := appendTo(&b.text, ev.Text); err != nil {
+			if err := reserve(len(ev.Text) + len(ev.Signature)); err != nil {
 				return err
 			}
-			if err := appendTo(&b.signature, ev.Signature); err != nil {
-				return err
-			}
+			b.text.WriteString(ev.Text)
+			b.signature.WriteString(ev.Signature)
 		case ir.EventReasoningSignature:
 			if ev.Signature == "" {
 				break
@@ -1051,13 +1501,14 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			if err != nil {
 				return err
 			}
-			if err := appendTo(&b.signature, ev.Signature); err != nil {
+			if err := reserve(len(ev.Signature)); err != nil {
 				return err
 			}
+			b.signature.WriteString(ev.Signature)
 		case ir.EventReasoningEnd:
-			// The block stays in extras; only its lifecycle ended.
+			// The block stays in place; only its lifecycle ended.
 		case ir.EventRedactedReasoning:
-			if len(extras) >= maxCollectedStreamBlocks {
+			if extraBlocks >= maxCollectedStreamBlocks {
 				return errCollectedStreamResponseTooLarge
 			}
 			// The overhead is reserved with the payload so repeated empty
@@ -1065,7 +1516,9 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			if err := reserve(collectedBlockOverhead + len(ev.Data)); err != nil {
 				return err
 			}
-			extras = append(extras, &extraBlock{redacted: true, data: ev.Data})
+			flushText()
+			resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockRedactedReasoning, RedactedData: ev.Data})
+			extraBlocks++
 		case ir.EventToolCallStart:
 			tb, err := newTool(ev.Index)
 			if err != nil {
@@ -1091,9 +1544,10 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			if err != nil {
 				return err
 			}
-			if err := appendTo(&tb.args, ev.ArgsFrag); err != nil {
+			if err := reserve(len(ev.ArgsFrag)); err != nil {
 				return err
 			}
+			tb.args.WriteString(ev.ArgsFrag)
 		case ir.EventFinish:
 			// A reported finish replaces the whole usage object. Nonzero-only
 			// collection would turn an explicit zero counter into a stale value.
@@ -1122,32 +1576,61 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 	if !sawEvent {
 		return nil, &ir.StreamFailure{Message: "upstream returned an empty stream"}
 	}
-	if reasoning.Len() > 0 {
-		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockReasoning, Text: reasoning.String()})
-	}
-	for _, b := range extras {
-		if b.redacted {
-			resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockRedactedReasoning, RedactedData: b.data})
-			continue
+	flushText()
+	for _, item := range reasoningItems {
+		n := reasoningProjectionLen(item)
+		// Reserve the returned projection before building it. Live part text and
+		// the snapshot clone remain charged; this is the additional retained copy.
+		if err := reserve(n); err != nil {
+			return nil, err
 		}
-		resp.Content = append(resp.Content, ir.ContentBlock{
-			Type: ir.BlockReasoning, Text: b.think.text.String(), AnthropicSignature: b.think.signature.String(),
-		})
+		resp.Content[item.blockIdx].Text = collectedReasoningText(item, n)
 	}
-	if text.Len() > 0 {
-		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText, Text: text.String()})
+	for _, b := range thinking {
+		resp.Content[b.blockIdx].Text = b.text.String()
+		resp.Content[b.blockIdx].AnthropicSignature = b.signature.String()
 	}
-	for _, idx := range order {
-		tb := tools[idx]
+	for _, tb := range tools {
 		args := []byte(tb.args.String())
 		if len(args) == 0 || !json.Valid(args) {
 			args = []byte("{}")
 		}
-		resp.Content = append(resp.Content, ir.ContentBlock{
-			Type: ir.BlockToolUse, ToolID: tb.id, ToolName: tb.name, ToolInput: json.RawMessage(args),
-		})
+		block := &resp.Content[tb.blockIdx]
+		block.ToolID = tb.id
+		block.ToolName = tb.name
+		block.ToolInput = json.RawMessage(args)
 	}
 	return resp, nil
+}
+
+// reasoningSnapshotBytes is the retained cost of the canonical snapshot clone:
+// item metadata plus one slice slot and part struct per summary part. It is
+// distinct from the live per-index parts, which are charged when they are
+// allocated, so both retained allocations are billed.
+func reasoningSnapshotBytes(rr *ir.ResponsesReasoning) int {
+	if rr == nil {
+		return 0
+	}
+	return reasoningMetadataBytes(rr) + len(rr.Summary)*collectedReasoningPartOverhead
+}
+
+// reasoningMetadataBytes is the retained string metadata footprint that is not
+// part of the readable text projection: item ID, status, encrypted bytes, and
+// every summary type and text copy. The per-part slice and struct bookkeeping is
+// added by reasoningSnapshotBytes for the structured clone, and charged
+// separately through legacyParts for the legacy path.
+func reasoningMetadataBytes(rr *ir.ResponsesReasoning) int {
+	if rr == nil {
+		return 0
+	}
+	n := len(rr.ID) + len(rr.Status)
+	if rr.EncryptedContent != nil {
+		n += len(*rr.EncryptedContent)
+	}
+	for _, p := range rr.Summary {
+		n += len(p.Type) + len(p.Text)
+	}
+	return n
 }
 
 // parseUsage recovers token counts from a unary response body's top-level usage

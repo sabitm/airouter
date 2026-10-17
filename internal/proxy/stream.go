@@ -575,9 +575,16 @@ func (s *translatedSink) handle(ev ir.StreamEvent) error {
 
 // projectAway reports whether this ingress cannot represent the event. OpenAI
 // and Responses keep readable reasoning text and discard signature, redacted,
-// and empty thinking lifecycle frames. The drop decision is separate from
-// whether the event actually carried opaque bytes.
+// and empty thinking lifecycle frames. A Responses-preserving ingress keeps
+// structured reasoning item snapshots; every other ingress drops them and any
+// encrypted bytes they carry. The Responses family is projected independently
+// first, so an Anthropic-capable ingress never retains a snapshot it cannot
+// represent. The drop decision is separate from whether the event actually
+// carried opaque bytes.
 func (s *translatedSink) projectAway(ev ir.StreamEvent) bool {
+	if ev.Kind == ir.EventReasoningItemDone {
+		return !preservesResponsesReasoning(s.ingressID)
+	}
 	if s.anthropicIngress() {
 		return false
 	}
@@ -606,6 +613,10 @@ func (s *translatedSink) visible(ev ir.StreamEvent) bool {
 		return true
 	case ir.EventReasoningDelta:
 		return ev.Text != "" || !ev.Indexed
+	case ir.EventReasoningItemDone:
+		// A Responses-preserving ingress needs the snapshot frame (and any
+		// encrypted state it carries) to finish the reasoning item.
+		return preservesResponsesReasoning(s.ingressID) && ev.Reasoning != nil
 	case ir.EventReasoningStart:
 		if ev.Text != "" {
 			return true
@@ -621,8 +632,12 @@ func (s *translatedSink) visible(ev ir.StreamEvent) bool {
 }
 
 func (s *translatedSink) noteProjectedOmission(ev ir.StreamEvent) {
+	if responsesOpaqueOmitted(ev) {
+		noteResponsesOmission(s.res, s.logger, s.ingressID)
+		return
+	}
 	if opaqueThinkingOmitted(ev) {
-		noteOpaqueOmission(s.res, s.logger, s.ingressID)
+		noteAnthropicOmission(s.res, s.logger, s.ingressID)
 	}
 }
 
@@ -637,8 +652,18 @@ func (s *translatedSink) buffer(ev ir.StreamEvent) error {
 }
 
 func pendingEventBytes(ev ir.StreamEvent) int {
-	return len(ev.ID) + len(ev.Model) + len(ev.Text) + len(ev.ToolID) + len(ev.ToolName) +
-		len(ev.ArgsFrag) + len(ev.Signature) + len(ev.Data)
+	n := len(ev.ID) + len(ev.Model) + len(ev.Text) + len(ev.ToolID) + len(ev.ToolName) +
+		len(ev.ArgsFrag) + len(ev.Signature) + len(ev.Data) + len(ev.ReasoningID)
+	if ev.Reasoning != nil {
+		n += len(ev.Reasoning.ID) + len(ev.Reasoning.Status)
+		if ev.Reasoning.EncryptedContent != nil {
+			n += len(*ev.Reasoning.EncryptedContent)
+		}
+		for _, p := range ev.Reasoning.Summary {
+			n += len(p.Type) + len(p.Text)
+		}
+	}
+	return n
 }
 
 func (s *translatedSink) note(ev ir.StreamEvent) {

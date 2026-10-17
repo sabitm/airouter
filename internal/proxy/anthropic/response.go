@@ -53,6 +53,10 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	for _, b := range resp.Content {
 		switch b.Type {
 		case ir.BlockReasoning:
+			// Opaque-only Responses items are not empty Anthropic thinking blocks.
+			if b.ResponsesReasoning != nil && b.Text == "" && b.AnthropicSignature == "" {
+				continue
+			}
 			content = append(content, anthBlock{Type: "thinking", Thinking: thinkingPtr(b.Text), Signature: b.AnthropicSignature})
 		case ir.BlockRedactedReasoning:
 			content = append(content, anthBlock{Type: "redacted_thinking", Data: b.RedactedData})

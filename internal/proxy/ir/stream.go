@@ -10,8 +10,15 @@ const (
 	// used by OpenAI, Responses, Kiro, and other non-Anthropic producers.
 	// Index is not a source block index on this event. Anthropic thinking uses
 	// the explicit lifecycle events below so a zero source index stays distinct
-	// from this legacy shape.
+	// from this legacy shape. A Responses summary delta may additionally set
+	// ReasoningID/ReasoningIndexSet and SummaryIndex; consumers that project
+	// readable text only ignore those fields.
 	EventReasoningDelta
+	// EventReasoningItemDone carries one complete OpenAI Responses reasoning
+	// item snapshot in Reasoning. It closes the item identified by ReasoningID
+	// or ReasoningIndexSet. Identical repeat snapshots must not be emitted
+	// twice. Encrypted bytes are never placed on Text.
+	EventReasoningItemDone
 	// EventReasoningStart opens one indexed thinking block. Index is the
 	// source content-block index.
 	EventReasoningStart
@@ -52,6 +59,22 @@ type StreamEvent struct {
 	// block Index, from a legacy EventReasoningDelta. Legacy producers leave
 	// this false; their Index is not a source block index.
 	Indexed bool
+
+	// ReasoningID is the source OpenAI Responses reasoning item ID when known.
+	// It is not an Anthropic block identity and not a function-call identity.
+	ReasoningID string
+	// ReasoningIndexSet reports that ReasoningIndex is the source streamed
+	// output_index for a Responses reasoning item. It is not a terminal
+	// output-array ordinal, and it is not an Anthropic content-block index.
+	ReasoningIndexSet bool
+	// ReasoningIndex is the source streamed output_index when ReasoningIndexSet.
+	ReasoningIndex int
+	// SummaryIndex is the ordered summary part ordinal within a Responses
+	// reasoning item. It is meaningful only with ReasoningID/ReasoningIndexSet.
+	SummaryIndex int
+	// Reasoning is the complete structured item on EventReasoningItemDone.
+	// The same pointer must not be mutated after emission.
+	Reasoning *ResponsesReasoning
 
 	// Signature is the opaque Anthropic signature fragment on
 	// EventReasoningSignature. It is not OpenAI encrypted_content.

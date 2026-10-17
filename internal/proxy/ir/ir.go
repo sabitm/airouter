@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 )
 
 type Role string
@@ -70,6 +71,91 @@ type SystemBlock struct {
 	CacheControl *CacheControl
 }
 
+// ReasoningSummaryPart is one ordered summary part of an OpenAI Responses
+// reasoning item. Empty parts are preserved because the part boundary is wire
+// fidelity, not decoded meaning. Type is normally "summary_text".
+type ReasoningSummaryPart struct {
+	Type string
+	Text string
+}
+
+// ResponsesReasoning is the provider-owned envelope of one OpenAI Responses
+// reasoning item. It is set on a BlockReasoning that came from (or will be
+// encoded as) exactly one reasoning item. ID and EncryptedContent are opaque,
+// provider-scoped continuity state and are not portable across providers or
+// models. EncryptedContent nil means absent or JSON null; a non-nil pointer
+// preserves an explicit empty string. Status is empty when the source omitted
+// it. Readable Summary text alone is portable.
+type ResponsesReasoning struct {
+	ID               string
+	Summary          []ReasoningSummaryPart
+	EncryptedContent *string
+	Status           string
+}
+
+// ProviderState reports whether the item carries provider-owned continuity
+// state that is unsafe to send to a different provider or model. Readable
+// summary text alone does not require a preserving route.
+func (r *ResponsesReasoning) ProviderState() bool {
+	return r != nil && (r.ID != "" || r.EncryptedContent != nil)
+}
+
+// ReadableText returns the ordered summary text projection. Opaque item state
+// is never part of the projection.
+func (r *ResponsesReasoning) ReadableText() string {
+	if r == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range r.Summary {
+		b.WriteString(p.Text)
+	}
+	return b.String()
+}
+
+// Clone returns a deep copy so retained snapshots cannot be mutated through
+// the source pointer.
+func (r *ResponsesReasoning) Clone() *ResponsesReasoning {
+	if r == nil {
+		return nil
+	}
+	out := &ResponsesReasoning{ID: r.ID, Status: r.Status}
+	if r.Summary != nil {
+		out.Summary = append([]ReasoningSummaryPart(nil), r.Summary...)
+	}
+	if r.EncryptedContent != nil {
+		v := *r.EncryptedContent
+		out.EncryptedContent = &v
+	}
+	return out
+}
+
+// Equal reports structural equality including an explicit empty encrypted
+// string versus absent. It is used to dedup repeat snapshots.
+func (r *ResponsesReasoning) Equal(other *ResponsesReasoning) bool {
+	if r == nil || other == nil {
+		return r == other
+	}
+	if r.ID != other.ID || r.Status != other.Status {
+		return false
+	}
+	if (r.EncryptedContent == nil) != (other.EncryptedContent == nil) {
+		return false
+	}
+	if r.EncryptedContent != nil && *r.EncryptedContent != *other.EncryptedContent {
+		return false
+	}
+	if len(r.Summary) != len(other.Summary) {
+		return false
+	}
+	for i := range r.Summary {
+		if r.Summary[i] != other.Summary[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // ContentBlock is a tagged union over the block kinds. Only the fields relevant
 // to Type are meaningful.
 type ContentBlock struct {
@@ -91,6 +177,12 @@ type ContentBlock struct {
 	// RedactedData is the opaque Anthropic redacted_thinking data string.
 	// Meaningful only on BlockRedactedReasoning.
 	RedactedData string
+
+	// ResponsesReasoning, when non-nil, marks a BlockReasoning that came from
+	// one OpenAI Responses reasoning item. Text is the readable projection of
+	// Summary. Encrypted bytes live only in EncryptedContent and must never be
+	// copied to Text, AnthropicSignature, or RedactedData.
+	ResponsesReasoning *ResponsesReasoning
 
 	// BlockToolUse: a model-issued call to a tool.
 	ToolID    string

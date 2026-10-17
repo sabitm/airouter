@@ -1177,3 +1177,32 @@ func TestAttachmentMaterializeReuseAcrossAttempts(t *testing.T) {
 		t.Fatal("second attempt missing inlined data")
 	}
 }
+
+// Attachment-only incompatibility keeps its dedicated message prefix. Thinking
+// and Responses-state incompatibility use their own messages and must not gain
+// this prefix.
+func TestAttachmentIncompatibleKeepsPrefix(t *testing.T) {
+	for _, name := range []string{"single", "all"} {
+		t.Run(name, func(t *testing.T) {
+			a := newScriptedUpstream(t, domain.ProtocolOpenAI)
+			b := newScriptedUpstream(t, domain.ProtocolOpenAI)
+			targets := []*scriptedUpstream{a}
+			protocols := []domain.Protocol{domain.ProtocolQoder}
+			if name == "all" {
+				targets = append(targets, b)
+				protocols = append(protocols, domain.ProtocolCursor)
+			}
+			base, token := setupCombo(t, domain.StrategyFailover, targets, protocols)
+			resp, out := post(t, base+"/v1/chat/completions", token, chatImageBody("default"))
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+			}
+			if !strings.Contains(string(out), "attachment not supported by upstream: ") {
+				t.Fatalf("attachment message lost its prefix: %s", out)
+			}
+			if a.hits.Load() != 0 || b.hits.Load() != 0 {
+				t.Fatalf("hits a=%d b=%d, want 0/0", a.hits.Load(), b.hits.Load())
+			}
+		})
+	}
+}
