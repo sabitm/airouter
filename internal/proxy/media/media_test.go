@@ -290,6 +290,7 @@ func TestOpencodeCapsMatchWireCodecs(t *testing.T) {
 	}{
 		{opencode: "opencode-chat", wire: "oai-chat"},
 		{opencode: "opencode-responses", wire: "oai-responses"},
+		{opencode: "opencode-messages", wire: "anth-msg"},
 	}
 	for _, alias := range aliases {
 		if got, want := CapsForCodecID(alias.opencode), CapsForCodecID(alias.wire); got != want {
@@ -314,6 +315,12 @@ func TestOpencodeCapsIncompatible(t *testing.T) {
 		{name: "responses URL PDF", codec: "opencode-responses", att: Attachment{Kind: KindPDF, HasURL: true}},
 		{name: "responses inline file", codec: "opencode-responses", att: Attachment{Kind: KindGeneric, HasData: true}},
 		{name: "responses URL file", codec: "opencode-responses", att: Attachment{Kind: KindGeneric, HasURL: true}},
+		{name: "messages inline image", codec: "opencode-messages", att: Attachment{Kind: KindImage, IsImage: true, HasData: true}},
+		{name: "messages URL image", codec: "opencode-messages", att: Attachment{Kind: KindImage, IsImage: true, HasURL: true}},
+		{name: "messages inline PDF", codec: "opencode-messages", att: Attachment{Kind: KindPDF, HasData: true}},
+		{name: "messages URL PDF", codec: "opencode-messages", att: Attachment{Kind: KindPDF, HasURL: true}},
+		{name: "messages nested image", codec: "opencode-messages", att: Attachment{Kind: KindImage, IsImage: true, HasData: true, InToolResult: true}},
+		{name: "messages nested PDF", codec: "opencode-messages", att: Attachment{Kind: KindPDF, HasData: true, InToolResult: true}},
 	}
 	for _, tc := range accepted {
 		t.Run(tc.name, func(t *testing.T) {
@@ -324,9 +331,10 @@ func TestOpencodeCapsIncompatible(t *testing.T) {
 	}
 
 	rejected := []struct {
-		name  string
-		codec string
-		att   Attachment
+		name       string
+		codec      string
+		att        Attachment
+		translated *bool
 	}{
 		{name: "chat URL PDF", codec: "opencode-chat", att: Attachment{Kind: KindPDF, HasURL: true}},
 		{name: "chat URL file", codec: "opencode-chat", att: Attachment{Kind: KindGeneric, HasURL: true}},
@@ -334,14 +342,28 @@ func TestOpencodeCapsIncompatible(t *testing.T) {
 		{name: "responses translated image ID", codec: "opencode-responses", att: Attachment{Kind: KindImage, IsImage: true, HasID: true}},
 		{name: "chat translated file ID", codec: "opencode-chat", att: Attachment{Kind: KindGeneric, HasID: true}},
 		{name: "responses translated file ID", codec: "opencode-responses", att: Attachment{Kind: KindGeneric, HasID: true}},
+		{name: "messages inline file", codec: "opencode-messages", att: Attachment{Kind: KindGeneric, HasData: true}},
+		{name: "messages URL file", codec: "opencode-messages", att: Attachment{Kind: KindGeneric, HasURL: true}},
+		{name: "messages translated image ID", codec: "opencode-messages", att: Attachment{Kind: KindImage, IsImage: true, HasID: true}},
+		{name: "messages native image ID", codec: "opencode-messages", att: Attachment{Kind: KindImage, IsImage: true, HasID: true}, translated: boolPtr(false)},
+		{name: "messages translated file ID", codec: "opencode-messages", att: Attachment{Kind: KindGeneric, HasID: true}},
+		{name: "messages native file ID", codec: "opencode-messages", att: Attachment{Kind: KindGeneric, HasID: true}, translated: boolPtr(false)},
 	}
 	for _, tc := range rejected {
 		t.Run(tc.name, func(t *testing.T) {
-			if reason := CapsForCodecID(tc.codec).Incompatible([]Attachment{tc.att}, true); reason == "" {
+			translated := true
+			if tc.translated != nil {
+				translated = *tc.translated
+			}
+			if reason := CapsForCodecID(tc.codec).Incompatible([]Attachment{tc.att}, translated); reason == "" {
 				t.Fatal("expected incompatibility")
 			}
 		})
 	}
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func TestInspectRequestToolResultPlacement(t *testing.T) {

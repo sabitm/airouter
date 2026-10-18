@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/media"
 	"airouter/internal/proxy/openai"
+	"airouter/internal/proxy/opencode"
 )
 
 const testPNGB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQI12P4z8AAAAMBAQAY3Y20AAAAAElFTkSuQmCC"
@@ -1204,5 +1206,230 @@ func TestAttachmentIncompatibleKeepsPrefix(t *testing.T) {
 				t.Fatalf("hits a=%d b=%d, want 0/0", a.hits.Load(), b.hits.Load())
 			}
 		})
+	}
+}
+
+const opencodeMessagesModel = "claude-sonnet-4-5"
+
+const opencodeMessagesSSE = "event: message_start\n" +
+	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"up\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n" +
+	"event: content_block_start\n" +
+	"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+	"event: content_block_delta\n" +
+	"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+	"event: content_block_stop\n" +
+	"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+	"event: message_delta\n" +
+	"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" +
+	"event: message_stop\n" +
+	"data: {\"type\":\"message_stop\"}\n\n"
+
+type opencodeMessagesCapture struct {
+	hits atomic.Int64
+	path atomic.Value
+	body atomic.Value
+}
+
+func (c *opencodeMessagesCapture) record(r *http.Request) {
+	c.hits.Add(1)
+	c.path.Store(r.URL.Path)
+	raw, _ := io.ReadAll(r.Body)
+	c.body.Store(raw)
+}
+
+func (c *opencodeMessagesCapture) bodyString() string {
+	raw, _ := c.body.Load().([]byte)
+	return string(raw)
+}
+
+// newOpencodeMessagesUpstream is a custom-URL OpenCode target. Tier treats the
+// httptest URL as zen, and claude-sonnet-4-5 selects Messages rather than Chat.
+func newOpencodeMessagesUpstream(t *testing.T, stream bool) (*httptest.Server, *opencodeMessagesCapture) {
+	t.Helper()
+	cap := &opencodeMessagesCapture{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.record(r)
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, opencodeMessagesSSE)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, anthropicUpstreamBody)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, cap
+}
+
+func setupOpencodeMessagesProxy(t *testing.T, upstreamURL string) (string, string) {
+	t.Helper()
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{
+		Name:     "opencode-messages",
+		BaseURL:  upstreamURL,
+		APIKey:   "up-key",
+		Protocol: domain.ProtocolOpencode,
+	}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{
+		Name:     "default",
+		Strategy: domain.StrategyFailover,
+		Targets: []domain.ComboTarget{{
+			ProviderID:    prov.ID,
+			UpstreamModel: opencodeMessagesModel,
+			Enabled:       true,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL, key.Token
+}
+
+func assertOpencodeMessagesPayload(t *testing.T, cap *opencodeMessagesCapture, blockType, mediaType, data string) {
+	t.Helper()
+	if cap.hits.Load() != 1 {
+		t.Fatalf("upstream hits=%d, want 1", cap.hits.Load())
+	}
+	path, _ := cap.path.Load().(string)
+	if path != opencode.MessagesPath {
+		t.Fatalf("upstream path=%q, want %s", path, opencode.MessagesPath)
+	}
+	raw := cap.bodyString()
+	var body struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type   string `json:"type"`
+				Source *struct {
+					Type      string `json:"type"`
+					MediaType string `json:"media_type"`
+					Data      string `json:"data"`
+					URL       string `json:"url"`
+				} `json:"source"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("decode upstream body: %v; body=%s", err, raw)
+	}
+	if body.Model != opencodeMessagesModel {
+		t.Fatalf("upstream model=%q, want %s", body.Model, opencodeMessagesModel)
+	}
+	if len(body.Messages) != 1 || body.Messages[0].Role != "user" {
+		t.Fatalf("upstream body must contain one user message: %s", raw)
+	}
+	attachments := 0
+	for _, block := range body.Messages[0].Content {
+		if block.Type == "text" {
+			continue
+		}
+		attachments++
+		if block.Type != blockType || block.Source == nil {
+			t.Fatalf("upstream attachment=%+v, want %s block with a source", block, blockType)
+		}
+		source := block.Source
+		if source.Type != "base64" || source.MediaType != mediaType || source.Data != data || source.URL != "" {
+			t.Fatalf("upstream source=%+v, want base64 source with media_type=%q, data=%q, and no URL", source, mediaType, data)
+		}
+	}
+	if attachments != 1 {
+		t.Fatalf("upstream attachments=%d, want 1; body=%s", attachments, raw)
+	}
+}
+
+func TestOpencodeMessagesAttachmentPreserved(t *testing.T) {
+	const pdfB64 = "JVBERi0xLjQgdGVzdAo="
+	cases := []struct {
+		name      string
+		stream    bool
+		body      string
+		blockType string
+		mediaType string
+		data      string
+	}{
+		{name: "unary image", body: chatImageBody("default"), blockType: "image", mediaType: "image/png", data: testPNGB64},
+		{name: "unary pdf", body: chatPDFBody("default"), blockType: "document", mediaType: "application/pdf", data: pdfB64},
+		{name: "stream image", stream: true, body: chatImageBody("default"), blockType: "image", mediaType: "image/png", data: testPNGB64},
+		{name: "stream pdf", stream: true, body: chatPDFBody("default"), blockType: "document", mediaType: "application/pdf", data: pdfB64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream, cap := newOpencodeMessagesUpstream(t, tc.stream)
+			base, token := setupOpencodeMessagesProxy(t, upstream.URL)
+			body := tc.body
+			if tc.stream {
+				body = strings.TrimSuffix(body, "}") + `,"stream":true}`
+			}
+			resp, out := post(t, base+"/v1/chat/completions", token, body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+			}
+			assertOpencodeMessagesPayload(t, cap, tc.blockType, tc.mediaType, tc.data)
+			if tc.stream {
+				if !strings.Contains(string(out), "\"content\":\"hi\"") || !strings.Contains(string(out), "data: [DONE]") {
+					t.Fatalf("downstream stream is not a valid completion: %s", out)
+				}
+				return
+			}
+			if extractText(t, "/v1/chat/completions", out) != "hello from anthropic" {
+				t.Fatalf("downstream text missing: %s", out)
+			}
+		})
+	}
+}
+
+// A Messages-capable OpenCode target must stay first when a later target is
+// also compatible. Unknown models stay on Chat and are not this assertion.
+func TestOpencodeMessagesFirstChoiceNotFiltered(t *testing.T) {
+	fallback := newScriptedUpstream(t, domain.ProtocolOpenAI)
+	upstream, cap := newOpencodeMessagesUpstream(t, false)
+	st := newTestStore(t)
+	ctx := context.Background()
+	first := &domain.Provider{Name: "oc", BaseURL: upstream.URL, APIKey: "up-key", Protocol: domain.ProtocolOpencode}
+	second := &domain.Provider{Name: "fallback", BaseURL: fallback.server.URL, APIKey: "up-key", Protocol: domain.ProtocolOpenAI}
+	if err := st.CreateProvider(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateProvider(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{
+		Name:     "default",
+		Strategy: domain.StrategyFailover,
+		Targets: []domain.ComboTarget{
+			{ProviderID: first.ID, UpstreamModel: opencodeMessagesModel, Enabled: true},
+			{ProviderID: second.ID, UpstreamModel: "m", Enabled: true},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	resp, out := post(t, srv.URL+"/v1/chat/completions", key.Token, chatImageBody("default"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+	}
+	assertOpencodeMessagesPayload(t, cap, "image", "image/png", testPNGB64)
+	if fallback.hits.Load() != 0 {
+		t.Fatalf("fallback hits=%d, want 0", fallback.hits.Load())
 	}
 }

@@ -49,7 +49,7 @@ func CapsForCodecID(id string) BackendCaps {
 			FileInline:  true,
 			FileID:      true, // passthrough-only enforced by caller
 		}
-	case "anth-msg", "claude-code":
+	case "anth-msg", "claude-code", "opencode-messages":
 		// encodeBlocks recurses into tool_result, preserving nested image/PDF.
 		return BackendCaps{
 			ImageInline:     true,
