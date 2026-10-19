@@ -322,19 +322,6 @@ func opencodeCaps(m string, protocol domain.Protocol) Caps {
 // OpencodeCaps converts a catalog row into thinking caps. ok false is an unknown model.
 func OpencodeCaps(spec opencode.ModelSpec, ok bool) Caps {
 	if !ok || spec.SDK == "google" || !opencodeWritesReasoning(spec) {
-		// Toggle-only, empty options, and Anthropic rows with no official effort
-		// variant produce no field. Budget on openai-compatible also produces none.
-		if ok && spec.Budget && spec.SDK == "anthropic" && len(spec.Efforts) == 0 {
-			return Caps{
-				Reasoning:  true,
-				CanDisable: false,
-				Format:     FormatClaudeBudget,
-				BudgetMin:  spec.BudgetMin,
-				BudgetMax:  spec.BudgetMax,
-				MaxOutput:  spec.Output,
-				Levels:     []string{"high", "max"},
-			}
-		}
 		out := spec.Output
 		if out == 0 {
 			out = 131072
@@ -359,7 +346,7 @@ func OpencodeCaps(spec opencode.ModelSpec, ok bool) Caps {
 	}
 	return Caps{
 		Reasoning:  true,
-		CanDisable: opencodeLevelIn("none", spec.Efforts) || opencodeQwen38FlashDisable(spec),
+		CanDisable: opencodeLevelIn("none", spec.Efforts) || opencodeQwen38FlashDisable(spec) || OpencodeAnthropicDisableSupported(spec),
 		Format:     format,
 		Levels:     append([]string(nil), spec.Efforts...),
 		MaxOutput:  spec.Output,

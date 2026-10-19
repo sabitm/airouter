@@ -838,7 +838,11 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	if err != nil {
 		return nil, err
 	}
-	return restoreOpencodeMiniMaxToggleCap(out, req, backend, provider)
+	out, err = restoreOpencodeMiniMaxToggleCap(out, req, backend, provider)
+	if err != nil {
+		return nil, err
+	}
+	return restoreOpencodeClaudeDisableCap(out, req, backend, provider)
 }
 
 // errOpencodeThinkingBudget rejects an enabled OpenCode Messages budget that
@@ -863,7 +867,16 @@ func rejectOpencodeExplicitBudget(req *ir.Request, backend codec, provider *doma
 		return nil
 	}
 	spec, ok := opencode.Lookup(opencode.Tier(provider.BaseURL), req.Model)
-	if !ok || !thinking.OpencodeExplicitBudgetInvalid(spec, eff, req.MaxTokens) {
+	if !ok {
+		return nil
+	}
+	// An explicit disable on an approved exact row wins over a numeric budget
+	// suffix. The scoped writer emits the disabled shape and sends no budget,
+	// so no budget can overflow. Other rows keep their existing validation.
+	if thinking.OpencodeAnthropicDisableDecision(spec, eff) {
+		return nil
+	}
+	if !thinking.OpencodeExplicitBudgetInvalid(spec, eff, req.MaxTokens) {
 		return nil
 	}
 	return thinking.ErrOpencodeExplicitBudget
@@ -1016,6 +1029,59 @@ func miniMaxToggleThinking(doc map[string]json.RawMessage) bool {
 	return value == "adaptive" || value == "disabled"
 }
 
+// restoreOpencodeClaudeDisableCap rewrites max_tokens after the generic
+// Anthropic encoder changed it for a disabled selected Claude row. A caller
+// cap is restored exactly. An omitted cap resets to the Anthropic default so a
+// raised budget cap does not survive. The disabled shape carries no budget, so
+// no generated cap is needed.
+func restoreOpencodeClaudeDisableCap(body []byte, req *ir.Request, backend codec, provider *domain.Provider) ([]byte, error) {
+	if !opencodeClaudeDisableFinal(body, req, backend, provider) {
+		return body, nil
+	}
+	want := req.MaxTokens
+	if want <= 0 {
+		want = anthropic.DefaultMaxTokens
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+	encodedCap, capIsNumber := positiveJSONInt(doc["max_tokens"])
+	if capIsNumber && encodedCap == want {
+		return body, nil
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		return nil, err
+	}
+	doc["max_tokens"] = encoded
+	return json.Marshal(doc)
+}
+
+// opencodeClaudeDisableFinal reports whether the finalized body is the exact
+// disabled thinking shape for a selected Claude OpenCode Messages row. It
+// scopes to the OpenCode protocol, OpenCode dialect, Messages codec, a
+// final-user request, the pinned catalog ids, and the same explicit-disable
+// decision as the writer. A positive, no-intent, assistant-final, empty, or
+// unmatched body stays false.
+func opencodeClaudeDisableFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
+	if provider == nil || provider.Protocol != domain.ProtocolOpencode || provider.Reasoning() != domain.ReasoningOpencode || backend.id != codecOpencodeMessages || req == nil {
+		return false
+	}
+	if !opencodeRequestEndsWithUser(req) {
+		return false
+	}
+	spec, ok := opencode.Lookup(opencode.Tier(provider.BaseURL), req.Model)
+	if !ok || !thinking.OpencodeAnthropicDisableDecision(spec, thinking.FromIR(req.Thinking)) {
+		return false
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return false
+	}
+	return disabledThinkingShape(doc)
+}
+
 func qwen38FlashFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
 	if provider == nil || provider.Protocol != domain.ProtocolOpencode || backend.id != codecOpencodeMessages || req == nil || req.MaxTokens <= 0 {
 		return false
@@ -1029,10 +1095,10 @@ func qwen38FlashFinal(body []byte, req *ir.Request, backend codec, provider *dom
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return false
 	}
-	return effortOnlyOutputConfig(doc) || qwenDisabledThinking(doc)
+	return effortOnlyOutputConfig(doc) || disabledThinkingShape(doc)
 }
 
-func qwenDisabledThinking(doc map[string]json.RawMessage) bool {
+func disabledThinkingShape(doc map[string]json.RawMessage) bool {
 	raw := doc["thinking"]
 	if len(raw) == 0 || string(raw) == "null" {
 		return false

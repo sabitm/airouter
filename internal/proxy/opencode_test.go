@@ -3350,10 +3350,12 @@ func TestOpencodeExplicitNumericBudget(t *testing.T) {
 				raw := []byte(`{"model":"combo","max_tokens":64000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192},"output_config":{"effort":"low","format":{"type":"json_object"}}}`)
 				got, out := prepareExplicitBudget(t, provider, anthropicCodec, raw, "claude-sonnet-4-5"+suffix)
 				switch suffix {
-				case "(high)", "(none)":
-					// none cannot disable this row, so the existing policy upgrades it
-					// to the lowest listed level. Both map to the high preset.
+				case "(high)":
 					assertExactEnabledBudget(t, out, 32000, 64000)
+				case "(none)":
+					// An explicit none suffix disables the approved row instead of
+					// upgrading to the lowest listed level.
+					assertClaudeDisabled(t, got, "claude-sonnet-4-5", 64000, false)
 				case "(max)":
 					assertExactEnabledBudget(t, out, 63999, 64000)
 				case "(auto)":

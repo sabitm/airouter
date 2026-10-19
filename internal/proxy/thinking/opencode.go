@@ -30,11 +30,17 @@ func writeOpencode(m map[string]any, model string, cfg *Config, tier string, pro
 		writeOpencodeMiniMaxToggle(m, cfg)
 		return
 	}
+	// Exact supported Claude rows accept an explicit disable that must not be
+	// rewritten as their lowest listed effort or as an enabled budget.
+	if OpencodeAnthropicDisableDecision(spec, cfg) {
+		writeOpencodeDisabledThinking(m)
+		return
+	}
 	if len(spec.Efforts) > 0 {
 		// Exact qwen3.8-flash Anthropic rows accept an explicit disable that must
 		// not be rewritten as their lowest listed effort.
-		if opencodeQwen38FlashDisable(spec) && qwen38FlashDisableIntent(cfg) {
-			writeOpencodeQwen38FlashDisabled(m)
+		if opencodeQwen38FlashDisable(spec) && opencodeDisableIntent(cfg) {
+			writeOpencodeDisabledThinking(m)
 			return
 		}
 		writeOpencodeEffort(m, spec, cfg)
@@ -49,10 +55,34 @@ func opencodeQwen38FlashDisable(spec opencode.ModelSpec) bool {
 	return spec.SDK == "anthropic" && spec.ID == "qwen3.8-flash"
 }
 
-// qwen38FlashDisableIntent separates explicit enablement from intensity.
+// OpencodeAnthropicDisableSupported selects the exact Anthropic Messages
+// catalog rows whose explicit disable must reach the writer. Prefix, suffix,
+// and neighboring model ids stay false. qwen3.8-flash keeps its own path.
+func OpencodeAnthropicDisableSupported(spec opencode.ModelSpec) bool {
+	if spec.SDK != "anthropic" {
+		return false
+	}
+	switch spec.ID {
+	case "claude-sonnet-4", "claude-opus-4-1", "claude-haiku-4-5",
+		"claude-sonnet-4-5", "claude-opus-4-5", "claude-sonnet-4-6",
+		"claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8":
+		return true
+	default:
+		return false
+	}
+}
+
+// OpencodeAnthropicDisableDecision reports whether spec is an approved exact
+// Claude row and cfg carries an explicit disable. The scoped writer, the
+// budget validation exemption, and cap restore must share this one decision.
+func OpencodeAnthropicDisableDecision(spec opencode.ModelSpec, cfg *Config) bool {
+	return OpencodeAnthropicDisableSupported(spec) && opencodeDisableIntent(cfg)
+}
+
+// opencodeDisableIntent separates explicit enablement from intensity.
 // A positive effort remains effort unless enablement or a none/off suffix
 // explicitly disables thinking.
-func qwen38FlashDisableIntent(cfg *Config) bool {
+func opencodeDisableIntent(cfg *Config) bool {
 	if cfg == nil {
 		return false
 	}
@@ -70,9 +100,9 @@ func qwen38FlashDisableIntent(cfg *Config) bool {
 	}
 }
 
-// writeOpencodeQwen38FlashDisabled writes the pinned SDK disabled shape and
+// writeOpencodeDisabledThinking writes the pinned SDK disabled shape and
 // removes effort. output_config siblings survive through the existing finalizer.
-func writeOpencodeQwen38FlashDisabled(m map[string]any) {
+func writeOpencodeDisabledThinking(m map[string]any) {
 	m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "disabled"})
 	deleteThinkingBudget(m)
 	if oc, ok := m["output_config"].(map[string]any); ok {
