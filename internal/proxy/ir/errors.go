@@ -47,3 +47,34 @@ func AsStreamFailure(err error) (*StreamFailure, bool) {
 	}
 	return nil, false
 }
+
+// RequestValidationError is a payload-free local rejection of caller request
+// data. It marks a fault the client can fix, such as tool-call arguments that
+// are not valid JSON, so the proxy returns HTTP 400 without contacting any
+// upstream. The message carries only message/block location and must never
+// include raw arguments, tool names, or tool ids.
+type RequestValidationError struct {
+	Message string
+}
+
+func (e *RequestValidationError) Error() string {
+	if e == nil || e.Message == "" {
+		return "invalid request"
+	}
+	return e.Message
+}
+
+// InvalidRequest returns a RequestValidationError with message. Callers must
+// not place caller-supplied content in message.
+func InvalidRequest(message string) error {
+	return &RequestValidationError{Message: message}
+}
+
+// AsRequestValidation reports whether err is or wraps a *RequestValidationError.
+func AsRequestValidation(err error) (*RequestValidationError, bool) {
+	var rv *RequestValidationError
+	if errors.As(err, &rv) {
+		return rv, true
+	}
+	return nil, false
+}

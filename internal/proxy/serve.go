@@ -241,6 +241,17 @@ func terminal(status int, message, errType string) attemptResult {
 	return attemptResult{status: status, errMsg: message, logErr: message, errType: errType}
 }
 
+// terminalEncodeError maps a backend.encodeRequest failure. A typed request
+// validation error is invalid caller data discovered locally: HTTP 400 with no
+// upstream contact and no failover. Any other failure is an internal encoding
+// fault and stays a generic HTTP 500 with the raw detail withheld.
+func terminalEncodeError(err error) attemptResult {
+	if _, ok := ir.AsRequestValidation(err); ok {
+		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
+	}
+	return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
+}
+
 func callerCanceledResult() attemptResult {
 	return attemptResult{status: http.StatusBadGateway, errMsg: "request canceled", logErr: "request canceled", errType: "api_error"}
 }
@@ -768,7 +779,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 
 	upstreamBody, err := backend.encodeRequest(req)
 	if err != nil {
-		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
+		return terminalEncodeError(err)
 	}
 	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, provider)
 	if err != nil {

@@ -315,7 +315,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 
 	upstreamBody, err := backend.encodeRequest(req)
 	if err != nil {
-		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
+		return terminalEncodeError(err)
 	}
 	// Provider-aware reasoning finalization before protocol prepare/signing.
 	upstreamBody, err = finalizeEncodedBody(upstreamBody, req, backend, provider)

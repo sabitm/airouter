@@ -1,0 +1,232 @@
+package anthropic
+
+import (
+	"encoding/json"
+	"math"
+	"strings"
+	"testing"
+
+	"airouter/internal/proxy/ir"
+)
+
+func encodeAndDecode(t *testing.T, req *ir.Request) messagesRequest {
+	t.Helper()
+	out, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeRequest: %v", err)
+	}
+	var enc messagesRequest
+	if err := json.Unmarshal(out, &enc); err != nil {
+		t.Fatalf("encoded body invalid: %v (%s)", err, out)
+	}
+	return enc
+}
+
+func decodeMessageBlocks(t *testing.T, raw json.RawMessage) []anthBlock {
+	t.Helper()
+	var blocks []anthBlock
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		t.Fatalf("message content invalid: %v (%s)", err, raw)
+	}
+	return blocks
+}
+
+// TestEncodeRequestMalformedToolInputIsValidationError verifies a non-empty
+// invalid tool argument fails the encode with a typed client error instead of
+// dropping the assistant turn, and that the error message leaks no payload.
+func TestEncodeRequestMalformedToolInputIsValidationError(t *testing.T) {
+	req := &ir.Request{
+		Model: "m",
+		Messages: []ir.Message{{
+			Role: ir.RoleAssistant,
+			Content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "sure"},
+				{Type: ir.BlockToolUse, ToolID: "call_secret_id", ToolName: "tool_secret_name", ToolInput: json.RawMessage(`{"secret":"hunter2",}`)},
+			},
+		}},
+	}
+	_, err := EncodeRequest(req)
+	if err == nil {
+		t.Fatal("want validation error")
+	}
+	if _, ok := ir.AsRequestValidation(err); !ok {
+		t.Fatalf("err = %v, want request validation error", err)
+	}
+	msg := err.Error()
+	for _, leak := range []string{"hunter2", "call_secret_id", "tool_secret_name"} {
+		if strings.Contains(msg, leak) {
+			t.Fatalf("error %q leaked %q", msg, leak)
+		}
+	}
+	if !strings.Contains(msg, "message 0") || !strings.Contains(msg, "block 1") {
+		t.Fatalf("error %q does not identify message and block", msg)
+	}
+}
+
+// TestEncodeRequestMalformedNestedToolResultInput verifies the typed error is
+// preserved through nested tool_result encoding and the position stays
+// meaningful.
+func TestEncodeRequestMalformedNestedToolResultInput(t *testing.T) {
+	req := &ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "ok"}}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{{
+				Type:      ir.BlockToolResult,
+				ToolUseID: "call_secret_id",
+				ToolResult: []ir.ContentBlock{
+					{Type: ir.BlockText, Text: "fine"},
+					{Type: ir.BlockToolUse, ToolID: "nested_id", ToolName: "nested_name", ToolInput: json.RawMessage(`[bad`)},
+				},
+			}}},
+		},
+	}
+	_, err := EncodeRequest(req)
+	if err == nil {
+		t.Fatal("want validation error")
+	}
+	if _, ok := ir.AsRequestValidation(err); !ok {
+		t.Fatalf("err = %v, want request validation error", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "message 1") || !strings.Contains(msg, "tool_result block 0") {
+		t.Fatalf("error %q does not identify nested position", msg)
+	}
+	for _, leak := range []string{"[bad", "call_secret_id", "nested_id", "nested_name"} {
+		if strings.Contains(msg, leak) {
+			t.Fatalf("error %q leaked %q", msg, leak)
+		}
+	}
+}
+
+// TestEncodeRequestMalformedToolSchemaIsValidationError verifies malformed
+// tool schema syntax is a typed client error and is not treated as schema
+// validation (a valid non-object schema still passes).
+func TestEncodeRequestMalformedToolSchemaIsValidationError(t *testing.T) {
+	req := &ir.Request{
+		Model:    "m",
+		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		Tools:    []ir.Tool{{Name: "tool_secret_name", Parameters: json.RawMessage(`{"type":`)}},
+	}
+	_, err := EncodeRequest(req)
+	if err == nil {
+		t.Fatal("want validation error")
+	}
+	if _, ok := ir.AsRequestValidation(err); !ok {
+		t.Fatalf("err = %v, want request validation error", err)
+	}
+	if strings.Contains(err.Error(), "tool_secret_name") {
+		t.Fatalf("error %q leaked tool name", err)
+	}
+	if !strings.Contains(err.Error(), "tool 0") {
+		t.Fatalf("error %q does not identify tool position", err)
+	}
+
+	// A syntactically valid non-object schema is not rejected.
+	req.Tools = []ir.Tool{{Name: "t", Parameters: json.RawMessage(`["not-an-object"]`)}}
+	if _, err := EncodeRequest(req); err != nil {
+		t.Fatalf("valid non-object schema rejected: %v", err)
+	}
+}
+
+// TestEncodeRequestValidHistoryPreserved verifies assistant text, reasoning,
+// multiple tool calls, and matching tool results all survive one encode, so a
+// failure in one block cannot silently discard its siblings.
+func TestEncodeRequestValidHistoryPreserved(t *testing.T) {
+	req := &ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+				{Type: ir.BlockReasoning, Text: "think"},
+				{Type: ir.BlockText, Text: "sure"},
+				{Type: ir.BlockToolUse, ToolID: "c1", ToolName: "f1", ToolInput: json.RawMessage(`{"a":1}`)},
+				{Type: ir.BlockToolUse, ToolID: "c2", ToolName: "f2", ToolInput: json.RawMessage(`{"b":2}`)},
+			}},
+			{Role: ir.RoleUser, Content: []ir.ContentBlock{
+				{Type: ir.BlockToolResult, ToolUseID: "c1", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "r1"}}},
+				{Type: ir.BlockToolResult, ToolUseID: "c2", ToolResult: []ir.ContentBlock{{Type: ir.BlockText, Text: "r2"}}},
+			}},
+		},
+	}
+	enc := encodeAndDecode(t, req)
+	if len(enc.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(enc.Messages))
+	}
+	assistant := decodeMessageBlocks(t, enc.Messages[0].Content)
+	if len(assistant) != 4 {
+		t.Fatalf("assistant blocks = %d, want 4 (%+v)", len(assistant), assistant)
+	}
+	if assistant[0].Type != "thinking" || thinkingText(assistant[0].Thinking) != "think" {
+		t.Fatalf("reasoning = %+v", assistant[0])
+	}
+	if assistant[1].Type != "text" || assistant[1].Text != "sure" {
+		t.Fatalf("text = %+v", assistant[1])
+	}
+	if assistant[2].Type != "tool_use" || assistant[2].ID != "c1" || assistant[2].Name != "f1" || string(assistant[2].Input) != `{"a":1}` {
+		t.Fatalf("tool 0 = %+v", assistant[2])
+	}
+	if assistant[3].Type != "tool_use" || assistant[3].ID != "c2" || assistant[3].Name != "f2" || string(assistant[3].Input) != `{"b":2}` {
+		t.Fatalf("tool 1 = %+v", assistant[3])
+	}
+	user := decodeMessageBlocks(t, enc.Messages[1].Content)
+	if len(user) != 2 || user[0].ToolUseID != "c1" || user[1].ToolUseID != "c2" {
+		t.Fatalf("tool results = %+v", user)
+	}
+}
+
+// TestEncodeRequestValidToolInputForms verifies syntax-only acceptance of
+// primitives, arrays, and null, exact raw-byte preservation (including large
+// numbers), and the empty-arguments default.
+func TestEncodeRequestValidToolInputForms(t *testing.T) {
+	const huge = `{"n":12345678901234567890123}`
+	cases := []struct {
+		name  string
+		input json.RawMessage
+		want  string
+	}{
+		{"empty defaults to object", nil, `{}`},
+		{"null", json.RawMessage(`null`), `null`},
+		{"array", json.RawMessage(`[1,2,3]`), `[1,2,3]`},
+		{"string", json.RawMessage(`"plain"`), `"plain"`},
+		{"number", json.RawMessage(`42`), `42`},
+		{"bool", json.RawMessage(`true`), `true`},
+		{"huge number fidelity", json.RawMessage(huge), huge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &ir.Request{
+				Model: "m",
+				Messages: []ir.Message{{Role: ir.RoleAssistant, Content: []ir.ContentBlock{
+					{Type: ir.BlockToolUse, ToolID: "c", ToolName: "f", ToolInput: tc.input},
+				}}},
+			}
+			enc := encodeAndDecode(t, req)
+			blocks := decodeMessageBlocks(t, enc.Messages[0].Content)
+			if len(blocks) != 1 || blocks[0].Type != "tool_use" {
+				t.Fatalf("blocks = %+v", blocks)
+			}
+			if got := string(blocks[0].Input); got != tc.want {
+				t.Fatalf("input = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEncodeRequestMarshalFailureIsNotValidationError verifies a final
+// json.Marshal failure caused by non-client data is not labelled as a client
+// validation error automatically.
+func TestEncodeRequestMarshalFailureIsNotValidationError(t *testing.T) {
+	nan := math.NaN()
+	req := &ir.Request{
+		Model:       "m",
+		Temperature: &nan,
+		Messages:    []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+	}
+	_, err := EncodeRequest(req)
+	if err == nil {
+		t.Fatal("want marshal error")
+	}
+	if _, ok := ir.AsRequestValidation(err); ok {
+		t.Fatalf("marshal failure mislabeled as validation error: %v", err)
+	}
+}

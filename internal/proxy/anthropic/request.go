@@ -236,11 +236,24 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 		out.MaxTokens = DefaultMaxTokens
 	}
 	if blocks := systemBlocksForEncode(req); blocks != nil {
-		out.System, _ = json.Marshal(blocks)
+		raw, err := json.Marshal(blocks)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: encode system: %w", err)
+		}
+		out.System = raw
 	} else if req.System != "" {
-		out.System, _ = json.Marshal(req.System)
+		raw, err := json.Marshal(req.System)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: encode system: %w", err)
+		}
+		out.System = raw
 	}
-	for _, t := range req.Tools {
+	for i, t := range req.Tools {
+		// Schema syntax is validated here; the shape (object with type/properties)
+		// is not, so a valid non-object schema still passes through unchanged.
+		if len(t.Parameters) > 0 && !json.Valid(t.Parameters) {
+			return nil, ir.InvalidRequest(fmt.Sprintf("invalid tool schema at tool %d", i))
+		}
 		out.Tools = append(out.Tools, anthTool{
 			Name:         t.Name,
 			Description:  t.Description,
@@ -251,12 +264,19 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 	if req.ToolChoice != nil {
 		out.ToolChoice = &anthToolChoice{Type: string(req.ToolChoice.Type), Name: req.ToolChoice.Name}
 	}
-	for _, m := range req.Messages {
+	for i, m := range req.Messages {
 		role := "user"
 		if m.Role == ir.RoleAssistant {
 			role = "assistant"
 		}
-		content, _ := json.Marshal(encodeBlocks(m.Content))
+		blocks, err := encodeBlocks(m.Content)
+		if err != nil {
+			return nil, fmt.Errorf("message %d: %w", i, err)
+		}
+		content, err := json.Marshal(blocks)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: encode message %d: %w", i, err)
+		}
 		out.Messages = append(out.Messages, anthMessage{Role: role, Content: content})
 	}
 	applyThinking(&out, req, protocol)
@@ -320,22 +340,25 @@ func applyThinking(out *messagesRequest, req *ir.Request, protocol domain.Protoc
 
 // encodeBlocks renders top-level request content blocks, including explicit
 // caller cache hints on the eligible block kinds.
-func encodeBlocks(blocks []ir.ContentBlock) []anthBlock {
+func encodeBlocks(blocks []ir.ContentBlock) ([]anthBlock, error) {
 	return encodeBlocksHints(blocks, true)
 }
 
 // encodeToolResultBlocks renders nested tool_result content. Hints are always
 // suppressed: a nested IR hint is dropped, never hoisted onto the outer block.
-func encodeToolResultBlocks(blocks []ir.ContentBlock) []anthBlock {
+func encodeToolResultBlocks(blocks []ir.ContentBlock) ([]anthBlock, error) {
 	return encodeBlocksHints(blocks, false)
 }
 
 // encodeBlocksHints renders blocks. A hint is emitted only when hints are
 // allowed and the block kind has a request-side marker slot; reasoning and
 // redacted reasoning never emit one even when the IR was hand-built with it.
-func encodeBlocksHints(blocks []ir.ContentBlock, hints bool) []anthBlock {
+// A non-empty tool input must be syntactically valid JSON; an invalid one is a
+// payload-free client validation error so the whole assistant turn is not lost.
+func encodeBlocksHints(blocks []ir.ContentBlock, hints bool) ([]anthBlock, error) {
 	out := make([]anthBlock, 0, len(blocks))
-	for _, b := range blocks {
+	for i := range blocks {
+		b := blocks[i]
 		switch b.Type {
 		case ir.BlockReasoning:
 			// An opaque-only Responses item has no readable summary. Do not turn
@@ -362,14 +385,23 @@ func encodeBlocksHints(blocks []ir.ContentBlock, hints bool) []anthBlock {
 			input := b.ToolInput
 			if len(input) == 0 {
 				input = json.RawMessage("{}")
+			} else if !json.Valid(input) {
+				return nil, ir.InvalidRequest(fmt.Sprintf("invalid tool call arguments at block %d", i))
 			}
 			out = append(out, anthBlock{Type: "tool_use", ID: b.ToolID, Name: b.ToolName, Input: input, CacheControl: cacheHintRaw(b.CacheControl, hints)})
 		case ir.BlockToolResult:
-			content, _ := json.Marshal(encodeToolResultBlocks(b.ToolResult))
+			nested, err := encodeToolResultBlocks(b.ToolResult)
+			if err != nil {
+				return nil, fmt.Errorf("tool_result block %d: %w", i, err)
+			}
+			content, err := json.Marshal(nested)
+			if err != nil {
+				return nil, fmt.Errorf("anthropic: encode tool_result block %d: %w", i, err)
+			}
 			out = append(out, anthBlock{Type: "tool_result", ToolUseID: b.ToolUseID, IsError: b.IsError, Content: content, CacheControl: cacheHintRaw(b.CacheControl, hints)})
 		}
 	}
-	return out
+	return out, nil
 }
 
 // cacheHintRaw converts a canonical hint to wire bytes only at an allowed
