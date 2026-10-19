@@ -1786,3 +1786,129 @@ func TestCollectReasoningProjectionRealDecoder(t *testing.T) {
 		t.Fatalf("real decoder one byte under = %v", err)
 	}
 }
+
+// codexProvisionalCipherSSEUpstream streams one reasoning item whose
+// output_item.added frame carries a short provisional ciphertext and whose
+// output_item.done and terminal array replace it with the completed value.
+// Codex omits the added status. withSummary covers both observed HAR shapes.
+func codexProvisionalCipherSSEUpstream(t *testing.T, withSummary bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		write := func(s string) { _, _ = io.WriteString(w, s) }
+		write("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"m\",\"status\":\"in_progress\"}}\n\n")
+		write("event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_up\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"prov\"}}\n\n")
+		summary := `[]`
+		if withSummary {
+			write("event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_up\",\"output_index\":0,\"summary_index\":0,\"delta\":\"readable\"}\n\n")
+			summary = `[{"type":"summary_text","text":"readable"}]`
+		}
+		write("event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_up\",\"type\":\"reasoning\",\"status\":\"completed\",\"encrypted_content\":\"completed-cipher\",\"summary\":" + summary + "}}\n\n")
+		write("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"model\":\"m\",\"status\":\"completed\",\"output\":[{\"id\":\"rs_up\",\"type\":\"reasoning\",\"status\":\"completed\",\"encrypted_content\":\"completed-cipher\",\"summary\":" + summary + "}],\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestCodexProvisionalCipherReplacedChatStream covers both failed HAR shapes:
+// a Chat stream with and without a readable summary where the provisional
+// output_item.added ciphertext differs from the completed one.
+func TestCodexProvisionalCipherReplacedChatStream(t *testing.T) {
+	for _, withSummary := range []bool{true, false} {
+		name := "without summary"
+		if withSummary {
+			name = "with summary"
+		}
+		t.Run(name, func(t *testing.T) {
+			up := codexProvisionalCipherSSEUpstream(t, withSummary)
+			base, token, _, _ := setupResponsesRouting(t, []routingTarget{{protocol: domain.ProtocolOpenAICodex, url: up.URL, model: "gpt-5-codex"}})
+			resp, out := post(t, base+"/v1/chat/completions", token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+			}
+			s := string(out)
+			if strings.Contains(s, "prov") || strings.Contains(s, "completed-cipher") {
+				t.Fatalf("opaque ciphertext leaked into chat stream: %s", s)
+			}
+			if strings.Contains(s, "conflicting reasoning encrypted content") {
+				t.Fatalf("replacement reported as a conflict: %s", s)
+			}
+			if withSummary {
+				if !strings.Contains(s, `"reasoning_content":"readable"`) {
+					t.Fatalf("readable summary missing: %s", s)
+				}
+			} else if strings.Contains(s, `"reasoning_content"`) {
+				t.Fatalf("summary invented without source: %s", s)
+			}
+			if !strings.Contains(s, `"prompt_tokens":3`) || !strings.Contains(s, `"completion_tokens":5`) {
+				t.Fatalf("usage lost: %s", s)
+			}
+		})
+	}
+}
+
+func TestCodexProvisionalCipherReplacedChatUnary(t *testing.T) {
+	up := codexProvisionalCipherSSEUpstream(t, true)
+	base, token, _, _ := setupResponsesRouting(t, []routingTarget{{protocol: domain.ProtocolOpenAICodex, url: up.URL, model: "gpt-5-codex"}})
+	resp, out := post(t, base+"/v1/chat/completions", token, `{"model":"default","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+	}
+	s := string(out)
+	if strings.Contains(s, "prov") || strings.Contains(s, "completed-cipher") {
+		t.Fatalf("opaque ciphertext leaked into chat response: %s", s)
+	}
+	if strings.Contains(s, "conflicting reasoning encrypted content") {
+		t.Fatalf("replacement reported as a conflict: %s", s)
+	}
+	if !strings.Contains(s, `"reasoning_content":"readable"`) {
+		t.Fatalf("readable summary missing: %s", s)
+	}
+	if !strings.Contains(s, `"prompt_tokens":3`) || !strings.Contains(s, `"completion_tokens":5`) {
+		t.Fatalf("usage lost: %s", s)
+	}
+}
+
+func TestCodexProvisionalCipherReplacedResponsesStream(t *testing.T) {
+	up := codexProvisionalCipherSSEUpstream(t, true)
+	base, token, _, _ := setupResponsesRouting(t, []routingTarget{{protocol: domain.ProtocolOpenAICodex, url: up.URL, model: "gpt-5-codex"}})
+	resp, out := post(t, base+"/v1/responses", token, `{"model":"default","stream":true,"input":"hi"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+	}
+	s := string(out)
+	if strings.Contains(s, "prov") {
+		t.Fatalf("provisional ciphertext leaked into responses stream: %s", s)
+	}
+	if strings.Contains(s, "conflicting reasoning encrypted content") {
+		t.Fatalf("replacement reported as a conflict: %s", s)
+	}
+	if !strings.Contains(s, `"encrypted_content":"completed-cipher"`) {
+		t.Fatalf("completed ciphertext lost: %s", s)
+	}
+	if !strings.Contains(s, `"delta":"readable"`) {
+		t.Fatalf("readable summary missing: %s", s)
+	}
+}
+
+func TestCodexProvisionalCipherReplacedResponsesUnary(t *testing.T) {
+	up := codexProvisionalCipherSSEUpstream(t, true)
+	base, token, _, _ := setupResponsesRouting(t, []routingTarget{{protocol: domain.ProtocolOpenAICodex, url: up.URL, model: "gpt-5-codex"}})
+	resp, out := post(t, base+"/v1/responses", token, `{"model":"default","input":"hi"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+	}
+	s := string(out)
+	if strings.Contains(s, "prov") {
+		t.Fatalf("provisional ciphertext leaked into responses body: %s", s)
+	}
+	if strings.Contains(s, "conflicting reasoning encrypted content") {
+		t.Fatalf("replacement reported as a conflict: %s", s)
+	}
+	if !strings.Contains(s, `"encrypted_content":"completed-cipher"`) {
+		t.Fatalf("completed ciphertext lost: %s", s)
+	}
+	if !strings.Contains(s, "readable") {
+		t.Fatalf("readable summary missing: %s", s)
+	}
+}

@@ -2,6 +2,7 @@ package responses
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"strings"
@@ -843,4 +844,258 @@ func TestSummaryAppendNoncontiguousFinalIndicesSuffixOnce(t *testing.T) {
 	if final := finalSummaryTexts(t, encoded, 2); len(final) != 1 || final[0] != "z" {
 		t.Fatalf("trailing item final = %q", final)
 	}
+}
+
+// reasoningAddedCipherEvent builds an output_item.added frame for a reasoning
+// item carrying an optional provisional encrypted snapshot. An empty status is
+// ignored by the decoder, matching Codex frames that omit the field.
+func reasoningAddedCipherEvent(index int, id, status string, encrypted *string) string {
+	item := fmt.Sprintf(`{"id":%q,"type":"reasoning","status":%q,"summary":[]}`, id, status)
+	if encrypted != nil {
+		item = fmt.Sprintf(`{"id":%q,"type":"reasoning","status":%q,"summary":[],"encrypted_content":%q}`, id, status, *encrypted)
+	}
+	return fmt.Sprintf(`{"type":"response.output_item.added","output_index":%d,"item":%s}`, index, item)
+}
+
+func reasoningDoneCipher(t *testing.T, evs []ir.StreamEvent, id string) *ir.ResponsesReasoning {
+	t.Helper()
+	var found *ir.ResponsesReasoning
+	for i := range evs {
+		if evs[i].Kind != ir.EventReasoningItemDone || evs[i].ReasoningID != id {
+			continue
+		}
+		found = evs[i].Reasoning
+	}
+	if found == nil {
+		t.Fatalf("missing reasoning done for %s", id)
+	}
+	return found
+}
+
+func TestDecodeStreamReasoningProvisionalCipherReplacement(t *testing.T) {
+	prov := "provisional-cipher"
+	done := "completed-cipher-longer"
+	empty := ""
+	summary := `[{"type":"summary_text","text":"chain"}]`
+	cases := []struct {
+		name       string
+		events     []string
+		wantCipher string
+		wantDeltas int
+		wantDones  int
+	}{
+		{
+			name: "added replaced by done without status",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "", &prov),
+				reasoningItemDoneEvent(0, "rs_1", "completed", &done, summary),
+			},
+			wantCipher: done, wantDeltas: 1, wantDones: 1,
+		},
+		{
+			name: "added replaced by final completion",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "in_progress", &prov),
+				completedEvent(finalOutput(reasoningFinalItem("rs_1", "completed", &done, summary)), ""),
+			},
+			wantCipher: done, wantDeltas: 1, wantDones: 1,
+		},
+		{
+			name: "added replaced with empty summary",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "", &prov),
+				reasoningItemDoneEvent(0, "rs_1", "completed", &done, `[]`),
+			},
+			wantCipher: done, wantDeltas: 0, wantDones: 1,
+		},
+		{
+			name: "identical provisional is free",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "", &prov),
+				reasoningItemDoneEvent(0, "rs_1", "completed", &prov, summary),
+			},
+			wantCipher: prov, wantDeltas: 1, wantDones: 1,
+		},
+		{
+			name: "nil done keeps provisional",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "", &prov),
+				reasoningItemDoneEvent(0, "rs_1", "completed", nil, summary),
+			},
+			wantCipher: prov, wantDeltas: 1, wantDones: 1,
+		},
+		{
+			name: "explicit empty is present",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "", nil),
+				reasoningItemDoneEvent(0, "rs_1", "completed", &empty, summary),
+			},
+			wantCipher: empty, wantDeltas: 1, wantDones: 1,
+		},
+		{
+			name: "final only completion",
+			events: []string{
+				completedEvent(finalOutput(reasoningFinalItem("rs_1", "completed", &done, summary)), ""),
+			},
+			wantCipher: done, wantDeltas: 1, wantDones: 1,
+		},
+		{
+			name: "repeated completed snapshot deduped",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "", &prov),
+				reasoningItemDoneEvent(0, "rs_1", "completed", &done, summary),
+				reasoningItemDoneEvent(0, "rs_1", "completed", &done, summary),
+			},
+			wantCipher: done, wantDeltas: 1, wantDones: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evs, err := collectStream(t, sseData(tc.events...))
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			got := reasoningDoneCipher(t, evs, "rs_1")
+			if got.EncryptedContent == nil || *got.EncryptedContent != tc.wantCipher {
+				t.Fatalf("cipher = %v want %q", got.EncryptedContent, tc.wantCipher)
+			}
+			deltas, dones := 0, 0
+			for _, ev := range evs {
+				switch ev.Kind {
+				case ir.EventReasoningDelta:
+					deltas++
+				case ir.EventReasoningItemDone:
+					dones++
+				}
+			}
+			if deltas != tc.wantDeltas || dones != tc.wantDones {
+				t.Fatalf("deltas=%d dones=%d want %d/%d", deltas, dones, tc.wantDeltas, tc.wantDones)
+			}
+		})
+	}
+}
+
+func TestDecodeStreamReasoningCompletedCipherImmutable(t *testing.T) {
+	first := strPtr("completed-one")
+	second := strPtr("completed-two")
+	summary := `[{"type":"summary_text","text":"chain"}]`
+	cases := []struct {
+		name   string
+		events []string
+	}{
+		{
+			name: "done then final",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "", first),
+				reasoningItemDoneEvent(0, "rs_1", "completed", first, summary),
+				completedEvent(finalOutput(reasoningFinalItem("rs_1", "completed", second, summary)), ""),
+			},
+		},
+		{
+			name: "done then done",
+			events: []string{
+				reasoningAddedCipherEvent(0, "rs_1", "", first),
+				reasoningItemDoneEvent(0, "rs_1", "completed", first, summary),
+				reasoningItemDoneEvent(0, "rs_1", "completed", second, summary),
+			},
+		},
+		{
+			name: "final then final",
+			events: []string{
+				completedEvent(finalOutput(reasoningFinalItem("rs_1", "completed", first, summary)), ""),
+				completedEvent(finalOutput(reasoningFinalItem("rs_1", "completed", second, summary)), ""),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := collectStream(t, sseData(tc.events...))
+			sf, ok := ir.AsStreamFailure(err)
+			if !ok || sf.Message != "conflicting reasoning encrypted content" {
+				t.Fatalf("err = %v, want conflicting encrypted content", err)
+			}
+		})
+	}
+}
+
+func TestDecodeStreamReasoningProvisionalCipherReplacementBudget(t *testing.T) {
+	const summaryText = "chain"
+	partState := reasoningPartOverhead + len("summary_text") + len(summaryText)
+	stateBytes := func(cipher int) int {
+		return len("rs_1") + len("completed") + cipher + partState
+	}
+	// The ledger charges item and both identity keys once, the initial
+	// ciphertext, the summary state, any positive ciphertext growth, the final
+	// status, and the retained emitted snapshot at done.
+	ledger := func(prov, done string) int {
+		return reasoningItemOverhead + (len("rs_1") + reasoningKeyOverhead) + reasoningKeyOverhead +
+			len(prov) + partState + max(0, len(done)-len(prov)) + len("completed") + stateBytes(len(done))
+	}
+	summary := `[{"type":"summary_text","text":"chain"}]`
+
+	t.Run("growth", func(t *testing.T) {
+		prov := strings.Repeat("p", 17)
+		done := strings.Repeat("d", 20)
+		body := sseData(
+			reasoningAddedCipherEvent(0, "rs_1", "", &prov),
+			reasoningItemDoneEvent(0, "rs_1", "completed", &done, summary),
+		)
+		exact := ledger(prov, done)
+		evs, err := decoderBudget(t, strings.NewReader(body), exact)
+		if err != nil {
+			t.Fatalf("exact budget failed: %v", err)
+		}
+		if got := reasoningDoneCipher(t, evs, "rs_1").EncryptedContent; got == nil || *got != done {
+			t.Fatalf("cipher = %v want replaced", got)
+		}
+		evs, err = decoderBudget(t, strings.NewReader(body), exact-1)
+		noBadDoneAfterDeltas(t, evs, err)
+		sf, ok := ir.AsStreamFailure(err)
+		if !ok || sf.Message != "reasoning state too large" {
+			t.Fatalf("one byte under err = %v", err)
+		}
+		deltas, dones := 0, 0
+		for _, ev := range evs {
+			switch ev.Kind {
+			case ir.EventReasoningDelta:
+				deltas++
+			case ir.EventReasoningItemDone:
+				dones++
+			}
+		}
+		if deltas != 1 || dones != 0 {
+			t.Fatalf("deltas=%d dones=%d, want the summary delta without a done", deltas, dones)
+		}
+	})
+
+	t.Run("equal replacement", func(t *testing.T) {
+		prov := strings.Repeat("e", 20)
+		body := sseData(
+			reasoningAddedCipherEvent(0, "rs_1", "", &prov),
+			reasoningItemDoneEvent(0, "rs_1", "completed", &prov, summary),
+		)
+		if _, err := decoderBudget(t, strings.NewReader(body), ledger(prov, prov)); err != nil {
+			t.Fatalf("equal replacement budget failed: %v", err)
+		}
+	})
+
+	t.Run("shorter replacement keeps conservative credit", func(t *testing.T) {
+		prov := strings.Repeat("p", 20)
+		done := strings.Repeat("d", 10)
+		body := sseData(
+			reasoningAddedCipherEvent(0, "rs_1", "", &prov),
+			reasoningItemDoneEvent(0, "rs_1", "completed", &done, summary),
+		)
+		exact := ledger(prov, done)
+		if exact <= ledger(done, done) {
+			t.Fatalf("shorter replacement reclaimed credit: %d <= %d", exact, ledger(done, done))
+		}
+		evs, err := decoderBudget(t, strings.NewReader(body), exact)
+		if err != nil {
+			t.Fatalf("shorter replacement budget failed: %v", err)
+		}
+		if got := reasoningDoneCipher(t, evs, "rs_1").EncryptedContent; got == nil || *got != done {
+			t.Fatalf("cipher = %v want shorter completed value", got)
+		}
+	})
 }

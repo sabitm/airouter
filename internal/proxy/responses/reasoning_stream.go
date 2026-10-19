@@ -642,9 +642,24 @@ func (r *responsesReasoningDecoder) applyEncrypted(item *responsesReasoningItem,
 		return nil
 	}
 	if item.encrypted != nil {
-		if *item.encrypted != *value {
+		if *item.encrypted == *value {
+			return nil
+		}
+		// A closed item keeps its completed ciphertext. An open item may replace
+		// a provisional snapshot with the complete one; ciphertext is opaque, so
+		// this is a whole-value replacement, never a prefix or an append.
+		if item.done {
 			return ir.ProtocolError("conflicting reasoning encrypted content")
 		}
+		// Only positive retained growth is charged; a shorter replacement does
+		// not reclaim the existing conservative ledger credit.
+		if growth := len(*value) - len(*item.encrypted); growth > 0 {
+			if err := r.charge(growth); err != nil {
+				return err
+			}
+		}
+		v := *value
+		item.encrypted = &v
 		return nil
 	}
 	if err := r.charge(len(*value)); err != nil {
