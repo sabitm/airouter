@@ -493,7 +493,15 @@ func TestStreamToolOpenAIToAnthropic(t *testing.T) {
 
 func setupStreamingBackend(t *testing.T, protocol domain.Protocol, sseBody string) (base, token string) {
 	t.Helper()
-	st := newTestStore(t)
+	base, token, _ = setupStreamingBackendWithStore(t, protocol, sseBody)
+	return base, token
+}
+
+// setupStreamingBackendWithStore is setupStreamingBackend plus the request-log
+// store, for tests that must inspect recorded usage after a custom stream.
+func setupStreamingBackendWithStore(t *testing.T, protocol domain.Protocol, sseBody string) (base, token string, st *store.Store) {
+	t.Helper()
+	st = newTestStore(t)
 	ctx := context.Background()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -517,7 +525,7 @@ func setupStreamingBackend(t *testing.T, protocol domain.Protocol, sseBody strin
 	New(st, nil).Mount(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
-	return ts.URL, key.Token
+	return ts.URL, key.Token, st
 }
 
 func collectResponsesToolStream(t *testing.T, body string) (name, args, done string) {
@@ -3907,5 +3915,211 @@ data: {"type":"response.failed","response":{"id":"resp_bad","status":"failed","e
 	}
 	if got := backoffSkips(px, p1.ID); got == 0 {
 		t.Fatal("failed provider was not penalized")
+	}
+}
+
+// openAISingleToolNoUsageSSE streams one text delta and one tool call whose
+// arguments arrive in two fragments. It has no usage chunk, so the translated
+// proxy must fall back to a character estimate that counts the full arguments.
+const openAISingleToolNoUsageSSE = `data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"[1"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":",2]"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+`
+
+// openAISingleToolUsageSSE is openAISingleToolNoUsageSSE plus an authoritative
+// usage chunk. The translated proxy must report it and not estimate.
+const openAISingleToolUsageSSE = `data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"[1"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":",2]"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-est","object":"chat.completion.chunk","created":1,"model":"up","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":9,"total_tokens":12}}
+
+data: [DONE]
+
+`
+
+// openAIMultiToolNoUsageSSE streams two tool calls whose identity is split
+// across Starts and whose argument fragments interleave. Index 0 arrives id
+// first and name later; index 1 does the same. Fragments for both indices are
+// interleaved before finish. There is no usage chunk.
+const openAIMultiToolNoUsageSSE = `data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function"}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function"}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"alpha"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"[1"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"name":"beta"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"[3"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":",2]"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":",4]"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multi","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+`
+
+// clientAnthTool is one tool_use block reassembled from a client Anthropic SSE
+// stream by block index, independent of the server-side estimate collector.
+type clientAnthTool struct {
+	name string
+	args string
+}
+
+// collectAnthropicToolCalls reassembles every tool_use block from an Anthropic
+// SSE stream. It keys fragments by the content-block index so interleaved calls
+// cannot be confused with each other.
+func collectAnthropicToolCalls(t *testing.T, body string) []clientAnthTool {
+	t.Helper()
+	reader := sse.NewReader(strings.NewReader(body))
+	byIndex := map[int]*clientAnthTool{}
+	var order []int
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch ev.Name {
+		case "content_block_start":
+			var d struct {
+				Index        int `json:"index"`
+				ContentBlock struct {
+					Type string `json:"type"`
+					Name string `json:"name"`
+				} `json:"content_block"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			if d.ContentBlock.Type != "tool_use" {
+				continue
+			}
+			if _, ok := byIndex[d.Index]; !ok {
+				byIndex[d.Index] = &clientAnthTool{}
+				order = append(order, d.Index)
+			}
+			byIndex[d.Index].name = d.ContentBlock.Name
+		case "content_block_delta":
+			var d struct {
+				Index int `json:"index"`
+				Delta struct {
+					Type        string `json:"type"`
+					PartialJSON string `json:"partial_json"`
+				} `json:"delta"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			if d.Delta.Type != "input_json_delta" {
+				continue
+			}
+			if tc, ok := byIndex[d.Index]; ok {
+				tc.args += d.Delta.PartialJSON
+			}
+		}
+	}
+	out := make([]clientAnthTool, 0, len(order))
+	for _, idx := range order {
+		out = append(out, *byIndex[idx])
+	}
+	return out
+}
+
+// TestTranslatedStreamUsageEstimateCountsAllToolFragments verifies the
+// no-usage translated fallback counts every argument fragment by IR index. The
+// backend is OpenAI Chat and the ingress is Anthropic, so the codec IDs differ
+// and translation runs. The two-tool case would misattribute fragments if the
+// estimate paired names and arguments by ordinal.
+func TestTranslatedStreamUsageEstimateCountsAllToolFragments(t *testing.T) {
+	cases := []struct {
+		name    string
+		sse     string
+		want    []clientAnthTool
+		wantOut int
+	}{
+		{
+			name:    "single tool multi-fragment",
+			sse:     openAISingleToolNoUsageSSE,
+			want:    []clientAnthTool{{name: "get_weather", args: "[1,2]"}},
+			wantOut: charsToTokens(len("hi") + len("get_weather") + len("[1,2]")),
+		},
+		{
+			name:    "two tools interleaved split identity",
+			sse:     openAIMultiToolNoUsageSSE,
+			want:    []clientAnthTool{{name: "alpha", args: "[1,2]"}, {name: "beta", args: "[3,4]"}},
+			wantOut: charsToTokens(len("hi") + len("alpha") + len("[1,2]") + len("beta") + len("[3,4]")),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, token, st := setupStreamingBackendWithStore(t, domain.ProtocolOpenAI, tc.sse)
+			resp, body := postStream(t, base+"/v1/messages", token,
+				`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d body = %s", resp.StatusCode, body)
+			}
+			got := collectAnthropicToolCalls(t, body)
+			if len(got) != len(tc.want) {
+				t.Fatalf("client tools = %+v, want %+v\n%s", got, tc.want, body)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("client tool[%d] = %+v, want %+v", i, got[i], tc.want[i])
+				}
+			}
+			l := waitForLogs(t, st, 1)[0]
+			if !l.UsageEstimated {
+				t.Fatalf("log usage not marked estimated: %+v", l)
+			}
+			if l.OutputTokens != tc.wantOut {
+				t.Errorf("log output tokens = %d, want %d", l.OutputTokens, tc.wantOut)
+			}
+		})
+	}
+}
+
+// TestTranslatedStreamUsageEstimateAuthoritativeOverride is the control: when
+// the backend reports usage, the reported counts win and the estimate flag stays
+// false even though tool arguments were streamed without a usage-based count.
+func TestTranslatedStreamUsageEstimateAuthoritativeOverride(t *testing.T) {
+	base, token, st := setupStreamingBackendWithStore(t, domain.ProtocolOpenAI, openAISingleToolUsageSSE)
+	resp, body := postStream(t, base+"/v1/messages", token,
+		`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.StatusCode, body)
+	}
+	l := waitForLogs(t, st, 1)[0]
+	if l.UsageEstimated {
+		t.Fatalf("authoritative usage marked estimated: %+v", l)
+	}
+	if l.InputTokens != 3 || l.OutputTokens != 9 {
+		t.Fatalf("log tokens = %d/%d, want 3/9", l.InputTokens, l.OutputTokens)
 	}
 }

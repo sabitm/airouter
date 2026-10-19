@@ -538,9 +538,18 @@ type translatedSink struct {
 	ingressID    string
 	logger       *slog.Logger
 	text         strings.Builder
-	toolNames    []string
-	toolArgs     []string
+	tools        map[int]*translatedToolState
+	toolOrder    []int
 	stopReason   ir.StopReason
+}
+
+// translatedToolState accumulates one streamed tool call for usage estimation.
+// It is keyed by the IR tool index and addressed through a pointer so the
+// embedded builder is never copied by map growth.
+type translatedToolState struct {
+	id   string
+	name string
+	args strings.Builder
 }
 
 func (s *translatedSink) anthropicIngress() bool {
@@ -675,9 +684,18 @@ func (s *translatedSink) note(ev ir.StreamEvent) {
 		// redacted bytes do not, and projected-away events never reach here.
 		s.text.WriteString(ev.Text)
 	case ir.EventToolCallStart:
-		s.toolNames = append(s.toolNames, ev.ToolName)
+		st := s.toolState(ev.Index)
+		// Start carries identity only. Update nonempty fields so a split or
+		// repeated Start never drops a learned name or id and never counts the
+		// same name twice. ArgsFrag on Start is ignored per the IR contract.
+		if ev.ToolID != "" {
+			st.id = ev.ToolID
+		}
+		if ev.ToolName != "" {
+			st.name = ev.ToolName
+		}
 	case ir.EventToolCallDelta:
-		s.toolArgs = append(s.toolArgs, ev.ArgsFrag)
+		s.toolState(ev.Index).args.WriteString(ev.ArgsFrag)
 	case ir.EventFinish:
 		s.stopReason = ev.StopReason
 	}
@@ -691,14 +709,34 @@ func (s *translatedSink) response() *ir.Response {
 	if s.text.Len() > 0 {
 		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText, Text: s.text.String()})
 	}
-	for i, name := range s.toolNames {
-		args := ""
-		if i < len(s.toolArgs) {
-			args = s.toolArgs[i]
-		}
-		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockToolUse, ToolName: name, ToolInput: json.RawMessage(args)})
+	for _, index := range s.toolOrder {
+		st := s.tools[index]
+		// Raw concatenated fragments, unvalidated and unrepaired. Incomplete or
+		// malformed JSON still counts toward the character estimate.
+		resp.Content = append(resp.Content, ir.ContentBlock{
+			Type:      ir.BlockToolUse,
+			ToolID:    st.id,
+			ToolName:  st.name,
+			ToolInput: json.RawMessage(st.args.String()),
+		})
 	}
 	return resp
+}
+
+// toolState returns the accumulator for an IR tool index and records that
+// index in first-seen order. Indices are opaque keys, so sparse or negative
+// values are valid and never allocate based on the numeric index.
+func (s *translatedSink) toolState(index int) *translatedToolState {
+	if st, ok := s.tools[index]; ok {
+		return st
+	}
+	if s.tools == nil {
+		s.tools = make(map[int]*translatedToolState)
+	}
+	st := &translatedToolState{}
+	s.tools[index] = st
+	s.toolOrder = append(s.toolOrder, index)
+	return st
 }
 
 func (s *translatedSink) commit() error {

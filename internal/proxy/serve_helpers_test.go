@@ -901,3 +901,206 @@ func TestUpstreamErrorMessage(t *testing.T) {
 		})
 	}
 }
+
+// sinkToolWant is the expected identity and raw argument payload of one
+// translated tool call in first-seen order.
+type sinkToolWant struct {
+	id   string
+	name string
+	args string
+}
+
+// TestTranslatedSinkGroupsToolFragmentsByIndex covers the estimate collector:
+// fragments must attach to their IR tool index, not to an ordinal slot shared
+// with the independent name list. The expected output count is derived from the
+// expected names and arguments so misattribution cannot hide behind an equal
+// aggregate length.
+func TestTranslatedSinkGroupsToolFragmentsByIndex(t *testing.T) {
+	cases := []struct {
+		name     string
+		events   []ir.StreamEvent
+		wantText string
+		wantStop ir.StopReason
+		want     []sinkToolWant
+	}{
+		{
+			name: "single multi-fragment",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventTextDelta, Text: "hi "},
+				{Kind: ir.EventToolCallStart, Index: 0, ToolID: "call_1", ToolName: "get_weather"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `{"city":`},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `"paris"}`},
+				{Kind: ir.EventFinish, StopReason: ir.StopToolUse},
+			},
+			wantText: "hi ",
+			wantStop: ir.StopToolUse,
+			want:     []sinkToolWant{{id: "call_1", name: "get_weather", args: `{"city":"paris"}`}},
+		},
+		{
+			name: "two interleaved tools",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallStart, Index: 0, ToolID: "a0", ToolName: "alpha"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: "AAA"},
+				{Kind: ir.EventToolCallStart, Index: 1, ToolID: "b1", ToolName: "beta"},
+				{Kind: ir.EventToolCallDelta, Index: 1, ArgsFrag: "B"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: "CCC"},
+				{Kind: ir.EventToolCallDelta, Index: 1, ArgsFrag: "BB"},
+			},
+			want: []sinkToolWant{
+				{id: "a0", name: "alpha", args: "AAACCC"},
+				{id: "b1", name: "beta", args: "BBB"},
+			},
+		},
+		{
+			name: "sparse out of order first seen",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallStart, Index: 5, ToolID: "i5", ToolName: "five"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: "zero"},
+				{Kind: ir.EventToolCallStart, Index: 0, ToolID: "i0", ToolName: "zero-name"},
+				{Kind: ir.EventToolCallDelta, Index: -3, ArgsFrag: "neg"},
+				{Kind: ir.EventToolCallDelta, Index: 5, ArgsFrag: "five-args"},
+			},
+			want: []sinkToolWant{
+				{id: "i5", name: "five", args: "five-args"},
+				{id: "i0", name: "zero-name", args: "zero"},
+				{name: "", args: "neg"},
+			},
+		},
+		{
+			name: "args before identity",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallDelta, Index: 3, ArgsFrag: `{"a":`},
+				{Kind: ir.EventToolCallStart, Index: 3, ToolID: "l3", ToolName: "late"},
+				{Kind: ir.EventToolCallDelta, Index: 3, ArgsFrag: `1}`},
+			},
+			want: []sinkToolWant{{id: "l3", name: "late", args: `{"a":1}`}},
+		},
+		{
+			name: "repeated split start preserves args and identity",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallDelta, Index: 1, ArgsFrag: "X"},
+				{Kind: ir.EventToolCallStart, Index: 1, ToolID: "only-id"},
+				{Kind: ir.EventToolCallStart, Index: 1},
+				{Kind: ir.EventToolCallStart, Index: 1, ToolName: "final-name"},
+				{Kind: ir.EventToolCallDelta, Index: 1, ArgsFrag: "Y"},
+			},
+			want: []sinkToolWant{{id: "only-id", name: "final-name", args: "XY"}},
+		},
+		{
+			name: "empty fragment",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallStart, Index: 0, ToolName: "e"},
+				{Kind: ir.EventToolCallDelta, Index: 0},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: ""},
+			},
+			want: []sinkToolWant{{name: "e", args: ""}},
+		},
+		{
+			name: "start args ignored",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallStart, Index: 0, ToolName: "n", ArgsFrag: "SHOULD_NOT_COUNT"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: "real"},
+			},
+			want: []sinkToolWant{{name: "n", args: "real"}},
+		},
+		{
+			name: "malformed partial json retained",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventToolCallStart, Index: 0, ToolName: "m"},
+				{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: `{"a":`},
+			},
+			want: []sinkToolWant{{name: "m", args: `{"a":`}},
+		},
+		{
+			name: "text and readable reasoning preserved",
+			events: []ir.StreamEvent{
+				{Kind: ir.EventTextDelta, Text: "t"},
+				{Kind: ir.EventReasoningDelta, Text: "r"},
+				{Kind: ir.EventFinish, StopReason: ir.StopEndTurn},
+			},
+			wantText: "tr",
+			wantStop: ir.StopEndTurn,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &translatedSink{}
+			for _, ev := range tc.events {
+				sink.note(ev)
+			}
+			resp := sink.response()
+			if resp.StopReason != tc.wantStop {
+				t.Fatalf("stop reason = %q, want %q", resp.StopReason, tc.wantStop)
+			}
+			var gotText string
+			var gotTools []sinkToolWant
+			for _, block := range resp.Content {
+				switch block.Type {
+				case ir.BlockText:
+					gotText += block.Text
+				case ir.BlockToolUse:
+					gotTools = append(gotTools, sinkToolWant{id: block.ToolID, name: block.ToolName, args: string(block.ToolInput)})
+				}
+			}
+			if gotText != tc.wantText {
+				t.Errorf("text = %q, want %q", gotText, tc.wantText)
+			}
+			if len(gotTools) != len(tc.want) {
+				t.Fatalf("tools = %+v, want %+v", gotTools, tc.want)
+			}
+			for i := range tc.want {
+				if gotTools[i] != tc.want[i] {
+					t.Errorf("tool[%d] = %+v, want %+v", i, gotTools[i], tc.want[i])
+				}
+			}
+			wantOut := charsToTokens(len(tc.wantText) + toolArgChars(tc.want))
+			if _, out := estimateUsage(nil, resp); out != wantOut {
+				t.Errorf("estimate output = %d, want %d", out, wantOut)
+			}
+		})
+	}
+}
+
+func toolArgChars(tools []sinkToolWant) int {
+	n := 0
+	for _, tool := range tools {
+		n += len(tool.name) + len(tool.args)
+	}
+	return n
+}
+
+// TestTranslatedSinkResponseSnapshotIsRepeatable verifies response() does not
+// consume accumulated state: repeated calls return equal snapshots and a later
+// fragment appends without mutating an earlier snapshot's byte slice.
+func TestTranslatedSinkResponseSnapshotIsRepeatable(t *testing.T) {
+	sink := &translatedSink{}
+	sink.note(ir.StreamEvent{Kind: ir.EventToolCallStart, Index: 0, ToolID: "id", ToolName: "n"})
+	sink.note(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: "A"})
+	first := sink.response()
+	second := sink.response()
+	if len(first.Content) != 1 || string(first.Content[0].ToolInput) != "A" {
+		t.Fatalf("first = %+v, want one tool with args A", first.Content)
+	}
+	if len(second.Content) != 1 || string(second.Content[0].ToolInput) != "A" {
+		t.Fatalf("second = %+v, want one tool with args A", second.Content)
+	}
+	sink.note(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: 0, ArgsFrag: "B"})
+	if string(first.Content[0].ToolInput) != "A" {
+		t.Fatalf("first snapshot mutated after append: %q", first.Content[0].ToolInput)
+	}
+	third := sink.response()
+	if len(third.Content) != 1 || string(third.Content[0].ToolInput) != "AB" {
+		t.Fatalf("third = %+v, want one tool with args AB", third.Content)
+	}
+}
+
+func TestTranslatedSinkNilAndEmptyResponse(t *testing.T) {
+	var nilSink *translatedSink
+	if got := nilSink.response(); got != nil {
+		t.Fatalf("nil sink response = %+v, want nil", got)
+	}
+	empty := (&translatedSink{}).response()
+	if empty == nil || len(empty.Content) != 0 {
+		t.Fatalf("empty sink response = %+v, want no content", empty)
+	}
+}
