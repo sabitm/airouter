@@ -264,18 +264,134 @@ func TestSniffStreamUsage(t *testing.T) {
 }
 
 func TestSniffStreamUsageAnthropicPartition(t *testing.T) {
-	start := `{"type":"message_start","message":{"usage":{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":0}}}`
-	res := &reqResult{}
-	sniffStreamUsage([]byte(start), res, "anth-msg")
-	sniffStreamUsage([]byte(`{"type":"message_delta","usage":{"input_tokens":200,"output_tokens":3}}`), res, "anth-msg")
-	if res.inTok != 2600 || res.outTok != 3 {
-		t.Fatalf("input-only = %d/%d, want 2600/3", res.inTok, res.outTok)
+	start := `{"type":"message_start","message":{"usage":{"input_tokens":200,"cache_read_input_tokens":2000,"cache_creation_input_tokens":400,"output_tokens":1}}}`
+	type snapshot struct {
+		in, out, ordinary, cacheRead, cacheWrite int
 	}
-	res = &reqResult{}
-	sniffStreamUsage([]byte(start), res, "claude-code")
-	sniffStreamUsage([]byte(`{"type":"message_delta","usage":{"output_tokens":3}}`), res, "claude-code")
-	if res.inTok != 2600 || res.outTok != 3 {
-		t.Fatalf("output-only = %d/%d, want 2600/3", res.inTok, res.outTok)
+	type step struct {
+		data string
+		want snapshot
+	}
+	seeded := snapshot{in: 2600, out: 1, ordinary: 200, cacheRead: 2000, cacheWrite: 400}
+	cases := []struct {
+		name  string
+		steps []step
+	}{
+		{
+			name: "present zero replaces previous output",
+			steps: []step{
+				{start, seeded},
+				{`{"type":"message_delta","usage":{"output_tokens":0}}`, snapshot{in: 2600, out: 0, ordinary: 200, cacheRead: 2000, cacheWrite: 400}},
+			},
+		},
+		{
+			name: "omitted output retains previous",
+			steps: []step{
+				{start, seeded},
+				{`{"type":"message_delta","usage":{"input_tokens":200}}`, seeded},
+			},
+		},
+		{
+			name: "null output retains previous",
+			steps: []step{
+				{start, seeded},
+				{`{"type":"message_delta","usage":{"output_tokens":null}}`, seeded},
+			},
+		},
+		{
+			name: "later positive replaces previous",
+			steps: []step{
+				{start, seeded},
+				{`{"type":"message_delta","usage":{"output_tokens":7}}`, snapshot{in: 2600, out: 7, ordinary: 200, cacheRead: 2000, cacheWrite: 400}},
+			},
+		},
+		{
+			name: "empty usage preserves prior counts",
+			steps: []step{
+				{start, seeded},
+				{`{"type":"message_delta","usage":{}}`, seeded},
+				{`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`, seeded},
+			},
+		},
+		{
+			name: "malformed usage ignored",
+			steps: []step{
+				{start, seeded},
+				{`{"type":"message_delta","usage":{"output_tokens":"bad"}}`, seeded},
+				{`{"type":"message_delta","usage":[]}`, seeded},
+				{`{"type":"message_delta","usage":{"output_tokens":2}}`, snapshot{in: 2600, out: 2, ordinary: 200, cacheRead: 2000, cacheWrite: 400}},
+			},
+		},
+		{
+			name: "present input and cache zero reset",
+			steps: []step{
+				{start, seeded},
+				{`{"type":"message_delta","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}`, snapshot{}},
+			},
+		},
+		{
+			name: "omitted input and cache retain previous",
+			steps: []step{
+				{start, seeded},
+				{`{"type":"message_delta","usage":{"output_tokens":3}}`, snapshot{in: 2600, out: 3, ordinary: 200, cacheRead: 2000, cacheWrite: 400}},
+			},
+		},
+	}
+	for _, codecID := range []string{"anth-msg", "claude-code"} {
+		for _, tc := range cases {
+			t.Run(codecID+"/"+tc.name, func(t *testing.T) {
+				res := &reqResult{}
+				for i, s := range tc.steps {
+					sniffStreamUsage([]byte(s.data), res, codecID)
+					got := snapshot{in: res.inTok, out: res.outTok, ordinary: res.anthOrdinary, cacheRead: res.anthCacheRead, cacheWrite: res.anthCacheWrite}
+					if got != s.want {
+						t.Fatalf("step %d = %+v, want %+v", i, got, s.want)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestSniffStreamUsageNonAnthropicKeepsPriorOnZero(t *testing.T) {
+	cases := []struct {
+		name    string
+		codecID string
+		steps   []string
+		wantIn  int
+		wantOut int
+	}{
+		{
+			name:    "openai chat",
+			codecID: "oai-chat",
+			steps: []string{
+				`{"usage":{"prompt_tokens":11,"completion_tokens":5}}`,
+				`{"usage":{"prompt_tokens":0,"completion_tokens":0}}`,
+			},
+			wantIn:  11,
+			wantOut: 5,
+		},
+		{
+			name:    "responses",
+			codecID: "oai-responses",
+			steps: []string{
+				`{"response":{"usage":{"input_tokens":11,"output_tokens":5}}}`,
+				`{"response":{"usage":{"input_tokens":0,"output_tokens":0}}}`,
+			},
+			wantIn:  11,
+			wantOut: 5,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := &reqResult{}
+			for _, data := range tc.steps {
+				sniffStreamUsage([]byte(data), res, tc.codecID)
+			}
+			if res.inTok != tc.wantIn || res.outTok != tc.wantOut {
+				t.Fatalf("got %d/%d, want %d/%d", res.inTok, res.outTok, tc.wantIn, tc.wantOut)
+			}
+		})
 	}
 }
 

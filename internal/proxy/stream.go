@@ -240,7 +240,7 @@ func sniffAnthropicStreamUsage(raw json.RawMessage, res *reqResult) {
 		InputTokens              *int `json:"input_tokens"`
 		CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
 		CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
-		OutputTokens             int  `json:"output_tokens"`
+		OutputTokens             *int `json:"output_tokens"`
 	}
 	if json.Unmarshal(raw, &f) != nil {
 		return
@@ -255,8 +255,8 @@ func sniffAnthropicStreamUsage(raw json.RawMessage, res *reqResult) {
 		res.anthCacheWrite = *f.CacheCreationInputTokens
 	}
 	res.inTok = res.anthOrdinary + res.anthCacheRead + res.anthCacheWrite
-	if f.OutputTokens != 0 {
-		res.outTok = f.OutputTokens
+	if f.OutputTokens != nil {
+		res.outTok = *f.OutputTokens
 	}
 }
 

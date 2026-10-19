@@ -72,6 +72,26 @@ data: {"type":"message_stop"}
 
 `
 
+const anthropicExplicitZeroOutputSSE = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_zero","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":11,"cache_creation_input_tokens":4,"cache_read_input_tokens":7,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
 const anthropicLateUsageSSE = `event: message_start
 data: {"type":"message_start","message":{"id":"msg_late","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}
 
@@ -751,6 +771,45 @@ func TestAnthropicPassthroughInputOnlyDeltaKeepsLoggedCache(t *testing.T) {
 	}
 }
 
+func TestAnthropicPassthroughOutputUsageSniffing(t *testing.T) {
+	omitted := strings.Replace(anthropicExplicitZeroOutputSSE, `"usage":{"output_tokens":0}`, `"usage":{}`, 1)
+	cases := []struct {
+		name    string
+		stream  string
+		wantOut int
+	}{
+		{"explicit zero replaces prior", anthropicExplicitZeroOutputSSE, 0},
+		{"omitted output retains prior", omitted, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, token, st := setupStreamingWithStore(t, domain.ProtocolAnthropic, tc.stream)
+			resp, body := postStream(t, base+"/v1/messages", token,
+				`{"model":"default","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+			wantEvents := collectSSEEvents(t, tc.stream)
+			gotEvents := collectSSEEvents(t, body)
+			if len(gotEvents) != len(wantEvents) {
+				t.Fatalf("relayed %d events, want %d: %s", len(gotEvents), len(wantEvents), body)
+			}
+			for i := range wantEvents {
+				if gotEvents[i].Name != wantEvents[i].Name || string(gotEvents[i].Data) != string(wantEvents[i].Data) {
+					t.Fatalf("event %d = %q/%s, want %q/%s", i, gotEvents[i].Name, gotEvents[i].Data, wantEvents[i].Name, wantEvents[i].Data)
+				}
+			}
+			l := waitForLogs(t, st, 1)[0]
+			if l.InputTokens != 22 || l.OutputTokens != tc.wantOut {
+				t.Fatalf("logged tokens = %d/%d, want 22/%d", l.InputTokens, l.OutputTokens, tc.wantOut)
+			}
+			if l.UsageEstimated {
+				t.Fatal("logged usage marked estimated")
+			}
+		})
+	}
+}
+
 func TestAnthropicToOpenAIInputOnlyDeltaKeepsInclusiveUsage(t *testing.T) {
 	base, token, st := setupStreamingWithStore(t, domain.ProtocolAnthropic, anthropicInputOnlyDeltaSSE)
 	resp, body := postStream(t, base+"/v1/chat/completions", token,
@@ -969,6 +1028,22 @@ func postStream(t *testing.T, url, token, body string) (*http.Response, string) 
 	out, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	return resp, string(out)
+}
+
+func collectSSEEvents(t *testing.T, body string) []sse.Event {
+	t.Helper()
+	reader := sse.NewReader(strings.NewReader(body))
+	var events []sse.Event
+	for {
+		ev, err := reader.Next()
+		if err == io.EOF {
+			return events
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, ev)
+	}
 }
 
 // collectStreamText reconstructs assistant text from a client SSE response in
