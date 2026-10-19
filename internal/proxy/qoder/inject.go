@@ -24,9 +24,38 @@ func PrepareWireBody(ctx context.Context, provider *domain.Provider, plainBody [
 	if err != nil {
 		return nil, err
 	}
+	// The encoder cannot see the provider, so prepare owns the account-scoped
+	// session id. Overwrite unconditionally, including an empty user id.
+	injected, err = withSessionID(injected, CredsFromProvider(provider).UserID, key)
+	if err != nil {
+		return nil, err
+	}
 	// Clamp max_tokens from model_config when present.
 	injected = clampMaxTokens(injected, cfg)
 	return EncodeBody(injected), nil
+}
+
+// withSessionID overwrites the top-level session_id with the reference value
+// stableHash("qoder-session", userID, modelKey). It rejects malformed JSON and
+// non-object roots instead of panicking.
+func withSessionID(body []byte, userID, modelKey string) ([]byte, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("qoder: set session_id: %w", err)
+	}
+	if m == nil {
+		return nil, fmt.Errorf("qoder: set session_id: not a JSON object")
+	}
+	raw, err := json.Marshal(stableHash("qoder-session", userID, modelKey))
+	if err != nil {
+		return nil, err
+	}
+	m["session_id"] = raw
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // InjectModelConfig sets model_config on a plaintext Qoder JSON body and

@@ -31,7 +31,13 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 		maxTokens = req.MaxTokens
 	}
 
-	recordID := stableChatRecordID(modelKey, req.Messages, tools, maxTokens)
+	recordID, err := stableChatRecordID(modelKey, req.System, msgs, tools, maxTokens)
+	if err != nil {
+		return nil, err
+	}
+	// Placeholder only: the encoder cannot access the provider. PrepareWireBody
+	// replaces this with the account-scoped stableHash("qoder-session",
+	// userID, modelKey).
 	sessionID := stableHash("qoder-session", modelKey)
 	now := time.Now().UnixMilli()
 	bizName := lastUser
@@ -195,27 +201,44 @@ func stableHash(prefix string, parts ...string) string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-func stableChatRecordID(model string, msgs []ir.Message, tools []map[string]any, maxTokens int) string {
+// qoderRecordNamespace is the fixed hash domain for chat_record_id and
+// request_set_id. Bump the trailing version only when the identity inputs
+// intentionally change, because that invalidates every previously derived
+// record id.
+const qoderRecordNamespace = "qoder-record-v1"
+
+// recordIdentity is the deterministic projection of the exact content Qoder
+// receives. Struct field order fixes the input boundaries; encoding/json sorts
+// the keys of the map values inside Messages and Tools, so identical encoded
+// content always serializes to identical bytes. Only encoder-selected values
+// belong here: randomized request/business ids, timestamps, account session id,
+// credentials, provider identity, and the live model_config are excluded.
+type recordIdentity struct {
+	Model     string           `json:"model"`
+	System    string           `json:"system"`
+	Messages  []map[string]any `json:"messages"`
+	Tools     []map[string]any `json:"tools"`
+	MaxTokens int              `json:"max_tokens"`
+}
+
+// stableChatRecordID hashes the already-encoded Qoder content. It takes the
+// encoder output, not IR, so it cannot drift from what Qoder actually receives.
+func stableChatRecordID(model, system string, msgs, tools []map[string]any, maxTokens int) (string, error) {
+	payload, err := json.Marshal(recordIdentity{
+		Model:     model,
+		System:    system,
+		Messages:  msgs,
+		Tools:     tools,
+		MaxTokens: maxTokens,
+	})
+	if err != nil {
+		return "", fmt.Errorf("qoder: record identity: %w", err)
+	}
 	h := sha256.New()
-	h.Write([]byte("qoder-record\x00"))
-	h.Write([]byte(model))
-	for _, m := range msgs {
-		h.Write([]byte{0})
-		h.Write([]byte(m.Role))
-		for _, b := range m.Content {
-			if b.Type == ir.BlockText {
-				h.Write([]byte{0})
-				h.Write([]byte(b.Text))
-			}
-		}
-	}
-	if len(tools) > 0 {
-		raw, _ := json.Marshal(tools)
-		h.Write([]byte{0})
-		h.Write(raw)
-	}
-	fmt.Fprintf(h, "\x00mt=%d", maxTokens)
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	h.Write([]byte(qoderRecordNamespace))
+	h.Write([]byte{0})
+	h.Write(payload)
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
 // ModelKeyFromBody extracts the model key embedded by EncodeRequest.
