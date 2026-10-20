@@ -204,3 +204,75 @@ func rawOrNull(s string) json.RawMessage {
 	}
 	return json.RawMessage(s)
 }
+
+// rejectProviderOwnedTool keeps an Anthropic server tool or provider-only
+// control from being converted into a callable custom function. Strict is
+// portable and is not rejected here.
+func rejectProviderOwnedTool(t ir.Tool) error {
+	at := t.AnthropicTool
+	if at == nil {
+		return nil
+	}
+	if at.Type != "" {
+		return ir.InvalidRequest("Anthropic server tools are not supported by this format")
+	}
+	if at.EagerInput != nil && *at.EagerInput {
+		return ir.InvalidRequest("eager input streaming is not supported by this format")
+	}
+	if at.DeferLoading != nil && *at.DeferLoading {
+		return ir.InvalidRequest("deferred tool loading is not supported by this format")
+	}
+	if at.MaxUses != nil || len(at.AllowedDomains) > 0 || len(at.BlockedDomains) > 0 {
+		return ir.InvalidRequest("provider-only tool controls are not supported by this format")
+	}
+	return nil
+}
+
+// responseFormat maps a validated Anthropic output_config.format to the
+// standard OpenAI json_schema response_format. The schema is preserved. OpenAI
+// requires a name, so a schema title is used when it is a safe identifier and
+// "structured_output" otherwise. Unknown format types fail before send.
+func responseFormat(a *ir.AnthropicRequest) (json.RawMessage, error) {
+	schema, ok, err := a.OutputFormatJSONSchema()
+	if err != nil || !ok {
+		return nil, err
+	}
+	if len(schema) == 0 {
+		return json.RawMessage(`{"type":"json_object"}`), nil
+	}
+	body := map[string]any{
+		"type": "json_schema",
+		"json_schema": map[string]any{
+			"name":   structuredOutputName(schema),
+			"schema": json.RawMessage(schema),
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func structuredOutputName(schema json.RawMessage) string {
+	var head struct {
+		Title string `json:"title"`
+	}
+	if json.Unmarshal(schema, &head) == nil {
+		name := head.Title
+		if len(name) > 0 && len(name) <= 64 {
+			valid := true
+			for _, r := range name {
+				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+					continue
+				}
+				valid = false
+				break
+			}
+			if valid {
+				return name
+			}
+		}
+	}
+	return "structured_output"
+}

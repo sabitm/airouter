@@ -47,7 +47,7 @@ var recipes = []recipe{
 	{ID: "qoder", Label: "Qoder", Sublabel: "qoder.com", Tag: "OAuth device", Kind: kindQoder, Protocol: domain.ProtocolQoder, Method: domain.AuthOAuth, Preset: "qoder", BaseURL: qoder.DefaultBaseURL},
 	{ID: "antigravity", Label: "Antigravity", Sublabel: "Google Cloud Code (unofficial)", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolAntigravity, Method: domain.AuthOAuth, Preset: "antigravity", BaseURL: antigravity.DefaultBaseURL},
 	{ID: "cursor", Label: "Cursor", Sublabel: "cursor.com (unofficial)", Tag: "OAuth", Kind: kindCursor, Protocol: domain.ProtocolCursor, Method: domain.AuthOAuth, Preset: "cursor", BaseURL: cursor.DefaultBaseURL},
-	{ID: "claude", Label: "Claude Code", Sublabel: "claude.ai (unofficial)", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolClaudeCode, Method: domain.AuthOAuth, Preset: "claude", BaseURL: claudecode.DefaultBaseURL},
+	{ID: "claude", Label: "Claude Code", Sublabel: "CLI profile (unofficial)", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolClaudeCode, Method: domain.AuthOAuth, Preset: "claude", BaseURL: claudecode.DefaultBaseURL},
 	{ID: "opencode", Label: "OpenCode", Sublabel: "opencode.ai free tier", Tag: "API key", Kind: kindOpencode, Protocol: domain.ProtocolOpencode, Method: domain.AuthAPIKey, BaseURL: opencode.ZenBaseURL},
 	{ID: "openai", Label: "OpenAI-compatible", Sublabel: "OpenRouter, OpenAI, vLLM...", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAI, Method: domain.AuthAPIKey},
 	{ID: "openai-responses", Label: "OpenAI Responses", Sublabel: "Responses API upstreams", Tag: "API key", Kind: kindGenericAPIKey, Protocol: domain.ProtocolOpenAIResponses, Method: domain.AuthAPIKey},

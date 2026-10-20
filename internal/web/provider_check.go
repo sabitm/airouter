@@ -284,11 +284,10 @@ func checkUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider)
 	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(parsed.Data))
 }
 
-// checkClaudeCodeUpstream validates a Claude Code OAuth token against the
-// Anthropic /models endpoint using the Claude Code CLI identity fingerprint, so
-// a passing Check implies the credential and client profile will be accepted on
-// real traffic. OAuth tokens are resolved/refreshed by the caller before this
-// runs, so p.APIKey holds the live access token.
+// checkClaudeCodeUpstream validates a Claude Code credential against GET
+// /models using the pinned CLI profile. A passing Check means the models
+// endpoint accepted the credential. It does not prove that Messages requests
+// will be accepted, and it does not send an inference request.
 func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -296,9 +295,13 @@ func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain
 		return false, "invalid base URL"
 	}
 	req.Header.Set("Authorization", "Bearer "+p.APIKey)
-	for k, v := range claudecode.IdentityHeaders() {
+	for k, v := range claudecode.StainlessRuntimeHeaders() {
 		req.Header.Set(k, v)
 	}
+	req.Header.Set("anthropic-version", claudecode.AnthropicVersion)
+	req.Header.Set("User-Agent", claudecode.DefaultProfile().UserAgent())
+	req.Header.Set("X-App", "cli")
+	req.Header.Set("anthropic-beta", claudecode.BetaHeaders(claudecode.BetaRequest{OAuth: claudecode.IsOAuthToken(p.APIKey)}))
 
 	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_claude_code")
 	if err != nil {
@@ -320,7 +323,7 @@ func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain
 	if err := json.Unmarshal(pr.Body, &parsed); err != nil || parsed.Data == nil {
 		return false, "reachable, but response shape unexpected"
 	}
-	return true, fmt.Sprintf("OK - reachable, token accepted (%d models)", len(parsed.Data))
+	return true, fmt.Sprintf("OK - /models accepted the credential (%d models). This does not prove Messages requests will be accepted.", len(parsed.Data))
 }
 
 // checkOpencodeUpstream validates a zen/go tier credential against the

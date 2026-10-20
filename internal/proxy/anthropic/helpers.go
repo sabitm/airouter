@@ -11,9 +11,10 @@ import (
 
 // billingHeaderRe matches the x-anthropic-billing-header telemetry marker that
 // Claude Code smuggles into the start of the system prompt body (not just as an
-// HTTP header). Internal fields are "; "-separated; the terminating ";" is not
-// followed by a space, which is the boundary before the real prompt text.
-var billingHeaderRe = regexp.MustCompile(`^x-anthropic-billing-header:(?:[^;]*; )*[^;]*;`)
+// HTTP header). Official fields are lowercase key=value segments terminated by
+// ';'. Restricting the grammar to those fields stops the strip at the prelude
+// boundary instead of consuming caller text that contains "; ".
+var billingHeaderRe = regexp.MustCompile(`^x-anthropic-billing-header:(?: [a-z][a-z0-9_]*=[^;]*;)+`)
 
 // clientIdentityOpener is the canonical Claude Code system-prompt opening line.
 // Gateways fingerprint it to reject the client; we drop it (and its trailing
@@ -98,12 +99,11 @@ func decodeSystem(raw json.RawMessage) (string, []ir.SystemBlock, error) {
 	return flat, out, nil
 }
 
-// systemBlocksForEncode returns the ordered wire blocks to emit when the IR
-// carries at least one surviving hint and the concatenated block text exactly
-// reproduces the flat System string. It returns nil when the flat string must
-// be used instead, so a changed System or a hand-built inconsistent IR never
-// resurrects stale structured data. Empty blocks are dropped so they cannot
-// place an invalid empty text block on the wire.
+// systemBlocksForEncode returns the ordered wire blocks when the concatenated
+// block text exactly reproduces System. A block array is preserved even when
+// no block carries cache_control, so caller boundaries are not rejoined into
+// one string. It returns nil when System was edited or the IR is inconsistent.
+// Empty text blocks are omitted.
 func systemBlocksForEncode(req *ir.Request) []anthBlock {
 	if req == nil || req.System == "" || len(req.SystemBlocks) == 0 {
 		return nil
@@ -121,7 +121,12 @@ func systemBlocksForEncode(req *ir.Request) []anthBlock {
 		}
 		out = append(out, anthBlock{Type: "text", Text: b.Text, CacheControl: cacheControlRaw(b.CacheControl)})
 	}
-	if !hasHint || full.String() != req.System {
+	if full.String() != req.System || len(out) == 0 {
+		return nil
+	}
+	// One unmarked surviving block has no internal boundary and needs no array.
+	// Multiple blocks keep their caller boundaries even without a cache hint.
+	if len(out) == 1 && !hasHint {
 		return nil
 	}
 	return out

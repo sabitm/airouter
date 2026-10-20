@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -63,10 +64,9 @@ func applyCodexHeaders(req *http.Request, provider *domain.Provider, ctx context
 //     these wire bytes in applyUpstreamHeaders).
 //   - Antigravity: injects OAuthCreds.ProjectID into the Cloud Code envelope
 //     (fail-closed when missing).
-//   - Claude Code: generates the per-request session id (saved on the trace
-//     context for the X-Claude-Code-Session-Id header) and applies the OAuth-only
-//     cloak/decoy transform. The cloak gate and seed read OAuthCreds directly
-//     because the access token is resolved later, inside forward/forwardStream.
+//   - Claude Code: defers session and body preparation to forward, after the
+//     effective token is resolved, so billing and metadata use that token and
+//     the current persisted account UUID.
 //   - OpenCode: resolves x-opencode-session (client identity, else a fallback
 //     namespaced by this Proxy's nonce and the provider) onto the trace context
 //     and applies the model-specific patch: muse-spark Responses normalization
@@ -141,11 +141,10 @@ func prepareUpstreamRequest(ctx context.Context, p *Proxy, backend codec, provid
 	case "antigravity":
 		return antigravity.InjectProjectID(body, antigravityProjectID(provider))
 	case "claude-code":
-		sid := newUUID()
-		if t := traceInfoFrom(ctx); t != nil {
-			t.ClaudeCodeSessionID = sid
-		}
-		return claudecode.ApplyOAuthCloaking(body, claudeCodeToken(provider), sid, claudeCodeSeed(provider))
+		// Preparation needs the effective credential snapshot. Defer the session
+		// and body until forward, after Resolve, so a refresh cannot leave a stale
+		// account scope on the trace or in the wire body.
+		return body, nil
 	case "opencode-chat", "opencode-responses", "opencode-messages":
 		prepareOpencodeSession(ctx, provider, body)
 		body, err := prepareOpencodeFreeTier(ctx, backend, provider, body)
@@ -306,29 +305,117 @@ func antigravityProjectID(provider *domain.Provider) string {
 	return ""
 }
 
-// claudeCodeToken returns the stored Claude OAuth access token, used only for the
-// sk-ant-oat cloak gate. The actual Authorization header uses the resolved
-// (refreshed) token set by forward; the stored token's marker is stable across
-// refresh, so reading it at prepare time (before resolve) is correct.
-func claudeCodeToken(provider *domain.Provider) string {
-	if provider != nil && provider.OAuthCreds != nil {
-		return provider.OAuthCreds.AccessToken
+// prepareClaudeCodeBody applies the pinned CLI profile using the effective
+// resolved token. Account and device ids come from persisted credentials.
+// A missing account stays empty; it is not derived from the token.
+func prepareClaudeCodeBody(ctx context.Context, provider *domain.Provider, body []byte) ([]byte, error) {
+	// Resolve has already installed the credential snapshot on this request-local
+	// provider. Derive the scope from that snapshot every send, not from an
+	// earlier attempt's trace or a pre-refresh account.
+	sid := claudeSessionID(ctx, provider, claudeTenantFrom(ctx))
+	if st := claudeStateFrom(ctx); st != nil {
+		st.wireSession = sid
 	}
-	return ""
+	if t := traceInfoFrom(ctx); t != nil {
+		t.ClaudeCodeSessionID = sid
+	}
+	account, device := claudeIdentity(provider)
+	if !claudecode.IsDeviceID(device) {
+		if provider != nil && provider.Method() == domain.AuthOAuth {
+			return nil, fmt.Errorf("claude-code: device id is not initialized")
+		}
+		// An API-key backend has no persisted install id. The id is derived from
+		// the provider so retries match, and it is not stored as an OAuth device.
+		device = syntheticAPIKeyDevice(provider)
+	}
+	return claudecode.Prepare(body, claudecode.PrepareInput{
+		Token:        providerToken(provider),
+		SessionID:    sid,
+		AccountUUID:  account,
+		DeviceID:     device,
+		ParentID:     claudeParentID(ctx, provider),
+		Profile:      claudeProfileFrom(ctx),
+		BaseURL:      providerBase(provider),
+		CacheDefault: !claudeCallerCache(body),
+		CacheTTL:     "5m",
+		Attribution:  claudeAttribution(ctx),
+	})
 }
 
-// claudeCodeSeed returns a stable per-account seed for metadata.user_id,
-// preferring the refresh token (stable across access-token refresh) and falling
-// back to the access token. Empty when unset, in which case the cloak helper
-// generates random device/account values.
-func claudeCodeSeed(provider *domain.Provider) string {
-	if provider == nil || provider.OAuthCreds == nil {
+// pSessionOrNew keeps the request seed stable while applying the current
+// provider scope. It is the request-local seed helper used by older callers.
+func pSessionOrNew(ctx context.Context, provider *domain.Provider) string {
+	return claudeSessionID(ctx, provider, claudeTenantFrom(ctx))
+}
+
+// syntheticAPIKeyDevice derives an install id for an API-key row. The id is
+// stable across retries and renames, and it never borrows OAuth identity. Only
+// the provider row id and the canonical effective base participate.
+func syntheticAPIKeyDevice(p *domain.Provider) string {
+	id := int64(0)
+	base := ""
+	if p != nil {
+		id = p.ID
+		base = claudeCanonicalBase(effectiveProviderBaseURL(p))
+	}
+	sum := sha256.Sum256([]byte("claude-apikey-device\x00" + fmt.Sprintf("%d\x00%s", id, base)))
+	return hex.EncodeToString(sum[:])
+}
+
+// claudeIdentity reads persisted Claude identity only from an explicit OAuth
+// row. An API-key row can carry stale or config-only OAuthCreds; those values
+// must not become a caller-visible account or install id.
+func claudeIdentity(p *domain.Provider) (account, device string) {
+	if p == nil || p.Method() != domain.AuthOAuth || p.OAuthCreds == nil {
+		return "", ""
+	}
+	return strings.TrimSpace(p.OAuthCreds.ClaudeAccountUUID), strings.TrimSpace(p.OAuthCreds.ClaudeDeviceID)
+}
+
+func claudeAttribution(ctx context.Context) claudecode.BillingInput {
+	in := claudecode.BillingInput{PromptID: claudePromptID(ctx)}
+	st := claudeStateFrom(ctx)
+	if st == nil {
+		return in
+	}
+	if st.agentID != "" {
+		in.IsSubagent = true
+	}
+	return in
+}
+
+// claudeWireBody prepares a Claude Code body once per send, after the
+// effective token is on the request-local provider. Other protocols return
+// the body unchanged. A refresh builds a new body with the new token.
+func claudeWireBody(ctx context.Context, provider *domain.Provider, path string, body []byte) ([]byte, error) {
+	if provider == nil || provider.Protocol != domain.ProtocolClaudeCode {
+		return body, nil
+	}
+	if !strings.Contains(path, "/messages") {
+		return body, nil
+	}
+	return prepareClaudeCodeBody(ctx, provider, body)
+}
+
+func providerToken(p *domain.Provider) string {
+	if p == nil {
 		return ""
 	}
-	if s := strings.TrimSpace(provider.OAuthCreds.RefreshToken); s != "" {
-		return s
+	return p.APIKey
+}
+
+func providerBase(p *domain.Provider) string {
+	if p == nil {
+		return ""
 	}
-	return provider.OAuthCreds.AccessToken
+	return p.BaseURL
+}
+
+func claudeCallerCache(body []byte) bool {
+	// Prepare recounts structured markers, including a top-level policy.
+	// A quoted field name in schema or text is not caller policy. This seam
+	// therefore does not suppress the default from a substring.
+	return false
 }
 
 // reqModelFromBody reads the model field of an encoded upstream body; empty
@@ -432,7 +519,7 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	// would reject does not leak through. Auth is already set by the scheme
 	// switch above; this does not touch Authorization.
 	if provider.Protocol == domain.ProtocolClaudeCode {
-		applyClaudeCodeHeaders(req, ctx)
+		applyClaudeCodeHeaders(req, ctx, provider, body)
 	}
 	// OpenCode gates the free tier on the opencode client fingerprint; set it
 	// after the client-header copy so a forwarded non-opencode UA is replaced.
@@ -702,17 +789,173 @@ func opencodeToolMapFrom(ctx context.Context) opencode.ToolMap {
 	return st.tools
 }
 
-// applyClaudeCodeHeaders sets the Claude Code CLI identity fingerprint and the
-// per-request X-Claude-Code-Session-Id (which must match metadata.user_id.session_id
-// in the body). Runs after the client-header copy so it overwrites forwarded
-// values. Authorization is left to the auth-scheme switch.
-func applyClaudeCodeHeaders(req *http.Request, ctx context.Context) {
-	for k, v := range claudecode.IdentityHeaders() {
+// applyClaudeCodeHeaders sets the pinned CLI fingerprint and the session id
+// that must match metadata.user_id.session_id. It runs after the client-header
+// copy so a forwarded identity does not replace the profile. Authorization is
+// left to the auth-scheme switch. Beta flags are feature-gated from the body.
+func applyClaudeCodeHeaders(req *http.Request, ctx context.Context, provider *domain.Provider, body []byte) {
+	profile := claudeProfileFrom(ctx)
+	for k, v := range claudecode.StainlessRuntimeHeaders() {
 		req.Header.Set(k, v)
 	}
-	if t := traceInfoFrom(ctx); t != nil && t.ClaudeCodeSessionID != "" {
-		req.Header.Set(claudecode.SessionIDHeader, t.ClaudeCodeSessionID)
+	req.Header.Set("anthropic-version", claudecode.AnthropicVersion)
+	req.Header.Set("User-Agent", profile.UserAgent())
+	req.Header.Set("X-App", "cli")
+	req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
+	beta := claudeBetaRequest(ctx, provider, body)
+	beta.CallerBetas = mergeCallerBetas(beta.CallerBetas, requestCallerBetas(req.Header))
+	req.Header.Set("anthropic-beta", claudecode.BetaHeaders(beta))
+	if sid := claudeWireSession(ctx); sid != "" {
+		req.Header.Set(claudecode.SessionIDHeader, sid)
 	}
+}
+
+func claudeBetaHeader(ctx context.Context, provider *domain.Provider, body []byte) string {
+	return claudecode.BetaHeaders(claudeBetaRequest(ctx, provider, body))
+}
+
+// mergeCallerBetas combines the validated context capture with values forwarded
+// on the wire. Dedupe happens before the feature gate, so a duplicate cannot
+// survive through a second source.
+func mergeCallerBetas(lists ...[]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, list := range lists {
+		for _, flag := range list {
+			if flag == "" || seen[flag] {
+				continue
+			}
+			seen[flag] = true
+			out = append(out, flag)
+		}
+	}
+	return out
+}
+
+func requestCallerBetas(h http.Header) []string {
+	if h == nil {
+		return nil
+	}
+	var out []string
+	for _, value := range h.Values("anthropic-beta") {
+		out = append(out, claudecode.ParseCallerBetas(value)...)
+	}
+	return out
+}
+
+func claudeBetaRequest(ctx context.Context, provider *domain.Provider, body []byte) claudecode.BetaRequest {
+	var probe struct {
+		Model string `json:"model"`
+		Tools []struct {
+			Type         string `json:"type"`
+			DeferLoading *bool  `json:"defer_loading"`
+		} `json:"tools"`
+		ContextManagement json.RawMessage `json:"context_management"`
+		OutputConfig      *struct {
+			Effort     string          `json:"effort"`
+			Format     json.RawMessage `json:"format"`
+			TaskBudget json.RawMessage `json:"task_budget"`
+		} `json:"output_config"`
+		Thinking *struct {
+			Type    string `json:"type"`
+			Display string `json:"display"`
+		} `json:"thinking"`
+		System   json.RawMessage `json:"system"`
+		Messages json.RawMessage `json:"messages"`
+	}
+	_ = json.Unmarshal(body, &probe)
+	req := claudecode.BetaRequest{
+		Model:       probe.Model,
+		OAuth:       claudecode.IsOAuthToken(providerToken(provider)),
+		CallerBetas: claudeCallerBetas(ctx),
+	}
+	if len(probe.ContextManagement) > 0 && probe.ContextManagement[0] == '{' {
+		req.ContextManagement = true
+	}
+	if probe.OutputConfig != nil {
+		req.Effort = probe.OutputConfig.Effort != ""
+		req.StructuredOutput = len(probe.OutputConfig.Format) > 0 && probe.OutputConfig.Format[0] == '{'
+		req.TaskBudget = validTaskBudgetFeature(probe.OutputConfig.TaskBudget)
+	}
+	if probe.Thinking != nil {
+		req.ThinkingActive = probe.Thinking.Type == "adaptive" || probe.Thinking.Type == "enabled"
+		req.ThinkingSummarized = probe.Thinking.Display == "summarized"
+		if probe.Thinking.Type == "adaptive" {
+			req.Effort = true
+		}
+	}
+	for _, t := range probe.Tools {
+		if t.Type != "" || (t.DeferLoading != nil && *t.DeferLoading) {
+			req.AdvancedTools = true
+		}
+	}
+	req.CacheScope, req.ExtendedTTL, req.CacheEvict = claudecode.CacheFeatures(body)
+	req.OneMillion = bodyRequestsOneMillion(probe.Model, body)
+	return req
+}
+
+// bodyRequestsOneMillion reports a structured long-context request. A model
+// id suffix [1m] is the CLI opt-in. A top-level betas array or metadata.betas
+// entry equal to the long-context flag is also structured. A quoted flag
+// inside schema text is not.
+func bodyRequestsOneMillion(model string, body []byte) bool {
+	if strings.Contains(strings.ToLower(model), "[1m]") {
+		return true
+	}
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(body, &doc) != nil {
+		return false
+	}
+	if betaListHas(doc["betas"], claudecode.BetaLongContext) {
+		return true
+	}
+	var meta struct {
+		Betas []string `json:"betas"`
+	}
+	if json.Unmarshal(doc["metadata"], &meta) == nil {
+		for _, flag := range meta.Betas {
+			if flag == claudecode.BetaLongContext {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validTaskBudgetFeature accepts only the verified output_config.task_budget
+// object shape. A schema key or a bare string is not a task-budget request.
+func validTaskBudgetFeature(raw json.RawMessage) bool {
+	if len(raw) == 0 || raw[0] != '{' {
+		return false
+	}
+	var budget struct {
+		Type      string `json:"type"`
+		Total     *int   `json:"total"`
+		Remaining *int   `json:"remaining"`
+	}
+	if json.Unmarshal(raw, &budget) != nil {
+		return false
+	}
+	if budget.Type != "tokens" || budget.Total == nil || *budget.Total < 0 {
+		return false
+	}
+	return budget.Remaining == nil || *budget.Remaining >= 0
+}
+
+func betaListHas(raw json.RawMessage, want string) bool {
+	if len(raw) == 0 || raw[0] != '[' {
+		return false
+	}
+	var flags []string
+	if json.Unmarshal(raw, &flags) != nil {
+		return false
+	}
+	for _, flag := range flags {
+		if flag == want {
+			return true
+		}
+	}
+	return false
 }
 
 // newUUID returns a random RFC 4122 version-4 UUID string for the
@@ -740,11 +983,15 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 	}
 	send := func() (int, []byte, error) {
 		started := time.Now()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		wire, err := claudeWireBody(ctx, provider, path, body)
 		if err != nil {
 			return 0, nil, err
 		}
-		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wire))
+		if err != nil {
+			return 0, nil, err
+		}
+		applyUpstreamHeaders(req, provider, clientHeaders, ctx, wire)
 		// Snapshot headers after auth/identity so HAR sees the wire credentials.
 		var harHdr http.Header
 		if harRecorder(ctx) != nil {
@@ -753,7 +1000,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		resp, err := p.client.Do(req)
 		if err != nil {
 			if harRecorder(ctx) != nil {
-				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, 0, nil, nil, "", 0, err.Error())
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, 0, nil, nil, "", 0, err.Error())
 			}
 			return 0, nil, err
 		}
@@ -761,19 +1008,19 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUnaryUpstreamResponseBytes+1))
 		if err != nil {
 			if harRecorder(ctx) != nil {
-				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody), err.Error())
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, resp.StatusCode, resp.Header, respBody, "", len(respBody), err.Error())
 			}
 			return resp.StatusCode, nil, err
 		}
 		if int64(len(respBody)) > maxUnaryUpstreamResponseBytes {
 			err := fmt.Errorf("upstream response too large (exceeds %d bytes)", maxUnaryUpstreamResponseBytes)
 			if harRecorder(ctx) != nil {
-				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody), err.Error())
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, resp.StatusCode, resp.Header, respBody, "", len(respBody), err.Error())
 			}
 			return resp.StatusCode, nil, err
 		}
 		if harRecorder(ctx) != nil {
-			p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, resp.StatusCode, resp.Header, respBody, "", len(respBody), "")
+			p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, resp.StatusCode, resp.Header, respBody, "", len(respBody), "")
 		}
 		return resp.StatusCode, respBody, nil
 	}
@@ -860,11 +1107,15 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 	}
 	send := func() (*http.Response, error) {
 		started := time.Now()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		wire, err := claudeWireBody(ctx, provider, path, body)
 		if err != nil {
 			return nil, err
 		}
-		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wire))
+		if err != nil {
+			return nil, err
+		}
+		applyUpstreamHeaders(req, provider, clientHeaders, ctx, wire)
 		req.Header.Set("Accept", accept)
 		var harHdr http.Header
 		if harRecorder(ctx) != nil {
@@ -873,7 +1124,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		resp, err := p.streamClient.Do(req)
 		if err != nil {
 			if harRecorder(ctx) != nil {
-				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, 0, nil, nil, "", 0, err.Error())
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, 0, nil, nil, "", 0, err.Error())
 			}
 			return nil, err
 		}
@@ -886,7 +1137,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 				method:  req.Method,
 				url:     url,
 				reqHdr:  harHdr,
-				reqBody: body,
+				reqBody: wire,
 				status:  resp.StatusCode,
 				respHdr: resp.Header.Clone(),
 				mime:    streamRespMIME(resp, accept),
@@ -989,9 +1240,14 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 		mu.Lock()
 		pw = npw
 		mu.Unlock()
+		wire, werr := claudeWireBody(ctx, provider, path, body)
+		if werr != nil {
+			closeWrite()
+			return nil, werr
+		}
 		go func() {
 			// Initial request bytes; the pipe stays open for mid-stream replies.
-			if _, err := npw.Write(body); err != nil {
+			if _, err := npw.Write(wire); err != nil {
 				npw.CloseWithError(err)
 			}
 		}()
@@ -1001,7 +1257,7 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 			closeWrite()
 			return nil, err
 		}
-		applyUpstreamHeaders(req, provider, clientHeaders, ctx, body)
+		applyUpstreamHeaders(req, provider, clientHeaders, ctx, wire)
 		req.Header.Set("Accept", accept)
 		var harHdr http.Header
 		if harRecorder(ctx) != nil {
@@ -1011,7 +1267,7 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 		if err != nil {
 			closeWrite()
 			if harRecorder(ctx) != nil {
-				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, body, 0, nil, nil, "", 0, err.Error())
+				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, 0, nil, nil, "", 0, err.Error())
 			}
 			return nil, err
 		}
@@ -1197,8 +1453,26 @@ func (c *harCaptureBody) Close() error {
 // provider is the request-local hydrated copy, so the mutation is request-scoped.
 // On error the best-available token is still written, so callers may proceed.
 func (p *Proxy) resolveToken(ctx context.Context, provider *domain.Provider, force bool) error {
-	tok, err := p.oauth.Resolve(ctx, provider, force)
-	provider.APIKey = tok
+	if provider == nil || p == nil || p.oauth == nil {
+		return nil
+	}
+	// Method gates the credential. Scheme and protocol do not. An API-key
+	// provider may keep config-only OAuthCreds; those creds must not replace
+	// APIKey, including when a stale AccessToken is present.
+	if provider.Method() != domain.AuthOAuth {
+		return nil
+	}
+	creds, err := p.oauth.ResolveCreds(ctx, provider, force)
+	if creds == nil {
+		return err
+	}
+	// Install the paired snapshot before the token. A later header or body
+	// read must see the account and device that produced this access token.
+	cp := *creds
+	provider.OAuthCreds = &cp
+	if cp.AccessToken != "" {
+		provider.APIKey = cp.AccessToken
+	}
 	return err
 }
 

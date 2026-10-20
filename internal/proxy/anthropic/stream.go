@@ -1,7 +1,9 @@
 package anthropic
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"sort"
 
@@ -13,32 +15,39 @@ import (
 
 type streamMessageStart struct {
 	Message struct {
-		ID    string    `json:"id"`
-		Model string    `json:"model"`
-		Usage anthUsage `json:"usage"`
+		ID                string          `json:"id"`
+		Model             string          `json:"model"`
+		Usage             anthUsage       `json:"usage"`
+		Container         json.RawMessage `json:"container"`
+		ContextManagement json.RawMessage `json:"context_management"`
 	} `json:"message"`
 }
 
 type streamContentBlockStart struct {
 	Index        int `json:"index"`
 	ContentBlock struct {
-		Type      string `json:"type"`
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		Thinking  string `json:"thinking"`
-		Signature string `json:"signature"`
-		Data      string `json:"data"`
+		Type      string            `json:"type"`
+		ID        string            `json:"id"`
+		Name      string            `json:"name"`
+		Text      string            `json:"text"`
+		Thinking  string            `json:"thinking"`
+		Signature string            `json:"signature"`
+		Data      string            `json:"data"`
+		Citations []json.RawMessage `json:"citations"`
 	} `json:"content_block"`
 }
 
 type streamContentBlockDelta struct {
 	Index int `json:"index"`
 	Delta struct {
-		Type        string `json:"type"`
-		Text        string `json:"text"`
-		Thinking    string `json:"thinking"`
-		Signature   string `json:"signature"`
-		PartialJSON string `json:"partial_json"`
+		Type             string          `json:"type"`
+		Text             string          `json:"text"`
+		Thinking         string          `json:"thinking"`
+		Signature        string          `json:"signature"`
+		PartialJSON      string          `json:"partial_json"`
+		Citation         json.RawMessage `json:"citation"`
+		Content          json.RawMessage `json:"content"`
+		EncryptedContent json.RawMessage `json:"encrypted_content"`
 	} `json:"delta"`
 }
 
@@ -48,9 +57,14 @@ type streamContentBlockStop struct {
 
 type streamMessageDelta struct {
 	Delta struct {
-		StopReason string `json:"stop_reason"`
+		StopReason   string          `json:"stop_reason"`
+		StopSequence *string         `json:"stop_sequence"`
+		StopDetails  json.RawMessage `json:"stop_details"`
+		Container    json.RawMessage `json:"container"`
 	} `json:"delta"`
-	Usage streamDeltaUsage `json:"usage"`
+	ContextManagement    json.RawMessage  `json:"context_management"`
+	InputTransformations json.RawMessage  `json:"input_transformations"`
+	Usage                streamDeltaUsage `json:"usage"`
 }
 
 // streamDeltaUsage is a cumulative Anthropic usage snapshot. Pointers distinguish
@@ -66,11 +80,31 @@ type streamDeltaUsage struct {
 // events. Used when Anthropic is the backend format. The block index from the
 // wire is carried through as StreamEvent.Index so the ingress encoder can
 // attribute tool argument fragments correctly.
+func quoteJSON(s string) string {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(raw)
+}
+
+func rawContentBlock(data []byte) json.RawMessage {
+	var wrap struct {
+		ContentBlock json.RawMessage `json:"content_block"`
+	}
+	if json.Unmarshal(data, &wrap) != nil {
+		return nil
+	}
+	return wrap.ContentBlock
+}
+
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	var stopReason ir.StopReason = ir.StopEndTurn
 	ordinary, cacheRead, cacheWrite := 0, 0, 0
 	inputTokens, outputTokens := 0, 0
+	var stopSequence *string
+	var container, contextManagement, stopDetails, inputTransformations json.RawMessage
 	finished := false
 	started := false
 	// thinkingOpen is the set of source indexes whose explicit thinking block
@@ -79,11 +113,42 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	// block cannot start while one remains open. Text, tool, and redacted
 	// indexes may create gaps; those indexes are not required to be contiguous.
 	thinkingOpen := map[int]thinkingDecodeState{}
-	// stoppedThrough is the highest stopped source index. An index at or below
+	// textOpen tracks source text blocks so a delta and its citations bind to
+	// the source block rather than the latest merged text buffer. Completed
+	// indexes are deleted, so the map is bounded by simultaneous open blocks.
+	textOpen := map[int]bool{}
+	// explicitText reports that the source used a content_block_start text
+	// lifecycle. Legacy streams without one may start at a text delta; after an
+	// explicit start, a missing or closed index is a protocol error and must not
+	// degrade to the legacy unindexed stream.
+	explicitText := false
+	// serverOpen tracks provider-owned blocks that may still receive input.
+	// Completed indexes are deleted and their bytes are released, so both the
+	// open-block count and retained bytes describe simultaneous state rather
+	// than total stream history.
+	type openServer struct {
+		typ   string
+		bytes int
+	}
+	serverOpen := map[int]*openServer{}
+	serverOpenBytes := 0
+	// stoppedThrough is the highest stopped indexed block. An index at or below
 	// it cannot open again. This avoids retaining every completed block and
 	// does not require thinking indexes to be contiguous.
 	stoppedThrough := -1
 	inclusiveInput := func() int { return ordinary + cacheRead + cacheWrite }
+	closeServer := func(index int) *openServer {
+		sb := serverOpen[index]
+		if sb == nil {
+			return nil
+		}
+		delete(serverOpen, index)
+		serverOpenBytes -= sb.bytes
+		if index > stoppedThrough {
+			stoppedThrough = index
+		}
+		return sb
+	}
 
 	for {
 		ev, err := reader.Next()
@@ -114,6 +179,20 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if json.Unmarshal(ev.Data, &m) != nil {
 				continue
 			}
+			if m.Message.Container != nil {
+				v, err := validateOptionalObject(m.Message.Container, "container")
+				if err != nil {
+					return ir.ProtocolError("message_start container is malformed")
+				}
+				container = v
+			}
+			if m.Message.ContextManagement != nil {
+				v, err := validateOptionalObject(m.Message.ContextManagement, "context_management")
+				if err != nil {
+					return ir.ProtocolError("message_start context_management is malformed")
+				}
+				contextManagement = v
+			}
 			ordinary = m.Message.Usage.InputTokens
 			cacheRead = m.Message.Usage.CacheReadInputTokens
 			cacheWrite = m.Message.Usage.CacheCreationInputTokens
@@ -122,6 +201,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				Kind: ir.EventMessageStart, ID: m.Message.ID, Model: m.Message.Model,
 				InputTokens:     inputTokens,
 				CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
+				Container: container, ContextManagement: contextManagement,
 			}); err != nil {
 				return err
 			}
@@ -130,6 +210,9 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			var s streamContentBlockStart
 			if json.Unmarshal(ev.Data, &s) != nil {
 				continue
+			}
+			if s.Index < 0 {
+				return ir.ProtocolError("negative content block index")
 			}
 			switch s.ContentBlock.Type {
 			case "tool_use":
@@ -174,11 +257,79 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if len(thinkingOpen) != 0 {
 					return ir.ProtocolError("content block started while thinking block is open")
 				}
+				if textOpen[s.Index] {
+					return ir.ProtocolError("text block started twice")
+				}
+				if s.Index <= stoppedThrough {
+					return ir.ProtocolError("text block restarted after stop")
+				}
+				if serverOpen[s.Index] != nil {
+					return ir.ProtocolError("text block started on an open server block")
+				}
+				if len(textOpen) >= maxOpenTextBlocks {
+					return ir.ProtocolError("too many open text blocks")
+				}
+				citations, err := decodeCitationItems(s.ContentBlock.Citations)
+				if err != nil {
+					return ir.ProtocolError("text block citations are malformed")
+				}
+				explicitText = true
+				textOpen[s.Index] = true
+				if err := emit(ir.StreamEvent{Kind: ir.EventTextStart, Index: s.Index, Text: s.ContentBlock.Text, TextIndexed: true}); err != nil {
+					return err
+				}
+				for _, c := range citations {
+					if err := emit(ir.StreamEvent{Kind: ir.EventTextCitation, Index: s.Index, Data: string(c.Raw), TextIndexed: true}); err != nil {
+						return err
+					}
+				}
+				started = true
+			default:
+				if s.ContentBlock.Type == "" {
+					break
+				}
+				if len(thinkingOpen) != 0 {
+					return ir.ProtocolError("content block started while thinking block is open")
+				}
+				if !knownServerBlockType(s.ContentBlock.Type) {
+					return ir.ProtocolError("unsupported server content block")
+				}
+				if s.Index <= stoppedThrough {
+					return ir.ProtocolError("server block restarted after stop")
+				}
+				if serverOpen[s.Index] != nil {
+					return ir.ProtocolError("server block started twice")
+				}
+				if len(serverOpen) >= maxOpenServerBlocks {
+					return ir.ProtocolError("too many open server blocks")
+				}
+				raw := rawContentBlock(ev.Data)
+				if len(raw) == 0 {
+					return ir.ProtocolError("server block is malformed")
+				}
+				if len(raw) > maxServerStartBytes {
+					return ir.ProtocolError("server start exceeded limit")
+				}
+				if _, err := serverStartObject(ir.StreamEvent{ServerType: s.ContentBlock.Type, Data: string(raw)}); err != nil {
+					return err
+				}
+				serverOpen[s.Index] = &openServer{typ: s.ContentBlock.Type, bytes: len(raw)}
+				serverOpenBytes += len(raw)
+				if serverOpenBytes > maxServerInputBytes {
+					return ir.ProtocolError("server input exceeded limit")
+				}
+				if err := emit(ir.StreamEvent{Kind: ir.EventServerStart, Index: s.Index, ServerType: s.ContentBlock.Type, Data: string(raw)}); err != nil {
+					return err
+				}
+				started = true
 			}
 		case "content_block_delta":
 			var d streamContentBlockDelta
 			if json.Unmarshal(ev.Data, &d) != nil {
 				continue
+			}
+			if d.Index < 0 {
+				return ir.ProtocolError("negative content block index")
 			}
 			switch d.Delta.Type {
 			case "thinking_delta":
@@ -210,7 +361,33 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if len(thinkingOpen) != 0 {
 					return ir.ProtocolError("text delta while thinking block is open")
 				}
-				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: d.Delta.Text}); err != nil {
+				if serverOpen[d.Index] != nil {
+					return ir.ProtocolError("text delta on a server block")
+				}
+				if d.Index <= stoppedThrough {
+					return ir.ProtocolError("text delta after block stop")
+				}
+				ev := ir.StreamEvent{Kind: ir.EventTextDelta, Text: d.Delta.Text}
+				if textOpen[d.Index] {
+					ev.Index = d.Index
+					ev.TextIndexed = true
+				} else if explicitText {
+					return ir.ProtocolError("text delta without an open text block")
+				}
+				if err := emit(ev); err != nil {
+					return err
+				}
+				started = true
+			case "citations_delta":
+				if !textOpen[d.Index] {
+					return ir.ProtocolError("citation delta without an open text block")
+				}
+				citations, err := decodeCitationItems([]json.RawMessage{d.Delta.Citation})
+				if err != nil {
+					return ir.ProtocolError("citation delta is malformed")
+				}
+				ev := ir.StreamEvent{Kind: ir.EventTextCitation, Index: d.Index, Data: string(citations[0].Raw), TextIndexed: true}
+				if err := emit(ev); err != nil {
 					return err
 				}
 				started = true
@@ -218,15 +395,58 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if _, open := thinkingOpen[d.Index]; open {
 					return ir.ProtocolError("tool delta while thinking block is open")
 				}
+				if sb := serverOpen[d.Index]; sb != nil {
+					if sb.typ == "compaction" {
+						return ir.ProtocolError("compaction block received an input delta")
+					}
+					if serverOpenBytes+len(d.Delta.PartialJSON) > maxServerInputBytes {
+						return ir.ProtocolError("server input exceeded limit")
+					}
+					sb.bytes += len(d.Delta.PartialJSON)
+					serverOpenBytes += len(d.Delta.PartialJSON)
+					if err := emit(ir.StreamEvent{Kind: ir.EventServerDelta, Index: d.Index, ArgsFrag: d.Delta.PartialJSON}); err != nil {
+						return err
+					}
+					started = true
+					break
+				}
+				if d.Index <= stoppedThrough {
+					return ir.ProtocolError("input delta after block stop")
+				}
 				if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: d.Index, ArgsFrag: d.Delta.PartialJSON}); err != nil {
 					return err
 				}
 				started = true
+			case "compaction_delta":
+				sb := serverOpen[d.Index]
+				if sb == nil || sb.typ != "compaction" {
+					return ir.ProtocolError("compaction delta without an open compaction block")
+				}
+				fields, err := compactionDeltaFields(ev.Data)
+				if err != nil {
+					return ir.ProtocolError("compaction delta is malformed")
+				}
+				if serverOpenBytes+len(fields) > maxServerInputBytes {
+					return ir.ProtocolError("server input exceeded limit")
+				}
+				sb.bytes += len(fields)
+				serverOpenBytes += len(fields)
+				if err := emit(ir.StreamEvent{Kind: ir.EventServerUpdate, Index: d.Index, ServerType: "compaction", Data: string(fields)}); err != nil {
+					return err
+				}
+				started = true
+			default:
+				if d.Delta.Type != "" {
+					return ir.ProtocolError("unsupported content delta")
+				}
 			}
 		case "content_block_stop":
 			var s streamContentBlockStop
 			if json.Unmarshal(ev.Data, &s) != nil {
 				continue
+			}
+			if s.Index < 0 {
+				return ir.ProtocolError("negative content block index")
 			}
 			if _, open := thinkingOpen[s.Index]; open {
 				delete(thinkingOpen, s.Index)
@@ -237,6 +457,24 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 					return err
 				}
 				started = true
+				break
+			}
+			if textOpen[s.Index] {
+				delete(textOpen, s.Index)
+				if s.Index > stoppedThrough {
+					stoppedThrough = s.Index
+				}
+				if err := emit(ir.StreamEvent{Kind: ir.EventTextEnd, Index: s.Index, TextIndexed: true}); err != nil {
+					return err
+				}
+				started = true
+				break
+			}
+			if closeServer(s.Index) != nil {
+				if err := emit(ir.StreamEvent{Kind: ir.EventServerEnd, Index: s.Index}); err != nil {
+					return err
+				}
+				started = true
 			}
 		case "message_delta":
 			var m streamMessageDelta
@@ -244,6 +482,35 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				continue
 			}
 			stopReason = stopReason2(m.Delta.StopReason)
+			stopSequence = m.Delta.StopSequence
+			if m.Delta.Container != nil {
+				v, err := validateOptionalObject(m.Delta.Container, "container")
+				if err != nil {
+					return ir.ProtocolError("message_delta container is malformed")
+				}
+				container = v
+			}
+			if m.Delta.StopDetails != nil {
+				v, err := validateOptionalObject(m.Delta.StopDetails, "stop_details")
+				if err != nil {
+					return ir.ProtocolError("message_delta stop_details is malformed")
+				}
+				stopDetails = v
+			}
+			if m.ContextManagement != nil {
+				v, err := validateOptionalObject(m.ContextManagement, "context_management")
+				if err != nil {
+					return ir.ProtocolError("message_delta context_management is malformed")
+				}
+				contextManagement = v
+			}
+			if m.InputTransformations != nil {
+				v, err := validateOptionalArray(m.InputTransformations, "input_transformations")
+				if err != nil {
+					return ir.ProtocolError("message_delta input_transformations is malformed")
+				}
+				inputTransformations = v
+			}
 			if m.Usage.InputTokens != nil {
 				ordinary = *m.Usage.InputTokens
 			}
@@ -259,10 +526,15 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if len(thinkingOpen) != 0 {
 				return ir.ProtocolError("thinking block closed by stream end")
 			}
+			if len(serverOpen) != 0 {
+				return ir.ProtocolError("server block closed by stream end")
+			}
 			if err := emit(ir.StreamEvent{
-				Kind: ir.EventFinish, StopReason: stopReason,
+				Kind: ir.EventFinish, StopReason: stopReason, StopSequence: stopSequence,
 				InputTokens: inputTokens, OutputTokens: outputTokens,
 				CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
+				Container: container, ContextManagement: contextManagement,
+				StopDetails: stopDetails, InputTransformations: inputTransformations,
 			}); err != nil {
 				return err
 			}
@@ -279,16 +551,64 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			// synthesize a finish that looks like valid signed history.
 			return ir.ProtocolError("thinking block closed by stream end")
 		}
+		if len(serverOpen) != 0 {
+			return ir.ProtocolError("server block closed by stream end")
+		}
 		return emit(ir.StreamEvent{
-			Kind: ir.EventFinish, StopReason: stopReason,
+			Kind: ir.EventFinish, StopReason: stopReason, StopSequence: stopSequence,
 			InputTokens: inputTokens, OutputTokens: outputTokens,
 			CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
+			Container: container, ContextManagement: contextManagement,
+			StopDetails: stopDetails, InputTransformations: inputTransformations,
 		})
 	}
 	if len(thinkingOpen) != 0 {
 		return ir.ProtocolError("thinking block closed by stream end")
 	}
 	return nil
+}
+
+// compactionDeltaFields extracts the verified compaction update fields. Content
+// is required and must be a JSON string. encrypted_content is optional and must
+// be a string or null. Unknown delta fields are not forwarded.
+func compactionDeltaFields(data []byte) (json.RawMessage, error) {
+	var wrap struct {
+		Delta json.RawMessage `json:"delta"`
+	}
+	if json.Unmarshal(data, &wrap) != nil {
+		return nil, errors.New("missing delta")
+	}
+	trimmed := bytes.TrimSpace(wrap.Delta)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("delta must be an object")
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(trimmed, &obj) != nil {
+		return nil, errors.New("delta must be an object")
+	}
+	content, ok := obj["content"]
+	if !ok {
+		return nil, errors.New("content is required")
+	}
+	content = bytes.TrimSpace(content)
+	if len(content) == 0 || content[0] != '"' {
+		return nil, errors.New("content must be a string")
+	}
+	out := map[string]json.RawMessage{"content": content}
+	if enc, ok := obj["encrypted_content"]; ok {
+		enc = bytes.TrimSpace(enc)
+		if len(enc) > 0 && !bytes.Equal(enc, nullJSON) {
+			if enc[0] != '"' {
+				return nil, errors.New("encrypted_content must be a string")
+			}
+		}
+		out["encrypted_content"] = enc
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 // thinkingDecodeState tracks one open source thinking block. signed means a
@@ -343,11 +663,38 @@ type StreamEncoder struct {
 	stoppedThrough int
 	legacyOpen     bool
 	legacyBlock    int
+	// texts maps a source text-block index to its open output block. The key -1
+	// is the legacy unindexed text stream. Entries are removed on stop, so the
+	// map is bounded by simultaneously open text blocks.
+	texts      map[int]int
+	textSource int
+	servers    map[int]*serverEncodeBlock
+	// serverOpenBytes and serverStoppedThrough bound simultaneous open server
+	// state and reject index reuse. Bytes are released on stop; this is not a
+	// cumulative history counter.
+	serverOpenBytes      int
+	serverStoppedThrough int
+	startContainer       json.RawMessage
+	startContext         json.RawMessage
 }
+
+// maxOpenServerBlocks bounds simultaneously open provider-owned blocks.
+const maxOpenServerBlocks = 32
+
+// maxServerInputBytes bounds retained server input fragments for one stream.
+const maxServerInputBytes = 1 << 20
+
+// maxServerStartBytes bounds one server content_block_start object. An SSE
+// frame may be larger, but an open server block must not retain that much per
+// index across the open-block cap.
+const maxServerStartBytes = 1 << 20
 
 // maxOpenThinkingBlocks bounds simultaneously open source thinking blocks.
 // Completed blocks are released, so this is not a history limit.
 const maxOpenThinkingBlocks = 64
+
+// maxOpenTextBlocks bounds simultaneously open source text blocks.
+const maxOpenTextBlocks = 64
 
 // thinkingBlock is one open source-indexed thinking block. block is its wire
 // index after content_block_start. A signature before the start is a protocol
@@ -355,6 +702,12 @@ const maxOpenThinkingBlocks = 64
 type thinkingBlock struct {
 	block  int
 	signed bool
+}
+
+type serverEncodeBlock struct {
+	block int
+	typ   string
+	bytes int
 }
 
 // streamTool is one IR-index tool call. block is -1 until content_block_start
@@ -371,7 +724,8 @@ func NewStreamEncoder(model string) *StreamEncoder {
 	return &StreamEncoder{
 		model: model, openKind: blockNone,
 		tools: map[int]*streamTool{}, thinking: map[int]*thinkingBlock{},
-		stoppedThrough: -1,
+		texts: map[int]int{}, textSource: -1,
+		stoppedThrough: -1, serverStoppedThrough: -1,
 	}
 }
 
@@ -423,13 +777,18 @@ func (e *StreamEncoder) ensureStart(w *sse.Writer) error {
 		InputTokens: e.inputTokens, CacheReadTokens: e.cacheRead, CacheWriteTokens: e.cacheWrite,
 	}
 	e.startWire = usageToAnth(startUsage)
-	return e.event(w, "message_start", map[string]any{
-		"message": map[string]any{
-			"id": id, "type": "message", "role": "assistant", "model": e.model,
-			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": anthUsageMap(startUsage, 0),
-		},
-	})
+	message := map[string]any{
+		"id": id, "type": "message", "role": "assistant", "model": e.model,
+		"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+		"usage": anthUsageMap(startUsage, 0),
+	}
+	if len(e.startContainer) > 0 {
+		message["container"] = json.RawMessage(e.startContainer)
+	}
+	if len(e.startContext) > 0 {
+		message["context_management"] = json.RawMessage(e.startContext)
+	}
+	return e.event(w, "message_start", map[string]any{"message": message})
 }
 
 func (e *StreamEncoder) explicitThinkingOpen() bool {
@@ -453,6 +812,12 @@ func (e *StreamEncoder) closeBlock(w *sse.Writer) error {
 	if e.legacyOpen && e.legacyBlock == idx {
 		e.legacyOpen = false
 	}
+	if e.textSource >= -1 && e.texts != nil {
+		if block, ok := e.texts[e.textSource]; ok && block == idx {
+			delete(e.texts, e.textSource)
+		}
+	}
+	e.textSource = -1
 	return e.event(w, "content_block_stop", map[string]any{"index": idx})
 }
 
@@ -595,6 +960,208 @@ func (e *StreamEncoder) closeOpenTools(w *sse.Writer) error {
 	return nil
 }
 
+func (e *StreamEncoder) encodeServerComplete(w *sse.Writer, ev ir.StreamEvent) error {
+	if e.explicitThinkingOpen() {
+		return ir.ProtocolError("server block while thinking block is open")
+	}
+	if ev.Index < 0 {
+		return ir.ProtocolError("negative content block index")
+	}
+	if ev.Index <= e.serverStoppedThrough {
+		return ir.ProtocolError("server block restarted after stop")
+	}
+	block, err := serverStartObject(ev)
+	if err != nil {
+		return err
+	}
+	if len(block) > maxServerStartBytes {
+		return ir.ProtocolError("server start exceeded limit")
+	}
+	if err := e.ensureStart(w); err != nil {
+		return err
+	}
+	if err := e.closeOpenText(w); err != nil {
+		return err
+	}
+	idx := e.nextIndex
+	e.nextIndex++
+	if err := e.event(w, "content_block_start", map[string]any{"index": idx, "content_block": block}); err != nil {
+		return err
+	}
+	if ev.Index > e.serverStoppedThrough {
+		e.serverStoppedThrough = ev.Index
+	}
+	return e.event(w, "content_block_stop", map[string]any{"index": idx})
+}
+
+func (e *StreamEncoder) encodeServerStart(w *sse.Writer, ev ir.StreamEvent) error {
+	if e.explicitThinkingOpen() {
+		return ir.ProtocolError("server block while thinking block is open")
+	}
+	if ev.Index < 0 {
+		return ir.ProtocolError("negative content block index")
+	}
+	if ev.Index <= e.serverStoppedThrough {
+		return ir.ProtocolError("server block restarted after stop")
+	}
+	if e.servers != nil && e.servers[ev.Index] != nil {
+		return ir.ProtocolError("server block started twice")
+	}
+	if e.servers != nil && len(e.servers) >= maxOpenServerBlocks {
+		return ir.ProtocolError("too many open server blocks")
+	}
+	block, err := serverStartObject(ev)
+	if err != nil {
+		return err
+	}
+	if len(block) > maxServerStartBytes {
+		return ir.ProtocolError("server start exceeded limit")
+	}
+	if e.serverOpenBytes+len(block) > maxServerInputBytes {
+		return ir.ProtocolError("server input exceeded limit")
+	}
+	if err := e.ensureStart(w); err != nil {
+		return err
+	}
+	if err := e.closeOpenText(w); err != nil {
+		return err
+	}
+	idx := e.nextIndex
+	e.nextIndex++
+	if e.servers == nil {
+		e.servers = map[int]*serverEncodeBlock{}
+	}
+	e.servers[ev.Index] = &serverEncodeBlock{block: idx, typ: ev.ServerType, bytes: len(block)}
+	e.serverOpenBytes += len(block)
+	return e.event(w, "content_block_start", map[string]any{"index": idx, "content_block": json.RawMessage(block)})
+}
+
+func (e *StreamEncoder) encodeServerDelta(w *sse.Writer, ev ir.StreamEvent) error {
+	sb := e.servers[ev.Index]
+	if sb == nil {
+		return ir.ProtocolError("server delta without an open server block")
+	}
+	if sb.typ == "compaction" {
+		return ir.ProtocolError("compaction block received an input delta")
+	}
+	if e.serverOpenBytes+len(ev.ArgsFrag) > maxServerInputBytes {
+		return ir.ProtocolError("server input exceeded limit")
+	}
+	sb.bytes += len(ev.ArgsFrag)
+	e.serverOpenBytes += len(ev.ArgsFrag)
+	return e.event(w, "content_block_delta", map[string]any{
+		"index": sb.block, "delta": map[string]any{"type": "input_json_delta", "partial_json": ev.ArgsFrag},
+	})
+}
+
+// encodeServerUpdate forwards one verified provider-owned field replacement,
+// currently a compaction content/encrypted_content update. The pure encoder
+// retains no start object or fragment history; it only remembers the open wire
+// index and type.
+func (e *StreamEncoder) encodeServerUpdate(w *sse.Writer, ev ir.StreamEvent) error {
+	sb := e.servers[ev.Index]
+	if sb == nil {
+		return ir.ProtocolError("server update without an open server block")
+	}
+	if sb.typ != "compaction" || ev.ServerType != "compaction" {
+		return ir.ProtocolError("server update is not supported for this block")
+	}
+	trimmed := bytes.TrimSpace([]byte(ev.Data))
+	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+		return ir.ProtocolError("server update is malformed")
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(trimmed, &fields) != nil {
+		return ir.ProtocolError("server update is malformed")
+	}
+	if e.serverOpenBytes+len(trimmed) > maxServerInputBytes {
+		return ir.ProtocolError("server input exceeded limit")
+	}
+	sb.bytes += len(trimmed)
+	e.serverOpenBytes += len(trimmed)
+	delta := map[string]any{"type": "compaction_delta"}
+	for key, value := range fields {
+		delta[key] = value
+	}
+	return e.event(w, "content_block_delta", map[string]any{"index": sb.block, "delta": delta})
+}
+
+func (e *StreamEncoder) encodeServerEnd(w *sse.Writer, ev ir.StreamEvent) error {
+	sb := e.servers[ev.Index]
+	if sb == nil {
+		return ir.ProtocolError("server stop without an open server block")
+	}
+	delete(e.servers, ev.Index)
+	e.serverOpenBytes -= sb.bytes
+	if ev.Index > e.serverStoppedThrough {
+		e.serverStoppedThrough = ev.Index
+	}
+	if e.openIndex == sb.block {
+		e.openKind = blockNone
+	}
+	return e.event(w, "content_block_stop", map[string]any{"index": sb.block})
+}
+
+// openTextBlock opens one output text block bound to a source index. The key
+// -1 is reserved for legacy unindexed text. A previous text block is closed and
+// released before its replacement starts.
+func (e *StreamEncoder) openTextBlock(w *sse.Writer, source int, initial string) (int, error) {
+	if err := e.ensureStart(w); err != nil {
+		return 0, err
+	}
+	if e.openKind == blockText || e.openKind == blockReasoning {
+		if err := e.closeBlock(w); err != nil {
+			return 0, err
+		}
+	}
+	idx := e.nextIndex
+	e.nextIndex++
+	e.openKind = blockText
+	e.openIndex = idx
+	e.textSource = source
+	e.texts[source] = idx
+	if err := e.event(w, "content_block_start", map[string]any{
+		"index": idx, "content_block": map[string]any{"type": "text", "text": initial},
+	}); err != nil {
+		return 0, err
+	}
+	return idx, nil
+}
+
+func (e *StreamEncoder) textBlockFor(source int) (int, bool) {
+	if e.openKind == blockText && e.textSource == source {
+		return e.openIndex, true
+	}
+	return 0, false
+}
+
+func (e *StreamEncoder) closeOpenText(w *sse.Writer) error {
+	if e.openKind == blockText || e.openKind == blockReasoning {
+		return e.closeBlock(w)
+	}
+	return nil
+}
+
+func serverStartObject(ev ir.StreamEvent) (json.RawMessage, error) {
+	if ev.ServerType == "" || !knownServerBlockType(ev.ServerType) {
+		return nil, ir.ProtocolError("unsupported server content block")
+	}
+	block := json.RawMessage(ev.Data)
+	if len(block) == 0 {
+		return json.RawMessage(`{"type":` + quoteJSON(ev.ServerType) + `}`), nil
+	}
+	if !json.Valid(block) || block[0] != '{' {
+		return nil, ir.ProtocolError("server block is malformed")
+	}
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(block, &probe) != nil || probe.Type != ev.ServerType {
+		return nil, ir.ProtocolError("server block type is invalid")
+	}
+	return append(json.RawMessage(nil), block...), nil
+}
+
 func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 	switch ev.Kind {
 	case ir.EventMessageStart:
@@ -602,31 +1169,102 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		if ev.Model != "" {
 			e.model = ev.Model
 		}
+		if len(ev.Container) > 0 {
+			v, err := validateOptionalObject(ev.Container, "container")
+			if err != nil {
+				return ir.ProtocolError("message_start container is malformed")
+			}
+			e.startContainer = v
+		}
+		if len(ev.ContextManagement) > 0 {
+			v, err := validateOptionalObject(ev.ContextManagement, "context_management")
+			if err != nil {
+				return ir.ProtocolError("message_start context_management is malformed")
+			}
+			e.startContext = v
+		}
 		e.applyUsage(ev)
 		return e.ensureStart(w)
+
+	case ir.EventTextStart:
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("text block started while thinking block is open")
+		}
+		if ev.Index < 0 {
+			return ir.ProtocolError("negative text block index")
+		}
+		if _, ok := e.texts[ev.Index]; ok {
+			return ir.ProtocolError("text block started twice")
+		}
+		if len(e.texts) >= maxOpenTextBlocks {
+			return ir.ProtocolError("too many open text blocks")
+		}
+		_, err := e.openTextBlock(w, ev.Index, ev.Text)
+		return err
+
+	case ir.EventTextEnd:
+		block, ok := e.texts[ev.Index]
+		if !ok {
+			return nil
+		}
+		if e.openKind == blockText && e.openIndex == block {
+			return e.closeBlock(w)
+		}
+		delete(e.texts, ev.Index)
+		if e.textSource == ev.Index {
+			e.textSource = -1
+		}
+		return nil
 
 	case ir.EventTextDelta:
 		if e.explicitThinkingOpen() {
 			return ir.ProtocolError("text delta while thinking block is open")
 		}
-		if err := e.ensureStart(w); err != nil {
-			return err
+		source := -1
+		if ev.TextIndexed {
+			source = ev.Index
 		}
-		if e.openKind != blockText {
-			if err := e.closeBlock(w); err != nil {
-				return err
+		block, ok := e.textBlockFor(source)
+		if !ok {
+			if ev.TextIndexed && ev.Text == "" {
+				return nil
 			}
-			e.openIndex = e.nextIndex
-			e.nextIndex++
-			e.openKind = blockText
-			if err := e.event(w, "content_block_start", map[string]any{
-				"index": e.openIndex, "content_block": map[string]any{"type": "text", "text": ""},
-			}); err != nil {
+			var err error
+			block, err = e.openTextBlock(w, source, "")
+			if err != nil {
 				return err
 			}
 		}
 		return e.event(w, "content_block_delta", map[string]any{
-			"index": e.openIndex, "delta": map[string]any{"type": "text_delta", "text": ev.Text},
+			"index": block, "delta": map[string]any{"type": "text_delta", "text": ev.Text},
+		})
+
+	case ir.EventTextCitation:
+		if e.explicitThinkingOpen() {
+			return ir.ProtocolError("citation while thinking block is open")
+		}
+		citations, err := decodeCitationItems([]json.RawMessage{json.RawMessage(ev.Data)})
+		if err != nil {
+			return ir.ProtocolError("citation is malformed")
+		}
+		source := -1
+		if ev.TextIndexed {
+			source = ev.Index
+		} else if block, open := e.textBlockFor(ev.Index); open && block >= 0 {
+			// An older citation carried only Index. Bind it only to that open
+			// source block, never to whichever unrelated text block is current.
+			source = ev.Index
+		}
+		block, ok := e.textBlockFor(source)
+		if !ok {
+			block, err = e.openTextBlock(w, source, "")
+			if err != nil {
+				return err
+			}
+		}
+		return e.event(w, "content_block_delta", map[string]any{
+			"index": block,
+			"delta": map[string]any{"type": "citations_delta", "citation": json.RawMessage(citations[0].Raw)},
 		})
 
 	case ir.EventReasoningStart:
@@ -741,6 +1379,17 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		}
 		return e.event(w, "content_block_stop", map[string]any{"index": idx})
 
+	case ir.EventServerBlock:
+		return e.encodeServerComplete(w, ev)
+	case ir.EventServerStart:
+		return e.encodeServerStart(w, ev)
+	case ir.EventServerDelta:
+		return e.encodeServerDelta(w, ev)
+	case ir.EventServerUpdate:
+		return e.encodeServerUpdate(w, ev)
+	case ir.EventServerEnd:
+		return e.encodeServerEnd(w, ev)
+
 	case ir.EventToolCallStart:
 		if e.explicitThinkingOpen() {
 			return ir.ProtocolError("tool start while thinking block is open")
@@ -812,10 +1461,51 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 				usage["cache_creation_input_tokens"] = part.CacheCreationInputTokens
 			}
 		}
-		if err := e.event(w, "message_delta", map[string]any{
-			"delta": map[string]any{"stop_reason": stopReasonWire(ev.StopReason), "stop_sequence": nil},
-			"usage": usage,
-		}); err != nil {
+		delta := map[string]any{"stop_reason": stopReasonWire(ev.StopReason), "stop_sequence": nil}
+		if ev.StopSequence != nil {
+			delta["stop_sequence"] = *ev.StopSequence
+		}
+		if len(ev.StopDetails) > 0 {
+			v, err := validateOptionalObject(ev.StopDetails, "stop_details")
+			if err != nil {
+				return ir.ProtocolError("stop_details is malformed")
+			}
+			if len(v) > 0 {
+				delta["stop_details"] = json.RawMessage(v)
+			}
+		}
+		// The pinned SDK reads message_delta.delta.container, not a top-level
+		// container. context_management and input_transformations stay on the
+		// event itself.
+		if len(ev.Container) > 0 {
+			v, err := validateOptionalObject(ev.Container, "container")
+			if err != nil {
+				return ir.ProtocolError("container is malformed")
+			}
+			if len(v) > 0 {
+				delta["container"] = json.RawMessage(v)
+			}
+		}
+		payload := map[string]any{"delta": delta, "usage": usage}
+		if len(ev.ContextManagement) > 0 {
+			v, err := validateOptionalObject(ev.ContextManagement, "context_management")
+			if err != nil {
+				return ir.ProtocolError("context_management is malformed")
+			}
+			if len(v) > 0 {
+				payload["context_management"] = json.RawMessage(v)
+			}
+		}
+		if len(ev.InputTransformations) > 0 {
+			v, err := validateOptionalArray(ev.InputTransformations, "input_transformations")
+			if err != nil {
+				return ir.ProtocolError("input_transformations is malformed")
+			}
+			if len(v) > 0 {
+				payload["input_transformations"] = json.RawMessage(v)
+			}
+		}
+		if err := e.event(w, "message_delta", payload); err != nil {
 			return err
 		}
 		e.finishEmitted = true
@@ -834,6 +1524,9 @@ func (e *StreamEncoder) EncodeError(w *sse.Writer, message, errType string) erro
 }
 
 func (e *StreamEncoder) Close(w *sse.Writer) error {
+	if len(e.servers) != 0 {
+		return ir.ProtocolError("server block closed by stream end")
+	}
 	if !e.started || e.finishEmitted {
 		return nil
 	}

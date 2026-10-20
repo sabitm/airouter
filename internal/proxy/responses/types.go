@@ -32,6 +32,10 @@ type request struct {
 	// silently yields "" instead of an error.
 	Store   *bool              `json:"store"`
 	Include *[]json.RawMessage `json:"include"`
+	// Metadata is portable caller metadata mapped from Anthropic metadata.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+	// Text carries the mapped output_config.format under text.format.
+	Text json.RawMessage `json:"text,omitempty"`
 }
 
 type respReasoning struct {
@@ -44,6 +48,7 @@ type tool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"`
+	Strict      *bool           `json:"strict,omitempty"`
 }
 
 type inputItem struct {

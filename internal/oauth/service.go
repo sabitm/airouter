@@ -30,6 +30,15 @@ type ProviderStore interface {
 	UpdateProviderOAuth(ctx context.Context, id int64, creds *domain.OAuthCreds) error
 }
 
+// OAuthCredsCASStore is the optional safe-write capability Claude Code needs.
+// A Claude refresh or first-use device initialization must not overwrite a
+// reconnect that committed after the token was read. Stores without this
+// capability fail the Claude operation explicitly rather than doing a lossy
+// whole-row write.
+type OAuthCredsCASStore interface {
+	UpdateProviderOAuthCAS(ctx context.Context, id int64, update func(current *domain.OAuthCreds) (*domain.OAuthCreds, bool, error)) (*domain.OAuthCreds, error)
+}
+
 // Service resolves an effective upstream bearer token for a provider, refreshing
 // OAuth access tokens as needed. It is the single entry point the proxy and
 // dashboard probes call before contacting an upstream.
@@ -44,7 +53,6 @@ type Service struct {
 	// never shared with proactive callers, whose cached result may reflect a
 	// different outcome. Keyed on (provider id, force).
 	inflight map[refreshKey]*call
-
 	// testOnJoin, if set, is called after this caller has obtained the
 	// inflight slot (leader or waiter) and before it waits. Tests use it as
 	// a join barrier; production leaves it nil.
@@ -92,10 +100,36 @@ func New(store ProviderStore) *Service {
 //
 // The provider passed in is a request-local hydrated copy, so the caller may
 // overwrite provider.APIKey with the returned token without affecting other
-// requests. Resolve does not mutate the passed provider.
+// requests. Resolve does not mutate the passed provider. Call ResolveCreds
+// when the request also needs the credential snapshot that produced the token.
 func (s *Service) Resolve(ctx context.Context, provider *domain.Provider, force bool) (string, error) {
-	if provider.Method() != domain.AuthOAuth || provider.OAuthCreds == nil {
+	// Method is independent of scheme and protocol. An API-key row may still
+	// carry config-only OAuthCreds (for example a Kiro profile). Those creds
+	// must not replace the static key, even when AccessToken is populated.
+	if provider == nil || provider.Method() != domain.AuthOAuth {
+		if provider == nil {
+			return "", nil
+		}
 		return provider.APIKey, nil
+	}
+	creds, err := s.ResolveCreds(ctx, provider, force)
+	if creds != nil && creds.AccessToken != "" {
+		return creds.AccessToken, err
+	}
+	return "", err
+}
+
+// ResolveCreds returns the credential snapshot that produced the effective
+// token. The snapshot is a copy. The caller may store it on a request-local
+// provider. ResolveCreds does not mutate the passed provider or a shared row
+// except for the existing refresh and Claude device initialization writes.
+func (s *Service) ResolveCreds(ctx context.Context, provider *domain.Provider, force bool) (*domain.OAuthCreds, error) {
+	if provider == nil || provider.Method() != domain.AuthOAuth || provider.OAuthCreds == nil {
+		if provider == nil || provider.OAuthCreds == nil {
+			return nil, nil
+		}
+		cp := *provider.OAuthCreds
+		return &cp, nil
 	}
 	creds := provider.OAuthCreds
 
@@ -115,30 +149,79 @@ func (s *Service) Resolve(ctx context.Context, provider *domain.Provider, force 
 	// persisted a fresh token) skips the token endpoint. The same skip applies
 	// to a fresh, unknown-expiry, or non-refreshable snapshot when the live
 	// row could not be read, so a store error does not force a token call.
-	if !force && !shouldRefresh(creds, s.now()) {
-		return creds.AccessToken, nil
-	}
-
-	// A proactive caller must not reuse a forced refresh's possibly-different
-	// outcome, and vice versa; the (id, force) inflight key keeps them isolated
-	// while concurrent forced refreshes (parallel 401 reactions on one
-	// provider) coalesce instead of double-using a rotating refresh token.
-	if force {
-		updated, err := s.dedupRefresh(ctx, refreshKey{id: provider.ID, force: true}, creds)
-		if err != nil {
-			// On a forced refresh failure, fall back to the current token: the
-			// 401 may have been transient, and an expired token is no worse than
-			// none. ErrInvalidGrant surfaces so the caller can flag reconnect.
-			return creds.AccessToken, err
+	var updated *domain.OAuthCreds
+	var resolveErr error
+	if force || shouldRefresh(creds, s.now()) {
+		// A proactive caller must not reuse a forced refresh's possibly-different
+		// outcome, and vice versa; the (id, force) inflight key keeps them isolated
+		// while concurrent forced refreshes (parallel 401 reactions on one
+		// provider) coalesce instead of double-using a rotating refresh token.
+		updated, resolveErr = s.dedupRefresh(ctx, refreshKey{id: provider.ID, force: force}, creds)
+		if updated == nil {
+			updated = creds
 		}
-		return updated.AccessToken, nil
+	} else {
+		updated = creds
 	}
+	ready, err := s.ensureClaudeIdentity(ctx, provider.ID, updated)
+	if err != nil && resolveErr == nil {
+		resolveErr = err
+	}
+	if ready == nil {
+		ready = updated
+	}
+	// Pair the token this call resolved with the account and device that
+	// belong to that same snapshot. A later store read must not replace one
+	// without the others.
+	cp := *ready
+	return &cp, resolveErr
+}
 
-	updated, err := s.dedupRefresh(ctx, refreshKey{id: provider.ID, force: false}, creds)
-	if err != nil {
-		return creds.AccessToken, err
+// ensureClaudeIdentity persists one device id for a Claude connection that
+// does not have one yet. Compare-and-swap is the concurrency control: two
+// service instances that share a store can each generate a candidate, but only
+// the first write commits and the loser returns the winner's snapshot. A
+// re-read alone is not a compare-and-swap. Randomness failure is returned and
+// does not invent a device.
+func (s *Service) ensureClaudeIdentity(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	if creds == nil || !creds.ClaudeCodeAuth || isDeviceID(creds.ClaudeDeviceID) {
+		return creds, nil
 	}
-	return updated.AccessToken, nil
+	return s.initClaudeDevice(ctx, id, creds)
+}
+
+// initClaudeDevice merges a generated device into the newest stored snapshot.
+// The generated value is stable across CAS retries. A concurrent refresh,
+// reconnect, or another service instance wins without losing its token,
+// account, or device. A deleted row or an empty/replaced credential row fails
+// closed instead of writing the caller's stale snapshot.
+func (s *Service) initClaudeDevice(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	cas, ok := s.store.(OAuthCredsCASStore)
+	if !ok {
+		return creds, errors.New("oauth: store does not support atomic Claude device initialization")
+	}
+	generated := *creds
+	if err := ensureClaudeDeviceID(&generated); err != nil {
+		return creds, err
+	}
+	ready, err := cas.UpdateProviderOAuthCAS(ctx, id, func(current *domain.OAuthCreds) (*domain.OAuthCreds, bool, error) {
+		if current == nil || !current.ClaudeCodeAuth {
+			return nil, false, errors.New("oauth: Claude credential row was replaced or deleted")
+		}
+		if isDeviceID(current.ClaudeDeviceID) {
+			return current, false, nil
+		}
+		next := *current
+		next.ClaudeDeviceID = generated.ClaudeDeviceID
+		return &next, true, nil
+	})
+	if err != nil {
+		return creds, err
+	}
+	if ready == nil || !isDeviceID(ready.ClaudeDeviceID) {
+		return creds, errors.New("oauth: Claude device initialization did not persist")
+	}
+	return ready, nil
 }
 
 // dedupRefresh collapses concurrent refreshes for the same provider and mode
@@ -178,7 +261,7 @@ func (s *Service) startOrJoin(ctx context.Context, key refreshKey, creds *domain
 	go func() {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
 		defer cancel()
-		updated, err := s.doRefresh(rctx, key.id, creds)
+		updated, err := s.doRefresh(rctx, key.id, creds, false)
 		c.publish(updated, err)
 		close(c.done)
 		s.mu.Lock()
@@ -194,22 +277,168 @@ func (s *Service) startOrJoin(ctx context.Context, key refreshKey, creds *domain
 	return c
 }
 
-// doRefresh performs a single refresh against the given creds basis and
-// persists the whole rotated creds row. The basis is chosen by the caller:
-// Resolve passes the live stored creds (re-read from the store) so the
-// writeback cannot clobber a concurrent dashboard reconnect, while
-// RefreshAndPersist intentionally passes form-pasted creds that must win over
-// the stored row. It is not re-read here.
-func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
-	// Work on a copy so a failed refresh leaves the caller's creds untouched.
+// doRefresh performs a single refresh against the given creds basis. Claude
+// Code uses compare-and-swap so a reconnect, another refresh, or a device
+// initialization that commits after the basis read is preserved. Other
+// providers keep their historical whole-row writeback; their refreshed fields
+// are provider-specific and must not pass through a Claude-shaped merge.
+func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCreds, authoritative bool) (*domain.OAuthCreds, error) {
+	if !authoritative && creds != nil && creds.ClaudeCodeAuth {
+		return s.doRefreshClaude(ctx, id, creds)
+	}
 	cp := *creds
 	if err := refresh(ctx, &cp, s.now()); err != nil {
 		return nil, err
 	}
+	if authoritative && cp.ClaudeCodeAuth {
+		return s.persistClaudeAuthoritative(ctx, id, &cp, creds)
+	}
 	if err := s.store.UpdateProviderOAuth(ctx, id, &cp); err != nil {
 		return nil, err
 	}
-	return &cp, nil
+	out := cp
+	return &out, nil
+}
+
+// doRefreshClaude refreshes first, then writes only if the stored credential
+// generation is still the one this call started from. The CAS callback applies
+// the rotated token fields onto the current row, so a concurrently initialized
+// device or a reconnect is not reverted. If another writer replaced the row,
+// the caller receives that newer snapshot instead of a stale rotation.
+func (s *Service) doRefreshClaude(ctx context.Context, id int64, basis *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	cas, ok := s.store.(OAuthCredsCASStore)
+	if !ok {
+		return nil, errors.New("oauth: store does not support atomic Claude refresh")
+	}
+	rotated := *basis
+	if err := refresh(ctx, &rotated, s.now()); err != nil {
+		// Another service instance may have rotated the same refresh token while
+		// this call was in flight. Prefer the newly stored usable row over
+		// surfacing a stale invalid_grant.
+		if live, lerr := s.store.GetProvider(ctx, id); lerr == nil && live != nil && live.OAuthCreds != nil && claudeGenerationChanged(live.OAuthCreds, basis) {
+			cp := *live.OAuthCreds
+			return &cp, nil
+		}
+		return nil, err
+	}
+	return cas.UpdateProviderOAuthCAS(ctx, id, func(current *domain.OAuthCreds) (*domain.OAuthCreds, bool, error) {
+		if current == nil || !current.ClaudeCodeAuth {
+			return nil, false, errors.New("oauth: Claude credential row was replaced or deleted")
+		}
+		if current.AccessToken == rotated.AccessToken &&
+			current.RefreshToken == rotated.RefreshToken &&
+			current.ExpiresAt == rotated.ExpiresAt {
+			return current, false, nil
+		}
+		if claudeGenerationChanged(current, basis) {
+			return current, false, nil
+		}
+		next := mergeClaudeRefresh(current, &rotated)
+		return next, true, nil
+	})
+}
+
+// persistClaudeAuthoritative writes dashboard-refreshed credentials. The form
+// is authoritative for token values, but the row may still have changed while
+// the token endpoint was called. A CAS retry keeps the operation deterministic
+// and avoids a torn credential blob.
+func (s *Service) persistClaudeAuthoritative(ctx context.Context, id int64, rotated, basis *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	cas, ok := s.store.(OAuthCredsCASStore)
+	if !ok {
+		if err := s.store.UpdateProviderOAuth(ctx, id, rotated); err != nil {
+			return nil, err
+		}
+		out := *rotated
+		return &out, nil
+	}
+	return cas.UpdateProviderOAuthCAS(ctx, id, func(current *domain.OAuthCreds) (*domain.OAuthCreds, bool, error) {
+		if current == nil {
+			return nil, false, errors.New("oauth: Claude credential row was deleted")
+		}
+		next := *rotated
+		sameGeneration := sameClaudeRefreshToken(current, basis)
+		sameAccount := next.ClaudeAccountUUID != "" && current.ClaudeAccountUUID != "" &&
+			next.ClaudeAccountUUID == current.ClaudeAccountUUID
+		if !isDeviceID(next.ClaudeDeviceID) && isDeviceID(current.ClaudeDeviceID) && (sameAccount || sameGeneration) {
+			next.ClaudeDeviceID = current.ClaudeDeviceID
+		}
+		// Borrow identity only while the stored row still belongs to the refresh
+		// basis. A different pasted refresh token is an unknown grant, even when
+		// the token response omitted account and organization.
+		if next.ClaudeAccountUUID == "" && current.ClaudeAccountUUID != "" && sameGeneration {
+			next.ClaudeAccountUUID = current.ClaudeAccountUUID
+			next.AccountID = current.ClaudeAccountUUID
+		}
+		if next.ClaudeOrgUUID == "" && current.ClaudeOrgUUID != "" && next.ClaudeAccountUUID != "" &&
+			next.ClaudeAccountUUID == current.ClaudeAccountUUID {
+			next.ClaudeOrgUUID = current.ClaudeOrgUUID
+			if next.OrganizationID == "" {
+				next.OrganizationID = current.OrganizationID
+			}
+		}
+		return &next, true, nil
+	})
+}
+
+// claudeGenerationChanged reports that the stored row no longer belongs to the
+// refresh basis. Device-only changes from first-use initialization are not a
+// new generation. A different refresh token or Claude account is.
+func claudeGenerationChanged(current, basis *domain.OAuthCreds) bool {
+	if current == nil || basis == nil {
+		return true
+	}
+	if current.RefreshToken != basis.RefreshToken {
+		return true
+	}
+	if current.ClaudeAccountUUID != basis.ClaudeAccountUUID {
+		return true
+	}
+	return false
+}
+
+// sameClaudeRefreshToken reports that the stored row still carries the refresh
+// token the caller refreshed. Account fields may be empty on one side; they do
+// not establish a new credential generation for this borrow decision.
+func sameClaudeRefreshToken(current, basis *domain.OAuthCreds) bool {
+	if current == nil || basis == nil || basis.RefreshToken == "" {
+		return false
+	}
+	return current.RefreshToken == basis.RefreshToken
+}
+
+// mergeClaudeRefresh starts from the newest stored row and applies only the
+// rotated token fields. Device and any field the refresh response omitted stay
+// at their freshly stored values.
+func mergeClaudeRefresh(current, rotated *domain.OAuthCreds) *domain.OAuthCreds {
+	out := *current
+	out.AccessToken = rotated.AccessToken
+	out.ExpiresAt = rotated.ExpiresAt
+	if rotated.RefreshToken != "" {
+		out.RefreshToken = rotated.RefreshToken
+	}
+	if rotated.ClaudeRefreshExpiresAt != 0 {
+		out.ClaudeRefreshExpiresAt = rotated.ClaudeRefreshExpiresAt
+	}
+	if rotated.ClaudeScopes != "" {
+		out.ClaudeScopes = rotated.ClaudeScopes
+	}
+	if rotated.ClaudeAccountUUID != "" {
+		out.ClaudeAccountUUID = rotated.ClaudeAccountUUID
+		out.AccountID = rotated.AccountID
+	}
+	if rotated.ClaudeOrgUUID != "" {
+		out.ClaudeOrgUUID = rotated.ClaudeOrgUUID
+		if rotated.OrganizationID != "" {
+			out.OrganizationID = rotated.OrganizationID
+		}
+	}
+	if rotated.Email != "" {
+		out.Email = rotated.Email
+	}
+	if !isDeviceID(out.ClaudeDeviceID) && isDeviceID(rotated.ClaudeDeviceID) {
+		out.ClaudeDeviceID = rotated.ClaudeDeviceID
+	}
+	return &out
 }
 
 // RefreshTokens exchanges the refresh token for a new access token without
@@ -228,7 +457,9 @@ func (s *Service) RefreshTokens(ctx context.Context, creds *domain.OAuthCreds) (
 // credentials back to the store, for the dashboard edit form where the provider
 // already has an id. Unlike RefreshTokens (create/import, no id) this persists.
 func (s *Service) RefreshAndPersist(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
-	return s.doRefresh(ctx, id, creds)
+	// The dashboard passes the credentials that must win. Do not discard them
+	// because the stored refresh token differs.
+	return s.doRefresh(ctx, id, creds, true)
 }
 
 // IsInvalidGrant reports whether err is an ErrInvalidGrant, for callers that

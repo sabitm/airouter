@@ -152,22 +152,115 @@ func claudeCaps(m string, protocol domain.Protocol) Caps {
 		MaxOutput:  64000,
 		Levels:     []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"},
 	}
-	// Adaptive for Opus/Sonnet 4.6+ (and 5.x). Haiku/Fable/Mythos stay budget.
-	// Claude Code uses the same model refinement (no longer all-adaptive).
-	if claudeAdaptiveModel(m) {
-		c.Format = FormatClaudeAdaptive
-		c.MaxOutput = 128000
-		// Adaptive effort set: none/low/medium/high/max (minimal->low, xhigh->high).
-		c.Levels = []string{"none", "low", "medium", "high", "max"}
-	} else if strings.Contains(m, "fable") || strings.Contains(m, "mythos") {
-		c.MaxOutput = 128000
-	}
-	if strings.Contains(m, "claude-3") {
+	row, known := claudeCatalogRow(m)
+	if known {
+		if row.maxOutput > 0 {
+			c.MaxOutput = row.maxOutput
+		}
+		// A catalog hit is not evidence of thinking. Claude 3.5 and 3.7 are in
+		// the table for output limits and have empty capability lists. They must
+		// not bypass the non-reasoner guard.
+		if row.nonReasoner {
+			c.Reasoning = false
+			c.Format = FormatNone
+			c.Levels = nil
+			return c
+		}
+		if row.adaptive {
+			c.Format = FormatClaudeAdaptive
+			c.Levels = claudeAdaptiveLevels(row)
+		} else {
+			c.Levels = []string{"none", "low", "medium", "high"}
+			if row.xhigh {
+				c.Levels = append(c.Levels, "xhigh")
+			}
+			if row.maxEffort {
+				c.Levels = append(c.Levels, "max")
+			}
+		}
+		if row.rejectsDisabled {
+			c.CanDisable = false
+			c.Levels = withoutLevel(c.Levels, "none")
+		}
+		if !row.effort && !row.adaptive {
+			// Budget models still accept a thinking budget. They do not accept
+			// an effort level the catalog does not list.
+		}
+	} else if strings.Contains(m, "claude-3") {
 		c.Reasoning = false
 		c.Format = FormatNone
+		c.Levels = nil
+	} else {
+		// An unknown name is not catalog evidence. Keep budget and do not
+		// invent adaptive, xhigh, or a disable rejection.
+		c.Levels = []string{"none", "low", "medium", "high"}
 	}
 	_ = protocol
 	return c
+}
+
+type claudeCatalogCaps struct {
+	adaptive        bool
+	effort          bool
+	maxEffort       bool
+	xhigh           bool
+	rejectsDisabled bool
+	nonReasoner     bool
+	maxOutput       int
+}
+
+func claudeCatalogRow(model string) (claudeCatalogCaps, bool) {
+	// Local table mirrors claudecode.LookupModel. thinking must not import
+	// claudecode: that package imports thinking through the proxy.
+	id := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		id = id[i+1:]
+	}
+	id = strings.ReplaceAll(id, ".", "-")
+	if i := strings.Index(id, "@"); i >= 0 {
+		id = id[:i]
+	}
+	if mapped, ok := claudeDatedIDs[id]; ok {
+		id = mapped
+	}
+	if _, ok := claudeCatalog[id]; !ok {
+		if i := claudeDateSuffix(id); i > 0 {
+			if _, ok := claudeCatalog[id[:i]]; ok {
+				id = id[:i]
+			}
+		}
+	}
+	row, ok := claudeCatalog[id]
+	return row, ok
+}
+
+func claudeDateSuffix(id string) int {
+	for i := len(id) - 1; i >= 0; i-- {
+		if id[i] == '-' && i+9 == len(id) {
+			all := true
+			for _, c := range id[i+1:] {
+				if c < '0' || c > '9' {
+					all = false
+					break
+				}
+			}
+			if all {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func claudeAdaptiveLevels(row claudeCatalogCaps) []string {
+	levels := []string{"none", "low", "medium", "high"}
+	if row.xhigh {
+		levels = append(levels, "xhigh")
+	}
+	if row.maxEffort {
+		levels = append(levels, "max")
+	}
+	return levels
 }
 
 func kimiCaps(m string) Caps {
@@ -362,35 +455,43 @@ func opencodeLevelIn(level string, levels []string) bool {
 	return false
 }
 
-func claudeAdaptiveModel(m string) bool {
-	// Opus 4.6+ / Sonnet 4.6+ / 5.x require thinking:{type:adaptive}+output_config.
-	// Haiku, Fable, Mythos, and older Opus/Sonnet stay on budget.
-	patterns := []string{
-		"claude-opus-4.6", "claude-opus-4-6",
-		"claude-opus-4.7", "claude-opus-4-7",
-		"claude-opus-4.8", "claude-opus-4-8",
-		"claude-opus-5",
-		"claude-sonnet-4.6", "claude-sonnet-4-6",
-		"claude-sonnet-4.7", "claude-sonnet-4-7",
-		"claude-sonnet-5",
-		"opus-4.6", "opus-4-6",
-		"opus-4.7", "opus-4-7",
-		"opus-4.8", "opus-4-8",
-		"opus-5",
-		"sonnet-4.6", "sonnet-4-6",
-		"sonnet-4.7", "sonnet-4-7",
-		"sonnet-5",
-	}
-	// Exclude haiku even if a broader pattern somehow matched.
-	if strings.Contains(m, "haiku") || strings.Contains(m, "fable") || strings.Contains(m, "mythos") {
-		return false
-	}
-	for _, p := range patterns {
-		if strings.Contains(m, p) {
-			return true
+var claudeCatalog = map[string]claudeCatalogCaps{
+	"claude-3-5-haiku":  {nonReasoner: true, maxOutput: 8192},
+	"claude-3-5-sonnet": {nonReasoner: true, maxOutput: 8192},
+	"claude-3-7-sonnet": {nonReasoner: true, maxOutput: 64000},
+	"claude-haiku-4-5":  {maxOutput: 64000},
+	"claude-haiku-5-5":  {adaptive: true, effort: true, maxEffort: true, xhigh: true, rejectsDisabled: true, maxOutput: 128000},
+	"claude-sonnet-4-0": {maxOutput: 64000},
+	"claude-sonnet-4-5": {maxOutput: 64000},
+	"claude-sonnet-4-6": {adaptive: true, effort: true, maxEffort: true, maxOutput: 128000},
+	"claude-sonnet-5":   {adaptive: true, effort: true, maxEffort: true, xhigh: true, maxOutput: 128000},
+	"claude-sonnet-5-5": {adaptive: true, effort: true, maxEffort: true, xhigh: true, rejectsDisabled: true, maxOutput: 128000},
+	"claude-opus-4-0":   {maxOutput: 32000},
+	"claude-opus-4-1":   {maxOutput: 32000},
+	"claude-opus-4-5":   {maxOutput: 64000},
+	"claude-opus-4-6":   {adaptive: true, effort: true, maxEffort: true, maxOutput: 128000},
+	"claude-opus-4-7":   {adaptive: true, effort: true, maxEffort: true, xhigh: true, maxOutput: 128000},
+	"claude-opus-4-8":   {adaptive: true, effort: true, maxEffort: true, xhigh: true, maxOutput: 128000},
+	"claude-opus-5":     {adaptive: true, effort: true, maxEffort: true, xhigh: true, maxOutput: 128000},
+	"claude-opus-5-5":   {adaptive: true, effort: true, maxEffort: true, xhigh: true, rejectsDisabled: true, maxOutput: 128000},
+	"claude-fable-5":    {adaptive: true, effort: true, maxEffort: true, xhigh: true, rejectsDisabled: true, maxOutput: 128000},
+	"claude-fable-5-1":  {adaptive: true, effort: true, maxEffort: true, xhigh: true, rejectsDisabled: true, maxOutput: 128000},
+	"claude-mythos-5":   {maxOutput: 128000},
+	"claude-mythos-5-1": {adaptive: true, effort: true, maxEffort: true, xhigh: true, rejectsDisabled: true, maxOutput: 128000},
+}
+
+var claudeDatedIDs = map[string]string{
+	"claude-haiku-4-5-20251001": "claude-haiku-4-5",
+}
+
+func withoutLevel(levels []string, drop string) []string {
+	out := make([]string, 0, len(levels))
+	for _, level := range levels {
+		if level != drop {
+			out = append(out, level)
 		}
 	}
-	return false
+	return out
 }
 
 func isKnownNonReasoner(m string) bool {

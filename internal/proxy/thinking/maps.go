@@ -122,21 +122,40 @@ func NormalizeCodexLevel(level string, caps Caps) string {
 	}
 }
 
-// MapClaudeAdaptiveLevel maps unified levels onto the adaptive effort set
-// (none/low/medium/high/max). minimal->low, xhigh->high; max is preserved.
-func MapClaudeAdaptiveLevel(level string) string {
+// MapClaudeAdaptiveLevel maps a level onto the caps set. minimal becomes low.
+// xhigh and max stay when the catalog row lists them. Otherwise they step down
+// to the highest accepted level. An empty caps list keeps the historical
+// adaptive collapse so non-catalog callers do not gain xhigh.
+func MapClaudeAdaptiveLevel(level string, caps Caps) string {
 	switch level {
 	case "", "auto":
 		return level
 	case "minimal":
-		return "low"
-	case "xhigh":
-		return "high"
-	case "none", "low", "medium", "high", "max":
-		return level
-	default:
+		level = "low"
+	}
+	if len(caps.Levels) == 0 {
+		if level == "xhigh" {
+			return "high"
+		}
 		return level
 	}
+	if levelIn(level, caps.Levels) {
+		return level
+	}
+	order := []string{"max", "xhigh", "high", "medium", "low"}
+	start := 0
+	for i, item := range order {
+		if item == level {
+			start = i
+			break
+		}
+	}
+	for _, item := range order[start:] {
+		if levelIn(item, caps.Levels) {
+			return item
+		}
+	}
+	return "high"
 }
 
 // MapKimiLevel maps unified levels onto Kimi's set (none/low/medium/high/max).

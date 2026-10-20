@@ -52,7 +52,7 @@ Anthropic-compatible APIs. The dashboard also includes guided connections for:
 | Qoder | OAuth device flow |
 | Antigravity (Google Cloud Code) | OAuth; unofficial |
 | Cursor | OAuth or imported CLI/IDE token; unofficial |
-| Claude Code | OAuth; unofficial |
+| Claude Code | OAuth; unofficial CLI profile, not a supported proxy |
 | OpenCode Zen | zen tier: key `public`; go tier: opencode.ai API key |
 
 Provider credentials and OAuth tokens are encrypted in SQLite using
@@ -130,6 +130,14 @@ redacted thinking is rejected with HTTP 400 when no enabled combo target can
 preserve that history. Other client formats receive only readable thinking text.
 The proxy does not copy Anthropic signatures into OpenAI encrypted content and
 does not return redacted data as text.
+
+Claude Code uses a pinned CLI profile (version 2.1.303). A dashboard Check
+calls `GET /models` only. A passing Check does not prove that Messages
+requests will be accepted, and it does not send an inference request. The
+profile does not include the Claude Agent SDK runtime, cloud gateway, remote
+workers, or telemetry. A browser connect uses the official authorize and token
+endpoints, but that login path is not a verified first-party login. Existing
+connections keep their stored endpoints and are not expanded to newer scopes.
 
 ## Configuration
 

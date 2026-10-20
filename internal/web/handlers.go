@@ -638,6 +638,9 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 			return
 		}
 	}
+	if proto == domain.ProtocolClaudeCode && prevKiro != nil {
+		preserveClaudeIdentity(cur.OAuthCreds, prevKiro, reconnected || imported)
+	}
 	if proto == domain.ProtocolCursor {
 		applyCursorConfig(cur.OAuthCreds, r)
 		if strings.TrimSpace(cur.OAuthCreds.MachineID) == "" {

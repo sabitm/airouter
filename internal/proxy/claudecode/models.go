@@ -23,9 +23,15 @@ func ListModelIDs(ctx context.Context, baseURL, accessToken string) ([]string, e
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	for k, v := range IdentityHeaders() {
+	for k, v := range StainlessRuntimeHeadersFor("list") {
 		req.Header.Set(k, v)
 	}
+	req.Header.Set("anthropic-version", AnthropicVersion)
+	req.Header.Set("User-Agent", DefaultProfile().UserAgent())
+	req.Header.Set("X-App", "cli")
+	// A model-list probe has no thinking, tools, or cache policy. The oauth
+	// beta is sent only for an OAuth token. Acceptance here is not Messages proof.
+	req.Header.Set("anthropic-beta", BetaHeaders(BetaRequest{OAuth: IsOAuthToken(accessToken)}))
 	resp, err := modelsClient.Do(req)
 	if err != nil {
 		return nil, err

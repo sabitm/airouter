@@ -268,6 +268,33 @@ func EncodeAgentRequest(req *ir.Request) ([]byte, error) {
 	if len(req.Messages) == 0 {
 		return nil, fmt.Errorf("cursor: empty messages")
 	}
+	if req.Anthropic != nil && len(req.Anthropic.OutputFormat) > 0 {
+		// Validate the shape so a malformed format is a client error, then
+		// reject because the Cursor protocol has no output-format slot.
+		if _, _, err := req.Anthropic.OutputFormatJSONSchema(); err != nil {
+			return nil, err
+		}
+		return nil, ir.InvalidRequest("output format is not supported by cursor")
+	}
+	for _, t := range req.Tools {
+		// Cursor has no strict flag. Accept a valid custom tool without
+		// promising schema enforcement, but reject provider-only controls that
+		// would otherwise be dropped silently.
+		if t.AnthropicTool != nil {
+			if t.AnthropicTool.Type != "" {
+				return nil, ir.InvalidRequest("Anthropic server tools are not supported by cursor")
+			}
+			if t.AnthropicTool.EagerInput != nil && *t.AnthropicTool.EagerInput {
+				return nil, ir.InvalidRequest("eager input streaming is not supported by cursor")
+			}
+			if t.AnthropicTool.DeferLoading != nil && *t.AnthropicTool.DeferLoading {
+				return nil, ir.InvalidRequest("deferred tool loading is not supported by cursor")
+			}
+			if t.AnthropicTool.MaxUses != nil || len(t.AnthropicTool.AllowedDomains) > 0 || len(t.AnthropicTool.BlockedDomains) > 0 {
+				return nil, ir.InvalidRequest("provider-only tool controls are not supported by cursor")
+			}
+		}
+	}
 
 	// The current turn is the trailing user message (the one the model answers);
 	// everything before it is replayable history. Mirrors the CLI's split.

@@ -226,7 +226,10 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	if id == "" {
 		id = ir.NewID("resp_")
 	}
-	output := buildOutput(resp.Content)
+	output, err := buildOutput(resp.Content)
+	if err != nil {
+		return nil, err
+	}
 
 	status := "completed"
 	var incomplete any
@@ -253,7 +256,7 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 // one reasoning item is emitted per structured reasoning block; readable
 // summaries come only from Summary (or the legacy Text field), never from
 // opaque provider state.
-func buildOutput(blocks []ir.ContentBlock) []map[string]any {
+func buildOutput(blocks []ir.ContentBlock) ([]map[string]any, error) {
 	var output []map[string]any
 	var textParts []map[string]any
 	flushText := func() {
@@ -299,9 +302,13 @@ func buildOutput(blocks []ir.ContentBlock) []map[string]any {
 				"name":      b.ToolName,
 				"arguments": args,
 			})
+		case ir.BlockServer:
+			// A provider-owned server block has no Responses projection. Do not
+			// return an empty successful response or a fake callable tool.
+			return nil, fmt.Errorf("responses: response server block %q is not representable", b.AnthropicServer.TypeString())
 		}
 		// BlockRedactedReasoning is omitted. Its data is not summary text.
 	}
 	flushText()
-	return output
+	return output, nil
 }

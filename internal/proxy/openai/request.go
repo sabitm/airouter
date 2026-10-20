@@ -138,6 +138,7 @@ func decodeTools(tools []chatTool) []ir.Tool {
 			Name:        t.Function.Name,
 			Description: t.Function.Description,
 			Parameters:  t.Function.Parameters,
+			Strict:      t.Function.Strict,
 		})
 	}
 	return out
@@ -203,17 +204,29 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 		out.Messages = append(out.Messages, encodeMessage(m)...)
 	}
 	for _, t := range req.Tools {
+		if err := rejectProviderOwnedTool(t); err != nil {
+			return nil, err
+		}
 		out.Tools = append(out.Tools, chatTool{
 			Type: "function",
 			Function: chatFunctionDef{
 				Name:        t.Name,
 				Description: t.Description,
 				Parameters:  t.Parameters,
+				Strict:      t.Strict,
 			},
 		})
 	}
 	if req.ToolChoice != nil {
 		out.ToolChoice = encodeToolChoice(req.ToolChoice)
+	}
+	if req.Anthropic != nil {
+		out.Metadata = req.Anthropic.Metadata
+		format, err := responseFormat(req.Anthropic)
+		if err != nil {
+			return nil, err
+		}
+		out.ResponseFormat = format
 	}
 	// Transport-default OpenAI dialect. Preserve explicit effort values here;
 	// only the provider-aware Codex finalizer applies model capability mapping.

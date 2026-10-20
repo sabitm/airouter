@@ -220,6 +220,87 @@ func kiroSameAccount(prev *domain.OAuthCreds, r *http.Request) bool {
 	return prev.AccessToken != "" && access == prev.AccessToken
 }
 
+// preserveClaudeIdentity keeps the install device and granted scopes when a
+// reconnect or import is the same Claude account. A same-account exchange
+// already generated a device; that device is kept only when the stored device
+// is empty, so reconnect does not rotate the install id. A different account
+// must not keep the old device, tokens, or account UUID. An unknown account
+// does not borrow identity from an empty refresh token. An empty new account
+// does not borrow a generic AccountID from another protocol. Replaced tokens
+// with an unknown grant do not inherit the old scope list.
+func preserveClaudeIdentity(next, prev *domain.OAuthCreds, replaced bool) {
+	if next == nil || prev == nil || !prev.ClaudeCodeAuth {
+		return
+	}
+	next.ClaudeCodeAuth = true
+	if !replaced {
+		fillClaudeIdentity(next, prev, true)
+		return
+	}
+	if !claudeSameAccount(next, prev) {
+		if next.ClaudeAccountUUID == "" {
+			next.AccountID = ""
+		}
+		return
+	}
+	fillClaudeIdentity(next, prev, false)
+}
+
+func fillClaudeIdentity(next, prev *domain.OAuthCreds, keepScopes bool) {
+	if next.ClaudeDeviceID == "" {
+		next.ClaudeDeviceID = prev.ClaudeDeviceID
+	} else if prev.ClaudeDeviceID != "" && next.ClaudeAccountUUID != "" && next.ClaudeAccountUUID == prev.ClaudeAccountUUID {
+		// Exchange generates a device before save. A confirmed same account keeps
+		// the stored device instead of that new value.
+		next.ClaudeDeviceID = prev.ClaudeDeviceID
+	}
+	if next.ClaudeAccountUUID == "" {
+		next.ClaudeAccountUUID = prev.ClaudeAccountUUID
+	}
+	if next.ClaudeOrgUUID == "" {
+		next.ClaudeOrgUUID = prev.ClaudeOrgUUID
+	}
+	if keepScopes && next.ClaudeScopes == "" {
+		next.ClaudeScopes = prev.ClaudeScopes
+	}
+	if next.ClaudeRefreshExpiresAt == 0 {
+		next.ClaudeRefreshExpiresAt = prev.ClaudeRefreshExpiresAt
+	}
+	if next.AccountID == "" {
+		next.AccountID = next.ClaudeAccountUUID
+	}
+}
+
+// claudeSameAccount is true only for a confirmed Claude account match or for
+// identical nonempty credentials. An empty new refresh token is not evidence
+// of the same account: an access-only import of a different session must not
+// inherit the old account, device, or scopes.
+func claudeSameAccount(next, prev *domain.OAuthCreds) bool {
+	if next == nil || prev == nil {
+		return false
+	}
+	if next.ClaudeAccountUUID != "" && prev.ClaudeAccountUUID != "" {
+		return next.ClaudeAccountUUID == prev.ClaudeAccountUUID
+	}
+	if next.RefreshToken != "" && prev.RefreshToken != "" && next.RefreshToken == prev.RefreshToken {
+		return true
+	}
+	if next.AccessToken != "" && prev.AccessToken != "" && next.AccessToken == prev.AccessToken && next.RefreshToken == prev.RefreshToken {
+		return true
+	}
+	return false
+}
+
+// claudeRefreshTokenReplaced reports a pasted refresh token that differs from
+// the stored one. No pasted token, or the same token, keeps the stored identity.
+func claudeRefreshTokenReplaced(prev *domain.OAuthCreds, r *http.Request) bool {
+	if prev == nil || r == nil {
+		return false
+	}
+	pasted := strings.TrimSpace(r.FormValue("refresh_token"))
+	return pasted != "" && pasted != prev.RefreshToken
+}
+
 func configureKiroImport(next, prev *domain.OAuthCreds, r *http.Request) {
 	if kiroSameAccount(prev, r) {
 		mergeKiroAccount(next, prev, r)
@@ -561,23 +642,29 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 			savedID = true
 			id = parsed
 			stored := p.OAuthCreds
+			// A different pasted Claude refresh token is a replacement credential,
+			// not the stored account. Capture that before the generic fill borrows
+			// old tokens or identity for an unknown grant.
+			claudeReplacement := p.Protocol == domain.ProtocolClaudeCode && claudeRefreshTokenReplaced(stored, r)
 			// A pasted Kiro refresh token may belong to another account. Never
 			// combine it with stored tokens or the old client registration.
 			if p.Protocol != domain.ProtocolKiro || kiroSameAccount(stored, r) {
 				if creds.RefreshToken == "" {
 					creds.RefreshToken = stored.RefreshToken
 				}
-				if creds.AccessToken == "" {
-					creds.AccessToken = stored.AccessToken
-				}
-				if creds.ExpiresAt == 0 {
-					creds.ExpiresAt = stored.ExpiresAt
-				}
-				if creds.Email == "" {
-					creds.Email = stored.Email
-				}
-				if creds.AccountID == "" {
-					creds.AccountID = stored.AccountID
+				if !claudeReplacement {
+					if creds.AccessToken == "" {
+						creds.AccessToken = stored.AccessToken
+					}
+					if creds.ExpiresAt == 0 {
+						creds.ExpiresAt = stored.ExpiresAt
+					}
+					if creds.Email == "" {
+						creds.Email = stored.Email
+					}
+					if creds.AccountID == "" {
+						creds.AccountID = stored.AccountID
+					}
 				}
 				if creds.TokenURL == "" {
 					creds.TokenURL = stored.TokenURL
@@ -640,14 +727,19 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 				if creds.DisplayName == "" {
 					creds.DisplayName = stored.DisplayName
 				}
-				if creds.OrganizationID == "" {
-					creds.OrganizationID = stored.OrganizationID
-				}
-				if creds.IDToken == "" {
-					creds.IDToken = stored.IDToken
+				if !claudeReplacement {
+					if creds.OrganizationID == "" {
+						creds.OrganizationID = stored.OrganizationID
+					}
+					if creds.IDToken == "" {
+						creds.IDToken = stored.IDToken
+					}
 				}
 				if creds.Preset == "" {
 					creds.Preset = stored.Preset
+				}
+				if p.Protocol == domain.ProtocolClaudeCode {
+					preserveClaudeIdentity(creds, stored, claudeReplacement)
 				}
 			}
 			if p.Protocol == domain.ProtocolKiro {

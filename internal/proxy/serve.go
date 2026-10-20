@@ -46,6 +46,9 @@ const (
 	maxCollectedStreamReasoningParts = 1024
 	collectedReasoningPartOverhead   = 128
 	collectedReasoningKeyOverhead    = 32
+	// collectedCitationOverhead bills the Citation struct and slice slot in
+	// addition to the raw object bytes, so many tiny citations stay bounded.
+	collectedCitationOverhead = 64
 )
 
 var (
@@ -374,6 +377,12 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// hash, or openTenantScope in open mode.
 		r = r.WithContext(withCodexRequest(r.Context(), auth.Scope, r.Header, body))
 	}
+	if hasClaudeCodeTarget(candidates) {
+		// Capture Claude Code session identity before translation drops metadata.
+		// The account UUID is never taken from this body.
+		r = r.WithContext(withClaudeRequest(r.Context(), r.Header, body))
+		r = r.WithContext(withClaudeTenant(r.Context(), auth.Scope))
+	}
 
 	// Walk the ordered (attachment-compatible) targets. A target that fails before
 	// any byte reaches the client falls through to the next; the first that commits
@@ -576,14 +585,17 @@ func emptyCandidateMessage(combo *domain.Combo, prep *attachmentPrep, filterReas
 	if prep == nil {
 		return "", false
 	}
-	if prep.needsThinkingPreservation() || prep.needsResponsesPreservation() {
+	if prep.needsThinkingPreservation() || prep.needsResponsesPreservation() || prep.needsAnthropicState() {
 		if filterReason != "" {
 			return filterReason, true
 		}
 		if prep.needsThinkingPreservation() {
 			return thinkingHistoryNoProvider, true
 		}
-		return responsesStateNoProvider, true
+		if prep.needsResponsesPreservation() {
+			return responsesStateNoProvider, true
+		}
+		return anthropicStateUnsupported, true
 	}
 	// Attachment-only incompatibility keeps its dedicated message envelope.
 	if prep.hasAttachments() {
@@ -623,7 +635,8 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 	needAttach := prep != nil && prep.hasAttachments()
 	needThink := prep != nil && prep.needsThinkingPreservation()
 	needResponses := prep != nil && prep.needsResponsesPreservation()
-	if needAttach || needThink || needResponses {
+	needAnthropic := prep != nil && prep.needsAnthropicState()
+	if needAttach || needThink || needResponses || needAnthropic {
 		compatible = make([]domain.ComboTarget, 0, len(enabled))
 		for _, t := range enabled {
 			backend := openaiCodec
@@ -643,6 +656,12 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 				}
 			}
 			if reason == "" && needResponses {
+				reason = prep.checkThinking(backend)
+				if reason != "" {
+					event = "thinking_target_skipped"
+				}
+			}
+			if reason == "" && needAnthropic {
 				reason = prep.checkThinking(backend)
 				if reason != "" {
 					event = "thinking_target_skipped"
@@ -937,6 +956,40 @@ func applyCollectedUsage(u *ir.Usage, ev ir.StreamEvent) {
 	}
 }
 
+// applyCollectedResponseState merges provider-owned response continuity fields
+// from message_start and message_delta. A later non-empty value replaces an
+// earlier one; absent values keep the earlier state.
+func applyCollectedResponseState(resp *ir.Response, ev ir.StreamEvent, reserve func(int) error) error {
+	if len(ev.Container) == 0 && len(ev.ContextManagement) == 0 && len(ev.StopDetails) == 0 && len(ev.InputTransformations) == 0 {
+		return nil
+	}
+	replace := func(dst *json.RawMessage, value json.RawMessage) error {
+		if len(value) == 0 {
+			return nil
+		}
+		if delta := len(value) - len(*dst); delta > 0 {
+			if err := reserve(delta); err != nil {
+				return err
+			}
+		}
+		*dst = append(json.RawMessage(nil), value...)
+		return nil
+	}
+	if resp.Anthropic == nil {
+		resp.Anthropic = &ir.AnthropicResponseState{}
+	}
+	if err := replace(&resp.Anthropic.Container, ev.Container); err != nil {
+		return err
+	}
+	if err := replace(&resp.Anthropic.ContextManagement, ev.ContextManagement); err != nil {
+		return err
+	}
+	if err := replace(&resp.Anthropic.StopDetails, ev.StopDetails); err != nil {
+		return err
+	}
+	return replace(&resp.Anthropic.InputTransformations, ev.InputTransformations)
+}
+
 func opencodeBackendForAttempt(ctx context.Context, backend codec) codec {
 	if !isOpencodeCodec(backend.id) {
 		return backend
@@ -980,37 +1033,88 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 	// fragmented stream does not reseat a growing string on every fragment.
 	// Every text block charges its overhead before allocation and the block
 	// count is bounded independently of the byte budget.
-	textBlock := -1
-	var textBuf strings.Builder
-	flushText := func() {
-		if textBlock < 0 {
+	// Text blocks are keyed by source block index. The key -1 is the legacy
+	// unindexed stream, which keeps its old adjacent-merge behavior. Each open
+	// state owns one output block so a later source block can never merge its
+	// text or citations into an earlier block.
+	type collectedText struct {
+		blockIdx int
+		text     strings.Builder
+	}
+	texts := map[int]*collectedText{}
+	plainBlocks := 0
+	newTextState := func() (*collectedText, error) {
+		if plainBlocks >= maxCollectedStreamBlocks {
+			return nil, errCollectedStreamResponseTooLarge
+		}
+		if err := reserve(collectedBlockOverhead); err != nil {
+			return nil, err
+		}
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText})
+		plainBlocks++
+		return &collectedText{blockIdx: len(resp.Content) - 1}, nil
+	}
+	ensureTextState := func(index int) (*collectedText, error) {
+		if st := texts[index]; st != nil {
+			return st, nil
+		}
+		st, err := newTextState()
+		if err != nil {
+			return nil, err
+		}
+		texts[index] = st
+		return st, nil
+	}
+	flushTextState := func(index int) {
+		st := texts[index]
+		if st == nil {
 			return
 		}
-		resp.Content[textBlock].Text = textBuf.String()
-		textBuf.Reset()
-		textBlock = -1
+		resp.Content[st.blockIdx].Text = st.text.String()
+		delete(texts, index)
 	}
-	plainBlocks := 0
-	appendText := func(text string) error {
-		// Legacy empty text events never create a block.
+	flushText := func() {
+		for index := range texts {
+			flushTextState(index)
+		}
+	}
+	appendText := func(index int, text string) error {
+		// Legacy empty text events never create a block. An indexed start
+		// already created its block, so empty indexed deltas do not add one.
 		if text == "" {
 			return nil
 		}
 		if err := reserve(len(text)); err != nil {
 			return err
 		}
-		if textBlock < 0 {
-			if plainBlocks >= maxCollectedStreamBlocks {
-				return errCollectedStreamResponseTooLarge
-			}
-			if err := reserve(collectedBlockOverhead); err != nil {
-				return err
-			}
-			resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText})
-			textBlock = len(resp.Content) - 1
-			plainBlocks++
+		st, err := ensureTextState(index)
+		if err != nil {
+			return err
 		}
-		textBuf.WriteString(text)
+		st.text.WriteString(text)
+		return nil
+	}
+	appendCitation := func(index int, data string) error {
+		trimmed := []byte(data)
+		if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+			return ir.ProtocolError("citation is malformed")
+		}
+		var head struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(trimmed, &head) != nil || head.Type == "" {
+			return ir.ProtocolError("citation has no type")
+		}
+		if err := reserve(len(trimmed) + collectedCitationOverhead); err != nil {
+			return err
+		}
+		st, err := ensureTextState(index)
+		if err != nil {
+			return err
+		}
+		resp.Content[st.blockIdx].Citations = append(resp.Content[st.blockIdx].Citations, ir.Citation{
+			Type: head.Type, Raw: append(json.RawMessage(nil), trimmed...),
+		})
 		return nil
 	}
 	// Indexed thinking and redacted blocks keep their arrival order so an
@@ -1385,6 +1489,25 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		name     string
 		args     strings.Builder
 	}
+	servers := map[int]*collectedServerBuf{}
+	serverStoppedThrough := -1
+	serverFor := func(index int, typ, start string) (*collectedServerBuf, error) {
+		if index < 0 {
+			return nil, ir.ProtocolError("negative content block index")
+		}
+		if index <= serverStoppedThrough {
+			return nil, ir.ProtocolError("server block restarted after stop")
+		}
+		if servers[index] != nil {
+			return nil, ir.ProtocolError("server block started twice")
+		}
+		if len(servers) >= maxCollectedStreamBlocks {
+			return nil, errCollectedStreamResponseTooLarge
+		}
+		sb := &collectedServerBuf{typ: typ, start: start}
+		servers[index] = sb
+		return sb, nil
+	}
 	tools := map[int]*toolBuf{}
 	newTool := func(index int) (*toolBuf, error) {
 		if tb := tools[index]; tb != nil {
@@ -1431,9 +1554,47 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 					return err
 				}
 			}
+			if err := applyCollectedResponseState(resp, ev, reserve); err != nil {
+				return err
+			}
 			applyCollectedUsage(&resp.Usage, ev)
+		case ir.EventTextStart:
+			if ev.Index < 0 {
+				return ir.ProtocolError("negative text block index")
+			}
+			if _, exists := texts[ev.Index]; exists {
+				return ir.ProtocolError("text block started twice")
+			}
+			st, err := ensureTextState(ev.Index)
+			if err != nil {
+				return err
+			}
+			if ev.Text != "" {
+				if err := reserve(len(ev.Text)); err != nil {
+					return err
+				}
+				st.text.WriteString(ev.Text)
+			}
+		case ir.EventTextEnd:
+			flushTextState(ev.Index)
 		case ir.EventTextDelta:
-			if err := appendText(ev.Text); err != nil {
+			index := -1
+			if ev.TextIndexed {
+				index = ev.Index
+			}
+			if err := appendText(index, ev.Text); err != nil {
+				return err
+			}
+		case ir.EventTextCitation:
+			index := -1
+			if ev.TextIndexed {
+				index = ev.Index
+			} else if texts[-1] == nil && texts[ev.Index] != nil {
+				// Older producers set only Index. Bind it only to a matching open
+				// source block; a dangling citation must not join another block.
+				index = ev.Index
+			}
+			if err := appendCitation(index, ev.Data); err != nil {
 				return err
 			}
 		case ir.EventReasoningDelta:
@@ -1530,6 +1691,83 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			flushText()
 			resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockRedactedReasoning, RedactedData: ev.Data})
 			extraBlocks++
+		case ir.EventServerStart:
+			if err := reserve(len(ev.Data) + len(ev.ServerType)); err != nil {
+				return err
+			}
+			sb, err := serverFor(ev.Index, ev.ServerType, ev.Data)
+			if err != nil {
+				return err
+			}
+			_ = sb
+		case ir.EventServerDelta:
+			sb := servers[ev.Index]
+			if sb == nil {
+				return ir.ProtocolError("server delta without an open server block")
+			}
+			if err := reserve(len(ev.ArgsFrag)); err != nil {
+				return err
+			}
+			sb.input.WriteString(ev.ArgsFrag)
+		case ir.EventServerUpdate:
+			sb := servers[ev.Index]
+			if sb == nil {
+				return ir.ProtocolError("server update without an open server block")
+			}
+			trimmed := []byte(ev.Data)
+			if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+				return ir.ProtocolError("server update is malformed")
+			}
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(trimmed, &fields) != nil {
+				return ir.ProtocolError("server update is malformed")
+			}
+			if err := reserve(len(trimmed)); err != nil {
+				return err
+			}
+			if sb.updates == nil {
+				sb.updates = map[string]json.RawMessage{}
+			}
+			for key, value := range fields {
+				sb.updates[key] = append(json.RawMessage(nil), value...)
+			}
+		case ir.EventServerEnd:
+			sb := servers[ev.Index]
+			if sb == nil {
+				return ir.ProtocolError("server stop without an open server block")
+			}
+			delete(servers, ev.Index)
+			if ev.Index > serverStoppedThrough {
+				serverStoppedThrough = ev.Index
+			}
+			raw, err := assembledServerBlock(sb)
+			if err != nil {
+				return err
+			}
+			if err := reserve(len(raw)); err != nil {
+				return err
+			}
+			flushText()
+			resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockServer, AnthropicServer: &ir.AnthropicServerBlock{WireType: sb.typ, Raw: raw}})
+		case ir.EventServerBlock:
+			if ev.Index < 0 {
+				return ir.ProtocolError("negative content block index")
+			}
+			if ev.Index <= serverStoppedThrough {
+				return ir.ProtocolError("server block restarted after stop")
+			}
+			raw := json.RawMessage(ev.Data)
+			if len(raw) == 0 || raw[0] != '{' || !json.Valid(raw) {
+				return ir.ProtocolError("server block is malformed")
+			}
+			if err := reserve(len(ev.Data)); err != nil {
+				return err
+			}
+			flushText()
+			resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockServer, AnthropicServer: &ir.AnthropicServerBlock{WireType: ev.ServerType, Raw: raw}})
+			if ev.Index > serverStoppedThrough {
+				serverStoppedThrough = ev.Index
+			}
 		case ir.EventToolCallStart:
 			tb, err := newTool(ev.Index)
 			if err != nil {
@@ -1575,6 +1813,10 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			if ev.StopReason != "" {
 				resp.StopReason = ev.StopReason
 			}
+			resp.StopSequence = ev.StopSequence
+			if err := applyCollectedResponseState(resp, ev, reserve); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -1601,6 +1843,9 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		resp.Content[b.blockIdx].Text = b.text.String()
 		resp.Content[b.blockIdx].AnthropicSignature = b.signature.String()
 	}
+	if len(servers) != 0 {
+		return nil, ir.ProtocolError("server block closed by stream end")
+	}
 	for _, tb := range tools {
 		args := []byte(tb.args.String())
 		if len(args) == 0 || !json.Valid(args) {
@@ -1612,6 +1857,38 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		block.ToolInput = json.RawMessage(args)
 	}
 	return resp, nil
+}
+
+type collectedServerBuf struct {
+	typ     string
+	start   string
+	input   strings.Builder
+	updates map[string]json.RawMessage
+}
+
+func assembledServerBlock(sb *collectedServerBuf) (json.RawMessage, error) {
+	if sb == nil || sb.start == "" || !json.Valid([]byte(sb.start)) {
+		return nil, ir.ProtocolError("server block is malformed")
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal([]byte(sb.start), &obj) != nil || obj["type"] == nil {
+		return nil, ir.ProtocolError("server block is malformed")
+	}
+	for key, value := range sb.updates {
+		obj[key] = value
+	}
+	if sb.input.Len() > 0 {
+		raw := []byte(sb.input.String())
+		if !json.Valid(raw) {
+			return nil, ir.ProtocolError("server input is malformed")
+		}
+		obj["input"] = json.RawMessage(raw)
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // reasoningSnapshotBytes is the retained cost of the canonical snapshot clone:

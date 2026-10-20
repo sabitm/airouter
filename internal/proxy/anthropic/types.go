@@ -8,27 +8,44 @@ import "encoding/json"
 // --- request ---
 
 type messagesRequest struct {
-	Model         string            `json:"model"`
-	System        json.RawMessage   `json:"system,omitempty"` // string or []block
-	Messages      []anthMessage     `json:"messages"`
-	MaxTokens     int               `json:"max_tokens"`
-	Temperature   *float64          `json:"temperature,omitempty"`
-	TopP          *float64          `json:"top_p,omitempty"`
-	StopSequences []string          `json:"stop_sequences,omitempty"`
-	Stream        bool              `json:"stream,omitempty"`
-	Tools         []anthTool        `json:"tools,omitempty"`
-	ToolChoice    *anthToolChoice   `json:"tool_choice,omitempty"`
-	Thinking      *anthThinking     `json:"thinking,omitempty"`
-	OutputConfig  *anthOutputConfig `json:"output_config,omitempty"`
+	Model             string            `json:"model"`
+	System            json.RawMessage   `json:"system,omitempty"` // string or []block
+	Messages          []anthMessage     `json:"messages"`
+	MaxTokens         int               `json:"max_tokens"`
+	Temperature       *float64          `json:"temperature,omitempty"`
+	TopP              *float64          `json:"top_p,omitempty"`
+	StopSequences     []string          `json:"stop_sequences,omitempty"`
+	Stream            bool              `json:"stream,omitempty"`
+	Tools             []anthTool        `json:"tools,omitempty"`
+	ToolChoice        *anthToolChoice   `json:"tool_choice,omitempty"`
+	Thinking          *anthThinking     `json:"thinking,omitempty"`
+	OutputConfig      *anthOutputConfig `json:"output_config,omitempty"`
+	Metadata          json.RawMessage   `json:"metadata,omitempty"`
+	ContextManagement json.RawMessage   `json:"context_management,omitempty"`
+	CacheControl      json.RawMessage   `json:"cache_control,omitempty"`
+	Fallbacks         json.RawMessage   `json:"fallbacks,omitempty"`
+	Container         json.RawMessage   `json:"container,omitempty"`
 }
 
 type anthThinking struct {
 	Type         string `json:"type"` // disabled | adaptive | enabled
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	Display      string `json:"display,omitempty"`
 }
 
 type anthOutputConfig struct {
-	Effort string `json:"effort,omitempty"`
+	Effort     string          `json:"effort,omitempty"`
+	Format     json.RawMessage `json:"format,omitempty"`
+	TaskBudget *anthTaskBudget `json:"task_budget,omitempty"`
+}
+
+// anthTaskBudget is the verified output_config.task_budget shape. Total and
+// Remaining are pointers so a missing total is distinguishable from an
+// explicit zero, and an explicit zero remaining is not dropped.
+type anthTaskBudget struct {
+	Type      string `json:"type"`
+	Total     *int   `json:"total"`
+	Remaining *int   `json:"remaining,omitempty"`
 }
 
 type anthMessage struct {
@@ -38,8 +55,15 @@ type anthMessage struct {
 
 type anthBlock struct {
 	Type string `json:"type"`
+	// Raw, when set, is the original object. MarshalJSON emits it unchanged so
+	// server-block fields that this struct does not model are not dropped.
+	Raw json.RawMessage `json:"-"`
 
 	Text string `json:"text,omitempty"`
+	// Citations is the wire value for a text citation list or the
+	// search_result {enabled} object. Text decoding validates only the array
+	// form; the search_result form stays inside its preserved server object.
+	Citations json.RawMessage `json:"citations,omitempty"`
 	// Thinking is a pointer so a signed empty thinking block can emit
 	// "thinking":"" without putting that field on text or tool blocks.
 	Thinking  *string `json:"thinking,omitempty"`
@@ -68,6 +92,14 @@ type anthBlock struct {
 	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
+func (b anthBlock) MarshalJSON() ([]byte, error) {
+	if len(b.Raw) > 0 {
+		return append([]byte(nil), b.Raw...), nil
+	}
+	type plain anthBlock
+	return json.Marshal(plain(b))
+}
+
 func thinkingText(s *string) string {
 	if s == nil {
 		return ""
@@ -87,22 +119,32 @@ type anthSource struct {
 }
 
 type anthTool struct {
-	Name         string          `json:"name"`
-	Description  string          `json:"description,omitempty"`
-	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
-	CacheControl json.RawMessage `json:"cache_control,omitempty"`
+	Type                string          `json:"type,omitempty"`
+	Name                string          `json:"name"`
+	Description         string          `json:"description,omitempty"`
+	InputSchema         json.RawMessage `json:"input_schema,omitempty"`
+	CacheControl        json.RawMessage `json:"cache_control,omitempty"`
+	Strict              *bool           `json:"strict,omitempty"`
+	EagerInputStreaming *bool           `json:"eager_input_streaming,omitempty"`
+	DeferLoading        *bool           `json:"defer_loading,omitempty"`
+	MaxUses             *int            `json:"max_uses,omitempty"`
+	AllowedDomains      []string        `json:"allowed_domains,omitempty"`
+	BlockedDomains      []string        `json:"blocked_domains,omitempty"`
 }
 
 // anthCacheControl is the wire shape of one canonical explicit cache hint. An
-// empty TTL is omitted so a marker without one re-emits without one.
+// empty TTL is omitted so a marker without one re-emits without one. Scope is
+// emitted only for the verified "global" value.
 type anthCacheControl struct {
-	Type string `json:"type"`
-	TTL  string `json:"ttl,omitempty"`
+	Type  string `json:"type"`
+	TTL   string `json:"ttl,omitempty"`
+	Scope string `json:"scope,omitempty"`
 }
 
 type anthToolChoice struct {
-	Type string `json:"type"` // auto | any | tool | none
-	Name string `json:"name,omitempty"`
+	Type                   string `json:"type"` // auto | any | tool | none
+	Name                   string `json:"name,omitempty"`
+	DisableParallelToolUse *bool  `json:"disable_parallel_tool_use,omitempty"`
 }
 
 // --- response ---
@@ -116,6 +158,12 @@ type messagesResponse struct {
 	StopReason   string      `json:"stop_reason"`
 	StopSequence *string     `json:"stop_sequence"`
 	Usage        anthUsage   `json:"usage"`
+	// Provider-owned continuity fields. Each is a validated JSON object or array
+	// shape from the pinned source; they round-trip only through Anthropic.
+	Container            json.RawMessage `json:"container,omitempty"`
+	ContextManagement    json.RawMessage `json:"context_management,omitempty"`
+	StopDetails          json.RawMessage `json:"stop_details,omitempty"`
+	InputTransformations json.RawMessage `json:"input_transformations,omitempty"`
 }
 
 type anthUsage struct {

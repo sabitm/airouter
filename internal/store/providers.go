@@ -185,6 +185,83 @@ func (s *Store) UpdateProviderOAuth(ctx context.Context, id int64, creds *domain
 	return err
 }
 
+// UpdateProviderOAuthCAS applies a conditional read-modify-write to one OAuth
+// credential blob. The update callback runs against the current decrypted
+// snapshot. A write succeeds only if the stored encrypted blob is still the
+// one the callback saw, so a refresh cannot overwrite a reconnect or another
+// writer that committed between the read and the update. The callback may run
+// more than once; it must derive its result from the argument, not from
+// captured mutable state.
+func (s *Store) UpdateProviderOAuthCAS(ctx context.Context, id int64, update func(current *domain.OAuthCreds) (*domain.OAuthCreds, bool, error)) (*domain.OAuthCreds, error) {
+	if update == nil {
+		return nil, errors.New("store: nil oauth update")
+	}
+	for attempt := 0; attempt < 32; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var stored string
+		err := s.db.QueryRowContext(ctx, "SELECT oauth_creds FROM providers WHERE id = ?", id).Scan(&stored)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		current, err := s.decryptOAuth(stored)
+		if err != nil {
+			return nil, err
+		}
+		base, err := s.decryptOAuth(stored)
+		if err != nil {
+			return nil, err
+		}
+		next, changed, err := update(current)
+		if err != nil {
+			return nil, err
+		}
+		if !changed {
+			return base, nil
+		}
+		oauthEnc, err := s.encryptOAuth(next)
+		if err != nil {
+			return nil, err
+		}
+		res, err := s.db.ExecContext(ctx,
+			"UPDATE providers SET oauth_creds=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND oauth_creds=?",
+			oauthEnc, id, stored)
+		if err != nil {
+			return nil, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n == 1 {
+			out := *next
+			return &out, nil
+		}
+		// The blob changed after the read. Loop so the callback sees the newest
+		// token, account, and device instead of overwriting them.
+	}
+	return nil, errors.New("store: oauth compare-and-swap did not converge")
+}
+
+func (s *Store) decryptOAuth(stored string) (*domain.OAuthCreds, error) {
+	if stored == "" {
+		return nil, nil
+	}
+	plain, err := s.cipher.Decrypt(stored)
+	if err != nil {
+		return nil, err
+	}
+	var creds domain.OAuthCreds
+	if err := json.Unmarshal([]byte(plain), &creds); err != nil {
+		return nil, err
+	}
+	return &creds, nil
+}
+
 func (s *Store) DeleteProvider(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM providers WHERE id = ?", id)
 	return err

@@ -301,7 +301,7 @@ func TestOAuthPresetCreatesClaudeCodeConfig(t *testing.T) {
 	if creds.RedirectURI != "http://localhost:56124/callback" {
 		t.Errorf("redirect uri = %q, want localhost loopback", creds.RedirectURI)
 	}
-	wantScopes := "org:create_api_key user:profile user:inference"
+	wantScopes := "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
 	if creds.Scopes != wantScopes {
 		t.Errorf("scopes = %q\nwant       %q", creds.Scopes, wantScopes)
 	}
@@ -314,11 +314,11 @@ func TestOAuthPresetCreatesClaudeCodeConfig(t *testing.T) {
 	if creds.ExtraAuthParams["code"] != "true" {
 		t.Errorf("extra params: %+v", creds.ExtraAuthParams)
 	}
-	if creds.AuthURL != "https://claude.ai/oauth/authorize" {
-		t.Errorf("auth url = %q, want claude.ai consent endpoint", creds.AuthURL)
+	if creds.AuthURL != "https://claude.com/cai/oauth/authorize" {
+		t.Errorf("auth url = %q, want official CLI authorize endpoint", creds.AuthURL)
 	}
-	if creds.TokenURL != "https://api.anthropic.com/v1/oauth/token" {
-		t.Errorf("token url = %q, want api.anthropic.com", creds.TokenURL)
+	if creds.TokenURL != "https://platform.claude.com/v1/oauth/token" {
+		t.Errorf("token url = %q, want official CLI token endpoint", creds.TokenURL)
 	}
 	if recipe, ok := recipeByID("claude"); !ok || recipe.Protocol != domain.ProtocolClaudeCode || recipe.Kind != kindInteractiveOAuth {
 		t.Fatalf("recipe missing or wrong: %+v", recipe)

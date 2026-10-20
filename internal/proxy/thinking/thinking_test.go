@@ -247,6 +247,23 @@ func TestCapsForDialects(t *testing.T) {
 	}
 }
 
+func TestClaude35CatalogDoesNotEnableThinking(t *testing.T) {
+	for _, model := range []string{"claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-7-sonnet", "anthropic/claude-3-5-sonnet-20241022"} {
+		c := CapsFor(model, domain.ProtocolAnthropic, domain.ReasoningClaude)
+		if c.Reasoning || c.Format != FormatNone {
+			t.Fatalf("%s caps = %+v, catalog hit must not enable thinking", model, c)
+		}
+		cc := CapsFor(model, domain.ProtocolClaudeCode, domain.ReasoningClaude)
+		if cc.Reasoning || cc.Format != FormatNone {
+			t.Fatalf("%s claude-code caps = %+v", model, cc)
+		}
+	}
+	opus := CapsFor("claude-opus-4-7", domain.ProtocolAnthropic, domain.ReasoningClaude)
+	if !opus.Reasoning || opus.Format != FormatClaudeAdaptive {
+		t.Fatalf("opus caps regressed: %+v", opus)
+	}
+}
+
 func TestCapsForKnownNonReasoners(t *testing.T) {
 	cases := []struct {
 		model   string
@@ -341,7 +358,9 @@ func TestApplyWireOpenAIMaxPolicy(t *testing.T) {
 }
 
 func TestMapLevels(t *testing.T) {
-	if MapClaudeAdaptiveLevel("minimal") != "low" || MapClaudeAdaptiveLevel("xhigh") != "high" || MapClaudeAdaptiveLevel("max") != "max" {
+	xhighCaps := Caps{Levels: []string{"low", "medium", "high", "xhigh", "max"}}
+	noXHigh := Caps{Levels: []string{"low", "medium", "high", "max"}}
+	if MapClaudeAdaptiveLevel("minimal", xhighCaps) != "low" || MapClaudeAdaptiveLevel("xhigh", xhighCaps) != "xhigh" || MapClaudeAdaptiveLevel("xhigh", noXHigh) != "high" || MapClaudeAdaptiveLevel("max", noXHigh) != "max" {
 		t.Fatal("claude adaptive map")
 	}
 	if MapKimiLevel("minimal") != "low" || MapKimiLevel("xhigh") != "max" {
@@ -1600,5 +1619,21 @@ func TestApplyWireGrokNonEffortStripsIncomingEffort(t *testing.T) {
 	}
 	if _, ok := m["reasoning_effort"]; ok {
 		t.Fatalf("reasoning_effort = %#v, want stripped", m["reasoning_effort"])
+	}
+}
+
+func TestClaudeDisabledDropsDisplayAndBudget(t *testing.T) {
+	raw := []byte(`{"model":"combo","max_tokens":16,"thinking":{"type":"disabled","display":"summarized","budget_tokens":8192},"messages":[{"role":"user","content":"hi"}]}`)
+	out, err := ApplyWire("anth-msg", raw, "claude-sonnet-5", &Config{Mode: ModeNone, Display: "summarized", Budget: 8192}, domain.ProtocolAnthropic, domain.ReasoningClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	th, _ := got["thinking"].(map[string]any)
+	if len(th) != 1 || th["type"] != "disabled" {
+		t.Fatalf("disabled thinking kept extra fields: %s", out)
 	}
 }

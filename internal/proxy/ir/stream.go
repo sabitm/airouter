@@ -1,10 +1,18 @@
 package ir
 
+import "encoding/json"
+
 // StreamEventKind tags the streaming delta union.
 type StreamEventKind int
 
 const (
 	EventMessageStart StreamEventKind = iota
+	// EventTextStart opens one source-indexed text block. Index is the source
+	// content-block index. Text is the block's initial text, which may be empty.
+	EventTextStart
+	// EventTextEnd closes the source-indexed text block identified by Index.
+	// Text must not be emitted after this event for that source block.
+	EventTextEnd
 	EventTextDelta
 	// EventReasoningDelta is the legacy unindexed, text-only reasoning delta
 	// used by OpenAI, Responses, Kiro, and other non-Anthropic producers.
@@ -35,6 +43,29 @@ const (
 	EventToolCallStart
 	EventToolCallDelta
 	EventFinish
+	// EventServerBlock is one complete provider-owned Anthropic content block
+	// that arrived with no later input delta. Data holds the original JSON object.
+	// Non-Anthropic encoders must not project it as text or as a client tool.
+	EventServerBlock
+	// EventServerStart opens one provider-owned block that may receive input
+	// deltas. Index is the source content-block index. Data is the start object.
+	EventServerStart
+	// EventServerDelta is one bounded input fragment for the open server block
+	// identified by Index. ArgsFrag is the fragment. It is not a client tool delta.
+	EventServerDelta
+	// EventServerEnd closes the open server block identified by Index.
+	EventServerEnd
+	// EventServerUpdate replaces provider-owned fields on an open server block.
+	// Index is the source content-block index. Data is a validated JSON object
+	// with only the fields the source delta replaced (currently compaction
+	// content and optional encrypted_content). It is not a client tool delta.
+	EventServerUpdate
+	// EventTextCitation appends one validated citation object to the text block
+	// identified by Index when TextIndexed is set. Legacy unindexed producers
+	// leave TextIndexed false and bind to the currently open legacy text block.
+	// Data holds the citation object. It is a read-only annotation, never a tool
+	// call. A stream with no matching text block opens one.
+	EventTextCitation
 )
 
 // StreamEvent is one decoded delta from a backend stream, in a format-neutral
@@ -53,12 +84,17 @@ type StreamEvent struct {
 	CacheReadTokens  int
 	CacheWriteTokens int
 
-	// EventTextDelta / EventReasoningDelta / EventReasoningStart text.
+	// EventTextStart / EventTextEnd / EventTextDelta / EventReasoningDelta /
+	// EventReasoningStart text.
 	Text string
 	// Indexed distinguishes an Anthropic thinking_delta, which carries a source
 	// block Index, from a legacy EventReasoningDelta. Legacy producers leave
 	// this false; their Index is not a source block index.
 	Indexed bool
+	// TextIndexed reports that EventTextDelta or EventTextCitation binds to the
+	// source text block at Index. Legacy unindexed text producers leave this
+	// false, so their adjacent deltas keep merging into one output block.
+	TextIndexed bool
 
 	// ReasoningID is the source OpenAI Responses reasoning item ID when known.
 	// It is not an Anthropic block identity and not a function-call identity.
@@ -80,21 +116,37 @@ type StreamEvent struct {
 	// EventReasoningSignature. It is not OpenAI encrypted_content.
 	Signature string
 	// Data is the opaque Anthropic redacted_thinking payload on
-	// EventRedactedReasoning.
+	// EventRedactedReasoning, the original JSON start object on EventServerStart,
+	// the original complete object on EventServerBlock, or the validated field
+	// replacement object on EventServerUpdate.
 	Data string
+	// ServerType is the Anthropic content block type on EventServerBlock,
+	// EventServerStart, and EventServerUpdate.
+	ServerType string
 
-	// EventToolCallStart / EventToolCallDelta
+	// EventTextStart / EventTextEnd / EventTextDelta / EventTextCitation /
+	// EventToolCallStart / EventToolCallDelta / EventServerStart / EventServerEnd
 	Index    int
 	ToolID   string
 	ToolName string
-	// ArgsFrag is consumed from EventToolCallDelta only. Start is identity
-	// (id/name/index); putting complete args on Start drops them at every
-	// ingress encoder and the unary collector.
+	// ArgsFrag is consumed from EventToolCallDelta and EventServerDelta. Start
+	// is identity (id/name/index) or a full start object; putting complete args
+	// on Start drops them at every ingress encoder and the unary collector.
 	ArgsFrag string
 
 	// EventFinish
 	StopReason   StopReason
 	OutputTokens int
+	// StopSequence is an explicit matched stop sequence on EventFinish. Nil
+	// means absent; an explicit empty string stays non-nil.
+	StopSequence *string
+	// Response-owned continuity fields carried by Anthropic message_start and
+	// message_delta frames. Each value is a validated JSON object or array. They
+	// are preserved only by a format that can express them.
+	Container            json.RawMessage
+	ContextManagement    json.RawMessage
+	StopDetails          json.RawMessage
+	InputTransformations json.RawMessage
 	// UsageReported is set only by the Cursor agent decoder on a normal
 	// Connect completion whose turn_ended supplied both input and output
 	// counters, including explicit zero. It is not encoded. Other codecs

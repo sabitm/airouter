@@ -3084,8 +3084,8 @@ func TestOpencodeMessagesReconcilesFinalThinkingBudget(t *testing.T) {
 		if err := json.Unmarshal(encoded, &before); err != nil {
 			t.Fatal(err)
 		}
-		if before["max_tokens"] != float64(64000) {
-			t.Fatalf("generic encoder cap = %v, want 64000", before["max_tokens"])
+		if before["max_tokens"] != float64(ceiling) {
+			t.Fatalf("generic encoder cap = %v, want source-backed %d", before["max_tokens"], ceiling)
 		}
 		originalReq := req.MaxTokens
 		originalKey := p.APIKey

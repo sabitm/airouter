@@ -38,11 +38,11 @@ const (
 	ProtocolCursor Protocol = "cursor"
 	// ProtocolClaudeCode is the Claude Code CLI-backed Anthropic Messages backend.
 	// Backend only: same Messages wire format as ProtocolAnthropic, but it
-	// impersonates the Claude Code CLI (identity headers, claude.ai OAuth with a
-	// JSON token exchange) and applies an OAuth-only anti-ban tool cloak/decoy
-	// transform. Its codec id is distinct from anth-msg so an Anthropic ingress
-	// request never passes through and always translates through the cloak
-	// prepare step rather than forwarding the raw body.
+	// speaks the Anthropic Messages API with the pinned Claude Code CLI
+	// profile. Its codec id is distinct from anth-msg so an Anthropic ingress
+	// request never passes through and always translates through the prepare
+	// step rather than forwarding the raw body. Official wire fidelity does not
+	// mean this proxy use is supported by Anthropic.
 	ProtocolClaudeCode Protocol = "claude-code"
 	// ProtocolOpencode is the opencode.ai Zen backend. Backend only: two
 	// model-dependent wire variants share one provider row — most models speak
@@ -305,12 +305,25 @@ type OAuthCreds struct {
 	// is sent as the bearer credential.
 	CursorAuth bool `json:"cursor_auth,omitempty"`
 
-	// ClaudeCodeAuth marks a Claude Code (claude.ai) OAuth connection. When true,
-	// the authorization-code exchange posts a JSON body (not form-urlencoded) and
-	// the proxy applies the Claude Code CLI identity headers plus the OAuth-only
-	// cloak/decoy transform. The cloak gate itself is the sk-ant-oat marker on the
-	// resolved access token, not this flag; refresh reuses the generic JSON path.
+	// ClaudeCodeAuth marks a Claude Code OAuth connection. When true, the
+	// authorization-code exchange and refresh post JSON to the Claude token
+	// endpoint. The proxy applies the pinned CLI profile using the resolved
+	// token. It does not rename tools or invent account UUIDs.
 	ClaudeCodeAuth bool `json:"claude_code_auth,omitempty"`
+	// ClaudeAccountUUID is the account.uuid from the token or profile response.
+	// It is not derived from a token and is not a client-supplied value.
+	ClaudeAccountUUID string `json:"claude_account_uuid,omitempty"`
+	// ClaudeOrgUUID is organization.uuid from the same response, when present.
+	ClaudeOrgUUID string `json:"claude_org_uuid,omitempty"`
+	// ClaudeDeviceID is a random 32-byte hex id created once per connection.
+	// It is independent of access and refresh tokens and survives refresh.
+	ClaudeDeviceID string `json:"claude_device_id,omitempty"`
+	// ClaudeScopes is the last granted scope list. Empty means unknown.
+	// Refresh sends this value and does not expand it to the current preset.
+	ClaudeScopes string `json:"claude_scopes,omitempty"`
+	// ClaudeRefreshExpiresAt is refresh_token_expires_in applied as Unix seconds.
+	// Zero means the token response did not supply it.
+	ClaudeRefreshExpiresAt int64 `json:"claude_refresh_expires_at,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

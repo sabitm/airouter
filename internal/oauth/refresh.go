@@ -136,6 +136,11 @@ func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	if c.ClineAuth {
 		return refreshCline(ctx, c, now)
 	}
+	// Claude Code refresh is a dedicated JSON grant. It must not share the
+	// generic JSON body, which omits scope and the Claude account fields.
+	if c.ClaudeCodeAuth {
+		return refreshClaude(ctx, c, now)
+	}
 	var req *http.Request
 	var err error
 	if c.RefreshJSON {

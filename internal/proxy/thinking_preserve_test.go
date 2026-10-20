@@ -714,7 +714,7 @@ func TestTwoRequestToolContinuationPreservesReplay(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if len(bodies) == 1 {
-			_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"thinking","thinking":"plan","signature":"sig-turn"},{"type":"thinking","thinking":"","signature":"sig-empty-turn"},{"type":"redacted_thinking","data":"redacted-turn"},{"type":"tool_use","id":"toolu_1","name":"search_ide","input":{"q":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":3}}`)
+			_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"thinking","thinking":"plan","signature":"sig-turn"},{"type":"thinking","thinking":"","signature":"sig-empty-turn"},{"type":"redacted_thinking","data":"redacted-turn"},{"type":"tool_use","id":"toolu_1","name":"search","input":{"q":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":3}}`)
 			return
 		}
 		_, _ = io.WriteString(w, `{"id":"msg_2","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"final"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":5}}`)
@@ -724,7 +724,7 @@ func TestTwoRequestToolContinuationPreservesReplay(t *testing.T) {
 	prov := &domain.Provider{
 		Name: "cc", BaseURL: upstream.URL, Protocol: domain.ProtocolClaudeCode,
 		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
-		OAuthCreds: &domain.OAuthCreds{AccessToken: "sk-ant-oat-test", RefreshToken: "rt", ExpiresAt: 0},
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "sk-ant-oat-test", RefreshToken: "rt", ExpiresAt: 0, ClaudeCodeAuth: true, ClaudeDeviceID: strings.Repeat("ab", 32)},
 	}
 	if err := st.CreateProvider(context.Background(), prov); err != nil {
 		t.Fatal(err)
@@ -767,8 +767,8 @@ func TestTwoRequestToolContinuationPreservesReplay(t *testing.T) {
 		t.Fatal("oauth token was not used")
 	}
 	assertThinkingWire(t, bodies[1], "sig-turn", "sig-empty-turn", "redacted-turn")
-	if !bytes.Contains(bodies[1], []byte(`"name":"search_ide"`)) {
-		t.Fatalf("continuation did not cloak tool: %s", bodies[1])
+	if !bytes.Contains(bodies[1], []byte(`"name":"search"`)) || bytes.Contains(bodies[1], []byte(`"name":"search_ide"`)) {
+		t.Fatalf("continuation renamed tool: %s", bodies[1])
 	}
 	if !bytes.Contains(out, []byte(`"text":"final"`)) {
 		t.Fatalf("final response = %s", out)
@@ -864,7 +864,7 @@ func TestStreamingToolContinuationReplaysSignedThinking(t *testing.T) {
 	prov := &domain.Provider{
 		Name: "cc", BaseURL: upstream.URL, Protocol: domain.ProtocolClaudeCode,
 		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
-		OAuthCreds: &domain.OAuthCreds{AccessToken: "sk-ant-oat-test", RefreshToken: "rt"},
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "sk-ant-oat-test", RefreshToken: "rt", ClaudeCodeAuth: true, ClaudeDeviceID: strings.Repeat("ab", 32)},
 	}
 	if err := st.CreateProvider(context.Background(), prov); err != nil {
 		t.Fatal(err)
@@ -905,8 +905,8 @@ func TestStreamingToolContinuationReplaysSignedThinking(t *testing.T) {
 	if !bytes.Contains(bodies[1], []byte(`"thinking":"plan"`)) || !bytes.Contains(bodies[1], []byte(`"signature":"sig-turn"`)) || !bytes.Contains(bodies[1], []byte(`"data":"redacted-turn"`)) {
 		t.Fatalf("continuation lost thinking: %s", bodies[1])
 	}
-	if !bytes.Contains(bodies[1], []byte(`"name":"search_ide"`)) {
-		t.Fatalf("continuation did not cloak: %s", bodies[1])
+	if !bytes.Contains(bodies[1], []byte(`"name":"search"`)) || bytes.Contains(bodies[1], []byte(`search_ide`)) {
+		t.Fatalf("continuation renamed tool: %s", bodies[1])
 	}
 	plan := bytes.Index(bodies[1], []byte(`"type":"thinking"`))
 	red := bytes.Index(bodies[1], []byte(`"type":"redacted_thinking"`))
@@ -1040,8 +1040,8 @@ func TestClaudeCodeDecloakKeepsThinking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Content[0].AnthropicSignature != "sig" || resp.Content[1].ToolName != "search" {
-		t.Fatalf("decloak changed thinking or tool: %+v", resp.Content)
+	if resp.Content[0].AnthropicSignature != "sig" || resp.Content[1].ToolName != "search_ide" {
+		t.Fatalf("decode changed thinking or tool: %+v", resp.Content)
 	}
 }
 
@@ -1115,7 +1115,7 @@ func anthropicToolThinkingSSE() string {
 		"event: content_block_stop\n" +
 		`data: {"type":"content_block_stop","index":1}` + "\n\n" +
 		"event: content_block_start\n" +
-		`data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"search_ide","input":{}}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"search","input":{}}}` + "\n\n" +
 		"event: content_block_delta\n" +
 		`data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}` + "\n\n" +
 		"event: content_block_stop\n" +
@@ -1283,4 +1283,29 @@ func anthropicThinkingSSE(signature, data string) string {
 		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}` + "\n\n" +
 		"event: message_stop\n" +
 		`data: {"type":"message_stop"}` + "\n\n"
+}
+
+func TestPendingLifecycleBoundsResponseState(t *testing.T) {
+	big := strings.Repeat("z", translatedPendingMaxBytes+1)
+	stop := big
+	cases := []struct {
+		name string
+		ev   ir.StreamEvent
+	}{
+		{name: "container", ev: ir.StreamEvent{Kind: ir.EventMessageStart, Container: json.RawMessage(`"` + big + `"`)}},
+		{name: "context_management", ev: ir.StreamEvent{Kind: ir.EventMessageStart, ContextManagement: json.RawMessage(`"` + big + `"`)}},
+		{name: "stop_details", ev: ir.StreamEvent{Kind: ir.EventMessageStart, StopDetails: json.RawMessage(`"` + big + `"`)}},
+		{name: "input_transformations", ev: ir.StreamEvent{Kind: ir.EventMessageStart, InputTransformations: json.RawMessage(`"` + big + `"`)}},
+		{name: "stop_sequence", ev: ir.StreamEvent{Kind: ir.EventMessageStart, StopSequence: &stop}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			sink := &translatedSink{w: rec, res: &reqResult{}, enc: anthropicCodec.newStreamEncoder("m"), ingressID: anthropicCodec.id}
+			err := sink.handle(tc.ev)
+			if err == nil || sink.committed || len(sink.pending) != 0 || sink.pendingBytes != 0 {
+				t.Fatalf("oversized %s retained: err=%v committed=%v pending=%d bytes=%d", tc.name, err, sink.committed, len(sink.pending), sink.pendingBytes)
+			}
+		})
+	}
 }

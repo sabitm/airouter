@@ -557,6 +557,17 @@ func (s *translatedSink) anthropicIngress() bool {
 }
 
 func (s *translatedSink) handle(ev ir.StreamEvent) error {
+	// Reject provider-owned blocks before buffering or noting them. A
+	// non-Anthropic encoder cannot represent them, and a later visible event
+	// would otherwise commit the stream before replay of the buffered block
+	// fails. Rejecting here keeps the failure before commitment so failover can
+	// run.
+	if !s.anthropicIngress() {
+		switch ev.Kind {
+		case ir.EventServerBlock, ir.EventServerStart, ir.EventServerDelta, ir.EventServerEnd, ir.EventServerUpdate:
+			return ir.ProtocolError("server block is not supported by this format")
+		}
+	}
 	if s.projectAway(ev) {
 		// Drop before note and pending so a projected-away payload cannot grow
 		// the buffer or the usage estimate. Log only an actual opaque omission,
@@ -620,6 +631,10 @@ func (s *translatedSink) visible(ev ir.StreamEvent) bool {
 	switch ev.Kind {
 	case ir.EventTextDelta, ir.EventToolCallStart, ir.EventToolCallDelta, ir.EventFinish:
 		return true
+	case ir.EventTextStart:
+		return ev.Text != ""
+	case ir.EventTextEnd:
+		return false
 	case ir.EventReasoningDelta:
 		return ev.Text != "" || !ev.Indexed
 	case ir.EventReasoningItemDone:
@@ -662,7 +677,12 @@ func (s *translatedSink) buffer(ev ir.StreamEvent) error {
 
 func pendingEventBytes(ev ir.StreamEvent) int {
 	n := len(ev.ID) + len(ev.Model) + len(ev.Text) + len(ev.ToolID) + len(ev.ToolName) +
-		len(ev.ArgsFrag) + len(ev.Signature) + len(ev.Data) + len(ev.ReasoningID)
+		len(ev.ArgsFrag) + len(ev.Signature) + len(ev.Data) + len(ev.ReasoningID) +
+		len(ev.ServerType) + len(ev.Container) + len(ev.ContextManagement) +
+		len(ev.StopDetails) + len(ev.InputTransformations)
+	if ev.StopSequence != nil {
+		n += len(*ev.StopSequence)
+	}
 	if ev.Reasoning != nil {
 		n += len(ev.Reasoning.ID) + len(ev.Reasoning.Status)
 		if ev.Reasoning.EncryptedContent != nil {
@@ -677,7 +697,7 @@ func pendingEventBytes(ev ir.StreamEvent) int {
 
 func (s *translatedSink) note(ev ir.StreamEvent) {
 	switch ev.Kind {
-	case ir.EventTextDelta:
+	case ir.EventTextStart, ir.EventTextDelta:
 		s.text.WriteString(ev.Text)
 	case ir.EventReasoningDelta, ir.EventReasoningStart:
 		// Readable reasoning contributes to usage estimates. Signature and

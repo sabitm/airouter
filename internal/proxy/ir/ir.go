@@ -5,6 +5,7 @@
 package ir
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -31,6 +32,9 @@ const (
 	BlockFile              BlockType = "file"
 	BlockToolUse           BlockType = "tool_use"
 	BlockToolResult        BlockType = "tool_result"
+	// BlockServer is a provider-owned Anthropic block. AnthropicServer holds
+	// the original object. Other codecs must not project it as text.
+	BlockServer BlockType = "server"
 )
 
 // Image holds an image from exactly one source: inline base64 Data, a remote
@@ -56,11 +60,14 @@ type File struct {
 
 // CacheControl is one caller-supplied Anthropic prompt-cache hint. Type is
 // always "ephemeral"; TTL is "" when the caller did not state one, otherwise
-// "5m" or "1h". It is request intent only, never response or usage data, and
-// codecs that have no marker slot drop it; no codec ever synthesizes one.
+// "5m" or "1h". Scope is "" or "global". It is request intent only, never
+// response or usage data. Codecs that have no marker slot drop it. Only the
+// Claude Code prepare step synthesizes a marker, and only when the caller
+// stated no cache policy.
 type CacheControl struct {
-	Type string
-	TTL  string
+	Type  string
+	TTL   string
+	Scope string
 }
 
 // SystemBlock is one ordered Anthropic system text block. SystemBlocks exists
@@ -156,6 +163,14 @@ func (r *ResponsesReasoning) Equal(other *ResponsesReasoning) bool {
 	return true
 }
 
+// Citation is one validated Anthropic citation object attached to an ordinary
+// text block. Raw preserves every caller/provider field; Type is the validated
+// citation kind. It is never a client tool call.
+type Citation struct {
+	Type string
+	Raw  json.RawMessage
+}
+
 // ContentBlock is a tagged union over the block kinds. Only the fields relevant
 // to Type are meaningful.
 type ContentBlock struct {
@@ -164,6 +179,10 @@ type ContentBlock struct {
 	Text  string // BlockText or BlockReasoning. Empty thinking text is valid.
 	Image *Image // BlockImage
 	File  *File  // BlockFile
+
+	// Citations are provider-issued citation objects on BlockText. They are
+	// read-only annotations, not tool calls. Other block kinds ignore them.
+	Citations []Citation
 
 	// CacheControl is an explicit caller cache marker. It is meaningful only on
 	// request blocks the target format represents. Reasoning and redacted
@@ -184,6 +203,12 @@ type ContentBlock struct {
 	// copied to Text, AnthropicSignature, or RedactedData.
 	ResponsesReasoning *ResponsesReasoning
 
+	// AnthropicServer is a provider-owned Anthropic block that is not a custom
+	// tool. Type is the wire block type (server_tool_use, tool_result variants,
+	// tool_reference, compaction, and other known server blocks). Raw is the
+	// original object. It is not portable to a non-Anthropic codec.
+	AnthropicServer *AnthropicServerBlock
+
 	// BlockToolUse: a model-issued call to a tool.
 	ToolID    string
 	ToolName  string
@@ -201,11 +226,57 @@ type Message struct {
 	Content []ContentBlock
 }
 
+// AnthropicServerBlock is one provider-owned Anthropic content block that
+// cannot be represented as text or a custom tool call. Raw is the original
+// JSON object. A non-Anthropic target must reject the request before send.
+type AnthropicServerBlock struct {
+	WireType string
+	Raw      json.RawMessage
+}
+
+// TypeString returns the wire type, or "" for a nil block. It is used in
+// payload-free error messages when a target cannot represent the block.
+func (s *AnthropicServerBlock) TypeString() string {
+	if s == nil {
+		return ""
+	}
+	return s.WireType
+}
+
 type Tool struct {
 	Name         string
 	Description  string
 	Parameters   json.RawMessage // JSON schema
 	CacheControl *CacheControl
+	// Strict requests strict schema enforcement. OpenAI and Responses emit
+	// their native strict field. Cursor accepts the same custom tool but has
+	// no strict flag, so the caller must not treat Cursor as enforcing it.
+	// Nil means omitted; false is the default and may be omitted on the wire.
+	Strict *bool
+	// AnthropicTool is set for an Anthropic server or typed tool definition.
+	// Nil means a custom function tool. A non-Anthropic target must reject a
+	// non-empty server Type or an active provider-only control before send
+	// rather than converting it to a custom tool. Explicit false controls are
+	// equivalent to omission.
+	AnthropicTool *AnthropicTool
+}
+
+// AnthropicTool is the provider-owned portion of an Anthropic tool definition.
+// Type is empty for a custom tool and set for server tools (web_search_*,
+// and other reserved types). EagerInput and DeferLoading are Anthropic-specific
+// provider controls; a target that cannot honor a true value must reject the
+// request before send. Raw is retained only for a verified server-tool object.
+// Portable strict intent lives on Tool.Strict.
+type AnthropicTool struct {
+	Type           string
+	EagerInput     *bool
+	DeferLoading   *bool
+	MaxUses        *int
+	AllowedDomains []string
+	BlockedDomains []string
+	// Raw is retained only for a verified server-tool object. It is not an
+	// unvalidated passthrough of unknown ingress fields.
+	Raw json.RawMessage
 }
 
 type ToolChoiceType string
@@ -220,6 +291,9 @@ const (
 type ToolChoice struct {
 	Type ToolChoiceType
 	Name string // set when Type == ToolChoiceTool
+	// DisableParallel is Anthropic tool_choice.disable_parallel_tool_use.
+	// Nil means the caller omitted it.
+	DisableParallel *bool
 }
 
 // ThinkingMode is the unified reasoning/thinking intent kind on a request.
@@ -253,6 +327,9 @@ type Thinking struct {
 	Enable    ThinkingEnable
 	Effort    string
 	BudgetSet bool
+	// Display is Anthropic thinking.display (omitted, summarized, or a
+	// caller-supplied known value). Empty means the caller omitted it.
+	Display string
 }
 
 type Request struct {
@@ -284,6 +361,76 @@ type Request struct {
 	// or null; a non-nil pointer preserves an explicit empty list. Entries keep
 	// caller order and are not filtered; unknown entries pass through.
 	Include *[]string
+	// Anthropic is provider-owned Messages state. Nil means the caller sent no
+	// Anthropic-only field. A non-Anthropic target must reject it before send.
+	Anthropic *AnthropicRequest
+}
+
+// AnthropicRequest holds Messages fields that are not portable across codecs.
+// Raw fields are validated JSON objects or arrays. Unknown keys inside a known
+// object are preserved. A non-Anthropic encoder must not drop these silently.
+type AnthropicRequest struct {
+	Metadata          json.RawMessage
+	ContextManagement json.RawMessage
+	OutputFormat      json.RawMessage
+	// TaskBudget is output_config.task_budget. Nil means absent or null.
+	TaskBudget *AnthropicTaskBudget
+	// Fallbacks is the validated server-side fallback selector: the string
+	// "default" or an array of objects that carry a model name.
+	Fallbacks json.RawMessage
+	// Container is the validated code-execution container selector: a string
+	// id or an object with an optional id and provider-owned extra fields.
+	Container     json.RawMessage
+	TopLevelCache *CacheControl
+	// CachePolicySet is true when the caller sent any cache_control, including
+	// a top-level marker. Claude Code uses it to avoid adding a default anchor.
+	CachePolicySet bool
+}
+
+// OutputFormatJSONSchema returns the schema from output_config.format when the
+// value is the verified {type:"json_schema", schema?} object. ok is false when
+// no format is set. An unsupported format is a client validation error, so a
+// target that cannot honor it fails before send instead of dropping it.
+func (a *AnthropicRequest) OutputFormatJSONSchema() (json.RawMessage, bool, error) {
+	if a == nil || len(a.OutputFormat) == 0 {
+		return nil, false, nil
+	}
+	var wire struct {
+		Type   string          `json:"type"`
+		Schema json.RawMessage `json:"schema"`
+	}
+	if err := json.Unmarshal(a.OutputFormat, &wire); err != nil || wire.Type == "" {
+		return nil, false, InvalidRequest("output_config.format is malformed")
+	}
+	if wire.Type != "json_schema" {
+		return nil, false, InvalidRequest("output_config.format type is not supported by this target")
+	}
+	if len(wire.Schema) > 0 {
+		trimmed := bytes.TrimSpace(wire.Schema)
+		if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+			return nil, false, InvalidRequest("output_config.format.schema must be an object")
+		}
+		wire.Schema = trimmed
+	}
+	return wire.Schema, true, nil
+}
+
+// AnthropicTaskBudget is the source-backed output_config.task_budget shape:
+// {type:"tokens", total, remaining?}. Total is always present; Remaining keeps
+// an explicit zero distinct from an omitted field.
+type AnthropicTaskBudget struct {
+	Total     int
+	Remaining *int
+}
+
+// AnthropicResponseState holds provider-owned response continuity fields that
+// only the Anthropic wire format can carry. Each Raw value is a validated JSON
+// object or array from the backend. Other ingress formats ignore it.
+type AnthropicResponseState struct {
+	Container            json.RawMessage
+	ContextManagement    json.RawMessage
+	StopDetails          json.RawMessage
+	InputTransformations json.RawMessage
 }
 
 type StopReason string
@@ -293,6 +440,8 @@ const (
 	StopMaxTokens    StopReason = "max_tokens"
 	StopStopSequence StopReason = "stop_sequence"
 	StopToolUse      StopReason = "tool_use"
+	StopRefusal      StopReason = "refusal"
+	StopPauseTurn    StopReason = "pause_turn"
 )
 
 // Usage is token accounting for a completed turn.
@@ -358,7 +507,12 @@ type Response struct {
 	Model      string
 	Content    []ContentBlock // text, reasoning, and tool_use blocks
 	StopReason StopReason
-	Usage      Usage
+	// StopSequence preserves an explicit matched stop sequence. Nil means the
+	// backend did not report one; an explicit empty string stays non-nil.
+	StopSequence *string
+	Usage        Usage
+	// Anthropic is provider-owned response continuity state. Nil when absent.
+	Anthropic *AnthropicResponseState
 }
 
 // NewID returns a random hex id with the given prefix, used when a target

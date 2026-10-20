@@ -36,7 +36,9 @@ func TestDecodeEncodeSignedThinkingStream(t *testing.T) {
 		{Kind: ir.EventReasoningSignature, Index: 0, Signature: "sig-"},
 		{Kind: ir.EventReasoningSignature, Index: 0, Signature: "exact"},
 		{Kind: ir.EventReasoningEnd, Index: 0},
-		{Kind: ir.EventTextDelta, Text: "answer"},
+		{Kind: ir.EventTextStart, Index: 1, TextIndexed: true},
+		{Kind: ir.EventTextDelta, Index: 1, Text: "answer", TextIndexed: true},
+		{Kind: ir.EventTextEnd, Index: 1, TextIndexed: true},
 		{Kind: ir.EventFinish, StopReason: ir.StopEndTurn, InputTokens: 2, OutputTokens: 3},
 	}
 	assertEvents(t, events, want)
@@ -380,7 +382,10 @@ func TestThinkingStopFreesNextExplicitBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if events[0].Index != 0 || events[1].Kind != ir.EventReasoningEnd || events[2].Text != "mid" || events[3].Index != 5 || events[3].Text != "later" {
+	if events[0].Index != 0 || events[1].Kind != ir.EventReasoningEnd ||
+		events[2].Kind != ir.EventTextStart || events[2].Index != 2 ||
+		events[3].Text != "mid" || !events[3].TextIndexed || events[4].Kind != ir.EventTextEnd ||
+		events[5].Index != 5 || events[5].Text != "later" {
 		t.Fatalf("gapped sequence = %+v", events)
 	}
 }

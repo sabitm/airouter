@@ -94,6 +94,10 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 					Arguments: string(rawOrNull(string(b.ToolInput))),
 				},
 			})
+		case ir.BlockServer:
+			// A provider-owned server block has no Chat Completions projection.
+			// Returning an empty successful message would hide the loss.
+			return nil, fmt.Errorf("openai: response server block %q is not representable", b.AnthropicServer.TypeString())
 		}
 	}
 	if t := text.String(); t != "" {

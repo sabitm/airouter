@@ -42,6 +42,9 @@ type Config struct {
 	Enable    Enable
 	Effort    string
 	BudgetSet bool
+	// Display is Anthropic thinking.display. Empty means the caller omitted it.
+	// Capture and the Anthropic codec keep it independent of Mode.
+	Display string
 }
 
 // ToIR converts cfg to ir.Thinking. Nil in, nil out.
@@ -56,6 +59,7 @@ func ToIR(cfg *Config) *ir.Thinking {
 		Enable:    ir.ThinkingEnable(cfg.Enable),
 		Effort:    cfg.Effort,
 		BudgetSet: cfg.BudgetSet,
+		Display:   cfg.Display,
 	}
 }
 
@@ -71,6 +75,7 @@ func FromIR(t *ir.Thinking) *Config {
 		Enable:    Enable(t.Enable),
 		Effort:    t.Effort,
 		BudgetSet: t.BudgetSet,
+		Display:   t.Display,
 	}
 }
 
@@ -87,6 +92,9 @@ func Merge(base, override *Config) *Config {
 	out := *override
 	if out.Enable == EnableUnset {
 		out.Enable = base.Enable
+	}
+	if out.Display == "" {
+		out.Display = base.Display
 	}
 	out.BudgetSet = out.BudgetSet || base.BudgetSet || base.Mode == ModeBudget
 	return &out
@@ -180,6 +188,9 @@ func CaptureMap(m map[string]any) *Config {
 		}
 	}
 	cfg.BudgetSet = numericField(objectField(m, "thinking", "budget_tokens")) || numericField(m["thinking_budget"])
+	if display, ok := objectField(m, "thinking", "display").(string); ok {
+		cfg.Display = strings.TrimSpace(display)
+	}
 	return cfg
 }
 
@@ -428,6 +439,7 @@ func stripRecognizedReasoning(m map[string]any, dialect domain.ReasoningDialect)
 		// Drop recognized thinking controls; if anything unknown remains keep the object.
 		delete(t, "type")
 		delete(t, "budget_tokens")
+		delete(t, "display")
 		if len(t) == 0 {
 			delete(m, "thinking")
 		} else if dialect == domain.ReasoningOpencode {
@@ -503,7 +515,7 @@ func writeNative(m map[string]any, model string, cfg *Config, caps Caps, formatI
 	case FormatOpenAIResponses:
 		writeOpenAIResponses(m, cfg, caps, protocol)
 	case FormatClaudeAdaptive:
-		writeClaudeAdaptive(m, cfg)
+		writeClaudeAdaptive(m, cfg, caps)
 	case FormatClaudeBudget:
 		writeClaudeBudget(m, cfg, caps)
 	case FormatKimi:
@@ -529,7 +541,7 @@ func writeNative(m map[string]any, model string, cfg *Config, caps Caps, formatI
 			writeOpenAIResponses(m, cfg, caps, protocol)
 		case "anth-msg":
 			if caps.Format == FormatClaudeAdaptive {
-				writeClaudeAdaptive(m, cfg)
+				writeClaudeAdaptive(m, cfg, caps)
 			} else {
 				writeClaudeBudget(m, cfg, caps)
 			}
@@ -578,12 +590,17 @@ func writeOpenAIResponses(m map[string]any, cfg *Config, caps Caps, protocol dom
 	m["reasoning"] = r
 }
 
-func writeClaudeAdaptive(m map[string]any, cfg *Config) {
+func writeClaudeAdaptive(m map[string]any, cfg *Config, caps Caps) {
 	if cfg.Mode == ModeNone {
-		m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "disabled"})
+		// Disabled thinking carries no display or budget fields.
+		m["thinking"] = map[string]any{"type": "disabled"}
 		return
 	}
-	m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "adaptive"})
+	fields := map[string]any{"type": "adaptive"}
+	if cfg.Display != "" {
+		fields["display"] = cfg.Display
+	}
+	m["thinking"] = mergeObject(m["thinking"], fields)
 	level := cfg.Level
 	switch cfg.Mode {
 	case ModeBudget:
@@ -591,7 +608,7 @@ func writeClaudeAdaptive(m map[string]any, cfg *Config) {
 	case ModeAuto:
 		level = "auto"
 	}
-	level = MapClaudeAdaptiveLevel(level)
+	level = MapClaudeAdaptiveLevel(level, caps)
 	if level == "" {
 		level = "medium"
 	}
@@ -606,7 +623,7 @@ func writeClaudeAdaptive(m map[string]any, cfg *Config) {
 
 func writeClaudeBudget(m map[string]any, cfg *Config, caps Caps) {
 	if cfg.Mode == ModeNone {
-		m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "disabled"})
+		m["thinking"] = map[string]any{"type": "disabled"}
 		return
 	}
 	if cfg.Mode == ModeAuto {
@@ -755,7 +772,7 @@ func WriteAnthropic(m map[string]any, cfg *Config, caps Caps) {
 		return
 	}
 	if caps.Format == FormatClaudeAdaptive {
-		writeClaudeAdaptive(m, cfg)
+		writeClaudeAdaptive(m, cfg, caps)
 		return
 	}
 	writeClaudeBudget(m, cfg, caps)

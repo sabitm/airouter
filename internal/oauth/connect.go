@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/claudecode"
 )
 
 // Connect drives a single OAuth authorization-code (+ PKCE for public clients)
@@ -100,6 +101,17 @@ func NewConnect(creds *domain.OAuthCreds) (*Connect, error) {
 // It includes the PKCE code_challenge for public clients (PKCE=true). Cline uses
 // a non-standard authorize shape (client_type + callback_url, no client_id/PKCE).
 func (c *Connect) AuthorizeURL() (string, error) {
+	return c.authorizeURL(false)
+}
+
+// ManualAuthorizeURL is the Claude manual-callback authorize URL. Other
+// providers return the same URL as AuthorizeURL. The CLI builds both URLs
+// and opens the loopback one unless the operator chooses manual paste.
+func (c *Connect) ManualAuthorizeURL() (string, error) {
+	return c.authorizeURL(true)
+}
+
+func (c *Connect) authorizeURL(manual bool) (string, error) {
 	authURL := c.creds.AuthURL
 	if c.baseURL != "" {
 		authURL = c.baseURL + "/authorize"
@@ -117,9 +129,17 @@ func (c *Connect) AuthorizeURL() (string, error) {
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", c.creds.ClientID)
-	q.Set("redirect_uri", c.creds.RedirectURI)
+	redirect := c.creds.RedirectURI
+	if manual && c.creds.ClaudeCodeAuth {
+		redirect = claudecode.ManualRedirectURL
+	}
+	q.Set("redirect_uri", redirect)
 	q.Set("state", c.state)
-	q.Set("scope", c.creds.Scopes)
+	scopes := c.creds.Scopes
+	if c.creds.ClaudeCodeAuth && c.creds.ExtraAuthParams["inference_only"] == "true" {
+		scopes = claudecode.InferenceOnlyScopes
+	}
+	q.Set("scope", scopes)
 	if c.creds.PKCE {
 		q.Set("code_challenge", challengeS256(c.verifier))
 		q.Set("code_challenge_method", "S256")
@@ -234,6 +254,17 @@ func (c *Connect) ExchangeCode(ctx context.Context, codeOrURL string) (*domain.O
 			return nil, errors.New("oauth: state mismatch")
 		}
 		code = u.Query().Get("code")
+		// Claude manual callbacks can echo state after '#'. A present echo must
+		// match. The exchange also checks a code#state form. A pasted manual
+		// callback uses the official manual redirect, not the loopback URI.
+		if c.creds.ClaudeCodeAuth {
+			if frag := u.Fragment; frag != "" && frag != c.state {
+				return nil, errors.New("oauth: state mismatch")
+			}
+			if strings.Contains(u.Path, "/oauth/code/callback") {
+				c.creds.RedirectURI = claudecode.ManualRedirectURL
+			}
+		}
 	}
 	if code == "" {
 		return nil, errors.New("oauth: no code in pasted input")

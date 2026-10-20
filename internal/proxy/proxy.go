@@ -215,13 +215,11 @@ var cursorCodec = codec{
 }
 
 // claudeCodeCodec is the Claude Code CLI backend: Anthropic Messages wire
-// format spoken with the Claude Code client identity, claude.ai OAuth, and an
-// OAuth-only tool cloak/decoy transform. It reuses the anthropic codec's
-// encoder for the base body and its stream encoder / error envelope; the cloak
-// is applied in prepareUpstreamRequest (where the resolved token and per-request
-// session id are visible) and decloaking in the response/stream wrappers. Its id
-// differs from anth-msg so Anthropic ingress never passes through. Anthropic
-// Messages supports unary and SSE, so it is not stream-only.
+// format spoken with the pinned CLI profile. It reuses the anthropic encoder
+// for the base body. Billing, system identity, and metadata are applied per
+// send after token resolution. Its id differs from anth-msg so Anthropic
+// ingress never passes through. Anthropic Messages supports unary and SSE, so
+// it is not stream-only. Official fidelity does not mean proxy use is supported.
 var claudeCodeCodec = codec{
 	id:               "claude-code",
 	protocol:         domain.ProtocolClaudeCode,

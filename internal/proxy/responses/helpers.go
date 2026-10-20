@@ -243,3 +243,74 @@ func mimeFromFilename(name string) string {
 		return ""
 	}
 }
+
+// rejectProviderOwnedTool keeps an Anthropic server tool or provider-only
+// control from being converted into a callable custom function. Strict is
+// portable and is not rejected here.
+func rejectProviderOwnedTool(t ir.Tool) error {
+	at := t.AnthropicTool
+	if at == nil {
+		return nil
+	}
+	if at.Type != "" {
+		return ir.InvalidRequest("Anthropic server tools are not supported by this format")
+	}
+	if at.EagerInput != nil && *at.EagerInput {
+		return ir.InvalidRequest("eager input streaming is not supported by this format")
+	}
+	if at.DeferLoading != nil && *at.DeferLoading {
+		return ir.InvalidRequest("deferred tool loading is not supported by this format")
+	}
+	if at.MaxUses != nil || len(at.AllowedDomains) > 0 || len(at.BlockedDomains) > 0 {
+		return ir.InvalidRequest("provider-only tool controls are not supported by this format")
+	}
+	return nil
+}
+
+// responseTextFormat maps a validated Anthropic output_config.format to the
+// standard Responses text.format object. The schema is preserved. A schema
+// title supplies the required name when it is a safe identifier.
+func responseTextFormat(a *ir.AnthropicRequest) (json.RawMessage, error) {
+	schema, ok, err := a.OutputFormatJSONSchema()
+	if err != nil || !ok {
+		return nil, err
+	}
+	if len(schema) == 0 {
+		return json.RawMessage(`{"format":{"type":"json_object"}}`), nil
+	}
+	body := map[string]any{
+		"format": map[string]any{
+			"type":   "json_schema",
+			"name":   structuredOutputName(schema),
+			"schema": json.RawMessage(schema),
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func structuredOutputName(schema json.RawMessage) string {
+	var head struct {
+		Title string `json:"title"`
+	}
+	if json.Unmarshal(schema, &head) == nil {
+		name := head.Title
+		if len(name) > 0 && len(name) <= 64 {
+			valid := true
+			for _, r := range name {
+				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+					continue
+				}
+				valid = false
+				break
+			}
+			if valid {
+				return name
+			}
+		}
+	}
+	return "structured_output"
+}

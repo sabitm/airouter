@@ -351,19 +351,18 @@ data: {"type":"message_stop"}
 	}
 }
 
-// TestStreamToolClaudeCodeDecloak verifies a claude-code backend stream with a
-// cloaked tool_use name is decloaked to the original on the way to an OpenAI
-// ingress.
-func TestStreamToolClaudeCodeDecloak(t *testing.T) {
-	cloaked := strings.Replace(anthropicToolSSE, `"name":"get_weather"`, `"name":"get_weather_ide"`, 1)
-	base, token := setupStreaming(t, domain.ProtocolClaudeCode, cloaked)
+// TestStreamToolClaudeCodeKeepsName verifies a claude-code backend stream
+// does not strip a caller tool name, including one that ends in _ide.
+func TestStreamToolClaudeCodeKeepsName(t *testing.T) {
+	named := strings.Replace(anthropicToolSSE, `"name":"get_weather"`, `"name":"get_weather_ide"`, 1)
+	base, token := setupStreaming(t, domain.ProtocolClaudeCode, named)
 	resp, body := postStream(t, base+"/v1/chat/completions", token, `{"model":"default","stream":true,"messages":[{"role":"user","content":"weather?"}]}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
 	name, args, finish := collectOpenAIToolStream(t, body)
-	if name != "get_weather" {
-		t.Errorf("tool name = %q, want get_weather (decloaked)", name)
+	if name != "get_weather_ide" {
+		t.Errorf("tool name = %q, want get_weather_ide", name)
 	}
 	if !strings.Contains(args, "paris") {
 		t.Errorf("tool args = %q, want paris", args)

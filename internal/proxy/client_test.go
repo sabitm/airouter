@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"airouter/internal/domain"
+	"airouter/internal/oauth"
 )
 
 type repeatingReader byte
@@ -29,6 +31,45 @@ func sizedResponse(req *http.Request, size int64) *http.Response {
 		ContentLength: size,
 		Request:       req,
 	}
+}
+
+func TestAPIKeyHeaderIgnoresStaleOAuthSnapshot(t *testing.T) {
+	var gotKey, gotAuth string
+	p := New(nil, nil)
+	p.oauth = oauth.New(oauthStore{})
+	p.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotKey = req.Header.Get("x-api-key")
+		gotAuth = req.Header.Get("Authorization")
+		return sizedResponse(req, 2), nil
+	})}
+	provider := &domain.Provider{
+		BaseURL:    "https://provider.example",
+		APIKey:     "static-key",
+		AuthMethod: domain.AuthAPIKey,
+		AuthScheme: domain.AuthXAPIKey,
+		Protocol:   domain.ProtocolAnthropic,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "stale-oauth", ClaudeCodeAuth: true},
+	}
+	status, _, err := p.forward(context.Background(), provider, "/messages", []byte(`{"model":"m"}`), nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if gotKey != "static-key" || gotAuth != "" {
+		t.Fatalf("outbound auth key=%q authorization=%q", gotKey, gotAuth)
+	}
+	if provider.APIKey != "static-key" {
+		t.Fatalf("request-local APIKey changed to %q", provider.APIKey)
+	}
+}
+
+type oauthStore struct{}
+
+func (oauthStore) GetProvider(context.Context, int64) (*domain.Provider, error) {
+	return nil, errors.New("unused")
+}
+
+func (oauthStore) UpdateProviderOAuth(context.Context, int64, *domain.OAuthCreds) error {
+	return nil
 }
 
 func TestForwardUnaryResponseSizeLimit(t *testing.T) {

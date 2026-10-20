@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/json"
 	"log/slog"
 
 	"airouter/internal/proxy/ir"
@@ -43,6 +45,134 @@ func preservesAnthropicThinking(codecID string) bool {
 	default:
 		return false
 	}
+}
+
+// preservesAnthropicExtensions reports whether the codec can carry typed
+// server tools, server blocks, and Anthropic-only request fields. OpenCode
+// Messages reuses the Anthropic encoder, so it carries the same fields.
+func preservesAnthropicExtensions(codecID string) bool {
+	switch codecID {
+	case codecAnthropic, codecClaudeCode, codecOpencodeMessages:
+		return true
+	default:
+		return false
+	}
+}
+
+// preservesAnthropicOutputFormat reports whether the codec has a native or
+// mapped slot for output_config.format. OpenAI and Responses map the supported
+// json_schema shape; other backends have no representation.
+func preservesAnthropicOutputFormat(codecID string) bool {
+	switch codecID {
+	case codecAnthropic, codecClaudeCode, codecOpencodeMessages,
+		"oai-chat", "oai-responses", "oai-codex", "opencode-chat", "opencode-responses":
+		return true
+	default:
+		return false
+	}
+}
+
+// preservesStrictTools reports whether the codec accepts strict custom-tool
+// intent. OpenAI and Responses emit native enforcement. Cursor accepts the
+// tool but has no strict flag, so enforcement is not promised. Other targets
+// must fail before send.
+func preservesStrictTools(codecID string) bool {
+	// Cursor accepts ordinary custom tools and their schemas. It has no native
+	// strict flag, so strict is not enforced and is not promised there.
+	return preservesAnthropicOutputFormat(codecID) || codecID == "cursor"
+}
+
+const (
+	anthropicStateUnsupported        = "provider-owned Anthropic tool or request state is not supported by this upstream format"
+	anthropicOutputFormatUnsupported = "output format is not supported by this upstream format"
+	anthropicStrictToolsUnsupported  = "strict tool schemas are not supported by this upstream format"
+)
+
+// requestAnthropicOwnedState reports caller state that must not be converted
+// into a custom tool or dropped on a non-Anthropic backend. Portable metadata
+// and strict custom-tool intent are not owned state; output format is handled
+// by an explicit target capability. Empty metadata/context values are absent.
+func requestAnthropicOwnedState(req *ir.Request) bool {
+	if req == nil {
+		return false
+	}
+	if req.Anthropic != nil {
+		if anthropicContextManagementOwned(req.Anthropic.ContextManagement) {
+			return true
+		}
+		if req.Anthropic.TaskBudget != nil || len(req.Anthropic.Fallbacks) > 0 || len(req.Anthropic.Container) > 0 {
+			return true
+		}
+	}
+	for _, t := range req.Tools {
+		if t.AnthropicTool == nil {
+			continue
+		}
+		at := t.AnthropicTool
+		if at.Type != "" || at.MaxUses != nil || len(at.AllowedDomains) > 0 || len(at.BlockedDomains) > 0 {
+			return true
+		}
+		if at.EagerInput != nil && *at.EagerInput {
+			return true
+		}
+		if at.DeferLoading != nil && *at.DeferLoading {
+			return true
+		}
+	}
+	return anthropicServerInMessages(req.Messages)
+}
+
+// anthropicContextManagementOwned is true only when at least one edit is
+// present. Null, {}, and {"edits":[]} are not provider-owned state.
+func anthropicContextManagementOwned(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
+		return false
+	}
+	var obj struct {
+		Edits []json.RawMessage `json:"edits"`
+	}
+	if json.Unmarshal(trimmed, &obj) != nil {
+		return true
+	}
+	return len(obj.Edits) > 0
+}
+
+func requestAnthropicOutputFormat(req *ir.Request) bool {
+	return req != nil && req.Anthropic != nil && len(req.Anthropic.OutputFormat) > 0
+}
+
+func requestStrictTools(req *ir.Request) bool {
+	if req == nil {
+		return false
+	}
+	for _, t := range req.Tools {
+		if t.Strict != nil && *t.Strict {
+			return true
+		}
+	}
+	return false
+}
+
+func anthropicServerInMessages(msgs []ir.Message) bool {
+	var walk func([]ir.ContentBlock) bool
+	walk = func(blocks []ir.ContentBlock) bool {
+		for _, b := range blocks {
+			if b.Type == ir.BlockServer || b.AnthropicServer != nil {
+				return true
+			}
+			if b.Type == ir.BlockToolResult && walk(b.ToolResult) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, m := range msgs {
+		if walk(m.Content) {
+			return true
+		}
+	}
+	return false
 }
 
 // preservesResponsesReasoning reports whether the codec can replay the

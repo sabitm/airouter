@@ -82,6 +82,8 @@ func (e *StreamEncoder) mustQueueForDeferred(ev ir.StreamEvent) bool {
 		return false
 	}
 	switch ev.Kind {
+	case ir.EventTextStart:
+		return ev.Text != "" && e.open != openMessage
 	case ir.EventTextDelta:
 		return ev.Text != "" && e.open != openMessage
 	case ir.EventToolCallStart:

@@ -295,11 +295,11 @@ func TestDecodeEncodeCacheControlNullAndMissingTTL(t *testing.T) {
 	requireMarker(t, "text missing ttl", out.Messages[0].Content[1].CacheControl, "ephemeral", "")
 }
 
-// TestDecodeEncodeTopLevelCacheControlExcluded covers the top-level
-// cache_control shorthand. The canonical IR has no top-level hint slot, so
-// decode ignores every value without failing, keeps all content, and encode
-// never emits a top-level, tool, or block marker for it.
-func TestDecodeEncodeTopLevelCacheControlExcluded(t *testing.T) {
+// TestDecodeEncodeTopLevelCacheControl covers the top-level cache_control
+// shorthand. A valid ephemeral marker is preserved on the Anthropic request
+// and re-emitted. A malformed marker is rejected. Content is kept either way
+// only when decode succeeds.
+func TestDecodeEncodeTopLevelCacheControl(t *testing.T) {
 	const schemaRaw = `{"type":"object","properties":{"q":{"type":"string"}}}`
 	cases := []struct {
 		name   string
@@ -337,6 +337,13 @@ func TestDecodeEncodeTopLevelCacheControlExcluded(t *testing.T) {
 			    ]}
 			  ]` + marker + `}`)
 			req, err := DecodeRequest(body)
+			valid := tc.name == "absent" || tc.name == "ephemeral" || tc.name == "ephemeral ttl 1h"
+			if !valid {
+				if err == nil {
+					t.Fatal("malformed top-level cache_control was accepted")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("DecodeRequest: %v", err)
 			}
@@ -344,7 +351,16 @@ func TestDecodeEncodeTopLevelCacheControlExcluded(t *testing.T) {
 			if err != nil {
 				t.Fatalf("EncodeRequest: %v", err)
 			}
-			requireTopLevelExcluded(t, req, encoded, schemaRaw)
+			if tc.name == "absent" {
+				requireTopLevelExcluded(t, req, encoded, schemaRaw)
+				return
+			}
+			if req.Anthropic == nil || req.Anthropic.TopLevelCache == nil || req.Anthropic.TopLevelCache.Type != "ephemeral" {
+				t.Fatalf("top-level hint dropped: %+v", req.Anthropic)
+			}
+			if !bytes.Contains(encoded, []byte(`"cache_control"`)) {
+				t.Fatalf("valid top-level marker not re-emitted: %s", encoded)
+			}
 		})
 	}
 }
@@ -721,7 +737,7 @@ func TestDecodeEncodeSystemCacheControl(t *testing.T) {
 // TestSystemCacheControlFlatFallbacks covers every case where the encoder must
 // drop structured blocks and use (or omit) the flat string instead.
 func TestSystemCacheControlFlatFallbacks(t *testing.T) {
-	t.Run("unmarked array encodes flat string", func(t *testing.T) {
+	t.Run("unmarked array keeps block boundaries", func(t *testing.T) {
 		body := []byte(`{"model":"m","max_tokens":1,"system":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"messages":[]}`)
 		req, err := DecodeRequest(body)
 		if err != nil {
@@ -734,7 +750,17 @@ func TestSystemCacheControlFlatFallbacks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		requireFlatSystem(t, encoded, "ab")
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &top); err != nil {
+			t.Fatal(err)
+		}
+		var blocks []map[string]any
+		if err := json.Unmarshal(top["system"], &blocks); err != nil {
+			t.Fatalf("system is not an array: %s", top["system"])
+		}
+		if len(blocks) != 2 || blocks[0]["text"] != "a" || blocks[1]["text"] != "b" {
+			t.Fatalf("system blocks = %s", top["system"])
+		}
 	})
 
 	t.Run("string input unchanged", func(t *testing.T) {
@@ -754,7 +780,7 @@ func TestSystemCacheControlFlatFallbacks(t *testing.T) {
 	})
 
 	t.Run("all prefix stripped omits system", func(t *testing.T) {
-		body := []byte(`{"model":"m","max_tokens":1,"system":[{"type":"text","text":"x-anthropic-billing-header: a; b;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.\n"}],"messages":[]}`)
+		body := []byte(`{"model":"m","max_tokens":1,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.303; cc_entrypoint=cli;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.\n"}],"messages":[]}`)
 		req, err := DecodeRequest(body)
 		if err != nil {
 			t.Fatal(err)
@@ -853,9 +879,9 @@ func TestEncodeSystemBlocksGuard(t *testing.T) {
 			want: `[{"type":"text","text":"a"},{"type":"text","text":"b","cache_control":{"type":"ephemeral","ttl":"1h"}}]`,
 		},
 		{
-			name: "no hint uses flat",
+			name: "no hint keeps multiple block boundaries",
 			req:  &ir.Request{Model: "m", MaxTokens: 1, System: "ab", SystemBlocks: []ir.SystemBlock{{Text: "a"}, {Text: "b"}}},
-			want: `"ab"`,
+			want: `[{"type":"text","text":"a"},{"type":"text","text":"b"}]`,
 		},
 		{
 			name: "mismatched flat uses flat without hints",

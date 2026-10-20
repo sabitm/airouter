@@ -283,6 +283,13 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		e.applyUsage(ev)
 		e.roleSent = true
 		return e.emit(w, chunkDelta{Role: "assistant"}, nil)
+	case ir.EventTextStart:
+		if ev.Text == "" {
+			return nil
+		}
+		return e.emit(w, chunkDelta{Content: ev.Text}, nil)
+	case ir.EventTextEnd:
+		return nil
 	case ir.EventTextDelta:
 		return e.emit(w, chunkDelta{Content: ev.Text}, nil)
 	case ir.EventReasoningDelta:
@@ -294,6 +301,12 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		return e.emit(w, chunkDelta{ReasoningContent: ev.Text}, nil)
 	case ir.EventReasoningSignature, ir.EventReasoningEnd, ir.EventRedactedReasoning:
 		// Anthropic signature and redacted payloads are not OpenAI stream fields.
+		return nil
+	case ir.EventServerBlock, ir.EventServerStart, ir.EventServerDelta, ir.EventServerEnd, ir.EventServerUpdate:
+		return ir.ProtocolError("server block is not supported by this format")
+	case ir.EventTextCitation:
+		// A read-only citation annotation has no field in this format. It is not
+		// a tool call and must not invent a server block.
 		return nil
 	case ir.EventToolCallStart:
 		// Repeated Starts for a known index reuse the client index; identity

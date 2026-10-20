@@ -8,6 +8,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"airouter/internal/crypto"
@@ -101,6 +102,123 @@ func TestUpdateProviderOAuth(t *testing.T) {
 	// Non-oauth fields must survive the targeted update.
 	if got.Name != "grok" || got.BaseURL != "https://api.x.ai/v1" || got.Protocol != domain.ProtocolOpenAI {
 		t.Errorf("provider identity changed: %+v", got)
+	}
+}
+
+// TestUpdateProviderOAuthCASRetriesConcurrentWrite proves the conditional
+// write does not lose increments when several writers race. Each callback runs
+// again on the newest decrypted blob after a failed compare.
+func TestUpdateProviderOAuthCASRetriesConcurrentWrite(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "cc", BaseURL: "https://api.anthropic.com", Protocol: domain.ProtocolClaudeCode,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{
+			ClaudeCodeAuth: true, AccessToken: "tok", RefreshToken: "rt",
+			ClaudeAccountUUID: "acct", ClaudeDeviceID: strings.Repeat("ab", 32),
+		},
+	}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	const workers, perWorker = 8, 12
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < perWorker; n++ {
+				if _, err := st.UpdateProviderOAuthCAS(ctx, p.ID, func(cur *domain.OAuthCreds) (*domain.OAuthCreds, bool, error) {
+					next := *cur
+					next.ExpiresAt++
+					return &next, true, nil
+				}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.ExpiresAt != workers*perWorker {
+		t.Fatalf("expires_at=%d, lost update", got.OAuthCreds.ExpiresAt)
+	}
+	if got.OAuthCreds.ClaudeDeviceID != strings.Repeat("ab", 32) || got.OAuthCreds.ClaudeAccountUUID != "acct" {
+		t.Fatalf("identity clobbered: %+v", got.OAuthCreds)
+	}
+}
+
+func TestUpdateProviderOAuthCASSurvivesRestartAndExport(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cas.db")
+	c, err := crypto.New("test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	p := &domain.Provider{
+		Name: "cc", BaseURL: "https://api.anthropic.com", Protocol: domain.ProtocolClaudeCode,
+		AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{ClaudeCodeAuth: true, AccessToken: "a", RefreshToken: "r", ClaudeAccountUUID: "acct"},
+	}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	device := strings.Repeat("cd", 32)
+	ready, err := st.UpdateProviderOAuthCAS(ctx, p.ID, func(cur *domain.OAuthCreds) (*domain.OAuthCreds, bool, error) {
+		next := *cur
+		next.ClaudeDeviceID = device
+		return &next, true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready == nil || ready.ClaudeDeviceID != device {
+		t.Fatalf("cas result = %+v", ready)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.ClaudeDeviceID != device || got.OAuthCreds.AccessToken != "a" {
+		t.Fatalf("after restart = %+v", got.OAuthCreds)
+	}
+	var buf bytes.Buffer
+	if err := st.Export(ctx, &buf); err != nil {
+		t.Fatal(err)
+	}
+	dst := testStore(t)
+	if _, err := dst.Import(ctx, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := dst.GetProvider(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.OAuthCreds.ClaudeDeviceID != device || imported.OAuthCreds.ClaudeAccountUUID != "acct" {
+		t.Fatalf("imported = %+v", imported.OAuthCreds)
 	}
 }
 

@@ -38,7 +38,7 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		if t.Type != "" && t.Type != "function" {
 			continue // only function tools are translated
 		}
-		out.Tools = append(out.Tools, ir.Tool{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
+		out.Tools = append(out.Tools, ir.Tool{Name: t.Name, Description: t.Description, Parameters: t.Parameters, Strict: t.Strict})
 	}
 	out.ToolChoice = decodeToolChoice(req.ToolChoice)
 	msgs, err := decodeInput(req.Input, &out.System)
@@ -262,21 +262,40 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
+			if err := rejectProviderOwnedTool(t); err != nil {
+				return nil, err
+			}
 			params := json.RawMessage(t.Parameters)
 			if len(params) == 0 {
 				params = json.RawMessage("{}")
 			}
-			tools = append(tools, map[string]any{
+			entry := map[string]any{
 				"type":        "function",
 				"name":        t.Name,
 				"description": t.Description,
 				"parameters":  params,
-			})
+			}
+			if t.Strict != nil {
+				entry["strict"] = *t.Strict
+			}
+			tools = append(tools, entry)
 		}
 		out["tools"] = tools
 	}
 	if req.ToolChoice != nil {
 		out["tool_choice"] = encodeToolChoice(req.ToolChoice)
+	}
+	if req.Anthropic != nil {
+		if len(req.Anthropic.Metadata) > 0 {
+			out["metadata"] = json.RawMessage(req.Anthropic.Metadata)
+		}
+		text, err := responseTextFormat(req.Anthropic)
+		if err != nil {
+			return nil, err
+		}
+		if len(text) > 0 {
+			out["text"] = text
+		}
 	}
 	caps := thinking.CapsFor(req.Model, domain.ProtocolOpenAIResponses, domain.ReasoningOpenAI)
 	if cfg := thinking.Effective(thinking.FromIR(req.Thinking), caps); cfg != nil {

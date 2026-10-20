@@ -21,6 +21,15 @@ type attachmentPrep struct {
 	// provider-owned Responses reasoning ID or encrypted_content that must not
 	// be retried at another provider or model.
 	preserveResponsesState bool
+	// preserveAnthropicState is true when the request carries typed server
+	// tools, server blocks, or other Anthropic-only fields.
+	preserveAnthropicState bool
+	// preserveOutputFormat is true when the caller explicitly asked for
+	// output_config.format. Targets must map it or reject before send.
+	preserveOutputFormat bool
+	// preserveStrictTools is true when a caller asked for strict schema
+	// enforcement, which a target must be able to express.
+	preserveStrictTools bool
 	// inlineBytes is the decoded size of locally available payloads, recorded
 	// once per request so materialize can charge remote bytes against the same
 	// budget without re-summing IR clones.
@@ -42,6 +51,9 @@ func (a *attachmentPrep) inspectDecoded(req *ir.Request) error {
 	a.inspected = true
 	a.preserveThinking = requiresAnthropicThinking(req)
 	a.preserveResponsesState = requestResponsesOwnedState(req)
+	a.preserveAnthropicState = requestAnthropicOwnedState(req)
+	a.preserveOutputFormat = requestAnthropicOutputFormat(req)
+	a.preserveStrictTools = requestStrictTools(req)
 	n := 0
 	for _, att := range atts {
 		n += att.Bytes
@@ -62,6 +74,13 @@ func (a *attachmentPrep) needsResponsesPreservation() bool {
 	return a != nil && a.preserveResponsesState
 }
 
+// needsAnthropicState reports request intent that must be filtered before
+// target ordering: provider-owned state, explicit output format, or strict
+// custom tools.
+func (a *attachmentPrep) needsAnthropicState() bool {
+	return a != nil && (a.preserveAnthropicState || a.preserveOutputFormat || a.preserveStrictTools)
+}
+
 // checkThinking returns a reason when backend cannot replay signed or redacted
 // Anthropic thinking, or provider-owned Responses reasoning, present in the
 // request. Anthropic and Responses capabilities are independent.
@@ -74,6 +93,15 @@ func (a *attachmentPrep) checkThinking(backend codec) string {
 	}
 	if a.preserveResponsesState && !preservesResponsesReasoning(backend.id) {
 		return responsesStateUnsupported
+	}
+	if a.preserveAnthropicState && !preservesAnthropicExtensions(backend.id) {
+		return anthropicStateUnsupported
+	}
+	if a.preserveOutputFormat && !preservesAnthropicOutputFormat(backend.id) {
+		return anthropicOutputFormatUnsupported
+	}
+	if a.preserveStrictTools && !preservesStrictTools(backend.id) {
+		return anthropicStrictToolsUnsupported
 	}
 	return ""
 }

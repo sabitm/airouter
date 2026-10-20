@@ -16,12 +16,10 @@ import (
 	"airouter/internal/store"
 )
 
-// TestClaudeCodeCloakAndHeaders verifies the full OAuth path: an OpenAI ingress
-// request to a claude-code OAuth backend is translated, cloaked (billing header,
-// fake user_id, suffixed tools + decoys), sent with the CLI identity headers and
-// a per-request session id that matches metadata.user_id.session_id, and the
-// upstream's cloaked tool_use response is decloaked back to the client.
-func TestClaudeCodeCloakAndHeaders(t *testing.T) {
+// TestClaudeCodePrepareAndHeaders verifies an OpenAI ingress request to a
+// Claude Code backend is translated, prepared with the pinned CLI profile,
+// and returned without renaming the caller tool.
+func TestClaudeCodePrepareAndHeaders(t *testing.T) {
 	var cap struct {
 		path string
 		auth string
@@ -38,7 +36,7 @@ func TestClaudeCodeCloakAndHeaders(t *testing.T) {
 		cap.sess = r.Header.Get(claudecode.SessionIDHeader)
 		cap.body, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"msg_x","type":"message","role":"assistant","model":"up","content":[{"type":"tool_use","id":"t1","name":"search_ide","input":{"q":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}}`)
+		_, _ = io.WriteString(w, `{"id":"msg_x","type":"message","role":"assistant","model":"up","content":[{"type":"tool_use","id":"t1","name":"search","input":{"q":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}}`)
 	}))
 	t.Cleanup(upstream.Close)
 
@@ -106,8 +104,11 @@ func TestClaudeCodeCloakAndHeaders(t *testing.T) {
 		t.Errorf("auth = %q, want bearer oat token", cap.auth)
 	}
 	// CLI identity fingerprint overwrote forwarded client values.
-	if !strings.HasPrefix(cap.ua, "claude-cli/2.1.92") {
-		t.Errorf("User-Agent = %q, want claude-cli fingerprint", cap.ua)
+	if !strings.HasPrefix(cap.ua, "claude-cli/"+claudecode.CLIVersion) {
+		t.Errorf("User-Agent = %q, want pinned claude-cli fingerprint", cap.ua)
+	}
+	if strings.Contains(cap.ua, "node") {
+		t.Errorf("User-Agent must not claim the Go process is node: %s", cap.ua)
 	}
 	if !strings.Contains(cap.beta, "claude-code-20250219") {
 		t.Errorf("anthropic-beta = %q, missing claude-code flag", cap.beta)
@@ -140,14 +141,16 @@ func TestClaudeCodeCloakAndHeaders(t *testing.T) {
 		tm, _ := tt.(map[string]any)
 		toolNames = append(toolNames, tm["name"].(string))
 	}
-	if !contains(toolNames, "search_ide") {
-		t.Errorf("client tool not suffixed in upstream tools: %v", toolNames)
+	if !contains(toolNames, "search") {
+		t.Errorf("client tool was renamed: %v", toolNames)
 	}
-	if !contains(toolNames, "Bash") {
-		t.Errorf("decoy tools not appended: %v", toolNames)
+	for _, name := range toolNames {
+		if name == "Bash" || strings.HasSuffix(name, "_ide") {
+			t.Errorf("decoy or suffix injected: %v", toolNames)
+		}
 	}
 
-	// The response was decloaked: the client sees the original tool name "search".
+	// The response keeps the caller tool name.
 	var oai struct {
 		Choices []struct {
 			Message struct {
@@ -166,7 +169,7 @@ func TestClaudeCodeCloakAndHeaders(t *testing.T) {
 		t.Fatalf("no tool call in response: %s", out)
 	}
 	if name := oai.Choices[0].Message.ToolCalls[0].Function.Name; name != "search" {
-		t.Errorf("response tool name = %q, want search (decloaked)", name)
+		t.Errorf("response tool name = %q, want search", name)
 	}
 }
 

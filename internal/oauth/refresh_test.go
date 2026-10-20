@@ -60,6 +60,53 @@ func (f *fakeStore) UpdateProviderOAuth(_ context.Context, id int64, creds *doma
 	return nil
 }
 
+// UpdateProviderOAuthCAS mirrors the real store's conditional write. Tests use
+// it to prove a refresh or device initialization retries against a row that a
+// competing writer replaced.
+func (f *fakeStore) UpdateProviderOAuthCAS(_ context.Context, id int64, update func(*domain.OAuthCreds) (*domain.OAuthCreds, bool, error)) (*domain.OAuthCreds, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		f.mu.Lock()
+		if f.writeErr != nil {
+			err := f.writeErr
+			f.mu.Unlock()
+			return nil, err
+		}
+		cur := f.creds[id]
+		var snapshot, arg *domain.OAuthCreds
+		if cur != nil {
+			cp := *cur
+			snapshot = &cp
+			cp2 := *cur
+			arg = &cp2
+		}
+		f.mu.Unlock()
+		if snapshot == nil {
+			return nil, errors.New("not found")
+		}
+		next, changed, err := update(arg)
+		if err != nil {
+			return nil, err
+		}
+		f.mu.Lock()
+		if !reflect.DeepEqual(f.creds[id], snapshot) {
+			f.mu.Unlock()
+			continue
+		}
+		if !changed {
+			out := *snapshot
+			f.mu.Unlock()
+			return &out, nil
+		}
+		cp := *next
+		f.creds[id] = &cp
+		f.writes.Add(1)
+		out := cp
+		f.mu.Unlock()
+		return &out, nil
+	}
+	return nil, errors.New("cas did not converge")
+}
+
 // tokenTestServer returns a token endpoint whose handler inspects the refresh
 // request and responds with a configurable body + status. The handler records
 // the form values seen.

@@ -20,6 +20,11 @@ type chatRequest struct {
 	Tools               []chatTool      `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"` // string or object
 	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
+	// Metadata carries portable caller metadata, including an Anthropic
+	// metadata object translated to this format.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+	// ResponseFormat is the mapped output_config.format intent.
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
 }
 
 type streamOptions struct {
@@ -75,6 +80,7 @@ type chatFunctionDef struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
 }
 
 // --- response ---

@@ -2464,7 +2464,13 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 		e.applyUsage(ev)
 		return e.ensureCreated(w)
 
-	case ir.EventTextDelta:
+	case ir.EventTextEnd:
+		return nil
+
+	case ir.EventTextStart, ir.EventTextDelta:
+		if ev.Text == "" {
+			return nil
+		}
 		if err := e.ensureCreated(w); err != nil {
 			return err
 		}
@@ -2486,6 +2492,12 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 		// Anthropic signature and redacted payloads are not Responses fields.
 		// Do not place them in encrypted_content. They never reorder output, so
 		// they pass through even while identity work is queued.
+		return nil
+	case ir.EventServerBlock, ir.EventServerStart, ir.EventServerDelta, ir.EventServerEnd, ir.EventServerUpdate:
+		return ir.ProtocolError("server block is not supported by this format")
+	case ir.EventTextCitation:
+		// A read-only citation annotation has no field in this format. It is not
+		// a tool call and must not invent a server block.
 		return nil
 
 	case ir.EventToolCallStart:
