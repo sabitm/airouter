@@ -1,6 +1,7 @@
 package web
 
 import (
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -299,6 +300,38 @@ func claudeRefreshTokenReplaced(prev *domain.OAuthCreds, r *http.Request) bool {
 	}
 	pasted := strings.TrimSpace(r.FormValue("refresh_token"))
 	return pasted != "" && pasted != prev.RefreshToken
+}
+
+// savedClaudeRefreshCreds copies the stored connection as the refresh basis.
+// Refresh is not a config edit: a current preset and hidden form fields must
+// not replace stored endpoints, client, scopes, or flags. A different pasted
+// refresh token is a new grant and does not inherit the previous grant's
+// account, device, or granted scopes. The stored pointer is not mutated.
+func savedClaudeRefreshCreds(stored *domain.OAuthCreds, r *http.Request) *domain.OAuthCreds {
+	next := *stored
+	if stored.ExtraAuthParams != nil {
+		next.ExtraAuthParams = maps.Clone(stored.ExtraAuthParams)
+	}
+	// Refresh rotates tokens. It does not import account identity from the
+	// edit form. A pasted refresh token is the only form value that selects
+	// the grant; an omitted token keeps the stored grant.
+	if pasted := strings.TrimSpace(r.FormValue("refresh_token")); pasted != "" {
+		next.RefreshToken = pasted
+	}
+	if claudeRefreshTokenReplaced(stored, r) {
+		next.AccessToken = ""
+		next.ExpiresAt = 0
+		next.Email = ""
+		next.IDToken = ""
+		next.AccountID = ""
+		next.OrganizationID = ""
+		next.ClaudeAccountUUID = ""
+		next.ClaudeOrgUUID = ""
+		next.ClaudeDeviceID = ""
+		next.ClaudeScopes = ""
+		next.ClaudeRefreshExpiresAt = 0
+	}
+	return &next
 }
 
 func configureKiroImport(next, prev *domain.OAuthCreds, r *http.Request) {
@@ -627,126 +660,139 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	statusView = r.FormValue("refresh_view") == "status"
 
-	creds, err := credsFromConnectForm(r)
-	if err != nil {
-		renderErr(&domain.OAuthCreds{}, err.Error())
-		return
-	}
-	applyManualTokens(creds, r)
-	applyKiroConfig(creds, r)
-
 	var savedID bool
 	var id int64
-	if parsed, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
+	var creds *domain.OAuthCreds
+	var err error
+	var saved *domain.Provider
+	if parsed, parseErr := strconv.ParseInt(r.FormValue("id"), 10, 64); parseErr == nil {
 		if p, gErr := h.store.GetProvider(r.Context(), parsed); gErr == nil && p.OAuthCreds != nil {
-			savedID = true
+			saved = p
 			id = parsed
-			stored := p.OAuthCreds
-			// A different pasted Claude refresh token is a replacement credential,
-			// not the stored account. Capture that before the generic fill borrows
-			// old tokens or identity for an unknown grant.
-			claudeReplacement := p.Protocol == domain.ProtocolClaudeCode && claudeRefreshTokenReplaced(stored, r)
-			// A pasted Kiro refresh token may belong to another account. Never
-			// combine it with stored tokens or the old client registration.
-			if p.Protocol != domain.ProtocolKiro || kiroSameAccount(stored, r) {
-				if creds.RefreshToken == "" {
-					creds.RefreshToken = stored.RefreshToken
-				}
-				if !claudeReplacement {
-					if creds.AccessToken == "" {
-						creds.AccessToken = stored.AccessToken
-					}
-					if creds.ExpiresAt == 0 {
-						creds.ExpiresAt = stored.ExpiresAt
-					}
-					if creds.Email == "" {
-						creds.Email = stored.Email
-					}
-					if creds.AccountID == "" {
-						creds.AccountID = stored.AccountID
-					}
-				}
-				if creds.TokenURL == "" {
-					creds.TokenURL = stored.TokenURL
-				}
-				if creds.ClientID == "" {
-					creds.ClientID = stored.ClientID
-				}
-				if creds.ClientSecret == "" {
-					creds.ClientSecret = stored.ClientSecret
-				}
-				if creds.Scopes == "" {
-					creds.Scopes = stored.Scopes
-				}
-				if creds.RedirectURI == "" {
-					creds.RedirectURI = stored.RedirectURI
-				}
-				if !creds.PKCE {
-					creds.PKCE = stored.PKCE
-				}
-				if p.Protocol == domain.ProtocolKiro {
-					mergeKiroAccount(creds, stored, r)
-				} else {
-					if creds.Region == "" {
-						creds.Region = stored.Region
-					}
-					if creds.KiroAuth == "" {
-						creds.KiroAuth = stored.KiroAuth
-					}
-					if creds.ProfileArn == "" {
-						creds.ProfileArn = stored.ProfileArn
-					}
-				}
-				if !creds.RefreshJSON {
-					creds.RefreshJSON = stored.RefreshJSON
-				}
-				if creds.RefreshURL == "" {
-					creds.RefreshURL = stored.RefreshURL
-				}
-				if !creds.ClineAuth {
-					creds.ClineAuth = stored.ClineAuth
-				}
-				if !creds.QoderAuth {
-					creds.QoderAuth = stored.QoderAuth
-				}
-				if !creds.AntigravityAuth {
-					creds.AntigravityAuth = stored.AntigravityAuth
-				}
-				if !creds.CursorAuth {
-					creds.CursorAuth = stored.CursorAuth
-				}
-				if creds.ProjectID == "" {
-					creds.ProjectID = stored.ProjectID
-				}
-				if creds.UserID == "" {
-					creds.UserID = stored.UserID
-				}
-				if creds.MachineID == "" {
-					creds.MachineID = stored.MachineID
-				}
-				if creds.DisplayName == "" {
-					creds.DisplayName = stored.DisplayName
-				}
-				if !claudeReplacement {
-					if creds.OrganizationID == "" {
-						creds.OrganizationID = stored.OrganizationID
-					}
-					if creds.IDToken == "" {
-						creds.IDToken = stored.IDToken
-					}
-				}
-				if creds.Preset == "" {
-					creds.Preset = stored.Preset
-				}
-				if p.Protocol == domain.ProtocolClaudeCode {
-					preserveClaudeIdentity(creds, stored, claudeReplacement)
-				}
-			}
-			if p.Protocol == domain.ProtocolKiro {
-				preserveKiroConfig(creds, stored, r)
-			}
-			creds.KiroContentOptOutSet = false
 		}
+	}
+	if saved != nil && saved.Protocol == domain.ProtocolClaudeCode {
+		// Saved Claude refresh owns its config basis. Do not build it from the
+		// current preset and then fill only empty fields.
+		savedID = true
+		creds = savedClaudeRefreshCreds(saved.OAuthCreds, r)
+	} else {
+		creds, err = credsFromConnectForm(r)
+		if err != nil {
+			renderErr(&domain.OAuthCreds{}, err.Error())
+			return
+		}
+		applyManualTokens(creds, r)
+		applyKiroConfig(creds, r)
+	}
+
+	if saved != nil && !savedID {
+		savedID = true
+		stored := saved.OAuthCreds
+		// A different pasted Claude refresh token is a replacement credential,
+		// not the stored account. Capture that before the generic fill borrows
+		// old tokens or identity for an unknown grant.
+		claudeReplacement := saved.Protocol == domain.ProtocolClaudeCode && claudeRefreshTokenReplaced(stored, r)
+		// A pasted Kiro refresh token may belong to another account. Never
+		// combine it with stored tokens or the old client registration.
+		if saved.Protocol != domain.ProtocolKiro || kiroSameAccount(stored, r) {
+			if creds.RefreshToken == "" {
+				creds.RefreshToken = stored.RefreshToken
+			}
+			if !claudeReplacement {
+				if creds.AccessToken == "" {
+					creds.AccessToken = stored.AccessToken
+				}
+				if creds.ExpiresAt == 0 {
+					creds.ExpiresAt = stored.ExpiresAt
+				}
+				if creds.Email == "" {
+					creds.Email = stored.Email
+				}
+				if creds.AccountID == "" {
+					creds.AccountID = stored.AccountID
+				}
+			}
+			if creds.TokenURL == "" {
+				creds.TokenURL = stored.TokenURL
+			}
+			if creds.ClientID == "" {
+				creds.ClientID = stored.ClientID
+			}
+			if creds.ClientSecret == "" {
+				creds.ClientSecret = stored.ClientSecret
+			}
+			if creds.Scopes == "" {
+				creds.Scopes = stored.Scopes
+			}
+			if creds.RedirectURI == "" {
+				creds.RedirectURI = stored.RedirectURI
+			}
+			if !creds.PKCE {
+				creds.PKCE = stored.PKCE
+			}
+			if saved.Protocol == domain.ProtocolKiro {
+				mergeKiroAccount(creds, stored, r)
+			} else {
+				if creds.Region == "" {
+					creds.Region = stored.Region
+				}
+				if creds.KiroAuth == "" {
+					creds.KiroAuth = stored.KiroAuth
+				}
+				if creds.ProfileArn == "" {
+					creds.ProfileArn = stored.ProfileArn
+				}
+			}
+			if !creds.RefreshJSON {
+				creds.RefreshJSON = stored.RefreshJSON
+			}
+			if creds.RefreshURL == "" {
+				creds.RefreshURL = stored.RefreshURL
+			}
+			if !creds.ClineAuth {
+				creds.ClineAuth = stored.ClineAuth
+			}
+			if !creds.QoderAuth {
+				creds.QoderAuth = stored.QoderAuth
+			}
+			if !creds.AntigravityAuth {
+				creds.AntigravityAuth = stored.AntigravityAuth
+			}
+			if !creds.CursorAuth {
+				creds.CursorAuth = stored.CursorAuth
+			}
+			if creds.ProjectID == "" {
+				creds.ProjectID = stored.ProjectID
+			}
+			if creds.UserID == "" {
+				creds.UserID = stored.UserID
+			}
+			if creds.MachineID == "" {
+				creds.MachineID = stored.MachineID
+			}
+			if creds.DisplayName == "" {
+				creds.DisplayName = stored.DisplayName
+			}
+			if !claudeReplacement {
+				if creds.OrganizationID == "" {
+					creds.OrganizationID = stored.OrganizationID
+				}
+				if creds.IDToken == "" {
+					creds.IDToken = stored.IDToken
+				}
+			}
+			if creds.Preset == "" {
+				creds.Preset = stored.Preset
+			}
+			if saved.Protocol == domain.ProtocolClaudeCode {
+				preserveClaudeIdentity(creds, stored, claudeReplacement)
+			}
+		}
+		if saved.Protocol == domain.ProtocolKiro {
+			preserveKiroConfig(creds, stored, r)
+		}
+		creds.KiroContentOptOutSet = false
 	}
 
 	if creds.RefreshToken == "" {
