@@ -12,6 +12,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/claudecode"
+	"airouter/internal/proxy/thinking"
 )
 
 const (
@@ -48,6 +49,9 @@ type claudeReqState struct {
 	// callerBetas is the validated anthropic-beta list captured before
 	// translation. The header seam merges only flags the model still supports.
 	callerBetas []string
+	// contextOneMillion is the current attempt's target [1m] selector. It is
+	// reset on every Claude Code attempt so failover cannot inherit it.
+	contextOneMillion bool
 }
 
 type claudeStateKeyT struct{}
@@ -82,6 +86,20 @@ func withClaudeRequest(ctx context.Context, h http.Header, body []byte) context.
 func claudeStateFrom(ctx context.Context) *claudeReqState {
 	st, _ := ctx.Value(claudeStateKey).(*claudeReqState)
 	return st
+}
+
+// applyClaudeCodeTargetModel removes recognized context selectors from the
+// Claude Code wire model and records the selector intent for this attempt. The
+// pinned CLI strips the tag from the API model but still sends the long-context
+// beta for a [1m] tag. Other protocols keep their model spelling unchanged.
+func applyClaudeCodeTargetModel(ctx context.Context, provider *domain.Provider, model string) string {
+	if provider == nil || provider.Protocol != domain.ProtocolClaudeCode {
+		return model
+	}
+	if st := claudeStateFrom(ctx); st != nil {
+		st.contextOneMillion = thinking.HasOneMillionContextSelector(model)
+	}
+	return thinking.StripContextSelectors(model)
 }
 
 func hasClaudeCodeTarget(targets []domain.ComboTarget) bool {

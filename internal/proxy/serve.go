@@ -792,6 +792,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		req.Thinking = thinking.ToIR(captured)
 	}
 	applyUpstreamModel(req, upstreamModel)
+	req.Model = applyClaudeCodeTargetModel(ctx, provider, req.Model)
 	// Encode the upstream transport: stream-only backends collect SSE and
 	// require stream:true on the wire; regular unary backends stay false.
 	req.Stream = backend.streamOnly

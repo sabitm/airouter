@@ -143,6 +143,7 @@ func codexCaps(m string) Caps {
 }
 
 func claudeCaps(m string, protocol domain.Protocol) Caps {
+	m = StripContextSelectors(m)
 	c := Caps{
 		Reasoning:  true,
 		CanDisable: true,
@@ -210,9 +211,9 @@ type claudeCatalogCaps struct {
 }
 
 func claudeCatalogRow(model string) (claudeCatalogCaps, bool) {
-	// Local table mirrors claudecode.LookupModel. thinking must not import
-	// claudecode: that package imports thinking through the proxy.
-	id := strings.ToLower(strings.TrimSpace(model))
+	// Local table mirrors claudecode.LookupModel. claudecode imports this
+	// package, so thinking must not import claudecode.
+	id := StripContextSelectors(strings.ToLower(strings.TrimSpace(model)))
 	if i := strings.LastIndex(id, "/"); i >= 0 {
 		id = id[i+1:]
 	}

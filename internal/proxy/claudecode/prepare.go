@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"airouter/internal/proxy/thinking"
 )
 
 // PrepareInput is the per-send Claude Code preparation. SessionID must match
@@ -113,6 +115,14 @@ func Prepare(body []byte, in PrepareInput) ([]byte, error) {
 		return nil, err
 	}
 	doc["metadata"] = meta
+	if raw := doc["model"]; len(raw) > 0 {
+		var model string
+		if json.Unmarshal(raw, &model) == nil {
+			if clean := thinking.StripContextSelectors(model); clean != model {
+				doc["model"], _ = json.Marshal(clean)
+			}
+		}
+	}
 	return json.Marshal(doc)
 }
 

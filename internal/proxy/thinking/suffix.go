@@ -1,9 +1,30 @@
 package thinking
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 )
+
+// contextSelectorPattern matches the Claude Code context-size tags removed by
+// the pinned CLI API model resolver. It removes every occurrence, not only a
+// trailing tag, and matches [1m]/[2m] in either case.
+var contextSelectorPattern = regexp.MustCompile(`(?i)\[(?:1|2)m\]`)
+
+var oneMillionSelectorPattern = regexp.MustCompile(`(?i)\[1m\]`)
+
+// StripContextSelectors removes recognized Claude Code context-size tags.
+// Unknown bracket text is preserved because the CLI does not consume it.
+func StripContextSelectors(model string) string {
+	return contextSelectorPattern.ReplaceAllString(model, "")
+}
+
+// HasOneMillionContextSelector reports a [1m] tag in a model spelling. The
+// pinned client sends the long-context beta for this tag before it removes the
+// tag from the API model id.
+func HasOneMillionContextSelector(model string) bool {
+	return oneMillionSelectorPattern.MatchString(model)
+}
 
 // ParseSuffix splits "model(high)" / "model(8192)" / "model(none)" / "model(auto)" / "model(ultra)".
 // Only known levels, digits, none/off, or auto are consumed; any other parenthetical

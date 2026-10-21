@@ -311,6 +311,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		req.Thinking = thinking.ToIR(captured)
 	}
 	applyUpstreamModel(req, upstreamModel)
+	req.Model = applyClaudeCodeTargetModel(ctx, provider, req.Model)
 	req.Stream = true
 
 	upstreamBody, err := backend.encodeRequest(req)

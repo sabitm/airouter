@@ -891,6 +891,10 @@ func claudeBetaRequest(ctx context.Context, provider *domain.Provider, body []by
 	}
 	req.CacheScope, req.ExtendedTTL, req.CacheEvict = claudecode.CacheFeatures(body)
 	req.OneMillion = bodyRequestsOneMillion(probe.Model, body)
+	if st := claudeStateFrom(ctx); st != nil && st.contextOneMillion {
+		req.OneMillion = true
+		req.ContextOneMillion = true
+	}
 	return req
 }
 

@@ -1,6 +1,10 @@
 package claudecode
 
-import "strings"
+import (
+	"strings"
+
+	"airouter/internal/proxy/thinking"
+)
 
 // Profile is the pinned Claude Code 2.1.303 request profile.
 // Runtime fingerprints are not invented. The process reports its own OS and
@@ -115,6 +119,9 @@ type BetaRequest struct {
 	ThinkingSummarized bool
 	FastMode           bool
 	OneMillion         bool
+	// ContextOneMillion carries the request-local target [1m] selector. The
+	// prepared wire model no longer contains that selector.
+	ContextOneMillion bool
 	// CallerBetas are validated anthropic-beta flags captured from the client
 	// header. Unknown names are already dropped. Model support is checked here.
 	CallerBetas []string
@@ -141,7 +148,7 @@ func BetaHeaders(req BetaRequest) string {
 	if req.OAuth {
 		add(BetaOAuth)
 	}
-	if req.OneMillion && modelSupportsOneMillion(model) {
+	if req.OneMillion && (req.ContextOneMillion || thinking.HasOneMillionContextSelector(req.Model) || modelSupportsOneMillion(model)) {
 		add(BetaLongContext)
 	}
 	if req.ThinkingActive && modelSupportsInterleavedThinking(model) {
@@ -325,15 +332,12 @@ func modelSupportsFastMode(model string) bool {
 }
 
 func modelSupportsOneMillion(model string) bool {
-	if strings.Contains(canonicalModel(model), "[1m]") {
-		return true
-	}
 	row, ok := LookupModel(model)
 	return ok && row.OneMillion
 }
 
 func canonicalModel(model string) string {
-	m := strings.ToLower(strings.TrimSpace(model))
+	m := thinking.StripContextSelectors(strings.ToLower(strings.TrimSpace(model)))
 	if i := strings.LastIndex(m, "/"); i >= 0 {
 		m = m[i+1:]
 	}
