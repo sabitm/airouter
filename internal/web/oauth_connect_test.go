@@ -240,6 +240,33 @@ func TestOAuthPresetCreatesXAIConfig(t *testing.T) {
 	if creds.Mode != domain.OAuthAuto {
 		t.Errorf("mode = %q, want auto", creds.Mode)
 	}
+	if creds.AuthURL != "https://auth.x.ai/oauth2/authorize" || creds.TokenURL != "https://auth.x.ai/oauth2/token" {
+		t.Errorf("xai endpoints = %q %q", creds.AuthURL, creds.TokenURL)
+	}
+	if creds.Scopes != "openid profile email offline_access grok-cli:access api:access" {
+		t.Errorf("scopes = %q", creds.Scopes)
+	}
+	if creds.RedirectURI != "http://127.0.0.1:56121/callback" {
+		t.Errorf("redirect = %q", creds.RedirectURI)
+	}
+	if creds.ClientSecret != "" || creds.RefreshURL != "" || creds.RefreshJSON || creds.ClineAuth || creds.QoderAuth || creds.CursorAuth || creds.ClaudeCodeAuth {
+		t.Errorf("xai creds gained unrelated auth config: %+v", creds)
+	}
+
+	p, ok := oauth.PresetByName("xai")
+	if !ok {
+		t.Fatal("missing xai preset")
+	}
+	if p.Protocol != domain.ProtocolOpenAI || p.APIBase != "https://api.x.ai/v1" {
+		t.Fatalf("xai preset transport = %q %q, want openai https://api.x.ai/v1", p.Protocol, p.APIBase)
+	}
+	provider, applied := oauth.Apply(p)
+	if provider.Protocol != domain.ProtocolOpenAI || provider.BaseURL != "https://api.x.ai/v1" || provider.AuthMethod != domain.AuthOAuth {
+		t.Fatalf("applied provider = %+v", provider)
+	}
+	if applied.ClientID != creds.ClientID || applied.TokenURL != creds.TokenURL || applied.Scopes != creds.Scopes || applied.PKCE != creds.PKCE {
+		t.Fatalf("applied creds diverged from connect form")
+	}
 }
 
 func TestOAuthPresetCreatesClineConfig(t *testing.T) {

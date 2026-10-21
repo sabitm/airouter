@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/oauth"
 )
 
 // oauthUpstream is a mock OpenAI provider that accepts only a specific bearer
@@ -261,3 +262,209 @@ func TestOAuthStreamingReactiveRefresh(t *testing.T) {
 }
 
 const openaiStreamChunk = `{"id":"chatcmpl-x","object":"chat.completion.chunk","model":"up","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`
+
+func TestGrokDefaultTransportUsesChatCompletions(t *testing.T) {
+	preset, ok := oauth.PresetByName("xai")
+	if !ok {
+		t.Fatal("missing xai preset")
+	}
+	if preset.Protocol != domain.ProtocolOpenAI || preset.APIBase != "https://api.x.ai/v1" {
+		t.Fatalf("xai preset transport = %q %q", preset.Protocol, preset.APIBase)
+	}
+	if preset.TokenURL != "https://auth.x.ai/oauth2/token" || preset.ClientID != "b1a00492-073a-47ea-816f-4c329264a828" || !preset.PKCE {
+		t.Fatalf("xai oauth config changed: token=%q client=%q pkce=%v", preset.TokenURL, preset.ClientID, preset.PKCE)
+	}
+
+	var got grokCapture
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got.record(r, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/chat/completions") && isStreamBody(body):
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, openAIToolSSE)
+		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
+			_, _ = io.WriteString(w, grokUnaryToolBody)
+		default:
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{
+		Name: "grok", BaseURL: upstream.URL, Protocol: preset.Protocol,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		ReasoningDialect: domain.ReasoningGrok,
+		OAuthCreds: &domain.OAuthCreds{
+			Mode: domain.OAuthAuto, Preset: "xai", AccessToken: "tok-grok",
+			RefreshToken: "rt", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+			TokenURL: preset.TokenURL, ClientID: preset.ClientID, PKCE: preset.PKCE,
+		},
+	}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Targets: []domain.ComboTarget{
+		{ProviderID: prov.ID, UpstreamModel: "grok-4", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, out := post(t, ts.URL+"/v1/responses", key.Token, grokResponsesIngress)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unary status = %d, body = %s", resp.StatusCode, out)
+	}
+	assertGrokChatTransport(t, got, false)
+	var unary struct {
+		Output []struct {
+			Type      string `json:"type"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"output"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(out, &unary); err != nil {
+		t.Fatal(err)
+	}
+	if len(unary.Output) != 1 || unary.Output[0].Type != "function_call" || unary.Output[0].Name != "get_weather" || unary.Output[0].Arguments != `{"city":"paris"}` {
+		t.Fatalf("translated tool = %+v", unary.Output)
+	}
+	if unary.Usage.InputTokens != 3 || unary.Usage.OutputTokens != 9 {
+		t.Fatalf("unary usage = %+v", unary.Usage)
+	}
+
+	got = grokCapture{}
+	streamResp, streamBody := postStream(t, ts.URL+"/v1/responses", key.Token, strings.Replace(grokResponsesIngress, `{`, `{"stream":true,`, 1))
+	if streamResp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, body = %s", streamResp.StatusCode, streamBody)
+	}
+	assertGrokChatTransport(t, got, true)
+	name, args, done := collectResponsesToolStream(t, streamBody)
+	if name != "get_weather" || args != `{"city":"paris"}` || done != `{"city":"paris"}` {
+		t.Fatalf("stream tool = %q %q %q", name, args, done)
+	}
+	in, outTok, total := collectResponsesUsage(t, streamBody)
+	if in != 3 || outTok != 9 || total != 12 {
+		t.Fatalf("stream usage = %d %d %d", in, outTok, total)
+	}
+}
+
+func TestExplicitResponsesGrokKeepsResponsesPath(t *testing.T) {
+	var got grokCapture
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got.record(r, body)
+		if !strings.HasSuffix(r.URL.Path, "/responses") {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, responsesUpstreamBody)
+	}))
+	t.Cleanup(upstream.Close)
+	st := newTestStore(t)
+	ctx := context.Background()
+	prov := &domain.Provider{
+		Name: "grok-explicit", BaseURL: upstream.URL, APIKey: "up-key",
+		Protocol: domain.ProtocolOpenAIResponses, AuthMethod: domain.AuthAPIKey,
+		ReasoningDialect: domain.ReasoningGrok,
+	}
+	if err := st.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Targets: []domain.ComboTarget{
+		{ProviderID: prov.ID, UpstreamModel: "grok-4", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(ctx, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, nil).Mount(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	resp, body := post(t, ts.URL+"/v1/responses", key.Token, `{"model":"default","input":"hi"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if got.path != "/responses" || got.auth != "Bearer up-key" {
+		t.Fatalf("explicit responses transport path=%q auth=%q", got.path, got.auth)
+	}
+	if !strings.Contains(string(body), "hello from responses") {
+		t.Fatalf("responses body not relayed: %s", body)
+	}
+}
+
+type grokCapture struct {
+	path    string
+	auth    string
+	headers http.Header
+	body    []byte
+}
+
+func (g *grokCapture) record(r *http.Request, body []byte) {
+	g.path = r.URL.Path
+	g.auth = r.Header.Get("Authorization")
+	g.headers = r.Header.Clone()
+	g.body = append([]byte(nil), body...)
+}
+
+func assertGrokChatTransport(t *testing.T, got grokCapture, stream bool) {
+	t.Helper()
+	if got.path != "/chat/completions" {
+		t.Fatalf("upstream path = %q, want /chat/completions", got.path)
+	}
+	if got.auth != "Bearer tok-grok" {
+		t.Fatalf("auth = %q, want bearer", got.auth)
+	}
+	for key, values := range got.headers {
+		joined := strings.ToLower(key + ":" + strings.Join(values, ","))
+		if strings.Contains(joined, "grok-cli") || strings.Contains(joined, "cli-chat-proxy") || strings.Contains(key, "X-Grok") {
+			t.Fatalf("unexpected CLI header %s", key)
+		}
+	}
+	var body map[string]any
+	if err := json.Unmarshal(got.body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["model"] != "grok-4" {
+		t.Fatalf("model = %v", body["model"])
+	}
+	if _, ok := body["input"]; ok {
+		t.Fatal("chat body still has responses input")
+	}
+	if stream {
+		opts, _ := body["stream_options"].(map[string]any)
+		if opts["include_usage"] != true {
+			t.Fatalf("stream_options = %#v", body["stream_options"])
+		}
+	}
+}
+
+func isStreamBody(body []byte) bool {
+	var m struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &m) == nil && m.Stream
+}
+
+const grokResponsesIngress = `{"model":"default","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]}`
+
+const grokUnaryToolBody = `{"id":"chatcmpl-9","object":"chat.completion","model":"grok-4","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"paris\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":9,"total_tokens":12}}`

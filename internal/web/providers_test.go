@@ -171,11 +171,17 @@ func TestGrokRecipeDefaultsToGrokDialect(t *testing.T) {
 	if !strings.Contains(html, `value="https://api.x.ai/v1"`) {
 		t.Fatalf("recipe HTML missing xai base URL; html=%s", html)
 	}
-	if !strings.Contains(html, `data-protocol="openai-responses"`) {
-		t.Fatalf("recipe HTML missing openai-responses protocol; html=%s", html)
+	if !strings.Contains(html, `data-protocol="openai"`) {
+		t.Fatalf("recipe HTML missing openai protocol; html=%s", html)
 	}
-	if r.Protocol != domain.ProtocolOpenAIResponses {
-		t.Fatalf("xai recipe protocol = %q, want openai-responses", r.Protocol)
+	if strings.Contains(html, `data-protocol="openai-responses"`) || strings.Contains(html, `value="openai-responses"`) {
+		t.Fatalf("xai recipe must not default to openai-responses; html=%s", html)
+	}
+	if r.Protocol != domain.ProtocolOpenAI {
+		t.Fatalf("xai recipe protocol = %q, want openai", r.Protocol)
+	}
+	if r.Method != domain.AuthOAuth || r.Preset != "xai" || r.BaseURL != "https://api.x.ai/v1" || r.ReasoningDialect != domain.ReasoningGrok {
+		t.Fatalf("xai recipe config changed: %+v", r)
 	}
 }
 
