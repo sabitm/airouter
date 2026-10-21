@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"airouter/internal/crypto"
@@ -612,6 +613,354 @@ func TestProviderTagsRoundTrip(t *testing.T) {
 	}
 	if len(got.Tags) != 0 {
 		t.Fatalf("cleared tags = %v", got.Tags)
+	}
+}
+
+func claudeProviderRow(creds *domain.OAuthCreds) *domain.Provider {
+	return &domain.Provider{
+		Name: "cc", BaseURL: "https://api.anthropic.com", Protocol: domain.ProtocolClaudeCode,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		Tags: []string{"team"}, OAuthCreds: creds,
+	}
+}
+
+func openSharedStore(t *testing.T, path string, c *crypto.Cipher) *Store {
+	t.Helper()
+	st, err := Open(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+func TestConditionalProviderWrites(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	original := &domain.OAuthCreds{
+		ClaudeCodeAuth: true, AccessToken: "old-access", RefreshToken: "same-refresh",
+		ExpiresAt: 10, ClaudeAccountUUID: "acct", ClaudeDeviceID: strings.Repeat("ab", 32),
+		ClaudeScopes: "user:inference", TokenURL: "https://stored.example/token", ClientID: "cid",
+	}
+	p := &domain.Provider{
+		Name: "cc", BaseURL: "https://api.anthropic.com", Protocol: domain.ProtocolClaudeCode,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		Tags: []string{"team"}, OAuthCreds: original,
+	}
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	basis, err := st.GetProviderOAuthStored(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if basis.OAuthBlob == "" || basis.Provider.OAuthCreds.AccessToken != "old-access" {
+		t.Fatalf("stored basis = %+v blob %q", basis.Provider, basis.OAuthBlob)
+	}
+
+	rotated := *original
+	rotated.AccessToken = "rotated-access"
+	rotated.ExpiresAt = 20
+	if err := st.UpdateProviderOAuth(ctx, p.ID, &rotated); err != nil {
+		t.Fatal(err)
+	}
+	save := ProviderConnectionSave{
+		ProviderMeta: ProviderMeta{
+			Name: "stale-name", BaseURL: "https://stale.example",
+			Protocol: domain.ProtocolClaudeCode, AuthMethod: domain.AuthOAuth,
+			AuthScheme: domain.AuthBearer,
+		},
+		OAuthCreds: original,
+	}
+	if err := st.UpdateProviderIfConnection(ctx, p.ID, save, domain.AuthOAuth, domain.ProtocolClaudeCode, basis.OAuthBlob); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale credential save err = %v, want conflict", err)
+	}
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "cc" || got.BaseURL != "https://api.anthropic.com" || got.OAuthCreds.AccessToken != "rotated-access" || got.OAuthCreds.ExpiresAt != 20 {
+		t.Fatalf("conflict changed row: %+v creds %+v", got, got.OAuthCreds)
+	}
+
+	meta := ProviderMeta{
+		Name: "renamed", BaseURL: "https://renamed.example", Protocol: domain.ProtocolClaudeCode,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer, Tags: []string{"kept"},
+	}
+	if err := st.UpdateProviderMetaIfConnection(ctx, p.ID, meta, domain.AuthOAuth, domain.ProtocolClaudeCode); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "renamed" || got.BaseURL != "https://renamed.example" || got.OAuthCreds.AccessToken != "rotated-access" || got.OAuthCreds.ExpiresAt != 20 {
+		t.Fatalf("metadata write changed credentials: %+v creds %+v", got, got.OAuthCreds)
+	}
+	if !equalStringSlice(got.Tags, []string{"kept"}) {
+		t.Fatalf("tags = %v", got.Tags)
+	}
+
+	got.AuthMethod = domain.AuthAPIKey
+	got.Protocol = domain.ProtocolOpenAI
+	got.OAuthCreds = nil
+	got.APIKey = "switched"
+	if err := st.UpdateProvider(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateProviderMetaIfConnection(ctx, p.ID, meta, domain.AuthOAuth, domain.ProtocolClaudeCode); !errors.Is(err, ErrConflict) {
+		t.Fatalf("auth switch err = %v, want conflict", err)
+	}
+	got, err = st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AuthMethod != domain.AuthAPIKey || got.Protocol != domain.ProtocolOpenAI || got.APIKey != "switched" || got.OAuthCreds != nil {
+		t.Fatalf("auth conflict mutated row: %+v", got)
+	}
+
+	if err := st.DeleteProvider(ctx, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateProviderIfConnection(ctx, p.ID, save, domain.AuthOAuth, domain.ProtocolClaudeCode, basis.OAuthBlob); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted credential save err = %v, want not found", err)
+	}
+	if err := st.UpdateProviderMetaIfConnection(ctx, p.ID, meta, domain.AuthOAuth, domain.ProtocolClaudeCode); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted metadata save err = %v, want not found", err)
+	}
+}
+
+func TestUpdateProviderConnectionCASGuardsConnection(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	original := &domain.OAuthCreds{
+		ClaudeCodeAuth: true, AccessToken: "old-access", RefreshToken: "same-refresh",
+		ExpiresAt: 10, ClaudeAccountUUID: "acct", ClaudeDeviceID: strings.Repeat("ab", 32),
+	}
+	p := claudeProviderRow(original)
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+
+	// A protocol switch with unchanged credentials is a conflict, not a
+	// successful write of a stale rotation into the switched row.
+	switched, err := st.GetProviderOAuthStored(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switched.Provider.Protocol = domain.ProtocolAnthropic
+	if err := st.UpdateProvider(ctx, switched.Provider); err != nil {
+		t.Fatal(err)
+	}
+	rotated := *original
+	rotated.AccessToken = "stale-rotation"
+	rotated.ExpiresAt = 44
+	_, err = st.UpdateProviderConnectionCAS(ctx, p.ID, func(current *domain.OAuthCreds, method domain.AuthMethod, proto domain.Protocol) (*domain.OAuthCreds, bool, error) {
+		if method != domain.AuthOAuth || proto != domain.ProtocolClaudeCode {
+			return nil, false, errors.New("connection changed")
+		}
+		next := *current
+		next.AccessToken = rotated.AccessToken
+		next.ExpiresAt = rotated.ExpiresAt
+		return &next, true, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "connection changed") {
+		t.Fatalf("protocol switch CAS err = %v", err)
+	}
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Protocol != domain.ProtocolAnthropic || got.OAuthCreds.AccessToken != "old-access" {
+		t.Fatalf("CAS mutated switched row: %+v creds %+v", got, got.OAuthCreds)
+	}
+
+	// A missing row is ErrNotFound so callers can tell deletion from conflict.
+	if err := st.DeleteProvider(ctx, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.UpdateProviderConnectionCAS(ctx, p.ID, func(current *domain.OAuthCreds, method domain.AuthMethod, proto domain.Protocol) (*domain.OAuthCreds, bool, error) {
+		return current, true, nil
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted row CAS err = %v, want not found", err)
+	}
+}
+
+func TestUpdateProviderConnectionCASRetriesAcrossInstances(t *testing.T) {
+	c, err := crypto.New("test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "shared.db")
+	writer := openSharedStore(t, dbPath, c)
+	reader := openSharedStore(t, dbPath, c)
+	other := openSharedStore(t, dbPath, c)
+	ctx := context.Background()
+	original := &domain.OAuthCreds{
+		ClaudeCodeAuth: true, AccessToken: "old-access", RefreshToken: "same-refresh",
+		ExpiresAt: 10, ClaudeAccountUUID: "acct", ClaudeDeviceID: strings.Repeat("ab", 32),
+	}
+	if err := writer.CreateProvider(ctx, claudeProviderRow(original)); err != nil {
+		t.Fatal(err)
+	}
+
+	// On the first attempt a second store instance commits a device
+	// initialization before this callback's write lands. The guarded write
+	// must lose that race and retry; the retry sees the device-initialized row
+	// and applies the rotation onto it instead of dropping the device.
+	injected := false
+	merged, err := reader.UpdateProviderConnectionCAS(ctx, 1, func(current *domain.OAuthCreds, method domain.AuthMethod, proto domain.Protocol) (*domain.OAuthCreds, bool, error) {
+		if current == nil || !current.ClaudeCodeAuth {
+			return nil, false, errors.New("credential row replaced")
+		}
+		if !injected {
+			injected = true
+			deviceInit := *current
+			deviceInit.ClaudeDeviceID = strings.Repeat("cd", 32)
+			if err := other.UpdateProviderOAuth(ctx, 1, &deviceInit); err != nil {
+				return nil, false, err
+			}
+			next := *current
+			next.AccessToken = "rotated-access"
+			return &next, true, nil
+		}
+		next := *current
+		next.AccessToken = "rotated-access"
+		next.ExpiresAt = 20
+		return &next, true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !injected {
+		t.Fatal("retry path was not exercised")
+	}
+	if merged.ClaudeDeviceID != strings.Repeat("cd", 32) {
+		t.Fatalf("retry dropped device initialization: %+v", merged)
+	}
+	if merged.AccessToken != "rotated-access" || merged.ExpiresAt != 20 {
+		t.Fatalf("retry dropped rotation: %+v", merged)
+	}
+	got, err := writer.GetProvider(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthCreds.ClaudeDeviceID != strings.Repeat("cd", 32) || got.OAuthCreds.AccessToken != "rotated-access" || got.OAuthCreds.ExpiresAt != 20 {
+		t.Fatalf("shared row = %+v", got.OAuthCreds)
+	}
+}
+
+func TestConditionalWritesPreserveArchived(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	original := &domain.OAuthCreds{
+		ClaudeCodeAuth: true, AccessToken: "old-access", RefreshToken: "same-refresh",
+		ExpiresAt: 10, ClaudeAccountUUID: "acct", ClaudeDeviceID: strings.Repeat("ab", 32),
+	}
+	p := claudeProviderRow(original)
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	basis, err := st.GetProviderOAuthStored(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetProviderArchived(ctx, p.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	meta := ProviderMeta{
+		Name: "renamed", BaseURL: "https://renamed.example", Protocol: domain.ProtocolClaudeCode,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+	}
+	if err := st.UpdateProviderMetaIfConnection(ctx, p.ID, meta, domain.AuthOAuth, domain.ProtocolClaudeCode); err != nil {
+		t.Fatal(err)
+	}
+	save := ProviderConnectionSave{ProviderMeta: meta, OAuthCreds: original}
+	save.OAuthCreds.AccessToken = "new-access"
+	if err := st.UpdateProviderIfConnection(ctx, p.ID, save, domain.AuthOAuth, domain.ProtocolClaudeCode, basis.OAuthBlob); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Archived {
+		t.Fatalf("stale snapshot restored archived: %+v", got)
+	}
+	if got.Name != "renamed" || got.OAuthCreds.AccessToken != "new-access" {
+		t.Fatalf("saved fields lost: %+v creds %+v", got, got.OAuthCreds)
+	}
+}
+
+func TestUpdateProviderIfConnectionConcurrent(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	p := claudeProviderRow(&domain.OAuthCreds{ClaudeCodeAuth: true, AccessToken: "start", RefreshToken: "rt"})
+	if err := st.CreateProvider(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 8
+	basis, err := st.GetProviderOAuthStored(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := ProviderMeta{
+		Name:             "writer",
+		BaseURL:          basis.Provider.BaseURL,
+		Protocol:         basis.Provider.Protocol,
+		AuthScheme:       basis.Provider.AuthScheme,
+		AuthMethod:       basis.Provider.AuthMethod,
+		ReasoningDialect: basis.Provider.ReasoningDialect,
+		Tags:             basis.Provider.Tags,
+	}
+	// Every worker derives its write from the SAME basis read and then waits on
+	// one barrier before writing. Without the atomic blob-and-connection
+	// predicate all eight writes would serialize and succeed; with it exactly
+	// one write commits and the other seven conflict.
+	var wg sync.WaitGroup
+	var conflicts atomic.Int32
+	var winners atomic.Int32
+	errCh := make(chan error, workers)
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			cp := *basis.Provider.OAuthCreds
+			cp.AccessToken = "writer"
+			cp.ExpiresAt = int64(n + 1)
+			<-start
+			if err := st.UpdateProviderIfConnection(ctx, p.ID, ProviderConnectionSave{
+				ProviderMeta: meta,
+				OAuthCreds:   &cp,
+			}, domain.AuthOAuth, domain.ProtocolClaudeCode, basis.OAuthBlob); err != nil {
+				if errors.Is(err, ErrConflict) {
+					conflicts.Add(1)
+					return
+				}
+				errCh <- err
+				return
+			}
+			winners.Add(1)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	if winners.Load() != 1 || conflicts.Load() != workers-1 {
+		t.Fatalf("winners = %d conflicts = %d, want 1 and %d", winners.Load(), conflicts.Load(), workers-1)
+	}
+	got, err := st.GetProvider(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "writer" || got.OAuthCreds.AccessToken != "writer" || got.OAuthCreds.RefreshToken != "rt" {
+		t.Fatalf("concurrent save tore row: %+v creds %+v", got, got.OAuthCreds)
 	}
 }
 

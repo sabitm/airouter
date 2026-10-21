@@ -499,18 +499,23 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid form")
 		return
 	}
-	cur, err := h.store.GetProvider(r.Context(), id)
+	// One read supplies both the provider snapshot and the exact encrypted
+	// credential blob. The oauth save paths condition their writes on that one
+	// coherent basis instead of a second read that could already see a changed
+	// connection.
+	stored, err := h.store.GetProviderOAuthStored(r.Context(), id)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
+	cur := stored.Provider
 	proto := domain.Protocol(r.FormValue("protocol"))
 	if !proto.Valid() {
 		htmxBadRequest(w, r, "provider-flash", "invalid protocol")
 		return
 	}
 	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
-		h.updateOAuthProvider(w, r, cur, proto)
+		h.updateOAuthProvider(w, r, cur, proto, stored.OAuthBlob)
 		return
 	}
 	auth := domain.AuthScheme(r.FormValue("auth_scheme"))
@@ -582,7 +587,14 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 // (a Reconnect) is attached or fresh tokens are pasted, otherwise the stored
 // tokens are kept. The paste fields are blank by default, so editing an oauth
 // provider without reconnecting or pasting never requires re-auth.
-func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cur *domain.Provider, proto domain.Protocol) {
+func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cur *domain.Provider, proto domain.Protocol, basisBlob string) {
+	// The connection state read before the form merges is the basis for every
+	// guarded write below. cur is mutated in place, so capture it first. The
+	// stored auth method is compared as raw column state; Method() is only for
+	// behavioral decisions, so a legacy empty method still matches its raw row.
+	fromMethod := cur.AuthMethod
+	fromProto := cur.Protocol
+	claudeInvolved := fromProto == domain.ProtocolClaudeCode || proto == domain.ProtocolClaudeCode
 	var prevCursorMachineID string
 	var prevKiro *domain.OAuthCreds
 	if cur.OAuthCreds != nil {
@@ -593,8 +605,10 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	reconnected := false
 	imported := false
 	if creds, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
+		// Copy before identity or config merges. A rejected save must leave the
+		// retained session snapshot unchanged.
+		creds = cloneOAuthCreds(creds)
 		if proto == domain.ProtocolKiro {
-			creds = cloneOAuthCreds(creds)
 			preserveKiroConfig(creds, prevKiro, r)
 		}
 		cur.OAuthCreds = creds
@@ -616,6 +630,9 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		htmxBadRequest(w, r, "provider-flash", "connect this provider or paste an access/refresh token before saving")
 		return
 	}
+	// A reconnect or import replaces credentials on either side of a Claude
+	// transition, not only when the target is Claude.
+	claudeCredentialWrite := reconnected || imported
 	if proto == domain.ProtocolKiro {
 		if reconnected {
 			applyKiroConnectionConfig(cur.OAuthCreds, r)
@@ -677,6 +694,14 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	if r.FormValue("reasoning_dialect") != "" || reasoningDialectEditable(proto) {
 		cur.ReasoningDialect = dialect
 	}
+	if claudeInvolved {
+		if claudeCredentialWrite {
+			h.saveClaudeOAuthCredentials(w, r, cur, fromMethod, fromProto, basisBlob)
+			return
+		}
+		h.saveClaudeOAuthMetadata(w, r, cur, fromMethod, fromProto)
+		return
+	}
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
@@ -685,6 +710,65 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		h.sessions.drop(s)
 	}
 	h.renderProviderList(w, r)
+}
+
+// saveClaudeOAuthMetadata writes editable fields and does not write
+// oauth_creds. The handler snapshot can be older than a rotation that commits
+// before this save, so the current credentials are kept. The write is
+// conditional on the connection state read before the form, so a concurrent
+// auth or protocol switch is rejected instead of mixed with stale metadata.
+func (h *Handler) saveClaudeOAuthMetadata(w http.ResponseWriter, r *http.Request, cur *domain.Provider, fromMethod domain.AuthMethod, fromProto domain.Protocol) {
+	err := h.store.UpdateProviderMetaIfConnection(r.Context(), cur.ID, store.ProviderMeta{
+		Name:             cur.Name,
+		BaseURL:          cur.BaseURL,
+		APIKey:           cur.APIKey,
+		Protocol:         cur.Protocol,
+		AuthScheme:       cur.AuthScheme,
+		AuthMethod:       cur.AuthMethod,
+		ReasoningDialect: cur.ReasoningDialect,
+		Tags:             cur.Tags,
+	}, fromMethod, fromProto)
+	if err != nil {
+		htmxBadRequest(w, r, "provider-flash", providerSaveErr(err))
+		return
+	}
+	h.renderProviderList(w, r)
+}
+
+// saveClaudeOAuthCredentials persists a reconnect or import only while the
+// encrypted credential blob and the connection state are still the ones read
+// before the form merges. A conflicting rotation, reconnect, or connection
+// switch leaves every provider field unchanged and keeps the connect session.
+// The session is dropped only after a successful write.
+func (h *Handler) saveClaudeOAuthCredentials(w http.ResponseWriter, r *http.Request, cur *domain.Provider, fromMethod domain.AuthMethod, fromProto domain.Protocol, basisBlob string) {
+	err := h.store.UpdateProviderIfConnection(r.Context(), cur.ID, store.ProviderConnectionSave{
+		ProviderMeta: store.ProviderMeta{
+			Name:             cur.Name,
+			BaseURL:          cur.BaseURL,
+			APIKey:           cur.APIKey,
+			Protocol:         cur.Protocol,
+			AuthScheme:       cur.AuthScheme,
+			AuthMethod:       cur.AuthMethod,
+			ReasoningDialect: cur.ReasoningDialect,
+			Tags:             cur.Tags,
+		},
+		OAuthCreds: cur.OAuthCreds,
+	}, fromMethod, fromProto, basisBlob)
+	if err != nil {
+		htmxBadRequest(w, r, "provider-flash", providerSaveErr(err))
+		return
+	}
+	if s := r.FormValue("oauth_session"); s != "" {
+		h.sessions.drop(s)
+	}
+	h.renderProviderList(w, r)
+}
+
+func providerSaveErr(err error) string {
+	if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
+		return "credentials changed during save; reload and retry"
+	}
+	return err.Error()
 }
 
 func (h *Handler) deleteProvider(w http.ResponseWriter, r *http.Request) {

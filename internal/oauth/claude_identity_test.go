@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -267,6 +268,457 @@ func repeatHex(pair string) string {
 func cloneCreds(c *domain.OAuthCreds) *domain.OAuthCreds {
 	cp := *c
 	return &cp
+}
+
+func TestSavedClaudeRefreshRejectsReconnectDuringCall(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	srv, hits := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 200, `{"access_token":"old-result","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	st.creds[1] = cloneCreds(stored)
+	svc := New(st)
+	req := ClaudeRefreshRequest{Stored: cloneCreds(stored), Effective: cloneCreds(stored), Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode}
+
+	type result struct {
+		creds *domain.OAuthCreds
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := svc.RefreshSavedClaude(context.Background(), 1, req)
+		done <- result{got, err}
+	}()
+	waitN(t, entered, 1)
+
+	reconnect := cloneCreds(stored)
+	reconnect.AccessToken = "reconnect-access"
+	reconnect.RefreshToken = "reconnect-refresh"
+	reconnect.ClaudeAccountUUID = "reconnect-account"
+	reconnect.AccountID = "reconnect-account"
+	reconnect.ClaudeDeviceID = repeatHex("cd")
+	st.mu.Lock()
+	st.creds[1] = reconnect
+	st.mu.Unlock()
+	close(release)
+
+	got := <-done
+	if !IsCredentialConflict(got.err) {
+		t.Fatalf("err = %v, want credential conflict", got.err)
+	}
+	if got.creds != nil {
+		t.Fatalf("conflict returned discarded credentials: %+v", got.creds)
+	}
+	st.mu.Lock()
+	final := st.creds[1]
+	st.mu.Unlock()
+	if final.AccessToken != "reconnect-access" || final.RefreshToken != "reconnect-refresh" || final.ClaudeAccountUUID != "reconnect-account" {
+		t.Fatalf("old refresh overwrote reconnect: %+v", final)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("token hits = %d", hits.Load())
+	}
+}
+
+func TestSavedClaudeRefreshDetectsSameTokenRotation(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	srv, _ := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 200, `{"access_token":"obsolete-access","expires_in":3600}`
+	})
+	winnerSrv, _ := tokenTestServer(t, func(url.Values) (int, string) {
+		return 200, `{"access_token":"winner-access","expires_in":7200}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	st.creds[2] = cloneCreds(stored)
+	first := New(st)
+	second := New(st)
+	req := ClaudeRefreshRequest{Stored: cloneCreds(stored), Effective: cloneCreds(stored), Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode}
+	winnerBasis := cloneCreds(stored)
+	winnerBasis.TokenURL = winnerSrv.URL
+
+	type result struct {
+		creds *domain.OAuthCreds
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := first.RefreshSavedClaude(context.Background(), 2, req)
+		done <- result{got, err}
+	}()
+	waitN(t, entered, 1)
+	winner, err := second.RefreshSavedClaude(context.Background(), 2, ClaudeRefreshRequest{
+		Stored: cloneCreds(stored), Effective: winnerBasis,
+		Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winner.AccessToken != "winner-access" {
+		t.Fatalf("winner did not rotate: %+v", winner)
+	}
+	close(release)
+	got := <-done
+	if !IsCredentialConflict(got.err) || got.creds != nil {
+		t.Fatalf("same-token rotation was overwritten: creds %+v err %v", got.creds, got.err)
+	}
+	st.mu.Lock()
+	final := st.creds[2]
+	st.mu.Unlock()
+	if final.AccessToken != winner.AccessToken || final.ExpiresAt != winner.ExpiresAt || final.RefreshToken != stored.RefreshToken {
+		t.Fatalf("stored row = %+v, winner %+v", final, winner)
+	}
+}
+
+func TestSavedClaudeReplacementConflictsAndClearsUnknownGrant(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	success, _ := tokenTestServer(t, func(url.Values) (int, string) {
+		return 200, `{"access_token":"replacement-access","expires_in":3600}`
+	})
+	conflictSrv, _ := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 200, `{"access_token":"obsolete-replacement","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(success.URL)
+	st.creds[3] = cloneCreds(stored)
+	svc := New(st)
+	effective := cloneCreds(stored)
+	effective.RefreshToken = "replacement-refresh"
+	effective.AccessToken = ""
+	effective.ExpiresAt = 0
+	effective.Email = ""
+	effective.AccountID = ""
+	effective.ClaudeAccountUUID = ""
+	effective.ClaudeOrgUUID = ""
+	effective.ClaudeDeviceID = ""
+	effective.ClaudeScopes = ""
+	effective.ClaudeRefreshExpiresAt = 0
+	clearReq := ClaudeRefreshRequest{Stored: cloneCreds(stored), Effective: cloneCreds(effective), Replacement: true, Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode}
+	cleared, err := svc.RefreshSavedClaude(context.Background(), 3, clearReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.AccessToken == "" || cleared.ClaudeAccountUUID != "" || cleared.ClaudeScopes != "" || cleared.ClaudeDeviceID == "" || cleared.ClaudeDeviceID == stored.ClaudeDeviceID {
+		t.Fatalf("replacement borrowed identity: %+v", cleared)
+	}
+	if cleared.TokenURL != stored.TokenURL || cleared.ClientID != stored.ClientID {
+		t.Fatalf("replacement migrated config: %+v", cleared)
+	}
+
+	conflictStored := cloneCreds(stored)
+	conflictStored.TokenURL = conflictSrv.URL
+	st.creds[3] = cloneCreds(conflictStored)
+	conflictEffective := cloneCreds(effective)
+	conflictEffective.TokenURL = conflictSrv.URL
+	conflictReq := ClaudeRefreshRequest{Stored: conflictStored, Effective: conflictEffective, Replacement: true, Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode}
+	conflictDone := make(chan error, 1)
+	go func() {
+		_, err := svc.RefreshSavedClaude(context.Background(), 3, conflictReq)
+		conflictDone <- err
+	}()
+	waitN(t, entered, 1)
+	reconnect := cloneCreds(stored)
+	reconnect.AccessToken = "reconnect-access"
+	reconnect.RefreshToken = "reconnect-refresh"
+	st.mu.Lock()
+	st.creds[3] = reconnect
+	st.mu.Unlock()
+	close(release)
+	if err := <-conflictDone; !IsCredentialConflict(err) {
+		t.Fatalf("replacement conflict err = %v", err)
+	}
+	st.mu.Lock()
+	final := st.creds[3]
+	st.mu.Unlock()
+	if final.AccessToken != "reconnect-access" || final.RefreshToken != "reconnect-refresh" {
+		t.Fatalf("replacement clobbered reconnect: %+v", final)
+	}
+}
+
+func TestSavedClaudeRefreshKeepsDeviceInitialization(t *testing.T) {
+	srv, _ := tokenTestServer(t, func(url.Values) (int, string) {
+		return 200, `{"access_token":"rotated-access","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	stored.ClaudeDeviceID = ""
+	st.creds[4] = cloneCreds(stored)
+	initialized := cloneCreds(stored)
+	initialized.ClaudeDeviceID = repeatHex("ef")
+	st.creds[4] = initialized
+	svc := New(st)
+	got, err := svc.RefreshSavedClaude(context.Background(), 4, ClaudeRefreshRequest{
+		Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+		Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != "rotated-access" || got.ClaudeDeviceID != repeatHex("ef") || got.ClaudeAccountUUID != stored.ClaudeAccountUUID {
+		t.Fatalf("device initialization lost: %+v", got)
+	}
+}
+
+func TestSavedClaudeRefreshRequiresAtomicStoreBeforeTokenCall(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
+		return 200, `{"access_token":"would-rotate","expires_in":3600}`
+	})
+	stored := savedClaudeBasis(srv.URL)
+	st := &plainStore{creds: cloneCreds(stored)}
+	svc := New(st)
+	got, err := svc.RefreshSavedClaude(context.Background(), 1, ClaudeRefreshRequest{
+		Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+		Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+	})
+	if err == nil || IsCredentialConflict(err) || IsInvalidGrant(err) || !strings.Contains(err.Error(), "atomic") {
+		t.Fatalf("missing provider-aware CAS err = %v", err)
+	}
+	if got != nil {
+		t.Fatalf("missing provider-aware CAS returned credentials: %+v", got)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("token endpoint called %d times before the capability check", hits.Load())
+	}
+	if st.writes != 0 {
+		t.Fatalf("store writes = %d, want 0", st.writes)
+	}
+}
+
+// plainStore has the legacy whole-blob and blob-only CAS capabilities but not
+// the provider-aware conditional write. A saved Claude refresh must fail before
+// it rotates the refresh token.
+type plainStore struct {
+	creds  *domain.OAuthCreds
+	writes int
+}
+
+func (p *plainStore) GetProvider(context.Context, int64) (*domain.Provider, error) {
+	cp := *p.creds
+	return &domain.Provider{ID: 1, Protocol: domain.ProtocolClaudeCode, AuthMethod: domain.AuthOAuth, OAuthCreds: &cp}, nil
+}
+
+func (p *plainStore) UpdateProviderOAuth(context.Context, int64, *domain.OAuthCreds) error {
+	p.writes++
+	return nil
+}
+
+func (p *plainStore) UpdateProviderOAuthCAS(context.Context, int64, func(*domain.OAuthCreds) (*domain.OAuthCreds, bool, error)) (*domain.OAuthCreds, error) {
+	p.writes++
+	return nil, errors.New("blob-only CAS is not enough for a saved Claude refresh")
+}
+
+func TestSavedClaudeRefreshRejectsConnectionSwitchDuringCall(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	srv, _ := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 200, `{"access_token":"obsolete-access","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	st.creds[5] = cloneCreds(stored)
+	svc := New(st)
+	done := make(chan struct {
+		creds *domain.OAuthCreds
+		err   error
+	}, 1)
+	go func() {
+		got, err := svc.RefreshSavedClaude(context.Background(), 5, ClaudeRefreshRequest{
+			Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+			Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+		})
+		done <- struct {
+			creds *domain.OAuthCreds
+			err   error
+		}{got, err}
+	}()
+	waitN(t, entered, 1)
+
+	st.setConnection(5, domain.AuthOAuth, domain.ProtocolAnthropic)
+	close(release)
+	got := <-done
+	if !IsCredentialConflict(got.err) || got.creds != nil {
+		t.Fatalf("connection switch: creds %+v err %v, want conflict", got.creds, got.err)
+	}
+	st.mu.Lock()
+	final := st.creds[5]
+	st.mu.Unlock()
+	if final.AccessToken != "stored-access" || final.ExpiresAt != 11 {
+		t.Fatalf("connection switch received stale rotation: %+v", final)
+	}
+}
+
+func TestSavedClaudeRefreshMapsDeletionToConflict(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	srv, _ := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 200, `{"access_token":"obsolete-access","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	st.creds[6] = cloneCreds(stored)
+	svc := New(st)
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.RefreshSavedClaude(context.Background(), 6, ClaudeRefreshRequest{
+			Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+			Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+		})
+		done <- err
+	}()
+	waitN(t, entered, 1)
+
+	st.mu.Lock()
+	delete(st.creds, 6)
+	st.mu.Unlock()
+	close(release)
+	if err := <-done; !IsCredentialConflict(err) {
+		t.Fatalf("deletion during refresh err = %v, want conflict", err)
+	}
+	if st.writes.Load() != 0 {
+		t.Fatalf("deletion during refresh wrote %d times", st.writes.Load())
+	}
+}
+
+func TestSavedClaudeRefreshDeletionOverridesUpstreamFailure(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	srv, _ := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 400, `{"error":"invalid_grant","error_description":"refresh token is invalid"}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	st.creds[7] = cloneCreds(stored)
+	svc := New(st)
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.RefreshSavedClaude(context.Background(), 7, ClaudeRefreshRequest{
+			Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+			Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+		})
+		done <- err
+	}()
+	waitN(t, entered, 1)
+
+	st.mu.Lock()
+	delete(st.creds, 7)
+	st.mu.Unlock()
+	close(release)
+	err := <-done
+	if !IsCredentialConflict(err) || IsInvalidGrant(err) {
+		t.Fatalf("deleted row classification err = %v, want conflict, not reconnect required", err)
+	}
+}
+
+func TestSavedClaudeRefreshStoreFailureKeepsUpstreamError(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	srv, _ := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 400, `{"error":"invalid_grant","error_description":"refresh token is invalid"}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	st.creds[8] = cloneCreds(stored)
+	svc := New(st)
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.RefreshSavedClaude(context.Background(), 8, ClaudeRefreshRequest{
+			Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+			Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+		})
+		done <- err
+	}()
+	waitN(t, entered, 1)
+
+	st.mu.Lock()
+	st.getErr = errors.New("db unavailable")
+	st.mu.Unlock()
+	close(release)
+	err := <-done
+	if IsCredentialConflict(err) || !IsInvalidGrant(err) {
+		t.Fatalf("store failure masked upstream error: %v", err)
+	}
+}
+
+func TestSavedClaudeRefreshRejectsChangedDeviceDuringCall(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	srv, _ := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+		return 200, `{"access_token":"obsolete-access","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	st.creds[9] = cloneCreds(stored)
+	svc := New(st)
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.RefreshSavedClaude(context.Background(), 9, ClaudeRefreshRequest{
+			Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+			Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+		})
+		done <- err
+	}()
+	waitN(t, entered, 1)
+
+	// A replaced device is a different install identity, not first-use
+	// initialization of an empty one.
+	replaced := cloneCreds(stored)
+	replaced.ClaudeDeviceID = repeatHex("cd")
+	st.mu.Lock()
+	st.creds[9] = replaced
+	st.mu.Unlock()
+	close(release)
+	if err := <-done; !IsCredentialConflict(err) {
+		t.Fatalf("replaced device err = %v, want conflict", err)
+	}
+	st.mu.Lock()
+	final := st.creds[9]
+	st.mu.Unlock()
+	if final.ClaudeDeviceID != repeatHex("cd") || final.AccessToken != "stored-access" {
+		t.Fatalf("replaced device row = %+v", final)
+	}
+}
+
+func savedClaudeBasis(tokenURL string) *domain.OAuthCreds {
+	return &domain.OAuthCreds{
+		Mode: domain.OAuthManual, Preset: "custom", ClaudeCodeAuth: true,
+		AccessToken: "stored-access", RefreshToken: "stored-refresh", ExpiresAt: 11,
+		Email: "stored@example.com", TokenURL: tokenURL, ClientID: "stored-client",
+		ClaudeAccountUUID: "acct-stored", AccountID: "acct-stored", ClaudeOrgUUID: "org-stored",
+		ClaudeDeviceID: repeatHex("ab"), ClaudeScopes: "user:inference", ClaudeRefreshExpiresAt: 99,
+	}
+}
+
+// A saved row that no longer uses the Claude protocol but still carries the
+// Claude credential marker refreshes through the historical authoritative
+// write, as it did before the saved Claude refresh path existed.
+func TestRefreshAndPersistClaudeCredsOutsideClaudeProtocol(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
+		return 200, `{"access_token":"rotated-access","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedClaudeBasis(srv.URL)
+	st.creds[1] = cloneCreds(stored)
+	svc := New(st)
+	got, err := svc.RefreshAndPersist(context.Background(), 1, cloneCreds(stored))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != "rotated-access" || got.ClaudeDeviceID != stored.ClaudeDeviceID {
+		t.Fatalf("authoritative Claude refresh lost config: %+v", got)
+	}
+	st.mu.Lock()
+	persisted := st.creds[1]
+	st.mu.Unlock()
+	if persisted.AccessToken != "rotated-access" || persisted.RefreshToken != stored.RefreshToken {
+		t.Fatalf("authoritative Claude refresh not persisted: %+v", persisted)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("hits = %d, want 1", hits.Load())
+	}
 }
 
 func TestDeviceRandomFailureIsExplicit(t *testing.T) {

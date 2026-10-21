@@ -661,6 +661,7 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 	statusView = r.FormValue("refresh_view") == "status"
 
 	var savedID bool
+	var savedClaude bool
 	var id int64
 	var creds *domain.OAuthCreds
 	var err error
@@ -672,8 +673,15 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if saved != nil && saved.Protocol == domain.ProtocolClaudeCode {
+		// A config-only row is effective APIKey even when a credential blob is
+		// present. Do not rotate those tokens through the OAuth refresh path.
+		if saved.Method() != domain.AuthOAuth {
+			renderErr(saved.OAuthCreds, "provider does not use OAuth; enable OAuth to refresh")
+			return
+		}
 		// Saved Claude refresh owns its config basis. Do not build it from the
 		// current preset and then fill only empty fields.
+		savedClaude = true
 		savedID = true
 		creds = savedClaudeRefreshCreds(saved.OAuthCreds, r)
 	} else {
@@ -824,12 +832,25 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var updated *domain.OAuthCreds
-	if savedID {
+	switch {
+	case savedClaude:
+		updated, err = h.oauth.RefreshSavedClaude(r.Context(), id, oauth.ClaudeRefreshRequest{
+			Stored:      saved.OAuthCreds,
+			Effective:   creds,
+			Replacement: claudeRefreshTokenReplaced(saved.OAuthCreds, r),
+			Method:      saved.AuthMethod,
+			Protocol:    saved.Protocol,
+		})
+	case savedID:
 		updated, err = h.oauth.RefreshAndPersist(r.Context(), id, creds)
-	} else {
+	default:
 		updated, err = h.oauth.RefreshTokens(r.Context(), creds)
 	}
 	if err != nil {
+		if oauth.IsCredentialConflict(err) {
+			renderErr(creds, "credentials changed during refresh; reload and retry")
+			return
+		}
 		if oauth.IsCursorNotRotatable(err) {
 			renderErr(creds, "cursor session cannot be rotated; access token is still valid")
 			return

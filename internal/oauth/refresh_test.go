@@ -18,20 +18,43 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/store"
 )
 
 // fakeStore is a ProviderStore that records OAuth writes and lets tests inspect
 // the last persisted creds. It also counts refresh-triggered writes.
 type fakeStore struct {
-	mu       sync.Mutex
-	creds    map[int64]*domain.OAuthCreds
+	mu    sync.Mutex
+	creds map[int64]*domain.OAuthCreds
+	// conns holds the provider connection state reported by the
+	// provider-aware conditional write. A missing entry is a saved Claude
+	// OAuth row, which is what the saved-refresh tests start from.
+	conns    map[int64]fakeConn
 	writes   atomic.Int64
 	writeErr error
 	getErr   error
 }
 
+type fakeConn struct {
+	method domain.AuthMethod
+	proto  domain.Protocol
+}
+
 func newFakeStore() *fakeStore {
-	return &fakeStore{creds: map[int64]*domain.OAuthCreds{}}
+	return &fakeStore{creds: map[int64]*domain.OAuthCreds{}, conns: map[int64]fakeConn{}}
+}
+
+func (f *fakeStore) connection(id int64) fakeConn {
+	if c, ok := f.conns[id]; ok {
+		return c
+	}
+	return fakeConn{method: domain.AuthOAuth, proto: domain.ProtocolClaudeCode}
+}
+
+func (f *fakeStore) setConnection(id int64, method domain.AuthMethod, proto domain.Protocol) {
+	f.mu.Lock()
+	f.conns[id] = fakeConn{method: method, proto: proto}
+	f.mu.Unlock()
 }
 
 func (f *fakeStore) GetProvider(_ context.Context, id int64) (*domain.Provider, error) {
@@ -42,10 +65,59 @@ func (f *fakeStore) GetProvider(_ context.Context, id int64) (*domain.Provider, 
 	}
 	c, ok := f.creds[id]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, store.ErrNotFound
 	}
 	cp := *c
-	return &domain.Provider{ID: id, AuthMethod: domain.AuthOAuth, OAuthCreds: &cp}, nil
+	conn := f.connection(id)
+	return &domain.Provider{ID: id, Protocol: conn.proto, AuthMethod: conn.method, OAuthCreds: &cp}, nil
+}
+
+// UpdateProviderConnectionCAS mirrors the real store's provider-aware
+// conditional write. The callback sees the connection state and the write only
+// commits while both the credentials and that state are unchanged.
+func (f *fakeStore) UpdateProviderConnectionCAS(_ context.Context, id int64, update func(*domain.OAuthCreds, domain.AuthMethod, domain.Protocol) (*domain.OAuthCreds, bool, error)) (*domain.OAuthCreds, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		f.mu.Lock()
+		if f.writeErr != nil {
+			err := f.writeErr
+			f.mu.Unlock()
+			return nil, err
+		}
+		cur := f.creds[id]
+		conn := f.connection(id)
+		var snapshot, arg *domain.OAuthCreds
+		if cur != nil {
+			cp := *cur
+			snapshot = &cp
+			cp2 := *cur
+			arg = &cp2
+		}
+		f.mu.Unlock()
+		if snapshot == nil {
+			return nil, store.ErrNotFound
+		}
+		next, changed, err := update(arg, conn.method, conn.proto)
+		if err != nil {
+			return nil, err
+		}
+		f.mu.Lock()
+		if !reflect.DeepEqual(f.creds[id], snapshot) || f.connection(id) != conn {
+			f.mu.Unlock()
+			continue
+		}
+		if !changed {
+			out := *snapshot
+			f.mu.Unlock()
+			return &out, nil
+		}
+		cp := *next
+		f.creds[id] = &cp
+		f.writes.Add(1)
+		out := cp
+		f.mu.Unlock()
+		return &out, nil
+	}
+	return nil, errors.New("cas did not converge")
 }
 
 func (f *fakeStore) UpdateProviderOAuth(_ context.Context, id int64, creds *domain.OAuthCreds) error {
@@ -81,7 +153,7 @@ func (f *fakeStore) UpdateProviderOAuthCAS(_ context.Context, id int64, update f
 		}
 		f.mu.Unlock()
 		if snapshot == nil {
-			return nil, errors.New("not found")
+			return nil, store.ErrNotFound
 		}
 		next, changed, err := update(arg)
 		if err != nil {
@@ -1200,5 +1272,258 @@ func TestRefreshAndPersistUsesCallerCreds(t *testing.T) {
 	store.mu.Unlock()
 	if persisted.AccessToken != "tok-form" || persisted.RefreshToken != "rt-pasted" {
 		t.Errorf("persisted = %+v, want pasted basis preserved on writeback", persisted)
+	}
+}
+
+// savedGenericBasis is a generic OAuth credential on the Claude protocol. It
+// has no Claude marker, so refresh must use the generic wire and persistence
+// path while still taking the saved provider-aware CAS.
+func savedGenericBasis(tokenURL string) *domain.OAuthCreds {
+	return &domain.OAuthCreds{
+		Mode: domain.OAuthManual, Preset: "custom",
+		AccessToken: "stored-access", RefreshToken: "stored-refresh", ExpiresAt: 11,
+		Email: "stored@example.com", IDToken: "stored-id-token", AccountID: "acct-stored",
+		OrganizationID: "org-stored",
+		TokenURL:       tokenURL, ClientID: "stored-client", ClientSecret: "stored-secret",
+		Scopes: "configured-scope", RedirectURI: "http://127.0.0.1:9/stored",
+		ExtraAuthParams: map[string]string{"legacy": "1"},
+		RefreshURL:      "https://stored.example/refresh",
+	}
+}
+
+func TestSavedGenericOAuthRefreshFormWire(t *testing.T) {
+	token := idTokenWith(t, "new@example.com", "acct-new")
+	var seen url.Values
+	var contentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contentType = r.Header.Get("Content-Type")
+		_ = r.ParseForm()
+		seen = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600,"id_token":"`+token+`"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	st := newFakeStore()
+	stored := savedGenericBasis(srv.URL)
+	st.creds[10] = cloneCreds(stored)
+	svc := New(st)
+	got, err := svc.RefreshSavedClaude(context.Background(), 10, ClaudeRefreshRequest{
+		Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+		Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contentType != "application/x-www-form-urlencoded" {
+		t.Fatalf("content-type = %q", contentType)
+	}
+	if seen.Get("grant_type") != "refresh_token" || seen.Get("client_id") != "stored-client" || seen.Get("client_secret") != "stored-secret" || seen.Get("refresh_token") != "stored-refresh" {
+		t.Fatalf("form body = %#v", seen)
+	}
+	if _, ok := seen["scope"]; ok {
+		t.Fatalf("generic refresh sent scope: %#v", seen)
+	}
+	if got.ClaudeCodeAuth || got.ClaudeDeviceID != "" || got.ClaudeScopes != "" || got.ClaudeRefreshExpiresAt != 0 {
+		t.Fatalf("generic refresh invented Claude state: %+v", got)
+	}
+	if got.AccessToken != "new-access" || got.RefreshToken != "new-refresh" || got.ExpiresAt == 0 || got.IDToken != token || got.Email != "new@example.com" || got.AccountID != "acct-new" {
+		t.Fatalf("generic token result = %+v", got)
+	}
+	if got.TokenURL != stored.TokenURL || got.ClientID != stored.ClientID || got.ClientSecret != stored.ClientSecret || got.Scopes != stored.Scopes || got.RefreshJSON || got.RefreshURL != stored.RefreshURL || !reflect.DeepEqual(got.ExtraAuthParams, stored.ExtraAuthParams) {
+		t.Fatalf("generic config changed: %+v", got)
+	}
+	if stored.AccessToken != "stored-access" || stored.RefreshToken != "stored-refresh" || stored.IDToken != "stored-id-token" {
+		t.Fatalf("source credentials mutated: %+v", stored)
+	}
+	st.mu.Lock()
+	persisted := st.creds[10]
+	st.mu.Unlock()
+	if persisted.AccessToken != "new-access" || persisted.IDToken != token || persisted.Email != "new@example.com" || persisted.AccountID != "acct-new" {
+		t.Fatalf("persisted generic result = %+v", persisted)
+	}
+}
+
+func TestSavedGenericOAuthRefreshJSONWire(t *testing.T) {
+	token := idTokenWith(t, "json@example.com", "acct-json")
+	srv := jsonTokenServer(t, func(body []byte, contentType string) (int, string) {
+		if contentType != "application/json" {
+			t.Errorf("content-type = %q", contentType)
+		}
+		var m map[string]string
+		if err := json.Unmarshal(body, &m); err != nil {
+			t.Fatalf("body not JSON: %v", err)
+		}
+		if m["grant_type"] != "refresh_token" || m["client_id"] != "stored-client" || m["refresh_token"] != "stored-refresh" {
+			t.Errorf("JSON body = %#v", m)
+		}
+		if _, ok := m["client_secret"]; ok {
+			t.Errorf("generic JSON refresh sent client_secret: %#v", m)
+		}
+		return 200, `{"access_token":"json-access","refresh_token":"json-refresh","expires_in":7200,"id_token":"` + token + `"}`
+	})
+
+	st := newFakeStore()
+	stored := savedGenericBasis(srv.URL)
+	stored.RefreshJSON = true
+	st.creds[11] = cloneCreds(stored)
+	svc := New(st)
+	got, err := svc.RefreshSavedClaude(context.Background(), 11, ClaudeRefreshRequest{
+		Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+		Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.RefreshJSON || got.ClaudeCodeAuth || got.ClaudeDeviceID != "" || got.ClaudeScopes != "" {
+		t.Fatalf("generic JSON refresh changed marker/config: %+v", got)
+	}
+	if got.AccessToken != "json-access" || got.RefreshToken != "json-refresh" || got.IDToken != token || got.Email != "json@example.com" || got.AccountID != "acct-json" {
+		t.Fatalf("generic JSON token result = %+v", got)
+	}
+}
+
+func TestSavedGenericOAuthRefreshConflictsWithConcurrentChanges(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*fakeStore)
+	}{
+		{
+			name: "reconnect",
+			edit: func(st *fakeStore) {
+				st.mu.Lock()
+				next := cloneCreds(st.creds[12])
+				next.AccessToken = "winner-access"
+				next.RefreshToken = "winner-refresh"
+				st.creds[12] = next
+				st.mu.Unlock()
+			},
+		},
+		{
+			name: "same token rotation",
+			edit: func(st *fakeStore) {
+				st.mu.Lock()
+				next := cloneCreds(st.creds[12])
+				next.AccessToken = "winner-access"
+				next.ExpiresAt = 999
+				st.creds[12] = next
+				st.mu.Unlock()
+			},
+		},
+		{
+			name: "protocol switch",
+			edit: func(st *fakeStore) {
+				st.setConnection(12, domain.AuthOAuth, domain.ProtocolAnthropic)
+			},
+		},
+		{
+			name: "auth switch",
+			edit: func(st *fakeStore) {
+				st.setConnection(12, domain.AuthAPIKey, domain.ProtocolClaudeCode)
+			},
+		},
+		{
+			name: "deletion",
+			edit: func(st *fakeStore) {
+				st.mu.Lock()
+				delete(st.creds, 12)
+				st.mu.Unlock()
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			release := make(chan struct{})
+			entered := make(chan struct{}, 1)
+			srv, _ := blockingTokenServer(t, entered, release, func(url.Values) (int, string) {
+				return 200, `{"access_token":"obsolete-access","expires_in":3600}`
+			})
+			st := newFakeStore()
+			stored := savedGenericBasis(srv.URL)
+			st.creds[12] = cloneCreds(stored)
+			svc := New(st)
+
+			done := make(chan struct {
+				creds *domain.OAuthCreds
+				err   error
+			}, 1)
+			go func() {
+				got, err := svc.RefreshSavedClaude(context.Background(), 12, ClaudeRefreshRequest{
+					Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+					Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+				})
+				done <- struct {
+					creds *domain.OAuthCreds
+					err   error
+				}{got, err}
+			}()
+			waitN(t, entered, 1)
+			tc.edit(st)
+			close(release)
+			got := <-done
+			if !IsCredentialConflict(got.err) || got.creds != nil {
+				t.Fatalf("concurrent change: creds %+v err %v, want conflict", got.creds, got.err)
+			}
+			st.mu.Lock()
+			final := st.creds[12]
+			st.mu.Unlock()
+			if final != nil && final.AccessToken == "obsolete-access" {
+				t.Fatalf("obsolete generic refresh was persisted: %+v", final)
+			}
+		})
+	}
+}
+
+func TestSavedRefreshRejectsEmptyMethodBeforeTokenCall(t *testing.T) {
+	srv, hits := tokenTestServer(t, func(url.Values) (int, string) {
+		return 200, `{"access_token":"should-not-rotate","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedGenericBasis(srv.URL)
+	st.creds[13] = cloneCreds(stored)
+	svc := New(st)
+	got, err := svc.RefreshSavedClaude(context.Background(), 13, ClaudeRefreshRequest{
+		Stored: cloneCreds(stored), Effective: cloneCreds(stored),
+		Protocol: domain.ProtocolClaudeCode,
+	})
+	if err == nil || IsCredentialConflict(err) || !strings.Contains(err.Error(), "OAuth Claude provider row") {
+		t.Fatalf("empty method err = %v", err)
+	}
+	if got != nil {
+		t.Fatalf("empty method returned credentials: %+v", got)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("token endpoint called %d times", hits.Load())
+	}
+}
+
+func TestSavedGenericReplacementDoesNotInheritIdentity(t *testing.T) {
+	srv, _ := tokenTestServer(t, func(form url.Values) (int, string) {
+		if form.Get("refresh_token") != "replacement-refresh" {
+			t.Errorf("sent refresh token %q", form.Get("refresh_token"))
+		}
+		return 200, `{"access_token":"replacement-access","expires_in":3600}`
+	})
+	st := newFakeStore()
+	stored := savedGenericBasis(srv.URL)
+	st.creds[14] = cloneCreds(stored)
+	svc := New(st)
+	effective := cloneCreds(stored)
+	effective.RefreshToken = "replacement-refresh"
+	got, err := svc.RefreshSavedClaude(context.Background(), 14, ClaudeRefreshRequest{
+		Stored: cloneCreds(stored), Effective: effective, Replacement: true,
+		Method: domain.AuthOAuth, Protocol: domain.ProtocolClaudeCode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != "replacement-access" || got.ClaudeCodeAuth {
+		t.Fatalf("replacement token result = %+v", got)
+	}
+	if got.Email != "" || got.IDToken != "" || got.AccountID != "" || got.OrganizationID != "" || got.ClaudeAccountUUID != "" || got.ClaudeOrgUUID != "" || got.ClaudeScopes != "" || got.ClaudeDeviceID != "" {
+		t.Fatalf("replacement inherited identity: %+v", got)
+	}
+	if got.TokenURL != stored.TokenURL || got.ClientID != stored.ClientID || got.ClientSecret != stored.ClientSecret || got.Scopes != stored.Scopes {
+		t.Fatalf("replacement changed config: %+v", got)
 	}
 }
