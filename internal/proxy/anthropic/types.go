@@ -25,6 +25,10 @@ type messagesRequest struct {
 	CacheControl      json.RawMessage   `json:"cache_control,omitempty"`
 	Fallbacks         json.RawMessage   `json:"fallbacks,omitempty"`
 	Container         json.RawMessage   `json:"container,omitempty"`
+	// Speed is captured raw so absent, null, and any non-null value stay
+	// distinguishable. The encoder never writes it; it rejects a non-null value
+	// instead of dropping caller intent.
+	Speed json.RawMessage `json:"speed,omitempty"`
 }
 
 type anthThinking struct {
@@ -134,11 +138,13 @@ type anthTool struct {
 
 // anthCacheControl is the wire shape of one canonical explicit cache hint. An
 // empty TTL is omitted so a marker without one re-emits without one. Scope is
-// emitted only for the verified "global" value.
+// emitted only for the verified "global" value. EvictOnComplete is a pointer
+// so an explicit false is emitted and an omitted or null flag is not.
 type anthCacheControl struct {
-	Type  string `json:"type"`
-	TTL   string `json:"ttl,omitempty"`
-	Scope string `json:"scope,omitempty"`
+	Type            string `json:"type"`
+	TTL             string `json:"ttl,omitempty"`
+	Scope           string `json:"scope,omitempty"`
+	EvictOnComplete *bool  `json:"evict_on_complete,omitempty"`
 }
 
 type anthToolChoice struct {

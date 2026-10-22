@@ -38,6 +38,13 @@ type attachmentPrep struct {
 	// preserveStrictTools is true when a caller asked for strict schema
 	// enforcement, which a target must be able to express.
 	preserveStrictTools bool
+	// preserveCacheEvict is true when an eligible cache marker asked for
+	// eviction on completion. Only an explicit true requires a preserving
+	// target; ordinary hints keep the legacy drop behavior.
+	preserveCacheEvict bool
+	// rejectAnthropicSpeed is true when the caller sent a non-null Messages
+	// speed value. Only the native Anthropic Messages codec may carry it.
+	rejectAnthropicSpeed bool
 	// inlineBytes is the decoded size of locally available payloads, recorded
 	// once per request so materialize can charge remote bytes against the same
 	// budget without re-summing IR clones.
@@ -71,6 +78,8 @@ func (a *attachmentPrep) inspectDecoded(req *ir.Request) error {
 	}
 	a.preserveOutputFormat = a.legacyOutputFormat || a.portableOutputFormat != nil
 	a.preserveStrictTools = requestStrictTools(req)
+	a.preserveCacheEvict = requestCacheEviction(req)
+	a.rejectAnthropicSpeed = requestAnthropicSpeed(req)
 	n := 0
 	for _, att := range atts {
 		n += att.Bytes
@@ -92,10 +101,10 @@ func (a *attachmentPrep) needsResponsesPreservation() bool {
 }
 
 // needsAnthropicState reports request intent that must be filtered before
-// target ordering: provider-owned state, explicit output format, or strict
-// custom tools.
+// target ordering: provider-owned state, explicit output format, strict
+// custom tools, enabled cache eviction, or a Messages speed value.
 func (a *attachmentPrep) needsAnthropicState() bool {
-	return a != nil && (a.preserveAnthropicState || a.preserveOutputFormat || a.preserveStrictTools)
+	return a != nil && (a.preserveAnthropicState || a.preserveOutputFormat || a.preserveStrictTools || a.preserveCacheEvict || a.rejectAnthropicSpeed)
 }
 
 // checkThinking returns a reason when backend cannot replay signed or redacted
@@ -119,6 +128,12 @@ func (a *attachmentPrep) checkThinking(backend codec) string {
 	}
 	if a.preserveStrictTools && !preservesStrictTools(backend.id) {
 		return anthropicStrictToolsUnsupported
+	}
+	if a.preserveCacheEvict && !preservesCacheEviction(backend.id) {
+		return cacheEvictionUnsupported
+	}
+	if a.rejectAnthropicSpeed && !preservesAnthropicSpeed(backend.id) {
+		return anthropicSpeedUnsupported
 	}
 	return ""
 }

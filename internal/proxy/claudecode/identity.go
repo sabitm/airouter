@@ -124,10 +124,13 @@ type SystemBlock struct {
 	CacheControl *CacheMark
 }
 
-// CacheMark is one validated ephemeral cache marker.
+// CacheMark is one validated ephemeral cache marker. EvictOnComplete is non-nil
+// only when the caller marker stated the field; a synthesized default anchor
+// never sets it.
 type CacheMark struct {
-	TTL   string
-	Scope string
+	TTL             string
+	Scope           string
+	EvictOnComplete *bool
 }
 
 func cacheControl(ttl string) map[string]any {
@@ -144,6 +147,9 @@ func cacheControlMap(cc *CacheMark) map[string]any {
 	}
 	if cc.Scope == "global" || cc.Scope == "org" {
 		out["scope"] = cc.Scope
+	}
+	if cc.EvictOnComplete != nil {
+		out["evict_on_complete"] = *cc.EvictOnComplete
 	}
 	return out
 }

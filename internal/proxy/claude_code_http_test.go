@@ -16,12 +16,12 @@ import (
 
 func TestClaudeBetaUsesOnlyWireCachePositions(t *testing.T) {
 	provider := &domain.Provider{Protocol: domain.ProtocolClaudeCode, APIKey: "sk-ant-oat-test"}
-	schema := []byte(`{"model":"claude-sonnet-5","max_tokens":8,"system":"keep","messages":[{"role":"user","content":"hi"}],"tools":[{"name":"t","input_schema":{"type":"object","properties":{"cache_control":{"type":"object","properties":{"scope":{"const":"global"},"ttl":{"const":"1h"},"type":{"const":"evict"}}}}}}]}`)
+	schema := []byte(`{"model":"claude-sonnet-5","max_tokens":8,"system":"keep","messages":[{"role":"user","content":"hi"}],"tools":[{"name":"t","input_schema":{"type":"object","properties":{"cache_control":{"type":"object","properties":{"scope":{"const":"global"},"ttl":{"const":"1h"},"evict_on_complete":{"const":true}}}}}}]}`)
 	req := claudeBetaRequest(context.Background(), provider, schema)
 	if req.CacheScope || req.ExtendedTTL || req.CacheEvict {
 		t.Fatalf("schema keys became cache policy: %+v", req)
 	}
-	wire := []byte(`{"model":"claude-sonnet-5","max_tokens":8,"system":[{"type":"text","text":"keep","cache_control":{"type":"ephemeral","scope":"global","ttl":"1h","type":"evict"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	wire := []byte(`{"model":"claude-sonnet-5","max_tokens":8,"system":[{"type":"text","text":"keep","cache_control":{"type":"ephemeral","scope":"global","ttl":"1h","evict_on_complete":true}}],"messages":[{"role":"user","content":"hi"}]}`)
 	req = claudeBetaRequest(context.Background(), provider, wire)
 	if !req.CacheScope || !req.ExtendedTTL || !req.CacheEvict {
 		t.Fatalf("wire markers were ignored: %+v", req)

@@ -654,6 +654,205 @@ func TestDecodeRequestCacheControlUnknownKeys(t *testing.T) {
 // decode -> IR -> encode: later-block hints, all TTL forms, ordered boundaries
 // with unmarked neighbors, flat/structured consistency, and an exact re-decode
 // round trip.
+// TestDecodeEncodeCacheControlEviction covers the evict_on_complete extension
+// at every eligible request position. A non-nil pointer preserves an explicit
+// false exactly like an explicit true; null and omission stay nil and never
+// re-emit the key. Nested tool_result content has no marker slot.
+func TestDecodeEncodeCacheControlEviction(t *testing.T) {
+	body := []byte(`{
+	  "model":"m","max_tokens":16,
+	  "cache_control":{"type":"ephemeral","evict_on_complete":true},
+	  "tools":[
+	    {"name":"evict","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h","evict_on_complete":true}},
+	    {"name":"keep","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"5m","evict_on_complete":false}},
+	    {"name":"nullevict","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","evict_on_complete":null}},
+	    {"name":"plain","input_schema":{"type":"object"}}
+	  ],
+	  "system":[
+	    {"type":"text","text":"s1","cache_control":{"type":"ephemeral","evict_on_complete":true}},
+	    {"type":"text","text":"s2","cache_control":{"type":"ephemeral","evict_on_complete":false}},
+	    {"type":"text","text":"s3"}
+	  ],
+	  "messages":[
+	    {"role":"user","content":[
+	      {"type":"text","text":"u1","cache_control":{"type":"ephemeral","evict_on_complete":true}},
+	      {"type":"text","text":"u2","cache_control":{"type":"ephemeral","evict_on_complete":false}},
+	      {"type":"tool_result","tool_use_id":"t1","cache_control":{"type":"ephemeral","evict_on_complete":false},
+	       "content":[{"type":"text","text":"nested","cache_control":{"type":"ephemeral","evict_on_complete":true}}]}
+	    ]}
+	  ]
+	}`)
+
+	req, err := DecodeRequest(body)
+	if err != nil {
+		t.Fatalf("DecodeRequest: %v", err)
+	}
+	if req.Anthropic == nil || req.Anthropic.TopLevelCache == nil || req.Anthropic.TopLevelCache.EvictOnComplete == nil || !*req.Anthropic.TopLevelCache.EvictOnComplete {
+		t.Fatalf("top-level eviction = %+v", req.Anthropic)
+	}
+	wantTool := []*bool{boolPtr(true), boolPtr(false), nil, nil}
+	for i, want := range wantTool {
+		got := req.Tools[i].CacheControl
+		if !evictPtrEqual(got, want) {
+			t.Fatalf("tool[%d] eviction = %v, want %v", i, got, want)
+		}
+	}
+	wantSystem := []*bool{boolPtr(true), boolPtr(false), nil}
+	for i, want := range wantSystem {
+		if !evictPtrEqual(req.SystemBlocks[i].CacheControl, want) {
+			t.Fatalf("system[%d] eviction = %+v, want %v", i, req.SystemBlocks[i].CacheControl, want)
+		}
+	}
+	user := req.Messages[0].Content
+	if !evictPtrEqual(user[0].CacheControl, boolPtr(true)) || !evictPtrEqual(user[1].CacheControl, boolPtr(false)) || !evictPtrEqual(user[2].CacheControl, boolPtr(false)) {
+		t.Fatalf("message eviction = %+v %+v %+v", user[0].CacheControl, user[1].CacheControl, user[2].CacheControl)
+	}
+	if len(user[2].ToolResult) != 1 || user[2].ToolResult[0].CacheControl != nil {
+		t.Fatalf("nested eviction survived: %+v", user[2].ToolResult)
+	}
+
+	encoded, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeRequest: %v", err)
+	}
+	out := decodeWireOut(t, encoded)
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &top); err != nil {
+		t.Fatal(err)
+	}
+	requireMarkerRaw(t, "top-level", top["cache_control"], `{"type":"ephemeral","evict_on_complete":true}`)
+	requireMarkerRaw(t, "tool evict", out.Tools[0].CacheControl, `{"type":"ephemeral","ttl":"1h","evict_on_complete":true}`)
+	requireMarkerRaw(t, "tool keep", out.Tools[1].CacheControl, `{"type":"ephemeral","ttl":"5m","evict_on_complete":false}`)
+	requireMarkerRaw(t, "tool null evict", out.Tools[2].CacheControl, `{"type":"ephemeral"}`)
+	requireNoMarker(t, "tool plain", out.Tools[3].CacheControl)
+	var sys []wireBlockOut
+	if err := json.Unmarshal(top["system"], &sys); err != nil {
+		t.Fatalf("system not an array: %s", top["system"])
+	}
+	requireMarkerRaw(t, "system s1", sys[0].CacheControl, `{"type":"ephemeral","evict_on_complete":true}`)
+	requireMarkerRaw(t, "system s2", sys[1].CacheControl, `{"type":"ephemeral","evict_on_complete":false}`)
+	requireNoMarker(t, "system s3", sys[2].CacheControl)
+	blocks := out.Messages[0].Content
+	requireMarkerRaw(t, "u1", blocks[0].CacheControl, `{"type":"ephemeral","evict_on_complete":true}`)
+	requireMarkerRaw(t, "u2", blocks[1].CacheControl, `{"type":"ephemeral","evict_on_complete":false}`)
+	requireMarkerRaw(t, "outer tool_result", blocks[2].CacheControl, `{"type":"ephemeral","evict_on_complete":false}`)
+	var inner []wireBlockOut
+	if err := json.Unmarshal(blocks[2].Content, &inner); err != nil {
+		t.Fatalf("nested content: %v", err)
+	}
+	requireNoMarker(t, "nested eviction", inner[0].CacheControl)
+	// A null eviction value is omission, never an emitted null.
+	if bytes.Contains(encoded, []byte(`"evict_on_complete":null`)) {
+		t.Fatalf("null eviction emitted: %s", encoded)
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+func evictPtrEqual(cc *ir.CacheControl, want *bool) bool {
+	var got *bool
+	if cc != nil {
+		got = cc.EvictOnComplete
+	}
+	if want == nil {
+		return got == nil
+	}
+	return got != nil && *got == *want
+}
+
+func requireMarkerRaw(t *testing.T, path string, raw json.RawMessage, want string) {
+	t.Helper()
+	got := compactRaw(t, raw)
+	if got != want {
+		t.Fatalf("%s: cache_control = %s, want %s", path, got, want)
+	}
+}
+
+// TestDecodeRequestRejectsMalformedEviction keeps a malformed evict_on_complete
+// value a payload-free client error at eligible positions, while an excluded
+// context still ignores it silently.
+func TestDecodeRequestRejectsMalformedEviction(t *testing.T) {
+	const secret = "secret-caller-text-must-not-leak"
+	for _, value := range []string{`"yes"`, `5`, `{}`, `[]`, `"true"`} {
+		marker := `{"type":"ephemeral","evict_on_complete":` + value + `}`
+		t.Run("tool/"+value, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"m","max_tokens":1,"messages":[],"tools":[{"name":"t","description":%q,"input_schema":{},"cache_control":%s}]}`, secret, marker))
+			_, err := DecodeRequest(body)
+			if err == nil {
+				t.Fatal("malformed eviction accepted on tool")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error leaked caller content: %v", err)
+			}
+		})
+		t.Run("message/"+value, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":%q,"cache_control":%s}]}]}`, secret, marker))
+			_, err := DecodeRequest(body)
+			if err == nil {
+				t.Fatal("malformed eviction accepted on message block")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error leaked caller content: %v", err)
+			}
+		})
+		t.Run("top-level/"+value, func(t *testing.T) {
+			body := []byte(`{"model":"m","max_tokens":1,"messages":[],"cache_control":` + marker + `}`)
+			_, err := DecodeRequest(body)
+			if err == nil {
+				t.Fatal("malformed eviction accepted at top level")
+			}
+		})
+		t.Run("excluded-nested/"+value, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t0","content":[{"type":"text","text":%q,"cache_control":%s}]}]}]}`, secret, marker))
+			req, err := DecodeRequest(body)
+			if err != nil {
+				t.Fatalf("excluded malformed eviction failed decode: %v", err)
+			}
+			outer := req.Messages[0].Content[0]
+			if len(outer.ToolResult) != 1 || outer.ToolResult[0].CacheControl != nil {
+				t.Fatalf("excluded eviction captured: %+v", outer.ToolResult)
+			}
+		})
+	}
+}
+
+// TestEncodeCacheControlEvictionPresenceIsExact pins hand-built IR pointers to
+// the wire shape: a nil pointer never emits the key and an explicit false does.
+func TestEncodeCacheControlEvictionPresenceIsExact(t *testing.T) {
+	req := &ir.Request{
+		Model: "m", MaxTokens: 1,
+		Anthropic:    &ir.AnthropicRequest{TopLevelCache: &ir.CacheControl{Type: "ephemeral", EvictOnComplete: boolPtr(false)}},
+		SystemBlocks: []ir.SystemBlock{{Text: "a", CacheControl: &ir.CacheControl{Type: "ephemeral", EvictOnComplete: boolPtr(true)}}},
+		System:       "a",
+		Messages:     []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "x"}}}},
+	}
+	encoded, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeRequest: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &top); err != nil {
+		t.Fatal(err)
+	}
+	requireMarkerRaw(t, "top-level false", top["cache_control"], `{"type":"ephemeral","evict_on_complete":false}`)
+	var sys []wireBlockOut
+	if err := json.Unmarshal(top["system"], &sys); err != nil {
+		t.Fatalf("system not an array: %s", top["system"])
+	}
+	requireMarkerRaw(t, "system true", sys[0].CacheControl, `{"type":"ephemeral","evict_on_complete":true}`)
+	blocks := out0(t, top)
+	requireNoMarker(t, "unmarked block", blocks[0].CacheControl)
+}
+
+func out0(t *testing.T, top map[string]json.RawMessage) []wireBlockOut {
+	t.Helper()
+	var msgs []wireMessageOut
+	if err := json.Unmarshal(top["messages"], &msgs); err != nil {
+		t.Fatalf("messages invalid: %v", err)
+	}
+	return msgs[0].Content
+}
+
 func TestDecodeEncodeSystemCacheControl(t *testing.T) {
 	body := []byte(`{"model":"m","max_tokens":16,
 	  "system":[

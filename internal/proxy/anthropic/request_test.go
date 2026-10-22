@@ -294,3 +294,88 @@ func TestEncodeRequestMarshalFailureIsNotValidationError(t *testing.T) {
 		t.Fatalf("marshal failure mislabeled as validation error: %v", err)
 	}
 }
+
+// TestDecodeRequestSpeedRaw pins the Messages speed field to raw-value
+// semantics: absent and null are absence; any non-null JSON shape (string,
+// bool, object, array, number) is retained verbatim and alone is enough to
+// create the Anthropic-owned request state.
+func TestDecodeRequestSpeedRaw(t *testing.T) {
+	cases := []struct {
+		name    string
+		field   string
+		wantSet bool
+		wantRaw string
+	}{
+		{"absent", "", false, ""},
+		{"null", `,"speed":null`, false, ""},
+		{"fast", `,"speed":"fast"`, true, `"fast"`},
+		{"empty", `,"speed":""`, true, `""`},
+		{"false", `,"speed":false`, true, `false`},
+		{"object", `,"speed":{"mode":"fast"}`, true, `{"mode":"fast"}`},
+		{"array", `,"speed":["x"]`, true, `["x"]`},
+		{"number", `,"speed":1`, true, `1`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]` + tc.field + `}`)
+			req, err := DecodeRequest(body)
+			if err != nil {
+				t.Fatalf("DecodeRequest: %v", err)
+			}
+			if !tc.wantSet {
+				if req.Anthropic != nil {
+					t.Fatalf("absent speed built Anthropic state: %+v", req.Anthropic)
+				}
+				return
+			}
+			if req.Anthropic == nil || req.Anthropic.Speed == nil {
+				t.Fatalf("speed dropped: %+v", req.Anthropic)
+			}
+			if got := string(req.Anthropic.Speed); got != tc.wantRaw {
+				t.Fatalf("speed = %s, want %s", got, tc.wantRaw)
+			}
+			if req.Anthropic.CachePolicySet {
+				t.Fatalf("speed marked cache policy: %+v", req.Anthropic)
+			}
+		})
+	}
+}
+
+// TestEncodeRequestRejectsNonNullSpeed is the translated-encoder backstop: a
+// non-null speed on the IR is rejected payload-free instead of dropped, and
+// null or absent encodes without any speed key.
+func TestEncodeRequestRejectsNonNullSpeed(t *testing.T) {
+	for _, raw := range []string{`"fast"`, `""`, `false`, `{"mode":"fast"}`, `[1]`, `0`, `"unknown-shape"`} {
+		req := &ir.Request{
+			Model: "m", MaxTokens: 1,
+			Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+			Anthropic: &ir.AnthropicRequest{Speed: json.RawMessage(raw)},
+		}
+		for _, encode := range []func(*ir.Request) ([]byte, error){EncodeRequest, EncodeRequestClaudeCode} {
+			out, err := encode(req)
+			if err == nil {
+				t.Fatalf("speed %s accepted: %s", raw, out)
+			}
+			if _, ok := ir.AsRequestValidation(err); !ok {
+				t.Fatalf("speed %s error not a validation error: %v", raw, err)
+			}
+			if strings.Contains(err.Error(), raw) {
+				t.Fatalf("error echoed caller value %s: %v", raw, err)
+			}
+		}
+	}
+	valid := &ir.Request{
+		Model: "m", MaxTokens: 1,
+		Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+		Anthropic: &ir.AnthropicRequest{Speed: json.RawMessage("null")},
+	}
+	for _, encode := range []func(*ir.Request) ([]byte, error){EncodeRequest, EncodeRequestClaudeCode} {
+		out, err := encode(valid)
+		if err != nil {
+			t.Fatalf("null speed rejected: %v", err)
+		}
+		if strings.Contains(string(out), `"speed"`) {
+			t.Fatalf("encoded speed key leaked: %s", out)
+		}
+	}
+}

@@ -152,6 +152,7 @@ func attachAnthropicRequest(out *ir.Request, req messagesRequest) error {
 	if err != nil {
 		return fmt.Errorf("top-level cache_control: %w", err)
 	}
+	speed := anthropicSpeedValue(req.Speed)
 	metadata, err := validateOptionalObject(req.Metadata, "metadata")
 	if err != nil {
 		return err
@@ -188,7 +189,7 @@ func attachAnthropicRequest(out *ir.Request, req messagesRequest) error {
 	if err != nil {
 		return err
 	}
-	if top == nil && metadata == nil && contextManagement == nil && len(format) == 0 && budget == nil && len(fallbacks) == 0 && len(container) == 0 {
+	if top == nil && metadata == nil && contextManagement == nil && len(format) == 0 && budget == nil && len(fallbacks) == 0 && len(container) == 0 && speed == nil {
 		return nil
 	}
 	out.Anthropic = &ir.AnthropicRequest{
@@ -200,8 +201,19 @@ func attachAnthropicRequest(out *ir.Request, req messagesRequest) error {
 		Container:         container,
 		TopLevelCache:     top,
 		CachePolicySet:    top != nil,
+		Speed:             speed,
 	}
 	return nil
+}
+
+// anthropicSpeedValue normalizes the Messages speed raw: absent and JSON null
+// are nil so omission stays portable; any non-null shape is retained verbatim.
+func anthropicSpeedValue(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, nullJSON) {
+		return nil
+	}
+	return append(json.RawMessage(nil), trimmed...)
 }
 
 func requireObject(raw json.RawMessage, name string) error {
@@ -400,9 +412,10 @@ func cacheControlFromRaw(raw json.RawMessage) (*ir.CacheControl, error) {
 		return nil, nil
 	}
 	var wire struct {
-		Type  *string `json:"type"`
-		TTL   *string `json:"ttl"`
-		Scope *string `json:"scope"`
+		Type  *string         `json:"type"`
+		TTL   *string         `json:"ttl"`
+		Scope *string         `json:"scope"`
+		Evict json.RawMessage `json:"evict_on_complete"`
 	}
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		return nil, errors.New("cache_control is malformed")
@@ -422,6 +435,15 @@ func cacheControlFromRaw(raw json.RawMessage) (*ir.CacheControl, error) {
 			return nil, errors.New(`cache_control.scope must be "global"`)
 		}
 		cc.Scope = *wire.Scope
+	}
+	// evict_on_complete follows the ttl/scope shape: null is omission, and any
+	// non-null non-bool value is a payload-free client error, not a silent drop.
+	if trimmed := bytes.TrimSpace(wire.Evict); len(trimmed) > 0 && !bytes.Equal(trimmed, nullJSON) {
+		var evict bool
+		if err := json.Unmarshal(trimmed, &evict); err != nil {
+			return nil, errors.New("cache_control.evict_on_complete must be a boolean")
+		}
+		cc.EvictOnComplete = &evict
 	}
 	return cc, nil
 }
@@ -509,6 +531,12 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 		}
 	}
 	if req.Anthropic != nil {
+		// A non-null Messages speed value is caller intent the translated encoder
+		// cannot represent; fail closed instead of silently dropping it. The
+		// native Anthropic passthrough never reaches this encoder.
+		if anthropicSpeedValue(req.Anthropic.Speed) != nil {
+			return nil, ir.InvalidRequest("speed is not supported by this target")
+		}
 		metadata, err := validateOptionalObject(req.Anthropic.Metadata, "metadata")
 		if err != nil {
 			return nil, ir.InvalidRequest("metadata is malformed")
@@ -764,7 +792,7 @@ func cacheControlRaw(cc *ir.CacheControl) json.RawMessage {
 	if cc == nil {
 		return nil
 	}
-	raw, err := json.Marshal(anthCacheControl{Type: cc.Type, TTL: cc.TTL, Scope: cc.Scope})
+	raw, err := json.Marshal(anthCacheControl{Type: cc.Type, TTL: cc.TTL, Scope: cc.Scope, EvictOnComplete: cc.EvictOnComplete})
 	if err != nil {
 		return nil
 	}

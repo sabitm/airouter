@@ -59,6 +59,27 @@ func preservesAnthropicExtensions(codecID string) bool {
 	}
 }
 
+// preservesCacheEviction reports whether the codec can carry an eligible cache
+// marker with evict_on_complete. The Anthropic family shares the Messages
+// marker positions and its encoders re-emit the flag; all other codecs would
+// silently lose it, so the request is filtered instead.
+func preservesCacheEviction(codecID string) bool {
+	switch codecID {
+	case codecAnthropic, codecClaudeCode, codecOpencodeMessages:
+		return true
+	default:
+		return false
+	}
+}
+
+// preservesAnthropicSpeed is deliberately narrower than the Anthropic
+// extension set: the Messages speed field survives only a native Anthropic
+// Messages passthrough. Claude Code and OpenCode Messages are distinct codec
+// ids, so a translated target rejects the request before contact.
+func preservesAnthropicSpeed(codecID string) bool {
+	return codecID == codecAnthropic
+}
+
 // preservesAnthropicOutputFormat reports whether the codec has a native or
 // mapped slot for output_config.format. OpenAI and Responses map the supported
 // json_schema shape; other backends have no representation.
@@ -88,6 +109,8 @@ const (
 	anthropicStrictToolsUnsupported  = "strict tool schemas are not supported by this upstream format"
 	jsonObjectFormatUnsupported      = "json_object output format is not supported by this upstream format"
 	strictFalseFormatUnsupported     = "strict=false json_schema output is not supported by this upstream format"
+	cacheEvictionUnsupported         = "cache eviction is not supported by this upstream format"
+	anthropicSpeedUnsupported        = "the Messages speed field is not supported by this upstream format"
 )
 
 // outputFormatTargetReason applies per-format target support for portable
@@ -196,6 +219,80 @@ func requestStrictTools(req *ir.Request) bool {
 		}
 	}
 	return false
+}
+
+// requestCacheEviction reports an explicit evict_on_complete:true at an
+// eligible API marker position: the top-level hint, system blocks, tools, and
+// top-level message content blocks, plus the preserved raw of a server block.
+// Nested tool_result content has no marker slot and is not walked. An explicit
+// false or an omitted flag is an ordinary cache hint, not a preserving need.
+func requestCacheEviction(req *ir.Request) bool {
+	if req == nil {
+		return false
+	}
+	if req.Anthropic != nil && cacheControlEvicts(req.Anthropic.TopLevelCache) {
+		return true
+	}
+	for i := range req.SystemBlocks {
+		if cacheControlEvicts(req.SystemBlocks[i].CacheControl) {
+			return true
+		}
+	}
+	for i := range req.Tools {
+		if cacheControlEvicts(req.Tools[i].CacheControl) {
+			return true
+		}
+	}
+	for _, m := range req.Messages {
+		for i := range m.Content {
+			b := &m.Content[i]
+			if cacheControlEvicts(b.CacheControl) {
+				return true
+			}
+			if b.Type == ir.BlockServer && b.AnthropicServer != nil && serverRawCacheEvicts(b.AnthropicServer.Raw) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cacheControlEvicts(cc *ir.CacheControl) bool {
+	return cc != nil && cc.EvictOnComplete != nil && *cc.EvictOnComplete
+}
+
+// serverRawCacheEvicts inspects only the top-level cache_control object of a
+// preserved server block, matching the existing marker-recognition scope.
+func serverRawCacheEvicts(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+		return false
+	}
+	var obj struct {
+		CacheControl json.RawMessage `json:"cache_control"`
+	}
+	if json.Unmarshal(trimmed, &obj) != nil {
+		return false
+	}
+	var mark struct {
+		Type            string `json:"type"`
+		EvictOnComplete *bool  `json:"evict_on_complete"`
+	}
+	if json.Unmarshal(obj.CacheControl, &mark) != nil {
+		return false
+	}
+	return mark.Type == "ephemeral" && mark.EvictOnComplete != nil && *mark.EvictOnComplete
+}
+
+// requestAnthropicSpeed reports a non-null Messages speed value. Absent and
+// null are portable omission; any non-null shape requires the native codec.
+func requestAnthropicSpeed(req *ir.Request) bool {
+	return req != nil && req.Anthropic != nil && anthropicSpeedSet(req.Anthropic.Speed)
+}
+
+func anthropicSpeedSet(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) != 0 && !bytes.Equal(trimmed, []byte("null"))
 }
 
 func anthropicServerInMessages(msgs []ir.Message) bool {

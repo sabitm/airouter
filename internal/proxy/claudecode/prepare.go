@@ -314,7 +314,18 @@ func sameCacheMark(a, b *CacheMark) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return a.TTL == b.TTL && a.Scope == b.Scope
+	if a.TTL != b.TTL || a.Scope != b.Scope {
+		return false
+	}
+	// Presence and value both matter: an explicit evict_on_complete on one side
+	// is never the same marker as an omitted one.
+	if (a.EvictOnComplete == nil) != (b.EvictOnComplete == nil) {
+		return false
+	}
+	if a.EvictOnComplete != nil && *a.EvictOnComplete != *b.EvictOnComplete {
+		return false
+	}
+	return true
 }
 
 func topLevelCachePolicy(raw json.RawMessage) bool {
@@ -373,7 +384,7 @@ func messagesCachePolicy(raw json.RawMessage) bool {
 }
 
 func defaultAnchor(mark *CacheMark) bool {
-	if mark == nil || mark.Scope != "" {
+	if mark == nil || mark.Scope != "" || mark.EvictOnComplete != nil {
 		return false
 	}
 	return mark.TTL == "5m" || mark.TTL == "1h"
@@ -391,11 +402,18 @@ func cacheMark(v any) *CacheMark {
 	if scope, ok := m["scope"].(string); ok && (scope == "global" || scope == "org") {
 		mark.Scope = scope
 	}
+	// A non-bool value is not caller policy this struct models; it stays unset
+	// so the marker cannot be mistaken for an explicit eviction choice.
+	if evict, ok := m["evict_on_complete"].(bool); ok {
+		mark.EvictOnComplete = &evict
+	}
 	return mark
 }
 
 // CacheFeatures reports structured cache-control flags at API marker positions.
-// A property named cache_control inside schema or text is not a marker.
+// A property named cache_control inside schema or text is not a marker. Eviction
+// is the verified ephemeral shape with evict_on_complete exactly true; an
+// explicit false or an invented type never activates it.
 func CacheFeatures(body []byte) (globalScope, extendedTTL, evict bool) {
 	var doc map[string]json.RawMessage
 	if json.Unmarshal(body, &doc) != nil {
@@ -412,8 +430,10 @@ func CacheFeatures(body []byte) (globalScope, extendedTTL, evict bool) {
 		if m["ttl"] == "1h" {
 			extendedTTL = true
 		}
-		if m["type"] == "evict" {
-			evict = true
+		if m["type"] == "ephemeral" {
+			if ev, ok := m["evict_on_complete"].(bool); ok && ev {
+				evict = true
+			}
 		}
 	}
 	if topLevelCachePolicy(doc["cache_control"]) {

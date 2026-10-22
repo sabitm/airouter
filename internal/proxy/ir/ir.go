@@ -63,11 +63,18 @@ type File struct {
 // "5m" or "1h". Scope is "" or "global". It is request intent only, never
 // response or usage data. Codecs that have no marker slot drop it. Only the
 // Claude Code prepare step synthesizes a marker, and only when the caller
-// stated no cache policy.
+// stated no cache policy. EvictOnComplete carries the verified
+// evict_on_complete extension: nil means the caller omitted it or sent JSON
+// null, and a non-nil pointer preserves an explicit false exactly like an
+// explicit true. A synthesized default anchor never sets it.
 type CacheControl struct {
 	Type  string
 	TTL   string
 	Scope string
+	// EvictOnComplete is nil for absent or null; true and false are explicit
+	// caller policy. Presence, not truth, is the distinction that must survive
+	// translation and re-preparation.
+	EvictOnComplete *bool
 }
 
 // SystemBlock is one ordered Anthropic system text block. SystemBlocks exists
@@ -390,6 +397,12 @@ type AnthropicRequest struct {
 	// CachePolicySet is true when the caller sent any cache_control, including
 	// a top-level marker. Claude Code uses it to avoid adding a default anchor.
 	CachePolicySet bool
+	// Speed is the Messages-only speed selector exactly as the caller sent it.
+	// Nil means absent or JSON null; any non-null value (string, bool, object,
+	// or any other JSON shape, known or unknown) is retained verbatim so a
+	// target can honor or reject it. It is body intent, not a capability flag,
+	// and only the native Anthropic Messages codec carries it.
+	Speed json.RawMessage
 }
 
 // OutputFormatJSONSchema returns the schema from output_config.format when the
