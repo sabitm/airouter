@@ -551,6 +551,11 @@ func isIdentityLine(s string) bool {
 	return s == IdentityCLI || s == IdentitySDK || s == IdentityAgent
 }
 
+// firstUserText selects the pinned CLI's fingerprint input: the first user
+// message in the encoded history and its first text block, including an empty
+// text. The scan stops at that message; missing, null, empty, non-text, or
+// malformed content yields an empty input and never falls through to a later
+// user message or a later block.
 func firstUserText(raw json.RawMessage) string {
 	if len(raw) == 0 || raw[0] != '[' {
 		return ""
@@ -563,28 +568,32 @@ func firstUserText(raw json.RawMessage) string {
 		return ""
 	}
 	for _, m := range msgs {
-		if m.Role != "user" || len(m.Content) == 0 {
+		if m.Role != "user" {
 			continue
+		}
+		if len(m.Content) == 0 || string(m.Content) == "null" {
+			return ""
 		}
 		if m.Content[0] == '"' {
 			var s string
-			if json.Unmarshal(m.Content, &s) == nil {
-				return s
+			if json.Unmarshal(m.Content, &s) != nil {
+				return ""
 			}
-			continue
+			return s
 		}
 		var blocks []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		}
 		if json.Unmarshal(m.Content, &blocks) != nil {
-			continue
+			return ""
 		}
 		for _, b := range blocks {
-			if (b.Type == "" || b.Type == "text") && b.Text != "" {
+			if b.Type == "" || b.Type == "text" {
 				return b.Text
 			}
 		}
+		return ""
 	}
 	return ""
 }
