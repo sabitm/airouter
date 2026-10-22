@@ -361,6 +361,11 @@ type Request struct {
 	// or null; a non-nil pointer preserves an explicit empty list. Entries keep
 	// caller order and are not filtered; unknown entries pass through.
 	Include *[]string
+	// OutputFormat is portable structured-output intent from an OpenAI Chat
+	// response_format or Responses text.format. Source records the ingress codec
+	// so a native passthrough preserves unknown or provider-native shapes. It is
+	// distinct from Anthropic.OutputFormat, which remains provider-owned state.
+	OutputFormat *OutputFormat
 	// Anthropic is provider-owned Messages state. Nil means the caller sent no
 	// Anthropic-only field. A non-Anthropic target must reject it before send.
 	Anthropic *AnthropicRequest

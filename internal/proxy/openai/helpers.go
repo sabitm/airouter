@@ -228,6 +228,59 @@ func rejectProviderOwnedTool(t ir.Tool) error {
 	return nil
 }
 
+// encodeResponseFormat maps portable intent first, then falls back to the
+// existing Anthropic-owned output_config.format mapping. A portable format keeps
+// OpenAI envelope fields and raw schema tokens. Unknown or malformed intent
+// fails before the request is marshaled.
+func encodeResponseFormat(req *ir.Request) (json.RawMessage, error) {
+	portable, err := req.EffectivePortableOutputFormat()
+	if err != nil {
+		return nil, err
+	}
+	if portable == nil {
+		if req.Anthropic == nil {
+			return nil, nil
+		}
+		return responseFormat(req.Anthropic)
+	}
+	if err := portable.Validate(); err != nil {
+		return nil, err
+	}
+	switch portable.Type {
+	case ir.OutputFormatJSONSchema:
+		js := map[string]any{
+			"name":   portable.Name,
+			"schema": json.RawMessage(portable.Schema),
+		}
+		if portable.Description != nil {
+			js["description"] = *portable.Description
+		}
+		switch {
+		case portable.Strict != nil:
+			js["strict"] = *portable.Strict
+		case portable.StrictNull:
+			// Explicit null stays null: OpenAI request types type strict as
+			// Optional[bool], so null must survive, not collapse to omission.
+			js["strict"] = nil
+		}
+		body := map[string]any{
+			"type":        "json_schema",
+			"json_schema": js,
+		}
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		return raw, nil
+	case ir.OutputFormatJSONObject:
+		return json.RawMessage(`{"type":"json_object"}`), nil
+	case ir.OutputFormatText:
+		return json.RawMessage(`{"type":"text"}`), nil
+	default:
+		return nil, ir.InvalidRequest("output format type is not supported")
+	}
+}
+
 // responseFormat maps a validated Anthropic output_config.format to the
 // standard OpenAI json_schema response_format. The schema is preserved. OpenAI
 // requires a name, so a schema title is used when it is a safe identifier and

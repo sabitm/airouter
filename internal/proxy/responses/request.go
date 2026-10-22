@@ -41,6 +41,7 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		out.Tools = append(out.Tools, ir.Tool{Name: t.Name, Description: t.Description, Parameters: t.Parameters, Strict: t.Strict})
 	}
 	out.ToolChoice = decodeToolChoice(req.ToolChoice)
+	out.OutputFormat = decodeResponseTextFormat(req.Text)
 	msgs, err := decodeInput(req.Input, &out.System)
 	if err != nil {
 		return nil, err
@@ -285,17 +286,15 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	if req.ToolChoice != nil {
 		out["tool_choice"] = encodeToolChoice(req.ToolChoice)
 	}
-	if req.Anthropic != nil {
-		if len(req.Anthropic.Metadata) > 0 {
-			out["metadata"] = json.RawMessage(req.Anthropic.Metadata)
-		}
-		text, err := responseTextFormat(req.Anthropic)
-		if err != nil {
-			return nil, err
-		}
-		if len(text) > 0 {
-			out["text"] = text
-		}
+	if req.Anthropic != nil && len(req.Anthropic.Metadata) > 0 {
+		out["metadata"] = json.RawMessage(req.Anthropic.Metadata)
+	}
+	text, err := encodeTextFormat(req)
+	if err != nil {
+		return nil, err
+	}
+	if len(text) > 0 {
+		out["text"] = text
 	}
 	caps := thinking.CapsFor(req.Model, domain.ProtocolOpenAIResponses, domain.ReasoningOpenAI)
 	if cfg := thinking.Effective(thinking.FromIR(req.Thinking), caps); cfg != nil {

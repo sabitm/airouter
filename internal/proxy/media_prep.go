@@ -24,9 +24,17 @@ type attachmentPrep struct {
 	// preserveAnthropicState is true when the request carries typed server
 	// tools, server blocks, or other Anthropic-only fields.
 	preserveAnthropicState bool
-	// preserveOutputFormat is true when the caller explicitly asked for
-	// output_config.format. Targets must map it or reject before send.
+	// preserveOutputFormat is true when the caller explicitly asked for a
+	// structured output format. Targets must map it or reject before send.
 	preserveOutputFormat bool
+	// legacyOutputFormat is the Anthropic-owned output_config.format field.
+	// portableOutputFormat is OpenAI Chat response_format or Responses
+	// text.format. They stay separate until a conflict check proves equivalence.
+	legacyOutputFormat   bool
+	portableOutputFormat *ir.OutputFormat
+	// outputFormatErr is a payload-free conflict or validation reason discovered
+	// before target ordering.
+	outputFormatErr string
 	// preserveStrictTools is true when a caller asked for strict schema
 	// enforcement, which a target must be able to express.
 	preserveStrictTools bool
@@ -52,7 +60,16 @@ func (a *attachmentPrep) inspectDecoded(req *ir.Request) error {
 	a.preserveThinking = requiresAnthropicThinking(req)
 	a.preserveResponsesState = requestResponsesOwnedState(req)
 	a.preserveAnthropicState = requestAnthropicOwnedState(req)
-	a.preserveOutputFormat = requestAnthropicOutputFormat(req)
+	a.legacyOutputFormat = requestAnthropicOutputFormat(req)
+	a.portableOutputFormat = nil
+	a.outputFormatErr = ""
+	if req != nil {
+		a.portableOutputFormat = req.OutputFormat
+		if _, err := req.EffectivePortableOutputFormat(); err != nil {
+			a.outputFormatErr = err.Error()
+		}
+	}
+	a.preserveOutputFormat = a.legacyOutputFormat || a.portableOutputFormat != nil
 	a.preserveStrictTools = requestStrictTools(req)
 	n := 0
 	for _, att := range atts {
@@ -97,11 +114,32 @@ func (a *attachmentPrep) checkThinking(backend codec) string {
 	if a.preserveAnthropicState && !preservesAnthropicExtensions(backend.id) {
 		return anthropicStateUnsupported
 	}
-	if a.preserveOutputFormat && !preservesAnthropicOutputFormat(backend.id) {
-		return anthropicOutputFormatUnsupported
+	if reason := a.checkOutputFormat(backend.id); reason != "" {
+		return reason
 	}
 	if a.preserveStrictTools && !preservesStrictTools(backend.id) {
 		return anthropicStrictToolsUnsupported
+	}
+	return ""
+}
+
+// checkOutputFormat applies per-format target support. A portable format with
+// the same codec id is a native passthrough, so unknown or malformed native
+// fields stay untouched. Legacy Anthropic output_config.format keeps its
+// existing codec capability rule. A portable format on any other target must be
+// validated and representable; otherwise the target is filtered before network.
+func (a *attachmentPrep) checkOutputFormat(codecID string) string {
+	if a == nil || !a.preserveOutputFormat {
+		return ""
+	}
+	if a.outputFormatErr != "" {
+		return a.outputFormatErr
+	}
+	if a.portableOutputFormat != nil {
+		return outputFormatTargetReason(codecID, a.portableOutputFormat)
+	}
+	if !preservesAnthropicOutputFormat(codecID) {
+		return anthropicOutputFormatUnsupported
 	}
 	return ""
 }

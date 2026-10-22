@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -265,6 +266,76 @@ func rejectProviderOwnedTool(t ir.Tool) error {
 		return ir.InvalidRequest("provider-only tool controls are not supported by this format")
 	}
 	return nil
+}
+
+// decodeResponseTextFormat extracts the portable format from the Responses text
+// object. Other text siblings such as verbosity are not interpreted here and
+// stay untouched on a same-codec passthrough. A malformed text or format keeps
+// invalid intent so translated requests fail instead of dropping it.
+func decodeResponseTextFormat(raw json.RawMessage) *ir.OutputFormat {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] != '{' || !json.Valid(trimmed) {
+		return &ir.OutputFormat{Source: "oai-responses", InvalidReason: "text must be an object"}
+	}
+	var text struct {
+		Format json.RawMessage `json:"format"`
+	}
+	if json.Unmarshal(trimmed, &text) != nil {
+		return &ir.OutputFormat{Source: "oai-responses", InvalidReason: "text must be an object"}
+	}
+	format := bytes.TrimSpace(text.Format)
+	if len(format) == 0 || bytes.Equal(format, []byte("null")) {
+		return nil
+	}
+	return ir.DecodeResponsesFormat(format, "oai-responses")
+}
+
+// encodeTextFormat maps portable intent first, then falls back to the existing
+// Anthropic-owned output_config.format mapping. Schema and envelope fields stay
+// raw so number tokens survive and explicit false remains present.
+func encodeTextFormat(req *ir.Request) (json.RawMessage, error) {
+	portable, err := req.EffectivePortableOutputFormat()
+	if err != nil {
+		return nil, err
+	}
+	if portable == nil {
+		if req.Anthropic == nil {
+			return nil, nil
+		}
+		return responseTextFormat(req.Anthropic)
+	}
+	if err := portable.Validate(); err != nil {
+		return nil, err
+	}
+	format := map[string]any{}
+	switch portable.Type {
+	case ir.OutputFormatJSONSchema:
+		format["type"] = "json_schema"
+		format["name"] = portable.Name
+		format["schema"] = json.RawMessage(portable.Schema)
+		if portable.Description != nil {
+			format["description"] = *portable.Description
+		}
+		switch {
+		case portable.Strict != nil:
+			format["strict"] = *portable.Strict
+		case portable.StrictNull:
+			// Explicit null stays null: Optional[bool] null must survive, not
+			// collapse to omission.
+			format["strict"] = nil
+		}
+	case ir.OutputFormatJSONObject:
+		format["type"] = "json_object"
+	case ir.OutputFormatText:
+		format["type"] = "text"
+	default:
+		return nil, ir.InvalidRequest("output format type is not supported")
+	}
+	body := map[string]any{"format": format}
+	return json.Marshal(body)
 }
 
 // responseTextFormat maps a validated Anthropic output_config.format to the

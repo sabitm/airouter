@@ -32,6 +32,7 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 	out.StopSequences = parseStop(req.Stop)
 	out.Tools = decodeTools(req.Tools)
 	out.ToolChoice = decodeToolChoice(req.ToolChoice)
+	out.OutputFormat = ir.DecodeChatResponseFormat(req.ResponseFormat, "oai-chat")
 	out.Thinking = thinking.ToIR(thinking.FromOpenAIEffort(req.ReasoningEffort))
 
 	var systemParts []string
@@ -222,12 +223,12 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	}
 	if req.Anthropic != nil {
 		out.Metadata = req.Anthropic.Metadata
-		format, err := responseFormat(req.Anthropic)
-		if err != nil {
-			return nil, err
-		}
-		out.ResponseFormat = format
 	}
+	format, err := encodeResponseFormat(req)
+	if err != nil {
+		return nil, err
+	}
+	out.ResponseFormat = format
 	// Transport-default OpenAI dialect. Preserve explicit effort values here;
 	// only the provider-aware Codex finalizer applies model capability mapping.
 	caps := thinking.CapsFor(req.Model, domain.ProtocolOpenAI, domain.ReasoningOpenAI)

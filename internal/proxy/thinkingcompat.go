@@ -86,7 +86,51 @@ const (
 	anthropicStateUnsupported        = "provider-owned Anthropic tool or request state is not supported by this upstream format"
 	anthropicOutputFormatUnsupported = "output format is not supported by this upstream format"
 	anthropicStrictToolsUnsupported  = "strict tool schemas are not supported by this upstream format"
+	jsonObjectFormatUnsupported      = "json_object output format is not supported by this upstream format"
+	strictFalseFormatUnsupported     = "strict=false json_schema output is not supported by this upstream format"
 )
+
+// outputFormatTargetReason applies per-format target support for portable
+// structured-output intent. Same-source native passthrough is exempt so a shape
+// this proxy does not model is still forwarded unchanged. OpenAI Chat and
+// Responses can carry json_schema and json_object. Anthropic-family targets can
+// carry json_schema only, and only when the caller did not ask for non-strict
+// output. Codex is absent because its encoder does not emit text.format; it is
+// filtered instead of silently dropping the caller requirement.
+func outputFormatTargetReason(codecID string, f *ir.OutputFormat) string {
+	if f == nil {
+		return ""
+	}
+	if f.Source != "" && f.Source == codecID {
+		return ""
+	}
+	if err := f.Validate(); err != nil {
+		return err.Error()
+	}
+	switch f.Type {
+	case ir.OutputFormatJSONSchema:
+		switch codecID {
+		case codecAnthropic, codecClaudeCode, codecOpencodeMessages:
+			if f.Strict != nil && !*f.Strict {
+				return strictFalseFormatUnsupported
+			}
+			return ""
+		case "oai-chat", "oai-responses", "opencode-chat", "opencode-responses":
+			return ""
+		}
+	case ir.OutputFormatJSONObject:
+		switch codecID {
+		case "oai-chat", "oai-responses", "opencode-chat", "opencode-responses":
+			return ""
+		case codecAnthropic, codecClaudeCode, codecOpencodeMessages:
+			return jsonObjectFormatUnsupported
+		}
+	case ir.OutputFormatText:
+		// Text is the unconstrained default; omitting the format represents it.
+		return ""
+	}
+	return anthropicOutputFormatUnsupported
+}
 
 // requestAnthropicOwnedState reports caller state that must not be converted
 // into a custom tool or dropped on a non-Anthropic backend. Portable metadata

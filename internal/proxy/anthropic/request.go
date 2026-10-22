@@ -495,6 +495,19 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 			DisableParallelToolUse: req.ToolChoice.DisableParallel,
 		}
 	}
+	portableFormat, err := req.EffectivePortableOutputFormat()
+	if err != nil {
+		return nil, err
+	}
+	if portableFormat != nil {
+		format, err := encodePortableOutputFormat(portableFormat)
+		if err != nil {
+			return nil, err
+		}
+		if len(format) > 0 {
+			out.OutputConfig = &anthOutputConfig{Format: format}
+		}
+	}
 	if req.Anthropic != nil {
 		metadata, err := validateOptionalObject(req.Anthropic.Metadata, "metadata")
 		if err != nil {
@@ -520,7 +533,7 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 		out.CacheControl = cacheControlRaw(req.Anthropic.TopLevelCache)
 		out.Fallbacks = fallbacks
 		out.Container = container
-		if len(req.Anthropic.OutputFormat) > 0 {
+		if portableFormat == nil && len(req.Anthropic.OutputFormat) > 0 {
 			if out.OutputConfig == nil {
 				out.OutputConfig = &anthOutputConfig{}
 			}
@@ -553,6 +566,40 @@ func encodeRequest(req *ir.Request, protocol domain.Protocol) ([]byte, error) {
 	}
 	applyThinking(&out, req, protocol)
 	return json.Marshal(out)
+}
+
+// encodePortableOutputFormat maps portable structured-output intent onto the
+// Anthropic output_config.format shape per the approved policy: the Claude
+// schema slot's supported mapping is type plus schema only, so OpenAI envelope
+// name and description are not invented as wire fields and no strict member is
+// emitted. Explicit strict false asks for non-enforced output, which this
+// enforced schema slot cannot represent, so it fails closed (this mapping is a
+// policy decision, not a verified guarantee of complete upstream enforcement).
+// Strict true, omission, and explicit strict:null all count as unspecified and
+// match the enforced slot. json_object has no equivalent schema and is rejected
+// rather than rewritten. Text is the unconstrained default and needs no format
+// object.
+func encodePortableOutputFormat(f *ir.OutputFormat) (json.RawMessage, error) {
+	if err := f.Validate(); err != nil {
+		return nil, err
+	}
+	switch f.Type {
+	case ir.OutputFormatJSONSchema:
+		if f.Strict != nil && !*f.Strict {
+			return nil, ir.InvalidRequest("strict=false json_schema output is not supported by this target")
+		}
+		body := map[string]any{
+			"type":   "json_schema",
+			"schema": json.RawMessage(f.Schema),
+		}
+		return json.Marshal(body)
+	case ir.OutputFormatJSONObject:
+		return nil, ir.InvalidRequest("json_object output format is not supported by this target")
+	case ir.OutputFormatText:
+		return nil, nil
+	default:
+		return nil, ir.InvalidRequest("output format type is not supported")
+	}
 }
 
 // applyThinking writes Anthropic thinking fields from IR. Anthropic rejects
