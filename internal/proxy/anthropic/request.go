@@ -574,6 +574,16 @@ func applyThinking(out *messagesRequest, req *ir.Request, protocol domain.Protoc
 		display = req.Thinking.Display
 	}
 	if cfg.Mode == thinking.ModeNone {
+		if caps.OmitOnDisable {
+			out.Thinking = nil
+			if out.OutputConfig != nil {
+				out.OutputConfig.Effort = ""
+				if len(out.OutputConfig.Format) == 0 && out.OutputConfig.TaskBudget == nil {
+					out.OutputConfig = nil
+				}
+			}
+			return
+		}
 		// Disabled thinking carries no display or budget fields.
 		out.Thinking = &anthThinking{Type: "disabled"}
 		return

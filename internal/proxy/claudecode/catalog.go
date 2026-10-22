@@ -1,5 +1,7 @@
 package claudecode
 
+import "airouter/internal/proxy/thinking"
+
 // modelCaps is one row of the 2.1.303 first-party catalog. Empty capability
 // lists are empty. They are not inferred from the family name.
 type modelCaps struct {
@@ -44,50 +46,9 @@ var catalog = map[string]modelCaps{
 	"claude-mythos-5-1": {Adaptive: true, Effort: true, MaxEffort: true, XHigh: true, RejectsDisabled: true, ContextMgmt: true, OneMillion: true, MaxOutput: 128000},
 }
 
-// datedCatalog maps a first-party dated id onto the catalog id.
-var datedCatalog = map[string]string{
-	"claude-haiku-4-5-20251001": "claude-haiku-4-5",
-}
-
 // LookupModel returns the catalog row for a model id. ok is false when the
 // id is not in the pinned table. A false row is not a guess.
 func LookupModel(model string) (modelCaps, bool) {
-	id := canonicalModel(model)
-	if mapped, ok := datedCatalog[id]; ok {
-		id = mapped
-	}
-	// A trailing date suffix on a known family still maps when the undated id
-	// is in the catalog. This covers first-party ids such as
-	// claude-haiku-4-5-20251001 without treating an unknown name as that family.
-	if _, ok := catalog[id]; !ok {
-		if i := stringsLastDate(id); i > 0 {
-			if _, ok := catalog[id[:i]]; ok {
-				id = id[:i]
-			}
-		}
-	}
-	row, ok := catalog[id]
+	row, ok := catalog[thinking.ClaudeCodeCapabilityID(model)]
 	return row, ok
-}
-
-func stringsLastDate(id string) int {
-	// claude-haiku-4-5-20251001 -> cut before -20251001
-	for i := len(id) - 1; i >= 0; i-- {
-		if id[i] == '-' && i+9 == len(id) && allDigits(id[i+1:]) {
-			return i
-		}
-	}
-	return -1
-}
-
-func allDigits(s string) bool {
-	if len(s) != 8 {
-		return false
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
 }

@@ -267,13 +267,14 @@ func Effective(cfg *Config, caps Caps) *Config {
 }
 
 // EffectiveForDialect applies capability clamps. Grok skips the none-to-min upgrade
-// so writeGrokNative can omit effort instead of forcing low.
+// so writeGrokNative can omit effort instead of forcing low. OmitOnDisable also
+// keeps none so the writers remove stale controls and send no thinking field.
 func EffectiveForDialect(cfg *Config, caps Caps, dialect domain.ReasoningDialect) *Config {
 	if cfg == nil || !caps.Reasoning || caps.Format == FormatNone {
 		return nil
 	}
 	out := *cfg
-	if out.Mode == ModeNone && !caps.CanDisable && dialect != domain.ReasoningGrok {
+	if out.Mode == ModeNone && !caps.OmitOnDisable && !caps.CanDisable && dialect != domain.ReasoningGrok {
 		out = Config{Mode: ModeLevel, Level: MinAcceptedLevel(caps)}
 	}
 	return &out
@@ -592,6 +593,10 @@ func writeOpenAIResponses(m map[string]any, cfg *Config, caps Caps, protocol dom
 
 func writeClaudeAdaptive(m map[string]any, cfg *Config, caps Caps) {
 	if cfg.Mode == ModeNone {
+		if caps.OmitOnDisable {
+			omitClaudeThinking(m)
+			return
+		}
 		// Disabled thinking carries no display or budget fields.
 		m["thinking"] = map[string]any{"type": "disabled"}
 		return
@@ -623,6 +628,10 @@ func writeClaudeAdaptive(m map[string]any, cfg *Config, caps Caps) {
 
 func writeClaudeBudget(m map[string]any, cfg *Config, caps Caps) {
 	if cfg.Mode == ModeNone {
+		if caps.OmitOnDisable {
+			omitClaudeThinking(m)
+			return
+		}
 		m["thinking"] = map[string]any{"type": "disabled"}
 		return
 	}
@@ -674,6 +683,21 @@ func ReconcileMaxTokens(m map[string]any, budget, maxOutput int) {
 		if t, ok := m["thinking"].(map[string]any); ok {
 			t["budget_tokens"] = budget
 		}
+	}
+}
+
+// omitClaudeThinking matches the pinned first-party disable wire: no thinking
+// field at all. It also removes a stale caller effort while keeping unrelated
+// output_config siblings such as format and task_budget.
+func omitClaudeThinking(m map[string]any) {
+	delete(m, "thinking")
+	oc, ok := m["output_config"].(map[string]any)
+	if !ok {
+		return
+	}
+	delete(oc, "effort")
+	if len(oc) == 0 {
+		delete(m, "output_config")
 	}
 }
 

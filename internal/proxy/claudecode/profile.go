@@ -275,13 +275,12 @@ func knownBeta(flag string) bool {
 	}
 }
 
-// modelSupportsInterleavedThinking matches DYn for a first-party model:
-// claude-3 and claude-haiku-4-5 do not receive the interleaved beta. Other
-// known and unknown non-haiku-4.5 names do. This is the beta gate, not the
+// modelSupportsInterleavedThinking matches first-party DYn: claude-3 does not
+// receive the interleaved beta. Haiku 4.5 does. This is the beta gate, not the
 // thinking-capability table.
 func modelSupportsInterleavedThinking(model string) bool {
 	m := canonicalModel(model)
-	if m == "" || m == "claude-haiku-4-5" || strings.Contains(m, "claude-3-") || strings.HasPrefix(m, "claude-3") {
+	if m == "" || strings.Contains(m, "claude-3-") || strings.HasPrefix(m, "claude-3") {
 		return false
 	}
 	return true
@@ -294,7 +293,7 @@ func modelSupportsContextManagement(model string) bool {
 		"claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8",
 		"claude-opus-5", "claude-opus-5-5",
 		"claude-fable-5", "claude-fable-5-1",
-		"claude-mythos-5-1":
+		"claude-mythos-5", "claude-mythos-5-1":
 		return true
 	default:
 		return false
@@ -315,7 +314,7 @@ func modelSupportsEffort(model string) bool {
 		"claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5",
 		"claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-opus-5-5",
 		"claude-fable-5", "claude-fable-5-1",
-		"claude-mythos-5-1":
+		"claude-mythos-5", "claude-mythos-5-1":
 		return true
 	default:
 		return false
@@ -337,13 +336,5 @@ func modelSupportsOneMillion(model string) bool {
 }
 
 func canonicalModel(model string) string {
-	m := thinking.StripContextSelectors(strings.ToLower(strings.TrimSpace(model)))
-	if i := strings.LastIndex(m, "/"); i >= 0 {
-		m = m[i+1:]
-	}
-	m = strings.ReplaceAll(m, ".", "-")
-	if i := strings.Index(m, "@"); i >= 0 {
-		m = m[:i]
-	}
-	return m
+	return thinking.ClaudeCodeCapabilityID(model)
 }

@@ -30,7 +30,11 @@ const (
 type Caps struct {
 	Reasoning  bool
 	CanDisable bool
-	Format     Format
+	// OmitOnDisable sends no thinking control for an explicit disable. It is
+	// distinct from CanDisable (write a disabled field) and !CanDisable
+	// (upgrade none to the minimum accepted level).
+	OmitOnDisable bool
+	Format        Format
 	// BudgetMin/Max clamp budget formats; zero means no clamp on that side.
 	BudgetMin int
 	BudgetMax int
@@ -153,7 +157,15 @@ func claudeCaps(m string, protocol domain.Protocol) Caps {
 		MaxOutput:  64000,
 		Levels:     []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"},
 	}
-	row, known := claudeCatalogRow(m)
+	var row claudeCatalogCaps
+	var known bool
+	if protocol == domain.ProtocolClaudeCode {
+		m = ClaudeCodeCapabilityID(m)
+		row, known = claudeCodeCatalogRow(m)
+		row = claudeCodeEffectiveRow(m, row, known)
+	} else {
+		row, known = claudeCatalogRow(m)
+	}
 	if known {
 		if row.maxOutput > 0 {
 			c.MaxOutput = row.maxOutput
@@ -179,6 +191,9 @@ func claudeCaps(m string, protocol domain.Protocol) Caps {
 				c.Levels = append(c.Levels, "max")
 			}
 		}
+		if row.omitOnDisable {
+			c.OmitOnDisable = true
+		}
 		if row.rejectsDisabled {
 			c.CanDisable = false
 			c.Levels = withoutLevel(c.Levels, "none")
@@ -200,12 +215,38 @@ func claudeCaps(m string, protocol domain.Protocol) Caps {
 	return c
 }
 
+// claudeCodeCatalogRow uses only the source-listed first-party identity. It
+// does not tail-strip an arbitrary date, so an unknown dated name stays unknown.
+func claudeCodeCatalogRow(model string) (claudeCatalogCaps, bool) {
+	row, ok := claudeCatalog[ClaudeCodeCapabilityID(model)]
+	return row, ok
+}
+
+// claudeCodeEffectiveRow applies pinned runtime capabilities that the raw
+// catalog row does not encode. Mythos 5 has an empty raw capability list, but
+// the first-party runtime enables adaptive thinking, effort (including
+// max/xhigh), and disabled-thinking rejection. It also omits the thinking field
+// for an explicit disable instead of sending disabled or upgrading to low.
+func claudeCodeEffectiveRow(id string, row claudeCatalogCaps, known bool) claudeCatalogCaps {
+	if id != "claude-mythos-5" || !known {
+		return row
+	}
+	row.adaptive = true
+	row.effort = true
+	row.maxEffort = true
+	row.xhigh = true
+	row.rejectsDisabled = true
+	row.omitOnDisable = true
+	return row
+}
+
 type claudeCatalogCaps struct {
 	adaptive        bool
 	effort          bool
 	maxEffort       bool
 	xhigh           bool
 	rejectsDisabled bool
+	omitOnDisable   bool
 	nonReasoner     bool
 	maxOutput       int
 }
@@ -213,14 +254,7 @@ type claudeCatalogCaps struct {
 func claudeCatalogRow(model string) (claudeCatalogCaps, bool) {
 	// Local table mirrors claudecode.LookupModel. claudecode imports this
 	// package, so thinking must not import claudecode.
-	id := StripContextSelectors(strings.ToLower(strings.TrimSpace(model)))
-	if i := strings.LastIndex(id, "/"); i >= 0 {
-		id = id[i+1:]
-	}
-	id = strings.ReplaceAll(id, ".", "-")
-	if i := strings.Index(id, "@"); i >= 0 {
-		id = id[:i]
-	}
+	id := normalizeClaudeModel(model)
 	if mapped, ok := claudeDatedIDs[id]; ok {
 		id = mapped
 	}

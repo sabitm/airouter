@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"airouter/internal/domain"
 	"airouter/internal/proxy/ir"
 )
 
@@ -29,6 +30,69 @@ func decodeMessageBlocks(t *testing.T, raw json.RawMessage) []anthBlock {
 		t.Fatalf("message content invalid: %v (%s)", err, raw)
 	}
 	return blocks
+}
+
+func TestEncodeRequestClaudeCodeMythos5DisableOmitsThinking(t *testing.T) {
+	zero := 0
+	req := &ir.Request{
+		Model:     "claude-mythos-5",
+		MaxTokens: 32,
+		Messages: []ir.Message{{
+			Role:    ir.RoleUser,
+			Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}},
+		}},
+		Thinking: &ir.Thinking{Mode: ir.ThinkingNone, Enable: ir.ThinkingEnableDisabled},
+		Anthropic: &ir.AnthropicRequest{
+			OutputFormat: json.RawMessage(`{"type":"json_schema","schema":{"type":"object","title":"Out"}}`),
+			TaskBudget:   &ir.AnthropicTaskBudget{Total: 1000, Remaining: &zero},
+		},
+	}
+	out, err := EncodeRequestClaudeCode(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["thinking"]; ok {
+		t.Fatalf("claude-code disable wrote thinking: %s", out)
+	}
+	var oc map[string]json.RawMessage
+	if err := json.Unmarshal(doc["output_config"], &oc); err != nil {
+		t.Fatalf("decode output_config: %v; body=%s", err, out)
+	}
+	if _, ok := oc["effort"]; ok {
+		t.Fatalf("claude-code disable wrote effort: %s", out)
+	}
+	if !strings.Contains(string(oc["format"]), "json_schema") || !strings.Contains(string(oc["task_budget"]), `"remaining":0`) {
+		t.Fatalf("output_config siblings lost: %s", out)
+	}
+
+	stale := messagesRequest{
+		Thinking:     &anthThinking{Type: "adaptive"},
+		OutputConfig: &anthOutputConfig{Effort: "high", Format: json.RawMessage(`{"type":"json_object"}`)},
+	}
+	applyThinking(&stale, req, domain.ProtocolClaudeCode)
+	if stale.Thinking != nil || stale.OutputConfig == nil || stale.OutputConfig.Effort != "" {
+		t.Fatalf("encoder kept stale controls: %+v", stale)
+	}
+	if !strings.Contains(string(stale.OutputConfig.Format), "json_object") {
+		t.Fatalf("encoder dropped output_config sibling: %+v", stale.OutputConfig)
+	}
+
+	generic, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var genericDoc map[string]json.RawMessage
+	if err := json.Unmarshal(generic, &genericDoc); err != nil {
+		t.Fatal(err)
+	}
+	var genericThinking anthThinking
+	if err := json.Unmarshal(genericDoc["thinking"], &genericThinking); err != nil || genericThinking.Type != "disabled" {
+		t.Fatalf("generic mythos disable changed: %s", generic)
+	}
 }
 
 // TestEncodeRequestMalformedToolInputIsValidationError verifies a non-empty
