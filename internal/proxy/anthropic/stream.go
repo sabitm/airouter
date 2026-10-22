@@ -117,6 +117,13 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	// the source block rather than the latest merged text buffer. Completed
 	// indexes are deleted, so the map is bounded by simultaneous open blocks.
 	textOpen := map[int]bool{}
+	// toolOpen tracks source indexes of started ordinary tool_use blocks.
+	// Completed indexes are deleted, so the map stays bounded by simultaneously
+	// open tools. Closing a tool advances stoppedThrough, which rejects late
+	// argument fragments and restarts of indexes spent by any block kind. The
+	// open set is consulted before stoppedThrough so a higher index's stop
+	// cannot close a still-open lower-index tool.
+	toolOpen := map[int]bool{}
 	// explicitText reports that the source used a content_block_start text
 	// lifecycle. Legacy streams without one may start at a text delta; after an
 	// explicit start, a missing or closed index is a protocol error and must not
@@ -218,6 +225,23 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			case "tool_use":
 				if len(thinkingOpen) != 0 {
 					return ir.ProtocolError("content block started while thinking block is open")
+				}
+				if serverOpen[s.Index] != nil {
+					return ir.ProtocolError("tool block started on an open server block")
+				}
+				// A repeated start on a still-open index is tolerated identity backfill
+				// and adds no open state, so the restart and capacity checks apply only
+				// when opening a new tool index. A still-open index can sit at or below
+				// stoppedThrough once a higher index of any kind has stopped; only a
+				// spent index is a restart.
+				if !toolOpen[s.Index] {
+					if s.Index <= stoppedThrough {
+						return ir.ProtocolError("tool block restarted after stop")
+					}
+					if len(toolOpen) >= maxOpenToolBlocks {
+						return ir.ProtocolError("too many open tool blocks")
+					}
+					toolOpen[s.Index] = true
 				}
 				if err := emit(ir.StreamEvent{
 					Kind: ir.EventToolCallStart, Index: s.Index,
@@ -364,17 +388,23 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if serverOpen[d.Index] != nil {
 					return ir.ProtocolError("text delta on a server block")
 				}
+				if textOpen[d.Index] {
+					// Still open: a higher index's stop advanced stoppedThrough past
+					// this index, but its deltas keep flowing. Once this block stops,
+					// the watermark check below rejects its late deltas again.
+					if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Index: d.Index, Text: d.Delta.Text, TextIndexed: true}); err != nil {
+						return err
+					}
+					started = true
+					break
+				}
 				if d.Index <= stoppedThrough {
 					return ir.ProtocolError("text delta after block stop")
 				}
-				ev := ir.StreamEvent{Kind: ir.EventTextDelta, Text: d.Delta.Text}
-				if textOpen[d.Index] {
-					ev.Index = d.Index
-					ev.TextIndexed = true
-				} else if explicitText {
+				if explicitText {
 					return ir.ProtocolError("text delta without an open text block")
 				}
-				if err := emit(ev); err != nil {
+				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: d.Delta.Text}); err != nil {
 					return err
 				}
 				started = true
@@ -405,6 +435,15 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 					sb.bytes += len(d.Delta.PartialJSON)
 					serverOpenBytes += len(d.Delta.PartialJSON)
 					if err := emit(ir.StreamEvent{Kind: ir.EventServerDelta, Index: d.Index, ArgsFrag: d.Delta.PartialJSON}); err != nil {
+						return err
+					}
+					started = true
+					break
+				}
+				if toolOpen[d.Index] {
+					// Still open: fragments keep flowing even when a higher index's
+					// stop advanced stoppedThrough past this index.
+					if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: d.Index, ArgsFrag: d.Delta.PartialJSON}); err != nil {
 						return err
 					}
 					started = true
@@ -468,6 +507,15 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 					return err
 				}
 				started = true
+				break
+			}
+			if toolOpen[s.Index] {
+				delete(toolOpen, s.Index)
+				if s.Index > stoppedThrough {
+					stoppedThrough = s.Index
+				}
+				// Ordinary tool blocks carry no decoder-side stop event; the
+				// ingress encoder closes its open tool blocks at Finish.
 				break
 			}
 			if closeServer(s.Index) != nil {
@@ -695,6 +743,10 @@ const maxOpenThinkingBlocks = 64
 
 // maxOpenTextBlocks bounds simultaneously open source text blocks.
 const maxOpenTextBlocks = 64
+
+// maxOpenToolBlocks bounds simultaneously open source tool_use blocks.
+// Completed tools are released, so this is not a history limit.
+const maxOpenToolBlocks = 64
 
 // thinkingBlock is one open source-indexed thinking block. block is its wire
 // index after content_block_start. A signature before the start is a protocol
