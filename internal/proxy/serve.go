@@ -255,6 +255,28 @@ func terminalEncodeError(err error) attemptResult {
 	return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
 }
 
+// retryableResponseIncompatibility maps an upstream response that the ingress
+// format cannot represent to a retryable backend fault. The fixed message keeps
+// server-block content and provider metadata out of client and terminal output.
+func retryableResponseIncompatibility(in, out int, estimated bool) attemptResult {
+	ar := retryable(http.StatusBadGateway, "upstream response is not representable in the ingress format", "api_error")
+	if estimated {
+		return ar.withEstimatedTokens(in, out)
+	}
+	return ar.withTokens(in, out)
+}
+
+// terminalResponseEncodeError keeps usage decoded before an internal encoder
+// fault on the attempt row. It stays terminal and non-retryable, and an
+// explicit zero is reported as known usage rather than a missing estimate.
+func terminalResponseEncodeError(in, out int, estimated bool) attemptResult {
+	ar := terminal(http.StatusInternalServerError, "failed to encode response", "api_error")
+	if estimated {
+		return ar.withEstimatedTokens(in, out)
+	}
+	return ar.withTokens(in, out)
+}
+
 func callerCanceledResult() attemptResult {
 	return attemptResult{status: http.StatusBadGateway, errMsg: "request canceled", logErr: "request canceled", errType: "api_error"}
 }
@@ -393,6 +415,12 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 	var sawRealAttempt bool
 	var lastReal attemptResult
 	for i, t := range candidates {
+		// A canceled caller must not dispatch another provider after the previous
+		// attempt completed. The first attempt still handles its own cancellation.
+		if i > 0 && ctxErr(r.Context()) {
+			last = callerCanceledResult()
+			break
+		}
 		provider := t.Provider
 		rec.Provider = provider.Name
 		rec.UpstreamModel = t.UpstreamModel
@@ -511,14 +539,12 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// upstream_attempt_failed covers each failed provider attempt.
 		res.fail(w, ingress, status, outcome.errMsg, outcome.errType)
 		res.logErr = outcome.logErr
-		// Attachment-only skips never produce usage. A selected real failure
-		// that recorded attempt-local tokens owns the final counts so an
-		// earlier target's pre-commit decode cannot remain on reqResult.
-		if outcome.hasTok {
-			res.inTok = outcome.inTok
-			res.outTok = outcome.outTok
-			res.usageEstimated = outcome.usageEstimated
-		}
+		// The selected final outcome owns the final counts even when it has no
+		// tokens. This prevents an earlier target's usage or estimate from
+		// remaining on reqResult.
+		res.inTok = outcome.inTok
+		res.outTok = outcome.outTok
+		res.usageEstimated = outcome.usageEstimated
 	}
 }
 
@@ -762,11 +788,12 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 	res.status = status
 	// Usage is not modeled in passthrough; recover it best-effort from the raw
 	// body, which already matches the ingress format.
-	res.inTok, res.outTok = parseUsage(respBody, ingress.id)
+	inTok, outTok := parseUsage(respBody, ingress.id)
+	res.inTok, res.outTok = inTok, outTok
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(respBody)
-	return committed()
+	return committed().withTokens(inTok, outTok)
 }
 
 // serveTranslated converts the request to the backend protocol, forwards it, and
@@ -838,8 +865,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		}
 		return retryable(http.StatusBadGateway, "failed to decode upstream response", "api_error")
 	}
-	res.inTok = resp.Usage.InputTokens
-	res.outTok = resp.Usage.OutputTokens
+	inTok, outTok := resp.Usage.InputTokens, resp.Usage.OutputTokens
 	if responseDropsOpaque(resp.Content) {
 		noteAnthropicOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
@@ -848,13 +874,17 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	}
 	out, err := ingress.encodeResponse(resp)
 	if err != nil {
-		return terminal(http.StatusInternalServerError, "failed to encode response", "api_error")
+		if _, ok := ir.AsResponseIncompatibility(err); ok {
+			return retryableResponseIncompatibility(inTok, outTok, false)
+		}
+		return terminalResponseEncodeError(inTok, outTok, false)
 	}
+	res.inTok, res.outTok = inTok, outTok
 	res.status = http.StatusOK
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
-	return committed()
+	return committed().withTokens(inTok, outTok)
 }
 
 // serveStreamOnlyUnary handles a stream-only backend (Codex, Kiro) for a
@@ -902,37 +932,44 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	if responseDropsResponsesOpaque(irResp.Content) {
 		noteResponsesOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
+	// Collect-only usage is decoded before the ingress encoder can reject the
+	// response, so a failed attempt reports its own counts. Do not add the
+	// generic 0/0 estimate to an unrepresentable response.
+	inTok, outTok := irResp.Usage.InputTokens, irResp.Usage.OutputTokens
+	usageEstimated := false
+	if backend.protocol == domain.ProtocolCursor {
+		// applyCursorUsage already chose raw or estimate. Do not run the
+		// request-byte heuristic: Cursor adds context the proxy did not send.
+		usageEstimated = !irResp.Usage.UsageReported
+	} else if !usageInputPlausible(len(upstreamBody), inTok) {
+		inTok = 0
+	}
 	out, err := ingress.encodeResponse(irResp)
 	if err != nil {
-		return terminal(http.StatusInternalServerError, "failed to encode response", "api_error")
+		if _, ok := ir.AsResponseIncompatibility(err); ok {
+			return retryableResponseIncompatibility(inTok, outTok, usageEstimated)
+		}
+		return terminalResponseEncodeError(inTok, outTok, usageEstimated)
 	}
 	if int64(len(out)) > maxUnaryUpstreamResponseBytes {
 		return retryable(http.StatusBadGateway, "upstream response too large", "api_error")
 	}
-	res.status = http.StatusOK
-	res.inTok = irResp.Usage.InputTokens
-	res.outTok = irResp.Usage.OutputTokens
-	if backend.protocol == domain.ProtocolCursor {
-		// applyCursorUsage already chose raw or estimate. Do not run the
-		// request-byte heuristic: Cursor adds context the proxy did not send.
-		res.usageEstimated = !irResp.Usage.UsageReported
-	} else if !usageInputPlausible(len(upstreamBody), res.inTok) {
-		res.inTok = 0
-	}
 	// A reported Cursor 0/0 is explicit. Do not replace it with the generic estimate.
-	if res.inTok == 0 && res.outTok == 0 && !res.usageEstimated && (backend.protocol != domain.ProtocolCursor || !irResp.Usage.UsageReported) {
-		inEst, outEst := estimateUsage(req, irResp)
-		res.inTok = inEst
-		res.outTok = outEst
-		res.usageEstimated = true
+	if inTok == 0 && outTok == 0 && !usageEstimated && (backend.protocol != domain.ProtocolCursor || !irResp.Usage.UsageReported) {
+		inTok, outTok = estimateUsage(req, irResp)
+		usageEstimated = true
 	}
+	res.status = http.StatusOK
+	res.inTok = inTok
+	res.outTok = outTok
+	res.usageEstimated = usageEstimated
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
-	if res.usageEstimated {
-		return committed().withEstimatedTokens(res.inTok, res.outTok)
+	if usageEstimated {
+		return committed().withEstimatedTokens(inTok, outTok)
 	}
-	return committed().withTokens(res.inTok, res.outTok)
+	return committed().withTokens(inTok, outTok)
 }
 
 // collectStreamResponse folds backend stream events into a unary IR response.

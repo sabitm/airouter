@@ -78,3 +78,28 @@ func AsRequestValidation(err error) (*RequestValidationError, bool) {
 	}
 	return nil, false
 }
+
+// ResponseIncompatibilityError marks a valid upstream response that the
+// ingress wire format cannot carry without dropping provider-owned state. It is
+// a retryable backend fault, not caller request validation. The type is
+// payload-free so terminal logs and client errors cannot leak response content.
+type ResponseIncompatibilityError struct{}
+
+func (e *ResponseIncompatibilityError) Error() string {
+	return "upstream response is not representable in the ingress format"
+}
+
+// IncompatibleResponse returns a ResponseIncompatibilityError.
+func IncompatibleResponse() error {
+	return &ResponseIncompatibilityError{}
+}
+
+// AsResponseIncompatibility reports whether err is or wraps a
+// *ResponseIncompatibilityError.
+func AsResponseIncompatibility(err error) (*ResponseIncompatibilityError, bool) {
+	var ri *ResponseIncompatibilityError
+	if errors.As(err, &ri) {
+		return ri, true
+	}
+	return nil, false
+}

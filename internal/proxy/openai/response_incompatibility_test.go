@@ -1,0 +1,84 @@
+package openai
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"airouter/internal/proxy/ir"
+)
+
+func TestEncodeResponseRejectsServerBlocks(t *testing.T) {
+	cases := []struct {
+		name    string
+		content []ir.ContentBlock
+	}{
+		{
+			name: "server-only",
+			content: []ir.ContentBlock{{
+				Type: ir.BlockServer,
+				AnthropicServer: &ir.AnthropicServerBlock{
+					WireType: "compaction",
+					Raw:      json.RawMessage(`{"type":"compaction","content":"server-secret"}`),
+				},
+			}},
+		},
+		{
+			name: "mixed-text-and-server",
+			content: []ir.ContentBlock{
+				{Type: ir.BlockText, Text: "primary-text"},
+				{Type: ir.BlockServer, AnthropicServer: &ir.AnthropicServerBlock{
+					WireType: "compaction",
+					Raw:      json.RawMessage(`{"type":"compaction","content":"server-secret"}`),
+				}},
+			},
+		},
+		{
+			name:    "nil-server-metadata",
+			content: []ir.ContentBlock{{Type: ir.BlockServer}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := EncodeResponse(&ir.Response{Model: "m", Content: tc.content})
+			if err == nil {
+				t.Fatalf("server block became a success: %s", out)
+			}
+			if _, ok := ir.AsResponseIncompatibility(err); !ok {
+				t.Fatalf("error type = %T, want response incompatibility", err)
+			}
+			if strings.Contains(err.Error(), "primary-text") || strings.Contains(err.Error(), "server-secret") || strings.Contains(err.Error(), "compaction") {
+				t.Fatalf("error leaked response detail: %v", err)
+			}
+		})
+	}
+}
+
+func TestEncodeResponseTextAndToolsUnchanged(t *testing.T) {
+	resp := &ir.Response{
+		Model: "m",
+		Content: []ir.ContentBlock{
+			{Type: ir.BlockReasoning, Text: "plan"},
+			{Type: ir.BlockText, Text: "answer"},
+			{Type: ir.BlockToolUse, ToolID: "call_1", ToolName: "lookup", ToolInput: json.RawMessage(`{"q":"x"}`)},
+		},
+	}
+	out, err := EncodeResponse(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got chatResponse
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Choices) != 1 {
+		t.Fatalf("choices = %d", len(got.Choices))
+	}
+	msg := got.Choices[0].Message
+	if msg.Content == nil || *msg.Content != "answer" || msg.ReasoningContent != "plan" {
+		t.Fatalf("message = %+v", msg)
+	}
+	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].ID != "call_1" || msg.ToolCalls[0].Function.Name != "lookup" || msg.ToolCalls[0].Function.Arguments != `{"q":"x"}` {
+		t.Fatalf("tool calls = %+v", msg.ToolCalls)
+	}
+}

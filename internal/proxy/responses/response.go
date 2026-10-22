@@ -305,7 +305,7 @@ func buildOutput(blocks []ir.ContentBlock) ([]map[string]any, error) {
 		case ir.BlockServer:
 			// A provider-owned server block has no Responses projection. Do not
 			// return an empty successful response or a fake callable tool.
-			return nil, fmt.Errorf("responses: response server block %q is not representable", b.AnthropicServer.TypeString())
+			return nil, ir.IncompatibleResponse()
 		}
 		// BlockRedactedReasoning is omitted. Its data is not summary text.
 	}
