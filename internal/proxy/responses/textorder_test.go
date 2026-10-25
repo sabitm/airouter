@@ -602,13 +602,13 @@ func TestDecodeStreamTextOverlimit(t *testing.T) {
 					out = append(out, ev)
 					return nil
 				}, maxRetainedTextBytes, maxTrackedTextItems, tc.maxPendingBytes, tc.maxPendingItems)
-				if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_a", false, 0, "a"))); err != nil {
+				if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_a", false, 0, "a")), false); err != nil {
 					t.Fatal(err)
 				}
-				if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_b", false, 1, "ok"))); err != nil {
+				if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_b", false, 1, "ok")), false); err != nil {
 					t.Fatal(err)
 				}
-				err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_b", false, 1, tc.offending)))
+				err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_b", false, 1, tc.offending)), false)
 				if err == nil || !strings.Contains(err.Error(), "pending message text exceeded limit") {
 					t.Fatalf("err = %v, want pending message text exceeded limit", err)
 				}
@@ -633,10 +633,10 @@ func TestDecodeStreamTextOverlimit(t *testing.T) {
 			out = append(out, ev)
 			return nil
 		}, maxRetainedTextBytes, maxTrackedTextItems, maxPendingTextBytes, maxPendingTextEvents)
-		if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_a", false, 0, "hel"))); err != nil {
+		if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_a", false, 0, "hel")), false); err != nil {
 			t.Fatal(err)
 		}
-		if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_b", false, 1, "world"))); err != nil {
+		if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_b", false, 1, "world")), false); err != nil {
 			t.Fatal(err)
 		}
 		if d.queueBytes == 0 || d.textQueueEvents == 0 {
@@ -747,10 +747,10 @@ func TestDecodeStreamClosedLaterMessageDrainExactlyOnce(t *testing.T) {
 		out = append(out, ev)
 		return nil
 	}, maxRetainedTextBytes, maxTrackedTextItems, maxPendingTextBytes, maxPendingTextEvents)
-	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 0, "hel"))); err != nil {
+	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 0, "hel")), false); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_b", 1, 0, "world"))); err != nil {
+	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_b", 1, 0, "world")), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.observeMessageDone(&streamEnvelope{OutputIndex: 1, OutputIndexSet: true, Item: &streamItem{ID: "msg_b", Type: "message", Content: []respOutputContent{{Type: "output_text", Text: "world"}}}}); err != nil {
@@ -759,13 +759,13 @@ func TestDecodeStreamClosedLaterMessageDrainExactlyOnce(t *testing.T) {
 	if len(d.textQueue) == 0 {
 		t.Fatal("closed later message released before earlier closed")
 	}
-	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 0, "hel"))); err != nil {
+	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 0, "hel")), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(d.textQueue) == 0 {
 		t.Fatal("closed later message released at earlier part done")
 	}
-	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 1, "lo"))); err != nil {
+	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 1, "lo")), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.observeMessageDone(&streamEnvelope{OutputIndex: 0, OutputIndexSet: true, Item: &streamItem{ID: "msg_a", Type: "message", Content: []respOutputContent{{Type: "output_text", Text: "hel"}, {Type: "output_text", Text: "lo"}}}}); err != nil {
@@ -852,10 +852,10 @@ func TestDecodeStreamOpenMessageDeltasStayLive(t *testing.T) {
 		out = append(out, ev)
 		return nil
 	}, maxRetainedTextBytes, maxTrackedTextItems, maxPendingTextBytes, maxPendingTextEvents)
-	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 0, "a"))); err != nil {
+	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 0, "a")), false); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 0, "b"))); err != nil {
+	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 0, "b")), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(d.textQueue) != 0 || d.queueBytes != 0 || d.textQueueEvents != 0 {

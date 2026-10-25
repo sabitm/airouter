@@ -1,7 +1,9 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"airouter/internal/proxy/ir"
@@ -56,8 +58,70 @@ func chatReasoningText(content string, reasoning json.RawMessage, details []json
 	return out.String()
 }
 
-// contentToText flattens a message content field (string, null, or array of
-// parts) into plain text, concatenating any text parts.
+// captureChatRefusal records whether the assistant refusal field was present
+// and non-null, including an explicit empty string. A non-string value fails
+// closed. Null and absence stay distinct from an empty refusal.
+func captureChatRefusal(m *chatMessage) error {
+	if m == nil || isNullishRaw(m.Refusal) {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(m.Refusal, &s); err != nil {
+		return fmt.Errorf("openai: decode request: refusal must be a string")
+	}
+	m.RefusalSet = true
+	m.Refusal = mustText(s)
+	return nil
+}
+
+func isNullishRaw(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
+// decodeChatTextAndRefusal preserves ordinary content and the native refusal
+// field independently. Chat cannot express exact cross-field interleaving, so
+// each field keeps its own order. Equal refusal text is not duplicated.
+func decodeChatTextAndRefusal(content, refusal json.RawMessage, refusalSet bool) []ir.ContentBlock {
+	var blocks []ir.ContentBlock
+	if text := contentToText(content); text != "" {
+		blocks = append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: text})
+	}
+	for _, part := range decodeRefusalParts(content) {
+		blocks = append(blocks, part)
+	}
+	if !refusalSet {
+		return blocks
+	}
+	var field string
+	_ = json.Unmarshal(refusal, &field)
+	for _, b := range blocks {
+		if b.Refusal && b.Text == field {
+			return blocks
+		}
+	}
+	return append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: field, Refusal: true})
+}
+
+func decodeRefusalParts(raw json.RawMessage) []ir.ContentBlock {
+	if len(raw) == 0 || raw[0] != '[' {
+		return nil
+	}
+	var parts []chatPart
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	var out []ir.ContentBlock
+	for _, p := range parts {
+		if p.Type == "refusal" {
+			out = append(out, ir.ContentBlock{Type: ir.BlockText, Text: p.Refusal, Refusal: true})
+		}
+	}
+	return out
+}
+
 func contentToText(raw json.RawMessage) string {
 	if len(raw) == 0 || string(raw) == "null" {
 		return ""

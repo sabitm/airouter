@@ -265,14 +265,14 @@ func TestDecodeStreamMixedPartDoneKeepsLaterQueued(t *testing.T) {
 		out = append(out, ev)
 		return nil
 	}, maxRetainedTextBytes, maxTrackedTextItems, maxPendingTextBytes, maxPendingTextEvents)
-	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_a", false, 0, "p1"))); err != nil {
+	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_a", false, 0, "p1")), false); err != nil {
 		t.Fatal(err)
 	}
 	// The barrier message's own delta is live, not buffered.
 	if len(out) == 0 || out[len(out)-1].Kind != ir.EventTextDelta || out[len(out)-1].Text != "p1" {
 		t.Fatalf("barrier delta not live: %+v", out)
 	}
-	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_b", false, 1, "B"))); err != nil {
+	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_b", false, 1, "B")), false); err != nil {
 		t.Fatal(err)
 	}
 	part := &reasoningSummary{Type: "output_text", Text: "p1", TextSet: true}
@@ -431,7 +431,7 @@ func TestDecodeStreamMixedQueueReleased(t *testing.T) {
 	d.maxCalls = maxTrackedToolCalls
 	d.reasoning.orderEmit = d.orderEmitReasoning
 	d.reasoning.msgCount = func() int { return len(d.texts) }
-	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_a", false, 0, "a"))); err != nil {
+	if err := d.observeTextDelta(textDeltaEnv(t, sseTextDelta("msg_a", false, 0, "a")), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.reasoning.observeDelta(textDeltaEnv(t, reasoningDeltaEvent(1, "rs_1", 0, "R"))); err != nil {

@@ -187,6 +187,13 @@ type ContentBlock struct {
 	Image *Image // BlockImage
 	File  *File  // BlockFile
 
+	// Refusal is meaningful only on BlockText. True marks that text segment as
+	// a model refusal, including an explicit empty refusal. A zero value is ordinary
+	// text, so existing producers stay unchanged. Consecutive same-kind text may
+	// merge; a marker change starts a new segment. Do not join mixed segments and
+	// then label the whole message as a refusal.
+	Refusal bool
+
 	// Citations are provider-issued citation objects on BlockText. They are
 	// read-only annotations, not tool calls. Other block kinds ignore them.
 	Citations []Citation
@@ -459,8 +466,54 @@ const (
 	StopStopSequence StopReason = "stop_sequence"
 	StopToolUse      StopReason = "tool_use"
 	StopRefusal      StopReason = "refusal"
-	StopPauseTurn    StopReason = "pause_turn"
+	// StopContentFilter is a content-filter truncation, not a completed model
+	// refusal. A completed refusal uses StopRefusal. Explicit truncation and tool
+	// stops outrank a refusal part. Anthropic has no native content-filter stop,
+	// so this reason projects to its refusal stop as a vocabulary approximation.
+	StopContentFilter StopReason = "content_filter"
+	StopPauseTurn     StopReason = "pause_turn"
 )
+
+// ProjectUnaryRefusal returns content for one known unary Anthropic refusal.
+// StopRefusal with no explicit refusal marker and no tool or server block marks
+// every unmarked text segment in a local copy. Boundaries, order, and reasoning
+// stay unchanged. An explicit marker, a tool, a server block, or any other stop
+// returns the original slice. A textless refusal appends one empty marked block.
+// The input is not mutated.
+func ProjectUnaryRefusal(resp *Response) []ContentBlock {
+	if resp == nil {
+		return nil
+	}
+	if resp.StopReason != StopRefusal {
+		return resp.Content
+	}
+	textCount := 0
+	for _, b := range resp.Content {
+		if b.Type == BlockText && b.Refusal {
+			return resp.Content
+		}
+		if b.Type == BlockToolUse || b.Type == BlockServer {
+			return resp.Content
+		}
+		if b.Type == BlockText {
+			textCount++
+		}
+	}
+	if textCount == 0 {
+		out := make([]ContentBlock, len(resp.Content)+1)
+		copy(out, resp.Content)
+		out[len(resp.Content)] = ContentBlock{Type: BlockText, Refusal: true}
+		return out
+	}
+	out := make([]ContentBlock, len(resp.Content))
+	copy(out, resp.Content)
+	for i := range out {
+		if out[i].Type == BlockText {
+			out[i].Refusal = true
+		}
+	}
+	return out
+}
 
 // Usage is token accounting for a completed turn.
 //

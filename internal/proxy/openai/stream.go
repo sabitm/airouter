@@ -28,6 +28,7 @@ type chunkChoice struct {
 type chunkDelta struct {
 	Role             string            `json:"role,omitempty"`
 	Content          string            `json:"content,omitempty"`
+	Refusal          *string           `json:"-"`
 	ReasoningContent string            `json:"reasoning_content,omitempty"`
 	Reasoning        json.RawMessage   `json:"reasoning,omitempty"`
 	ReasoningDetails []json.RawMessage `json:"reasoning_details,omitempty"`
@@ -43,6 +44,64 @@ type chunkToolCall struct {
 type chunkFn struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
+}
+
+func (d *chunkDelta) UnmarshalJSON(data []byte) error {
+	type plain chunkDelta
+	var raw struct {
+		plain
+		Refusal json.RawMessage `json:"refusal"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*d = chunkDelta(raw.plain)
+	if len(bytes.TrimSpace(raw.Refusal)) > 0 && string(bytes.TrimSpace(raw.Refusal)) != "null" {
+		var s string
+		if err := json.Unmarshal(raw.Refusal, &s); err != nil {
+			return err
+		}
+		d.Refusal = &s
+	}
+	return nil
+}
+
+// malformedChatRefusalChunk reports a recognized chat chunk whose supported
+// refusal field is present but not a string or null. The check never echoes
+// the field value. An unrelated malformed frame returns false.
+func malformedChatRefusalChunk(raw []byte) bool {
+	var head struct {
+		Choices []struct {
+			Delta struct {
+				Refusal json.RawMessage `json:"refusal"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(raw, &head) != nil {
+		return false
+	}
+	for _, choice := range head.Choices {
+		field := bytes.TrimSpace(choice.Delta.Refusal)
+		if len(field) == 0 || string(field) == "null" || field[0] == '"' {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (d chunkDelta) MarshalJSON() ([]byte, error) {
+	type plain chunkDelta
+	raw, err := json.Marshal(plain(d))
+	if err != nil || d.Refusal == nil {
+		return raw, err
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	obj["refusal"] = *d.Refusal
+	return json.Marshal(obj)
 }
 
 // errorScalar decodes optional error metadata without failing the surrounding
@@ -103,6 +162,7 @@ func (e *chatStreamError) UnmarshalJSON(data []byte) error {
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	reader := sse.NewReader(r)
 	started := false
+	sawRefusal := false
 	var stopReason ir.StopReason = ir.StopEndTurn
 	inputTokens, outputTokens := 0, 0
 	cacheRead, cacheWrite := 0, 0
@@ -146,7 +206,13 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			return sf
 		}
 		var chunk chatChunk
-		if json.Unmarshal(ev.Data, &chunk) != nil {
+		if err := json.Unmarshal(ev.Data, &chunk); err != nil {
+			// A recognized chunk whose supported refusal field is malformed must not
+			// drop the sibling content or terminal state. Unrelated malformed frames
+			// keep the historical skip.
+			if malformedChatRefusalChunk(ev.Data) {
+				return ir.ProtocolError("openai: malformed refusal stream field")
+			}
 			continue
 		}
 		if !started {
@@ -164,7 +230,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		hasContent := false
 		for _, c := range chunk.Choices {
 			reasoning := chatReasoningText(c.Delta.ReasoningContent, c.Delta.Reasoning, c.Delta.ReasoningDetails)
-			if c.Delta.Content != "" || reasoning != "" || len(c.Delta.ToolCalls) > 0 ||
+			if c.Delta.Content != "" || c.Delta.Refusal != nil || reasoning != "" || len(c.Delta.ToolCalls) > 0 ||
 				(c.FinishReason != nil && *c.FinishReason != "") {
 				hasContent = true
 				break
@@ -197,6 +263,14 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 					return err
 				}
 			}
+			if c.Delta.Refusal != nil {
+				// Presence includes an explicit empty refusal. Stronger finish reasons
+				// stay stronger; only an end-turn finish upgrades below.
+				sawRefusal = true
+				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: *c.Delta.Refusal, Refusal: true}); err != nil {
+					return err
+				}
+			}
 			for _, tc := range c.Delta.ToolCalls {
 				if tc.ID != "" || tc.Function.Name != "" {
 					if err := emit(ir.StreamEvent{Kind: ir.EventToolCallStart, Index: tc.Index, ToolID: tc.ID, ToolName: tc.Function.Name}); err != nil {
@@ -210,12 +284,16 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				}
 			}
 			if c.FinishReason != nil && *c.FinishReason != "" {
-				stopReason = stopReasonFromFinish(*c.FinishReason)
+				next := stopReasonFromFinish(*c.FinishReason)
+				stopReason = strongerChatStop(stopReason, next)
 			}
 		}
 	}
 	if !started {
 		return nil
+	}
+	if sawRefusal && stopReason == ir.StopEndTurn {
+		stopReason = ir.StopRefusal
 	}
 	return emit(ir.StreamEvent{
 		Kind: ir.EventFinish, StopReason: stopReason,
@@ -284,13 +362,19 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		e.roleSent = true
 		return e.emit(w, chunkDelta{Role: "assistant"}, nil)
 	case ir.EventTextStart:
-		if ev.Text == "" {
+		if ev.Text == "" && !ev.Refusal {
 			return nil
+		}
+		if ev.Refusal {
+			return e.emit(w, chunkDelta{Refusal: &ev.Text}, nil)
 		}
 		return e.emit(w, chunkDelta{Content: ev.Text}, nil)
 	case ir.EventTextEnd:
 		return nil
 	case ir.EventTextDelta:
+		if ev.Refusal {
+			return e.emit(w, chunkDelta{Refusal: &ev.Text}, nil)
+		}
 		return e.emit(w, chunkDelta{Content: ev.Text}, nil)
 	case ir.EventReasoningDelta:
 		return e.emit(w, chunkDelta{ReasoningContent: ev.Text}, nil)

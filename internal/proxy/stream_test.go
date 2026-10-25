@@ -3261,14 +3261,14 @@ func TestOpenAIExplicitEmptyFinishDoesNotFailOver(t *testing.T) {
 					t.Fatalf("anthropic usage missing: %s", body)
 				}
 			case "/v1/responses":
-				if !strings.Contains(body, `"model":"primary-model"`) || !strings.Contains(body, "response.completed") || !strings.Contains(body, `"status":"incomplete"`) {
+				if !strings.Contains(body, `"model":"primary-model"`) || !strings.Contains(body, "response.incomplete") || !strings.Contains(body, `"status":"incomplete"`) || !strings.Contains(body, `"reason":"max_output_tokens"`) {
 					t.Fatalf("responses empty completion missing metadata: %s", body)
 				}
 				if !strings.Contains(body, `"input_tokens":8`) || !strings.Contains(body, `"output_tokens":0`) {
 					t.Fatalf("responses usage missing: %s", body)
 				}
 			}
-			if strings.Count(body, "event: message_stop") > 1 || strings.Count(body, "event: response.completed") > 1 {
+			if strings.Count(body, "event: message_stop") > 1 || strings.Count(body, "event: response.completed") > 1 || strings.Count(body, "event: response.incomplete") > 1 {
 				t.Fatalf("duplicate terminal event: %s", body)
 			}
 			logs := waitForLogs(t, st, 1)

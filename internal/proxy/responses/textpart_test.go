@@ -254,13 +254,13 @@ func TestDecodeStreamTextPartBounds(t *testing.T) {
 	t.Run("part count bound rejects excess part", func(t *testing.T) {
 		d := newTextDecoder(emit, maxRetainedTextBytes, maxTrackedTextItems, maxPendingTextBytes, maxPendingTextEvents)
 		d.maxTextParts = 2
-		if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 0, "a"))); err != nil {
+		if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_a", 0, 0, "a")), false); err != nil {
 			t.Fatal(err)
 		}
-		if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_b", 1, 0, "b"))); err != nil {
+		if err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_b", 1, 0, "b")), false); err != nil {
 			t.Fatal(err)
 		}
-		err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_b", 1, 1, "c")))
+		err := d.observeTextDelta(textDeltaEnv(t, sseTextDeltaCI("msg_b", 1, 1, "c")), false)
 		if err == nil || !strings.Contains(err.Error(), "too many message text parts") {
 			t.Fatalf("err = %v, want too many message text parts", err)
 		}
@@ -425,19 +425,19 @@ func TestDecodeStreamTextPartEarlierGrowthShift(t *testing.T) {
 // slice panic and no part can point past the aggregate text.
 func TestReconcileTextPartOffsetsMonotonic(t *testing.T) {
 	d := newTextDecoder(func(ir.StreamEvent) error { return nil }, maxRetainedTextBytes, maxTrackedTextItems, maxPendingTextBytes, maxPendingTextEvents)
-	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 2, ""))); err != nil {
+	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 2, "")), false); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 0, "a"))); err != nil {
+	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 0, "a")), false); err != nil {
 		t.Fatal(err)
 	}
 	item := d.textByItem["msg_a"]
 	assertPartOffsetsMonotonic(t, item)
-	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 1, "b"))); err != nil {
+	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 1, "b")), false); err != nil {
 		t.Fatal(err)
 	}
 	assertPartOffsetsMonotonic(t, item)
-	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 2, ""))); err != nil {
+	if err := d.observeTextDone(textDeltaEnv(t, sseTextDone("msg_a", 0, 2, "")), false); err != nil {
 		t.Fatal(err)
 	}
 	assertPartOffsetsMonotonic(t, item)

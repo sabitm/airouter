@@ -107,7 +107,12 @@ func decodeInput(raw json.RawMessage, systemOut *string) ([]ir.Message, error) {
 			continue
 		}
 		var it inputItem
-		if json.Unmarshal(rawItem, &it) != nil {
+		if err := json.Unmarshal(rawItem, &it); err != nil {
+			if head.Type == "" || head.Type == "message" {
+				if msg := malformedRefusalInput(rawItem); msg != "" {
+					return nil, fmt.Errorf("%s", msg)
+				}
+			}
 			continue
 		}
 		switch it.Type {
@@ -124,6 +129,9 @@ func decodeInput(raw json.RawMessage, systemOut *string) ([]ir.Message, error) {
 			role := ir.RoleUser
 			if it.Role == "assistant" {
 				role = ir.RoleAssistant
+			}
+			if msg := malformedRefusalContent(it.Content); msg != "" {
+				return nil, fmt.Errorf("%s", msg)
 			}
 			blocks := decodeParts(it.Content)
 			if role == ir.RoleAssistant && len(msgs) > 0 && msgs[len(msgs)-1].Role == ir.RoleAssistant {
@@ -146,6 +154,44 @@ func decodeInput(raw json.RawMessage, systemOut *string) ([]ir.Message, error) {
 	return msgs, nil
 }
 
+// malformedRefusalInput reports a message item whose recognized refusal part
+// has an invalid supported field. The message names the family only.
+func malformedRefusalInput(rawItem json.RawMessage) string {
+	var item struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(rawItem, &item) != nil {
+		return ""
+	}
+	return malformedRefusalContent(item.Content)
+}
+
+func malformedRefusalContent(raw json.RawMessage) string {
+	if len(raw) == 0 || raw[0] != '[' {
+		return ""
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	for _, rawPart := range parts {
+		var head struct {
+			Type    string          `json:"type"`
+			Refusal json.RawMessage `json:"refusal"`
+		}
+		if json.Unmarshal(rawPart, &head) != nil || head.Type != "refusal" {
+			continue
+		}
+		if !isNullish(head.Refusal) {
+			var s string
+			if json.Unmarshal(head.Refusal, &s) != nil {
+				return "responses: malformed refusal content"
+			}
+		}
+	}
+	return ""
+}
+
 func decodeParts(raw json.RawMessage) []ir.ContentBlock {
 	if len(raw) == 0 {
 		return nil
@@ -158,22 +204,16 @@ func decodeParts(raw json.RawMessage) []ir.ContentBlock {
 		return nil
 	}
 	var parts []contentPart
-	if json.Unmarshal(raw, &parts) != nil {
+	if err := json.Unmarshal(raw, &parts); err != nil {
 		return nil
 	}
 	var blocks []ir.ContentBlock
 	for _, p := range parts {
-		switch p.Type {
-		case "input_text", "output_text", "text":
-			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: p.Text})
-		case "input_image":
-			// Always emit a recognized image block so missing/empty sources fail
-			// closed at InspectRequest rather than vanishing on passthrough.
-			// file_id is a source; image_url alone is not required.
-			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockImage, Image: imageFromPart(p)})
-		case "input_file":
-			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockFile, File: fileFromPart(p)})
+		block, ok := contentPartBlock(p)
+		if !ok {
+			continue
 		}
+		blocks = append(blocks, block)
 	}
 	return blocks
 }
@@ -345,7 +385,7 @@ func encodeInput(req *ir.Request) []map[string]any {
 						items = append(items, reasoningOutputItem(nil, b.Text, false))
 					}
 				case ir.BlockText:
-					textParts = append(textParts, map[string]any{"type": "output_text", "text": b.Text, "annotations": []any{}})
+					textParts = append(textParts, outputTextPart(b))
 				case ir.BlockToolUse:
 					flushText()
 					args := string(b.ToolInput)

@@ -262,20 +262,24 @@ func TestEncodeToolChoice(t *testing.T) {
 
 func TestResponsesStopReason(t *testing.T) {
 	cases := []struct {
-		name    string
-		status  string
-		sawTool bool
-		want    ir.StopReason
+		name       string
+		status     string
+		reason     string
+		sawTool    bool
+		sawRefusal bool
+		want       ir.StopReason
 	}{
-		{"incomplete", "incomplete", false, ir.StopMaxTokens},
-		{"completed with tool", "completed", true, ir.StopToolUse},
-		{"completed no tool", "completed", false, ir.StopEndTurn},
-		{"other with tool", "other", true, ir.StopToolUse},
-		{"other no tool", "other", false, ir.StopEndTurn},
+		{"incomplete", "incomplete", "", false, false, ir.StopMaxTokens},
+		{"incomplete content filter", "incomplete", "content_filter", false, true, ir.StopContentFilter},
+		{"completed with tool", "completed", "", true, true, ir.StopToolUse},
+		{"completed refusal", "completed", "", false, true, ir.StopRefusal},
+		{"completed no tool", "completed", "", false, false, ir.StopEndTurn},
+		{"other with tool", "other", "", true, false, ir.StopToolUse},
+		{"other no tool", "other", "", false, false, ir.StopEndTurn},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := responsesStopReason(tc.status, tc.sawTool); got != tc.want {
+			if got := responsesStopReason(tc.status, tc.reason, tc.sawTool, tc.sawRefusal); got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})

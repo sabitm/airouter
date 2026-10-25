@@ -132,8 +132,42 @@ func (it *respOutputItem) UnmarshalJSON(data []byte) error {
 }
 
 type respOutputContent struct {
-	Type string `json:"type"` // output_text | text
+	Type string `json:"type"` // output_text | text | refusal
 	Text string `json:"text"`
+	// TextSet reports a non-null text field, including an explicit empty string.
+	TextSet bool `json:"-"`
+	// Refusal is the native refusal explanation. RefusalSet distinguishes an
+	// explicit empty refusal from an absent or null field.
+	Refusal    string `json:"refusal"`
+	RefusalSet bool   `json:"-"`
+}
+
+// UnmarshalJSON keeps text and refusal presence distinct. A wrong-type
+// supported field fails. Null and absence stay unset and are not an explicit
+// empty refusal.
+func (c *respOutputContent) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type    string          `json:"type"`
+		Text    json.RawMessage `json:"text"`
+		Refusal json.RawMessage `json:"refusal"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*c = respOutputContent{Type: raw.Type}
+	if !isNullish(raw.Text) {
+		if err := json.Unmarshal(raw.Text, &c.Text); err != nil {
+			return err
+		}
+		c.TextSet = true
+	}
+	if !isNullish(raw.Refusal) {
+		if err := json.Unmarshal(raw.Refusal, &c.Refusal); err != nil {
+			return err
+		}
+		c.RefusalSet = true
+	}
+	return nil
 }
 
 // DecodeResponse parses an OpenAI Responses object into the IR. Used when
@@ -159,15 +193,34 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 			// readable projection is empty. Encrypted bytes stay in the envelope.
 			out.Content = append(out.Content, reasoningBlock(it.ID, reasoningSummaryParts(it.Summary), it.EncryptedContent, it.Status))
 		case "message":
-			var text strings.Builder
-			for _, c := range it.Content {
-				if c.Type == "output_text" || c.Type == "text" {
-					text.WriteString(c.Text)
+			// Preserve part order. Consecutive same-kind parts may merge; a marker
+			// change starts a new segment. An explicit empty refusal is retained.
+			// One builder owns each segment so many small parts stay linear.
+			var seg *textSegment
+			flush := func() {
+				if seg == nil {
+					return
 				}
+				text := seg.text.String()
+				if text != "" || seg.refusal {
+					out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockText, Text: text, Refusal: seg.refusal})
+				}
+				seg = nil
 			}
-			if t := text.String(); t != "" {
-				out.Content = append(out.Content, ir.ContentBlock{Type: ir.BlockText, Text: t})
+			for _, c := range it.Content {
+				part, ok := outputContentPart(c)
+				if !ok {
+					continue
+				}
+				if seg != nil && seg.refusal == part.Refusal {
+					seg.text.WriteString(part.Text)
+					continue
+				}
+				flush()
+				seg = &textSegment{refusal: part.Refusal}
+				seg.text.WriteString(part.Text)
 			}
+			flush()
 		case "function_call":
 			sawTool = true
 			out.Content = append(out.Content, ir.ContentBlock{
@@ -175,7 +228,7 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 			})
 		}
 	}
-	out.StopReason = responsesStopReason(resp.Status, sawTool)
+	out.StopReason = responsesStopReason(resp.Status, incompleteReason(resp.IncompleteDetails), sawTool, responseSawRefusal(out.Content))
 	if resp.Usage != nil {
 		out.Usage = usageFromWire(resp.Usage)
 	}
@@ -207,15 +260,45 @@ func usageToWire(u ir.Usage) map[string]any {
 	return wire
 }
 
-// responsesStopReason maps a Responses status to an IR stop reason. Truncation
-// (status "incomplete", reason max_output_tokens) takes priority; otherwise a
-// present tool call means the model is waiting on a tool result.
-func responsesStopReason(status string, sawTool bool) ir.StopReason {
+func incompleteReason(details *respIncomplete) string {
+	if details == nil {
+		return ""
+	}
+	return details.Reason
+}
+
+// textSegment accumulates one contiguous ordinary or refusal run. The
+// builder is not copied; only its finished string is retained.
+type textSegment struct {
+	text    strings.Builder
+	refusal bool
+}
+
+func responseSawRefusal(blocks []ir.ContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == ir.BlockText && b.Refusal {
+			return true
+		}
+	}
+	return false
+}
+
+// responsesStopReason maps a Responses terminal status. Explicit incomplete
+// status wins: content_filter is a filter truncation, and every other reason
+// keeps the historical max-token fallback. A tool stop then outranks a refusal
+// part. A completed refusal is StopRefusal, not an upstream failure.
+func responsesStopReason(status, reason string, sawTool, sawRefusal bool) ir.StopReason {
 	if status == "incomplete" {
+		if reason == "content_filter" {
+			return ir.StopContentFilter
+		}
 		return ir.StopMaxTokens
 	}
 	if sawTool {
 		return ir.StopToolUse
+	}
+	if sawRefusal {
+		return ir.StopRefusal
 	}
 	return ir.StopEndTurn
 }
@@ -226,16 +309,20 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	if id == "" {
 		id = ir.NewID("resp_")
 	}
-	output, err := buildOutput(resp.Content)
+	output, err := buildOutput(ir.ProjectUnaryRefusal(resp))
 	if err != nil {
 		return nil, err
 	}
 
 	status := "completed"
 	var incomplete any
-	if resp.StopReason == ir.StopMaxTokens {
+	switch resp.StopReason {
+	case ir.StopMaxTokens:
 		status = "incomplete"
 		incomplete = map[string]any{"reason": "max_output_tokens"}
+	case ir.StopContentFilter:
+		status = "incomplete"
+		incomplete = map[string]any{"reason": "content_filter"}
 	}
 
 	out := map[string]any{
@@ -287,7 +374,7 @@ func buildOutput(blocks []ir.ContentBlock) ([]map[string]any, error) {
 				output = append(output, reasoningOutputItem(nil, b.Text, true))
 			}
 		case ir.BlockText:
-			textParts = append(textParts, map[string]any{"type": "output_text", "text": b.Text, "annotations": []any{}})
+			textParts = append(textParts, outputTextPart(b))
 		case ir.BlockToolUse:
 			flushText()
 			args := string(b.ToolInput)

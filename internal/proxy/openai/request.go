@@ -41,7 +41,11 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 	var toolCarrier *ir.Message
 	flushCarrier := func() { toolCarrier = nil }
 
-	for _, m := range req.Messages {
+	for i := range req.Messages {
+		m := &req.Messages[i]
+		if err := captureChatRefusal(m); err != nil {
+			return nil, err
+		}
 		switch m.Role {
 		case "system", "developer":
 			flushCarrier()
@@ -98,6 +102,8 @@ func decodeUserContent(raw json.RawMessage) []ir.ContentBlock {
 		switch p.Type {
 		case "text":
 			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: p.Text})
+		case "refusal":
+			blocks = append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: p.Refusal, Refusal: true})
 		case "image_url":
 			// Always emit a recognized image block so missing/empty sources fail
 			// closed at InspectRequest rather than vanishing on passthrough.
@@ -113,14 +119,15 @@ func decodeUserContent(raw json.RawMessage) []ir.ContentBlock {
 	return blocks
 }
 
-func decodeAssistantContent(m chatMessage) []ir.ContentBlock {
+func decodeAssistantContent(m *chatMessage) []ir.ContentBlock {
+	if m == nil {
+		return nil
+	}
 	var blocks []ir.ContentBlock
 	if reasoning := chatReasoningText(m.ReasoningContent, m.Reasoning, m.ReasoningDetails); reasoning != "" {
 		blocks = append(blocks, ir.ContentBlock{Type: ir.BlockReasoning, Text: reasoning})
 	}
-	if t := contentToText(m.Content); t != "" {
-		blocks = append(blocks, ir.ContentBlock{Type: ir.BlockText, Text: t})
-	}
+	blocks = append(blocks, decodeChatTextAndRefusal(m.Content, m.Refusal, m.RefusalSet)...)
 	for _, tc := range m.ToolCalls {
 		blocks = append(blocks, ir.ContentBlock{
 			Type:      ir.BlockToolUse,
@@ -246,7 +253,8 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 func encodeMessage(m ir.Message) []chatMessage {
 	if m.Role == ir.RoleAssistant {
 		msg := chatMessage{Role: "assistant"}
-		var text, reasoning strings.Builder
+		var text, reasoning, refusalText strings.Builder
+		refusalSet := false
 		for _, b := range m.Content {
 			switch b.Type {
 			case ir.BlockReasoning:
@@ -256,6 +264,13 @@ func encodeMessage(m ir.Message) []chatMessage {
 			case ir.BlockRedactedReasoning:
 				// Opaque redacted data has no OpenAI text projection.
 			case ir.BlockText:
+				if b.Refusal {
+					// The first marked segment sets the field, even when it is empty.
+					// Later marked segments append in order without copying the builder.
+					refusalSet = true
+					refusalText.WriteString(b.Text)
+					continue
+				}
 				text.WriteString(b.Text)
 			case ir.BlockToolUse:
 				msg.ToolCalls = append(msg.ToolCalls, chatToolCall{
@@ -270,6 +285,10 @@ func encodeMessage(m ir.Message) []chatMessage {
 		}
 		if t := text.String(); t != "" {
 			msg.Content = mustText(t)
+		}
+		if refusalSet {
+			msg.Refusal = mustText(refusalText.String())
+			msg.RefusalSet = true
 		}
 		msg.ReasoningContent = reasoning.String()
 		return []chatMessage{msg}

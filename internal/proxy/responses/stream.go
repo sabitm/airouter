@@ -46,6 +46,8 @@ type streamEnvelope struct {
 	Name            string            `json:"name"`
 	Text            string            `json:"text"`
 	TextSet         bool              `json:"-"`
+	Refusal         string            `json:"refusal"`
+	RefusalSet      bool              `json:"-"`
 	SummaryIndex    int               `json:"summary_index"`
 	SummaryIndexSet bool              `json:"-"`
 	ContentIndex    int               `json:"content_index"`
@@ -65,6 +67,7 @@ func (e *streamEnvelope) UnmarshalJSON(data []byte) error {
 		Arguments    string            `json:"arguments"`
 		Name         string            `json:"name"`
 		Text         *string           `json:"text"`
+		Refusal      *string           `json:"refusal"`
 		SummaryIndex *int              `json:"summary_index"`
 		ContentIndex *int              `json:"content_index"`
 		Part         *reasoningSummary `json:"part"`
@@ -83,6 +86,10 @@ func (e *streamEnvelope) UnmarshalJSON(data []byte) error {
 	if raw.Text != nil {
 		e.Text = *raw.Text
 		e.TextSet = true
+	}
+	if raw.Refusal != nil {
+		e.Refusal = *raw.Refusal
+		e.RefusalSet = true
 	}
 	if raw.OutputIndex != nil {
 		e.OutputIndex = *raw.OutputIndex
@@ -201,6 +208,7 @@ func malformedMessageEvent(raw []byte) string {
 	}
 	switch head.Type {
 	case "response.output_text.delta", "response.output_text.done",
+		"response.refusal.delta", "response.refusal.done",
 		"response.content_part.added", "response.content_part.done":
 		return "responses: malformed message stream event"
 	case "response.output_item.added", "response.output_item.done":
@@ -380,15 +388,30 @@ func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxA
 					}
 				}
 			}
+		case "response.content_part.added":
+			if err := dec.observeContentPartAdded(&env); err != nil {
+				return err
+			}
 		case "response.output_text.delta":
 			if err := dec.rejectContent(env.Delta); err != nil {
 				return err
 			}
-			if err := dec.observeTextDelta(&env); err != nil {
+			if err := dec.observeTextDelta(&env, false); err != nil {
+				return err
+			}
+		case "response.refusal.delta":
+			if err := dec.rejectContent(env.Delta); err != nil {
+				return err
+			}
+			if err := dec.observeTextDelta(&env, true); err != nil {
 				return err
 			}
 		case "response.output_text.done":
-			if err := dec.observeTextDone(&env); err != nil {
+			if err := dec.observeTextDone(&env, false); err != nil {
+				return err
+			}
+		case "response.refusal.done":
+			if err := dec.observeRefusalDone(&env); err != nil {
 				return err
 			}
 		case "response.content_part.done":
@@ -458,11 +481,7 @@ func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxA
 					cacheRead = u.CacheReadTokens
 					cacheWrite = u.CacheWriteTokens
 				}
-				if env.Response.Status == "incomplete" {
-					stop = ir.StopMaxTokens
-				} else if dec.sawTool {
-					stop = ir.StopToolUse
-				}
+				stop = responsesStopReason(env.Response.Status, incompleteReason(env.Response.IncompleteDetails), dec.sawTool, dec.sawRefusal)
 			}
 		}
 	}
@@ -479,9 +498,14 @@ func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxA
 		if err := ensureStarted("", ""); err != nil {
 			return err
 		}
-		if stop != ir.StopMaxTokens {
+		// An explicit incomplete status already won. A tool stop outranks a
+		// refusal part, but it does not replace content-filter or max-token truncation.
+		if stop != ir.StopMaxTokens && stop != ir.StopContentFilter {
 			stop = ir.StopToolUse
 		}
+	}
+	if stop == ir.StopEndTurn && dec.sawRefusal {
+		stop = ir.StopRefusal
 	}
 	if !started {
 		return nil
@@ -544,6 +568,9 @@ type responsesToolDecoder struct {
 	nextIndex     int
 	argBytes      int
 	sawTool       bool
+	// sawRefusal records a native refusal part. It selects StopRefusal only when
+	// no stronger terminal reason is set. It is not an upstream failure.
+	sawRefusal bool
 	// reasoning reconciles Responses reasoning items. It is nil only in tests
 	// that construct the decoder directly for tool-only assertions.
 	reasoning *responsesReasoningDecoder
@@ -608,9 +635,14 @@ type pendingOrderWork struct {
 // text. done marks a part closed by its own complete snapshot; a whole-message
 // snapshot closes every part.
 type responsesTextPart struct {
-	end  int
-	typ  string
-	done bool
+	end int
+	typ string
+	// refusal is the part kind. A marker change splits recovered suffixes so
+	// mixed ordinary text and refusal are not merged semantically. kindSet keeps
+	// an explicit ordinary part distinct from a part whose kind is still unknown.
+	refusal bool
+	kindSet bool
+	done    bool
 }
 
 // responsesTextItem tracks one message item for final text recovery. itemID and
@@ -628,6 +660,17 @@ type responsesTextItem struct {
 	text         strings.Builder
 	emitted      int
 	parts        []*responsesTextPart
+	// emptyRefusalEmitted records content indices whose explicit empty refusal
+	// was already emitted. The index is bounded by the part cap.
+	emptyRefusalEmitted []bool
+	// loose records contiguous unindexed byte ranges and their markers.
+	// A snapshot may claim those bytes only when every overlapping range has
+	// the same marker. The ranges are coalesced, so bookkeeping stays bounded
+	// by the part cap rather than by the delta count.
+	loose []looseTextRange
+	// indexedDelta records that a delta named a content index. A later loose
+	// delta is then an unsupported mixture. A done snapshot does not set this.
+	indexedDelta bool
 	terminal     bool
 }
 
@@ -641,11 +684,26 @@ type textIdentity struct {
 func finalMessageText(item *respOutputItem) string {
 	var b strings.Builder
 	for _, c := range item.Content {
-		if c.Type == "output_text" || c.Type == "text" {
-			b.WriteString(c.Text)
+		part, ok := outputContentPart(c)
+		if !ok {
+			continue
 		}
+		b.WriteString(part.Text)
 	}
 	return b.String()
+}
+
+func messageHasRefusal(item *respOutputItem) bool {
+	if item == nil {
+		return false
+	}
+	for _, c := range item.Content {
+		part, ok := outputContentPart(c)
+		if ok && part.Refusal {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *responsesToolDecoder) retainText(n int) error {
@@ -665,11 +723,21 @@ func (d *responsesToolDecoder) retainText(n int) error {
 // While an earlier identified message is still waiting for its terminal
 // snapshot, later identified text queues instead of emitting, so a recovered
 // suffix can never be emitted after already emitted later text.
-func (d *responsesToolDecoder) observeTextDelta(env *streamEnvelope) error {
+func (d *responsesToolDecoder) observeTextDelta(env *streamEnvelope, refusal bool) error {
 	if env.Delta == "" {
+		// An identified empty refusal delta still records the part kind so a later
+		// done snapshot can preserve an explicit empty refusal.
+		if refusal && (env.ItemID != "" || env.OutputIndexSet) {
+			return d.noteRefusalPart(env)
+		}
 		return nil
 	}
 	if env.ItemID == "" && !env.OutputIndexSet {
+		// A refusal delta needs an item or output index. Guessing its identity would
+		// reclassify later snapshots. Ordinary unkeyed text keeps the legacy path.
+		if refusal {
+			return ir.ProtocolError("refusal delta has no content identity")
+		}
 		d.sawUnkeyedText = true
 		if err := d.ensureMessageStart(); err != nil {
 			return err
@@ -687,7 +755,7 @@ func (d *responsesToolDecoder) observeTextDelta(env *streamEnvelope) error {
 	// queued event is rejected without retaining or emitting it.
 	open := d.firstOpenText()
 	if item == open {
-		if err := d.appendTextDelta(item, env); err != nil {
+		if err := d.appendTextDelta(item, env, refusal); err != nil {
 			return err
 		}
 		return d.emitTextSuffix(item)
@@ -696,7 +764,7 @@ func (d *responsesToolDecoder) observeTextDelta(env *streamEnvelope) error {
 	if err := d.checkPending(cost); err != nil {
 		return err
 	}
-	if err := d.appendTextDelta(item, env); err != nil {
+	if err := d.appendTextDelta(item, env, refusal); err != nil {
 		return err
 	}
 	d.appendPending(pendingOrderWork{
@@ -710,13 +778,16 @@ func (d *responsesToolDecoder) observeTextDelta(env *streamEnvelope) error {
 // snapshot for the same index validates against the right bytes. A delta that
 // names an already closed part, or that would grow a non-tail part, is
 // rejected so a late delta cannot reorder completed content.
-func (d *responsesToolDecoder) appendTextDelta(item *responsesTextItem, env *streamEnvelope) error {
+func (d *responsesToolDecoder) appendTextDelta(item *responsesTextItem, env *streamEnvelope, refusal bool) error {
 	if env.ContentIndexSet {
 		index := env.ContentIndex
 		if err := d.ensureTextParts(item, index); err != nil {
 			return err
 		}
 		part := item.parts[index]
+		if err := d.notePartKind(part, refusal); err != nil {
+			return err
+		}
 		if part.done {
 			return ir.ProtocolError("conflicting message text")
 		}
@@ -728,9 +799,30 @@ func (d *responsesToolDecoder) appendTextDelta(item *responsesTextItem, env *str
 		}
 		item.text.WriteString(env.Delta)
 		part.end += len(env.Delta)
+		item.indexedDelta = true
+		if refusal && env.Delta != "" {
+			// A nonempty indexed delta records the refusal without closing the part.
+			d.sawRefusal = true
+		}
 		return nil
 	}
+	// Unindexed deltas stay in the historical aggregate. They do not move an
+	// indexed part boundary. A loose delta after an indexed delta is a different
+	// unsupported mixture: its marker cannot be attributed without guessing.
+	// A part created only by a done snapshot is not that mixture.
+	if item.indexedDelta {
+		return ir.ProtocolError("conflicting message text")
+	}
+	start := item.text.Len()
+	// Marker acceptance is checked before retention. A rejected delta leaves
+	// neither a range nor retained bytes for a later snapshot to claim.
+	if err := looseRangeAccepted(item, start, start+len(env.Delta), refusal); err != nil {
+		return err
+	}
 	if err := d.retainText(len(env.Delta)); err != nil {
+		return err
+	}
+	if err := d.noteLooseKind(item, start, start+len(env.Delta), refusal); err != nil {
 		return err
 	}
 	item.text.WriteString(env.Delta)
@@ -1226,18 +1318,150 @@ func (item *responsesTextItem) partStart(index int) int {
 	return item.parts[index-1].end
 }
 
-// reconcileTextPart grows one content part to a complete snapshot. The part is
-// keyed by actual content_index, so a late part-zero done is checked against
-// part zero's own bytes, not the concatenation of every part. Already streamed
-// bytes are never re-emitted. Growth is allowed only at the aggregate tail, so
-// a complete snapshot can recover a missing suffix but cannot reorder bytes
-// already sent. An identical snapshot is free; a contradicting one fails.
-func (d *responsesToolDecoder) reconcileTextPart(item *responsesTextItem, index int, snapshot string) error {
+// looseTextRange is one contiguous run of identified bytes that arrived
+// without a content_index. start is inclusive and end is exclusive in the
+// message aggregate. Adjacent runs with the same marker coalesce.
+type looseTextRange struct {
+	start   int
+	end     int
+	refusal bool
+}
+
+// looseRangeAccepted reports whether [start, end) can join the loose ranges.
+// It does not mutate. A marker change inside one contiguous run is rejected
+// before the delta bytes are retained.
+func looseRangeAccepted(item *responsesTextItem, start, end int, refusal bool) error {
+	if item == nil || start > end || start < 0 {
+		return ir.ProtocolError("conflicting message text")
+	}
+	if start == end {
+		return nil
+	}
+	n := len(item.loose)
+	if n == 0 {
+		return nil
+	}
+	last := item.loose[n-1]
+	if last.end > start {
+		return ir.ProtocolError("conflicting message text")
+	}
+	if last.end == start && last.refusal != refusal {
+		return ir.ProtocolError("conflicting message text")
+	}
+	if last.end != start && n >= maxTrackedTextParts {
+		return ir.ProtocolError("too many message text parts")
+	}
+	return nil
+}
+
+// noteLooseKind records one already accepted unindexed range. Adjacent ranges
+// with the same marker coalesce, so the slice stays bounded by the part cap.
+func (d *responsesToolDecoder) noteLooseKind(item *responsesTextItem, start, end int, refusal bool) error {
+	if start == end {
+		return nil
+	}
+	n := len(item.loose)
+	if n > 0 && item.loose[n-1].end == start {
+		item.loose[n-1].end = end
+	} else {
+		if err := d.retainText(textPartOverhead); err != nil {
+			return err
+		}
+		item.loose = append(item.loose, looseTextRange{start: start, end: end, refusal: refusal})
+	}
+	if refusal {
+		// A loose identified refusal is recorded even though its part stays open.
+		d.sawRefusal = true
+	}
+	return nil
+}
+
+// looseMarkerAt reports the marker of the unindexed range that contains off.
+// A byte with no loose range is not an identified unindexed byte.
+func looseMarkerAt(item *responsesTextItem, off int) (refusal bool, ok bool) {
+	for i := range item.loose {
+		r := &item.loose[i]
+		if off < r.start {
+			return false, false
+		}
+		if off < r.end {
+			return r.refusal, true
+		}
+	}
+	return false, false
+}
+
+// claimLooseRange requires every identified unindexed byte in [start, end) to
+// carry marker. Bytes with no loose range are not relabeled. The check reads
+// only the coalesced ranges, so it does not copy the message text.
+func claimLooseRange(item *responsesTextItem, start, end int, refusal bool) error {
+	if start >= end {
+		return nil
+	}
+	for i := range item.loose {
+		r := &item.loose[i]
+		if r.end <= start {
+			continue
+		}
+		if r.start >= end {
+			break
+		}
+		if r.refusal != refusal {
+			return ir.ProtocolError("conflicting message text")
+		}
+	}
+	return nil
+}
+
+// shiftLoose moves every loose boundary at or after at right by delta. A
+// boundary inside a loose range is a contradiction: growth must not split an
+// identified unindexed run.
+func shiftLoose(item *responsesTextItem, at, delta int) error {
+	if delta == 0 {
+		return nil
+	}
+	for i := range item.loose {
+		r := &item.loose[i]
+		if r.start >= at {
+			r.start += delta
+			r.end += delta
+			continue
+		}
+		if r.end > at {
+			return ir.ProtocolError("conflicting message text")
+		}
+	}
+	return nil
+}
+
+func (d *responsesToolDecoder) notePartKind(part *responsesTextPart, refusal bool) error {
+	if part.kindSet && part.refusal != refusal {
+		return ir.ProtocolError("conflicting message text")
+	}
+	part.kindSet = true
+	part.refusal = refusal
+	if refusal {
+		part.typ = "refusal"
+	} else if part.typ == "" {
+		part.typ = "output_text"
+	}
+	return nil
+}
+
+func (d *responsesToolDecoder) reconcileTextPart(item *responsesTextItem, index int, snapshot string, refusal bool) error {
 	if err := d.ensureTextParts(item, index); err != nil {
 		return err
 	}
 	part := item.parts[index]
 	start := item.partStart(index)
+	// Claim the existing overlap before kind or suffix state changes. An exact
+	// snapshot is the same claim: it must not relabel loose bytes.
+	if err := claimLooseRange(item, start, part.end, refusal); err != nil {
+		return err
+	}
+	if err := d.notePartKind(part, refusal); err != nil {
+		return err
+	}
 	retained := item.text.String()[start:part.end]
 	var suffix string
 	switch {
@@ -1254,6 +1478,8 @@ func (d *responsesToolDecoder) reconcileTextPart(item *responsesTextItem, index 
 		// Growth is safe only when no later part already holds bytes; empty
 		// placeholders do not block it because their derived offsets follow.
 		for j := index + 1; j < len(item.parts); j++ {
+			// A later part that already holds bytes owns a boundary. An empty closed
+			// placeholder does not, because its offset follows this growth.
 			if item.parts[j].end > item.partStart(j) {
 				return ir.ProtocolError("conflicting message text order")
 			}
@@ -1266,8 +1492,17 @@ func (d *responsesToolDecoder) reconcileTextPart(item *responsesTextItem, index 
 		if following[:match] != suffix[:match] {
 			return ir.ProtocolError("conflicting message text order")
 		}
+		// The suffix may cover a later loose run before it adds new bytes. Reject
+		// that relabel before the extra bytes are retained.
+		if err := claimLooseRange(item, part.end, part.end+len(suffix), refusal); err != nil {
+			return err
+		}
 		if len(suffix) > len(following) {
 			extra := suffix[len(following):]
+			growthAt := item.text.Len()
+			if err := shiftLoose(item, growthAt, len(extra)); err != nil {
+				return err
+			}
 			if err := d.retainText(len(extra)); err != nil {
 				return err
 			}
@@ -1284,6 +1519,10 @@ func (d *responsesToolDecoder) reconcileTextPart(item *responsesTextItem, index 
 		}
 	}
 	part.done = true
+	if part.refusal {
+		// Closing the part records the refusal. An added placeholder does not.
+		d.sawRefusal = true
+	}
 	return nil
 }
 
@@ -1295,18 +1534,27 @@ func (d *responsesToolDecoder) reconcileTextPart(item *responsesTextItem, index 
 func (d *responsesToolDecoder) applyMessageContent(item *responsesTextItem, content []respOutputContent) error {
 	retained := item.text.String()
 	texts := make([]string, len(content))
+	kinds := make([]bool, len(content))
+	known := make([]bool, len(content))
 	var full strings.Builder
 	for i, c := range content {
-		if c.Type == "" || c.Type == "output_text" || c.Type == "text" {
-			texts[i] = c.Text
-			full.WriteString(c.Text)
+		part, ok := outputContentPart(c)
+		if !ok {
+			continue
 		}
+		texts[i] = part.Text
+		kinds[i] = part.Refusal
+		known[i] = true
+		full.WriteString(part.Text)
 	}
 	if !strings.HasPrefix(full.String(), retained) {
 		return ir.ProtocolError("conflicting message text")
 	}
 	for i, text := range texts {
-		if err := d.reconcileTextPart(item, i, text); err != nil {
+		if !known[i] {
+			continue
+		}
+		if err := d.reconcileTextPart(item, i, text, kinds[i]); err != nil {
 			return err
 		}
 	}
@@ -1324,15 +1572,127 @@ func (d *responsesToolDecoder) applyMessageContent(item *responsesTextItem, cont
 // emitTextSuffix sends the retained bytes not yet streamed. Repeated terminal
 // snapshots emit nothing new.
 func (d *responsesToolDecoder) emitTextSuffix(item *responsesTextItem) error {
-	if item.emitted >= item.text.Len() {
+	if len(item.parts) == 0 {
+		return d.emitLooseTail(item, item.text.Len())
+	}
+	// Walk retained part boundaries so a recovered suffix keeps the part marker.
+	for i, part := range item.parts {
+		start := item.partStart(i)
+		end := part.end
+		if end < start || end > item.text.Len() {
+			return ir.ProtocolError("conflicting message text")
+		}
+		if item.emitted < start {
+			// Bytes before this part were not claimed by an earlier part. They keep
+			// the loose marker recorded when they arrived.
+			if err := d.emitLooseTail(item, start); err != nil {
+				return err
+			}
+		}
+		if item.emitted < end {
+			if err := d.emitClaimedSpan(item, item.emitted, end, part.refusal); err != nil {
+				return err
+			}
+		}
+		if part.refusal && part.done && start == end && !item.emptyRefusalSeen(i) {
+			if err := d.ensureMessageStart(); err != nil {
+				return err
+			}
+			if err := d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Refusal: true}); err != nil {
+				return err
+			}
+			item.markEmptyRefusal(i)
+		}
+	}
+	return d.emitLooseTail(item, item.text.Len())
+}
+
+// emitClaimedSpan emits [from, to) with the snapshot marker. The caller must
+// already have claimed every loose byte in that span. A mismatch here is a
+// missed claim and fails before the bytes are emitted under the wrong marker.
+func (d *responsesToolDecoder) emitClaimedSpan(item *responsesTextItem, from, to int, refusal bool) error {
+	if from >= to {
 		return nil
 	}
-	frag := item.text.String()[item.emitted:]
-	item.emitted = item.text.Len()
+	if err := claimLooseRange(item, from, to, refusal); err != nil {
+		return err
+	}
 	if err := d.ensureMessageStart(); err != nil {
 		return err
 	}
-	return d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: frag})
+	if err := d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: item.text.String()[from:to], Refusal: refusal}); err != nil {
+		return err
+	}
+	item.emitted = to
+	return nil
+}
+
+// emitLooseTail emits retained bytes that no indexed part owns. Each byte must
+// belong to one loose range. A gap, or a range boundary inside the tail, fails
+// before any of those bytes are emitted unmarked.
+func (d *responsesToolDecoder) emitLooseTail(item *responsesTextItem, limit int) error {
+	if item.emitted >= limit {
+		return nil
+	}
+	if err := d.ensureMessageStart(); err != nil {
+		return err
+	}
+	text := item.text.String()
+	for item.emitted < limit {
+		refusal, ok := looseMarkerAt(item, item.emitted)
+		if !ok {
+			return ir.ProtocolError("conflicting message text")
+		}
+		end := limit
+		for i := range item.loose {
+			r := &item.loose[i]
+			if item.emitted >= r.start && item.emitted < r.end {
+				if r.end < end {
+					end = r.end
+				}
+				break
+			}
+		}
+		if end <= item.emitted {
+			return ir.ProtocolError("conflicting message text")
+		}
+		if err := d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: text[item.emitted:end], Refusal: refusal}); err != nil {
+			return err
+		}
+		item.emitted = end
+	}
+	return nil
+}
+
+func (item *responsesTextItem) emptyRefusalSeen(index int) bool {
+	return index >= 0 && index < len(item.emptyRefusalEmitted) && item.emptyRefusalEmitted[index]
+}
+
+func textItemWillEmit(item *responsesTextItem) bool {
+	if item == nil {
+		return false
+	}
+	if item.emitted < item.text.Len() {
+		return true
+	}
+	for i, part := range item.parts {
+		if part.refusal && part.done && item.partStart(i) == part.end && !item.emptyRefusalSeen(i) {
+			return true
+		}
+	}
+	return false
+}
+
+func (item *responsesTextItem) markEmptyRefusal(index int) {
+	if index < 0 || index >= maxTrackedTextParts {
+		return
+	}
+	if len(item.emptyRefusalEmitted) <= index {
+		next := make([]bool, index+1)
+		copy(next, item.emptyRefusalEmitted)
+		item.emptyRefusalEmitted = next
+	}
+	item.emptyRefusalEmitted[index] = true
 }
 
 // observeMessageAdded registers a streamed message identity before its deltas.
@@ -1375,10 +1735,21 @@ func (d *responsesToolDecoder) observeMessageDone(env *streamEnvelope) error {
 // observeTextDone reconciles one content part's complete text by content_index.
 // A later part's done is not compared against the full concatenation, and its
 // missing suffix is recovered when it is the tail.
-func (d *responsesToolDecoder) observeTextDone(env *streamEnvelope) error {
+func (d *responsesToolDecoder) observeTextDone(env *streamEnvelope, refusal bool) error {
 	if d.sawUnkeyedText || !env.TextSet {
 		return nil
 	}
+	return d.observePartSnapshot(env, env.Text, refusal)
+}
+
+func (d *responsesToolDecoder) observeRefusalDone(env *streamEnvelope) error {
+	if d.sawUnkeyedText || !env.RefusalSet {
+		return nil
+	}
+	return d.observePartSnapshot(env, env.Refusal, true)
+}
+
+func (d *responsesToolDecoder) observePartSnapshot(env *streamEnvelope, snapshot string, refusal bool) error {
 	item, err := d.bindText(textIdentity{
 		outputIndex: env.OutputIndex, hasIndex: env.OutputIndexSet, itemID: env.ItemID,
 	}, true, false)
@@ -1389,20 +1760,55 @@ func (d *responsesToolDecoder) observeTextDone(env *streamEnvelope) error {
 	if env.ContentIndexSet {
 		index = env.ContentIndex
 	}
-	if err := d.reconcileTextPart(item, index, env.Text); err != nil {
+	if err := d.reconcileTextPart(item, index, snapshot, refusal); err != nil {
 		return err
 	}
 	return d.flushClosedText(item)
 }
 
+func (d *responsesToolDecoder) noteRefusalPart(env *streamEnvelope) error {
+	item, err := d.bindText(textIdentity{
+		outputIndex: env.OutputIndex, hasIndex: env.OutputIndexSet, itemID: env.ItemID,
+	}, true, false)
+	if err != nil {
+		return err
+	}
+	if item.terminal || d.responseDone {
+		return ir.ProtocolError("conflicting message text")
+	}
+	index := 0
+	if env.ContentIndexSet {
+		index = env.ContentIndex
+	}
+	if err := d.ensureTextParts(item, index); err != nil {
+		return err
+	}
+	return d.notePartKind(item.parts[index], true)
+}
+
 // observePartDone reconciles one content_part.done frame whose part is a text
 // part, keyed by actual content_index.
-func (d *responsesToolDecoder) observePartDone(env *streamEnvelope) error {
-	if d.sawUnkeyedText || env.Part == nil || !env.Part.TextSet {
+// observeContentPartAdded records a refusal part without closing it. An empty
+// added part is placeholder metadata and is not terminal. Nonempty readable
+// content uses the same bounded ordering queue as a text delta, so a later
+// message cannot emit ahead of an unresolved earlier message.
+func (d *responsesToolDecoder) observeContentPartAdded(env *streamEnvelope) error {
+	if env.Part == nil || env.Part.Type != "refusal" {
 		return nil
 	}
-	if env.Part.Type != "" && env.Part.Type != "output_text" && env.Part.Type != "text" {
-		return nil
+	if !env.Part.RefusalSet && !env.Part.TextSet {
+		return d.noteRefusalPart(env)
+	}
+	snapshot := ""
+	if env.Part.RefusalSet {
+		snapshot = env.Part.Refusal
+	} else if env.Part.TextSet {
+		snapshot = env.Part.Text
+	}
+	if snapshot == "" {
+		// An explicit empty added part remains a placeholder. It records the kind
+		// without inventing visible output or selecting a completed refusal.
+		return d.noteRefusalPart(env)
 	}
 	item, err := d.bindText(textIdentity{
 		outputIndex: env.OutputIndex, hasIndex: env.OutputIndexSet, itemID: env.ItemID,
@@ -1410,14 +1816,86 @@ func (d *responsesToolDecoder) observePartDone(env *streamEnvelope) error {
 	if err != nil {
 		return err
 	}
+	if item.terminal || d.responseDone {
+		return ir.ProtocolError("conflicting message text")
+	}
 	index := 0
 	if env.ContentIndexSet {
 		index = env.ContentIndex
 	}
-	if err := d.reconcileTextPart(item, index, env.Part.Text); err != nil {
+	if err := d.ensureTextParts(item, index); err != nil {
 		return err
 	}
-	return d.flushClosedText(item)
+	part := item.parts[index]
+	if err := d.notePartKind(part, true); err != nil {
+		return err
+	}
+	if part.done {
+		return ir.ProtocolError("conflicting message text")
+	}
+	start := item.partStart(index)
+	retained := ""
+	if part.end >= start && part.end <= item.text.Len() {
+		retained = item.text.String()[start:part.end]
+	}
+	if !strings.HasPrefix(snapshot, retained) {
+		return ir.ProtocolError("conflicting message text")
+	}
+	extra := snapshot[len(retained):]
+	if extra == "" {
+		// A repeated added snapshot is metadata. It must not emit again or close
+		// the part; a later delta can still extend it.
+		return nil
+	}
+	if index != len(item.parts)-1 || part.end != item.text.Len() {
+		return ir.ProtocolError("conflicting message text order")
+	}
+	// Budget and identity are decided before retention. A rejected added part
+	// leaves neither the bytes nor a queued emission.
+	open := d.firstOpenText()
+	queued := item != open
+	cost := 0
+	if queued {
+		cost = len(extra) + textQueueEntryOverhead
+		if err := d.checkPending(cost); err != nil {
+			return err
+		}
+	}
+	if err := d.retainText(len(extra)); err != nil {
+		return err
+	}
+	item.text.WriteString(extra)
+	part.end += len(extra)
+	d.sawRefusal = true
+	if queued {
+		d.appendPending(pendingOrderWork{
+			kind: pendingOrderText, textOwner: item, cost: cost,
+		})
+		return nil
+	}
+	return d.emitTextSuffix(item)
+}
+
+func (d *responsesToolDecoder) observePartDone(env *streamEnvelope) error {
+	if d.sawUnkeyedText || env.Part == nil {
+		return nil
+	}
+	refusal := env.Part.Type == "refusal"
+	if refusal {
+		if !env.Part.TextSet && !env.Part.RefusalSet {
+			return nil
+		}
+	} else if !env.Part.TextSet {
+		return nil
+	}
+	if env.Part.Type != "" && env.Part.Type != "output_text" && env.Part.Type != "text" && !refusal {
+		return nil
+	}
+	snapshot := env.Part.Text
+	if refusal && env.Part.RefusalSet {
+		snapshot = env.Part.Refusal
+	}
+	return d.observePartSnapshot(env, snapshot, refusal)
 }
 
 func (d *responsesToolDecoder) observeAdded(env *streamEnvelope) error {
@@ -1527,7 +2005,7 @@ func (d *responsesToolDecoder) observeFinal(items []respOutputItem) error {
 				continue
 			}
 			full := finalMessageText(item)
-			ti, err := d.matchTextFinal(i, item, full != "")
+			ti, err := d.matchTextFinal(i, item, full != "" || messageHasRefusal(item))
 			if err != nil {
 				return err
 			}
@@ -1557,7 +2035,7 @@ func (d *responsesToolDecoder) observeFinal(items []respOutputItem) error {
 		case slots[i].reasoning != nil:
 			willEmit = d.reasonWillEmit(slots[i].reasoning)
 		case slots[i].text != nil:
-			willEmit = slots[i].text.emitted < slots[i].text.text.Len()
+			willEmit = textItemWillEmit(slots[i].text)
 		}
 		if willEmit {
 			if err := d.rejectReorderedEmission(i); err != nil {
@@ -2144,7 +2622,11 @@ type StreamEncoder struct {
 	openItemID  string
 	openOutIdx  int
 
-	textBuf strings.Builder
+	// openParts records each content part of the open message in order. A marker
+	// change closes the current part and opens the next; earlier bytes stay in
+	// their original part. Pointers keep each strings.Builder stable across append.
+	openParts []*respOpenPart
+	partIdx   int
 
 	// Structured Responses reasoning state. reasoningOpen is the item currently
 	// emitting summary frames; reasoningOpenPart is its open summary part.
@@ -2181,6 +2663,12 @@ type StreamEncoder struct {
 // respTool is one IR-index function call. itemID is empty until
 // output_item.added has been written; identity may arrive across repeated
 // Starts and argument fragments may precede the first Start.
+type respOpenPart struct {
+	refusal bool
+	text    strings.Builder
+	closed  bool
+}
+
 type respTool struct {
 	itemID  string
 	outIdx  int
@@ -2263,29 +2751,34 @@ func (e *StreamEncoder) ensureCreated(w *sse.Writer) error {
 func (e *StreamEncoder) closeOpen(w *sse.Writer) error {
 	switch e.open {
 	case openMessage:
-		full := e.textBuf.String()
-		if err := e.emit(w, "response.output_text.done", map[string]any{
-			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": 0, "text": full,
-		}); err != nil {
+		if err := e.closeOpenPart(w); err != nil {
 			return err
 		}
-		if err := e.emit(w, "response.content_part.done", map[string]any{
-			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": 0,
-			"part": map[string]any{"type": "output_text", "text": full, "annotations": []any{}},
-		}); err != nil {
-			return err
+		content := make([]any, 0, len(e.openParts))
+		for _, part := range e.openParts {
+			text := part.text.String()
+			if part.refusal {
+				content = append(content, map[string]any{"type": "refusal", "refusal": text})
+				continue
+			}
+			if text == "" {
+				continue
+			}
+			content = append(content, map[string]any{"type": "output_text", "text": text, "annotations": []any{}})
+		}
+		if content == nil {
+			content = []any{}
 		}
 		item := map[string]any{
 			"id": e.openItemID, "type": "message", "status": "completed", "role": "assistant",
-			"content": []any{},
-		}
-		if full != "" {
-			item["content"] = []any{map[string]any{"type": "output_text", "text": full, "annotations": []any{}}}
+			"content": content,
 		}
 		e.items = append(e.items, item)
 		if err := e.emit(w, "response.output_item.done", map[string]any{"output_index": e.openOutIdx, "item": item}); err != nil {
 			return err
 		}
+		e.openParts = nil
+		e.partIdx = 0
 	case openReasoning:
 		if e.reasoningOpen != nil {
 			if err := e.closeReasoningItem(w, e.reasoningOpen); err != nil {
@@ -2468,7 +2961,7 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 		return nil
 
 	case ir.EventTextStart, ir.EventTextDelta:
-		if ev.Text == "" {
+		if ev.Text == "" && !ev.Refusal {
 			return nil
 		}
 		if err := e.ensureCreated(w); err != nil {
@@ -2479,9 +2972,19 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 				return err
 			}
 		}
-		e.textBuf.WriteString(ev.Text)
-		return e.emit(w, "response.output_text.delta", map[string]any{
-			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": 0, "delta": ev.Text,
+		if err := e.ensureMessagePart(w, ev.Refusal); err != nil {
+			return err
+		}
+		if ev.Text == "" {
+			return nil
+		}
+		e.openParts[e.partIdx].text.WriteString(ev.Text)
+		name := "response.output_text.delta"
+		if ev.Refusal {
+			name = "response.refusal.delta"
+		}
+		return e.emit(w, name, map[string]any{
+			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": e.partIdx, "delta": ev.Text,
 		})
 
 	case ir.EventReasoningDelta, ir.EventReasoningStart:
@@ -2554,12 +3057,13 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 		if err := e.closeDeferredReasoning(w); err != nil {
 			return err
 		}
-		status := "completed"
-		if ev.StopReason == ir.StopMaxTokens {
-			status = "incomplete"
-		}
 		e.finishEmitted = true
-		return e.emit(w, "response.completed", map[string]any{"response": e.responseObj(status, e.items, true)})
+		name, status, reason := responseTerminal(ev.StopReason)
+		obj := e.responseObj(status, e.items, true)
+		if reason != "" {
+			obj["incomplete_details"] = map[string]any{"reason": reason}
+		}
+		return e.emit(w, name, map[string]any{"response": obj})
 	}
 	return nil
 }
@@ -2579,6 +3083,17 @@ func (e *StreamEncoder) EncodeError(w *sse.Writer, message, errType string) erro
 	})
 }
 
+func responseTerminal(stop ir.StopReason) (name, status, reason string) {
+	switch stop {
+	case ir.StopMaxTokens:
+		return "response.incomplete", "incomplete", "max_output_tokens"
+	case ir.StopContentFilter:
+		return "response.incomplete", "incomplete", "content_filter"
+	default:
+		return "response.completed", "completed", ""
+	}
+}
+
 func (e *StreamEncoder) openMessageItem(w *sse.Writer) error {
 	if err := e.closeOpen(w); err != nil {
 		return err
@@ -2593,18 +3108,62 @@ func (e *StreamEncoder) openMessageItem(w *sse.Writer) error {
 	e.openOutIdx = e.outputIndex
 	e.outputIndex++
 	e.open = openMessage
-	e.textBuf.Reset()
-	if err := e.emit(w, "response.output_item.added", map[string]any{
+	e.openParts = nil
+	e.partIdx = 0
+	return e.emit(w, "response.output_item.added", map[string]any{
 		"output_index": e.openOutIdx,
 		"item": map[string]any{
 			"id": e.openItemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{},
 		},
+	})
+}
+
+func (e *StreamEncoder) ensureMessagePart(w *sse.Writer, refusal bool) error {
+	if len(e.openParts) > 0 && e.openParts[e.partIdx].refusal == refusal {
+		return nil
+	}
+	if len(e.openParts) > 0 {
+		if err := e.closeOpenPart(w); err != nil {
+			return err
+		}
+		e.partIdx++
+	}
+	e.openParts = append(e.openParts, &respOpenPart{refusal: refusal})
+	part := map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
+	if refusal {
+		part = map[string]any{"type": "refusal", "refusal": ""}
+	}
+	return e.emit(w, "response.content_part.added", map[string]any{
+		"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": e.partIdx, "part": part,
+	})
+}
+
+func (e *StreamEncoder) closeOpenPart(w *sse.Writer) error {
+	if len(e.openParts) == 0 || e.openParts[e.partIdx].closed {
+		return nil
+	}
+	part := e.openParts[e.partIdx]
+	e.openParts[e.partIdx].closed = true
+	text := part.text.String()
+	if part.refusal {
+		if err := e.emit(w, "response.refusal.done", map[string]any{
+			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": e.partIdx, "refusal": text,
+		}); err != nil {
+			return err
+		}
+		return e.emit(w, "response.content_part.done", map[string]any{
+			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": e.partIdx,
+			"part": map[string]any{"type": "refusal", "refusal": text},
+		})
+	}
+	if err := e.emit(w, "response.output_text.done", map[string]any{
+		"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": e.partIdx, "text": text,
 	}); err != nil {
 		return err
 	}
-	return e.emit(w, "response.content_part.added", map[string]any{
-		"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": 0,
-		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+	return e.emit(w, "response.content_part.done", map[string]any{
+		"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": e.partIdx,
+		"part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
 	})
 }
 

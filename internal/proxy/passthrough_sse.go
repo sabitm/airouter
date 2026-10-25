@@ -61,6 +61,7 @@ func classifyOpenAIChatPassthrough(ev sse.Event) (passthroughClass, *ir.StreamFa
 			Delta struct {
 				Role      string          `json:"role"`
 				Content   json.RawMessage `json:"content"`
+				Refusal   json.RawMessage `json:"refusal"`
 				ToolCalls json.RawMessage `json:"tool_calls"`
 			} `json:"delta"`
 			FinishReason *string `json:"finish_reason"`
@@ -72,7 +73,7 @@ func classifyOpenAIChatPassthrough(ev sse.Event) (passthroughClass, *ir.StreamFa
 	}
 
 	for _, c := range chunk.Choices {
-		if jsonValuePresent(c.Delta.Content) || jsonValuePresent(c.Delta.ToolCalls) {
+		if jsonValuePresent(c.Delta.Content) || jsonValuePresent(c.Delta.Refusal) || jsonValuePresent(c.Delta.ToolCalls) {
 			return passVisible, nil
 		}
 	}
@@ -90,11 +91,17 @@ func classifyOpenAIChatPassthrough(ev sse.Event) (passthroughClass, *ir.StreamFa
 
 func classifyResponsesPassthrough(ev sse.Event) (passthroughClass, *ir.StreamFailure) {
 	var env struct {
-		Type  string          `json:"type"`
-		Delta json.RawMessage `json:"delta"`
-		Item  *struct {
+		Type    string          `json:"type"`
+		Delta   json.RawMessage `json:"delta"`
+		Refusal json.RawMessage `json:"refusal"`
+		Item    *struct {
 			Type string `json:"type"`
 		} `json:"item"`
+		Part *struct {
+			Type    string `json:"type"`
+			Text    string `json:"text"`
+			Refusal string `json:"refusal"`
+		} `json:"part"`
 		Response *struct {
 			Status string          `json:"status"`
 			Error  json.RawMessage `json:"error"`
@@ -145,17 +152,34 @@ func classifyResponsesPassthrough(ev sse.Event) (passthroughClass, *ir.StreamFai
 	case "response.completed", "response.incomplete":
 		return passTerminal, nil
 	case "response.created", "response.in_progress", "response.content_part.added":
+		// An empty refusal part is metadata. It must not commit before a visible
+		// byte or a successful terminal event.
+		if typ == "response.content_part.added" && env.Part != nil && env.Part.Type == "refusal" && env.Part.Refusal != "" {
+			return passVisible, nil
+		}
 		return passLifecycle, nil
 	case "response.output_item.added":
 		if env.Item != nil && env.Item.Type != "" && env.Item.Type != "message" {
 			return passVisible, nil
 		}
 		return passLifecycle, nil
-	case "response.output_text.delta", "response.function_call_arguments.delta":
+	case "response.output_text.delta", "response.refusal.delta", "response.function_call_arguments.delta":
 		if jsonValuePresent(env.Delta) {
 			return passVisible, nil
 		}
 		return passLifecycle, nil
+	case "response.refusal.done":
+		// Native done carries the explanation at the top level. An explicit empty
+		// value is metadata; nonempty text commits before a later error.
+		if !jsonValuePresent(env.Refusal) {
+			return passLifecycle, nil
+		}
+		return passVisible, nil
+	case "response.content_part.done":
+		if env.Part != nil && env.Part.Type == "refusal" && env.Part.Refusal == "" {
+			return passLifecycle, nil
+		}
+		return passVisible, nil
 	case "ping":
 		return passLifecycle, nil
 	}

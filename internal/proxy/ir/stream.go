@@ -95,6 +95,11 @@ type StreamEvent struct {
 	// source text block at Index. Legacy unindexed text producers leave this
 	// false, so their adjacent deltas keep merging into one output block.
 	TextIndexed bool
+	// Refusal marks EventTextStart, EventTextDelta, and EventTextEnd as a refusal
+	// segment. It is meaningful only on those text events. A zero value is ordinary
+	// text. A change of this marker splits a segment; earlier bytes are not
+	// reclassified. An explicit empty refusal may carry Refusal with empty Text.
+	Refusal bool
 
 	// ReasoningID is the source OpenAI Responses reasoning item ID when known.
 	// It is not an Anthropic block identity and not a function-call identity.

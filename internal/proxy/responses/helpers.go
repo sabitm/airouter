@@ -9,6 +9,54 @@ import (
 	"airouter/internal/proxy/media"
 )
 
+// outputContentPart maps one message content part. A refusal part stays a
+// marked text block, including an explicit empty refusal. Ordinary text and
+// refusal are never concatenated into one labeled segment.
+func outputContentPart(c respOutputContent) (ir.ContentBlock, bool) {
+	switch c.Type {
+	case "output_text", "text", "":
+		return ir.ContentBlock{Type: ir.BlockText, Text: c.Text}, true
+	case "refusal":
+		text := c.Refusal
+		if !c.RefusalSet && c.TextSet {
+			text = c.Text
+		}
+		return ir.ContentBlock{Type: ir.BlockText, Text: text, Refusal: true}, true
+	default:
+		return ir.ContentBlock{}, false
+	}
+}
+
+// contentPartBlock maps one request content part. Refusal presence is required:
+// a refusal type with no refusal field is not invented text.
+func contentPartBlock(p contentPart) (ir.ContentBlock, bool) {
+	switch p.Type {
+	case "input_text", "output_text", "text":
+		return ir.ContentBlock{Type: ir.BlockText, Text: p.Text}, true
+	case "refusal":
+		if !p.RefusalSet {
+			return ir.ContentBlock{}, false
+		}
+		return ir.ContentBlock{Type: ir.BlockText, Text: p.Refusal, Refusal: true}, true
+	case "input_image":
+		return ir.ContentBlock{Type: ir.BlockImage, Image: imageFromPart(p)}, true
+	case "input_file":
+		return ir.ContentBlock{Type: ir.BlockFile, File: fileFromPart(p)}, true
+	default:
+		return ir.ContentBlock{}, false
+	}
+}
+
+// outputTextPart renders one IR text block as a native Responses part. A
+// refusal marker uses the refusal field and never also copies that text into
+// an output_text part.
+func outputTextPart(b ir.ContentBlock) map[string]any {
+	if b.Refusal {
+		return map[string]any{"type": "refusal", "refusal": b.Text}
+	}
+	return map[string]any{"type": "output_text", "text": b.Text, "annotations": []any{}}
+}
+
 func contentToText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""

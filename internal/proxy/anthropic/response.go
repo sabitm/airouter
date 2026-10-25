@@ -189,7 +189,9 @@ func stopReasonWire(sr ir.StopReason) string {
 		return "tool_use"
 	case ir.StopStopSequence:
 		return "stop_sequence"
-	case ir.StopRefusal:
+	case ir.StopRefusal, ir.StopContentFilter:
+		// Anthropic has no content-filter stop. Project that truncation to the
+		// refusal vocabulary without rewriting already emitted text.
 		return "refusal"
 	case ir.StopPauseTurn:
 		return "pause_turn"

@@ -1078,56 +1078,73 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 	type collectedText struct {
 		blockIdx int
 		text     strings.Builder
+		// refusal is the marker of the bytes in text. A marker change flushes this
+		// state and starts another block. The zero value is ordinary text. An explicit
+		// empty refusal is the open block itself, not a second flag.
+		refusal bool
 	}
 	texts := map[int]*collectedText{}
 	plainBlocks := 0
-	newTextState := func() (*collectedText, error) {
+	newTextState := func(refusal bool) (*collectedText, error) {
 		if plainBlocks >= maxCollectedStreamBlocks {
 			return nil, errCollectedStreamResponseTooLarge
 		}
 		if err := reserve(collectedBlockOverhead); err != nil {
 			return nil, err
 		}
-		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText})
+		resp.Content = append(resp.Content, ir.ContentBlock{Type: ir.BlockText, Refusal: refusal})
 		plainBlocks++
-		return &collectedText{blockIdx: len(resp.Content) - 1}, nil
+		return &collectedText{blockIdx: len(resp.Content) - 1, refusal: refusal}, nil
 	}
-	ensureTextState := func(index int) (*collectedText, error) {
-		if st := texts[index]; st != nil {
-			return st, nil
-		}
-		st, err := newTextState()
-		if err != nil {
-			return nil, err
-		}
-		texts[index] = st
-		return st, nil
-	}
+	var ensureTextState func(index int, refusal bool) (*collectedText, error)
 	flushTextState := func(index int) {
 		st := texts[index]
 		if st == nil {
 			return
 		}
 		resp.Content[st.blockIdx].Text = st.text.String()
+		resp.Content[st.blockIdx].Refusal = st.refusal
 		delete(texts, index)
+	}
+	ensureTextState = func(index int, refusal bool) (*collectedText, error) {
+		if st := texts[index]; st != nil {
+			// Same-kind fragments keep the open block. A marker change closes it so
+			// mixed segments stay ordered and are not relabeled as one refusal.
+			if st.refusal == refusal {
+				return st, nil
+			}
+			flushTextState(index)
+		}
+		st, err := newTextState(refusal)
+		if err != nil {
+			return nil, err
+		}
+		texts[index] = st
+		return st, nil
 	}
 	flushText := func() {
 		for index := range texts {
 			flushTextState(index)
 		}
 	}
-	appendText := func(index int, text string) error {
-		// Legacy empty text events never create a block. An indexed start
-		// already created its block, so empty indexed deltas do not add one.
-		if text == "" {
+	appendText := func(index int, text string, refusal bool) error {
+		// Legacy empty text events never create a block. An explicit empty
+		// refusal is the exception: it is a successful model response with no
+		// invented explanation.
+		if text == "" && !refusal {
 			return nil
 		}
-		if err := reserve(len(text)); err != nil {
-			return err
+		if text != "" {
+			if err := reserve(len(text)); err != nil {
+				return err
+			}
 		}
-		st, err := ensureTextState(index)
+		st, err := ensureTextState(index, refusal)
 		if err != nil {
 			return err
+		}
+		if text == "" {
+			return nil
 		}
 		st.text.WriteString(text)
 		return nil
@@ -1146,7 +1163,12 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		if err := reserve(len(trimmed) + collectedCitationOverhead); err != nil {
 			return err
 		}
-		st, err := ensureTextState(index)
+		// A citation stays on the open ordinary segment. It does not convert a
+		// refusal segment or invent a second block for the annotation.
+		if stExisting := texts[index]; stExisting != nil && stExisting.refusal {
+			return ir.ProtocolError("citation on refusal text")
+		}
+		st, err := ensureTextState(index, false)
 		if err != nil {
 			return err
 		}
@@ -1603,7 +1625,7 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			if _, exists := texts[ev.Index]; exists {
 				return ir.ProtocolError("text block started twice")
 			}
-			st, err := ensureTextState(ev.Index)
+			st, err := ensureTextState(ev.Index, ev.Refusal)
 			if err != nil {
 				return err
 			}
@@ -1620,7 +1642,7 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			if ev.TextIndexed {
 				index = ev.Index
 			}
-			if err := appendText(index, ev.Text); err != nil {
+			if err := appendText(index, ev.Text, ev.Refusal); err != nil {
 				return err
 			}
 		case ir.EventTextCitation:

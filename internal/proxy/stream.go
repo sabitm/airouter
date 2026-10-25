@@ -630,8 +630,12 @@ func (s *translatedSink) projectAway(ev ir.StreamEvent) bool {
 // readable text and discards its signature.
 func (s *translatedSink) visible(ev ir.StreamEvent) bool {
 	switch ev.Kind {
-	case ir.EventTextDelta, ir.EventToolCallStart, ir.EventToolCallDelta, ir.EventFinish:
+	case ir.EventToolCallStart, ir.EventToolCallDelta, ir.EventFinish:
 		return true
+	case ir.EventTextDelta:
+		// An explicit empty refusal is successful metadata, not visible bytes.
+		// Buffer it until a nonempty fragment or Finish commits the stream.
+		return ev.Text != ""
 	case ir.EventTextStart:
 		return ev.Text != ""
 	case ir.EventTextEnd:
@@ -699,6 +703,7 @@ func pendingEventBytes(ev ir.StreamEvent) int {
 func (s *translatedSink) note(ev ir.StreamEvent) {
 	switch ev.Kind {
 	case ir.EventTextStart, ir.EventTextDelta:
+		// Readable text only. A refusal marker does not add a second copy.
 		s.text.WriteString(ev.Text)
 	case ir.EventReasoningDelta, ir.EventReasoningStart:
 		// Readable reasoning contributes to usage estimates. Signature and

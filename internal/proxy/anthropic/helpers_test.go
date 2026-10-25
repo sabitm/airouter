@@ -373,6 +373,8 @@ func TestStopReasonWire(t *testing.T) {
 		{ir.StopToolUse, "tool_use"},
 		{ir.StopStopSequence, "stop_sequence"},
 		{ir.StopEndTurn, "end_turn"},
+		{ir.StopRefusal, "refusal"},
+		{ir.StopContentFilter, "refusal"},
 		{"unknown", "end_turn"},
 	}
 	for _, tc := range cases {

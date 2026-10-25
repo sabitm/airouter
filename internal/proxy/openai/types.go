@@ -32,8 +32,12 @@ type streamOptions struct {
 }
 
 type chatMessage struct {
-	Role             string            `json:"role"`
-	Content          json.RawMessage   `json:"content,omitempty"` // string or []chatPart, may be null
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content,omitempty"` // string or []chatPart, may be null
+	// Refusal is encoded by MarshalJSON so an explicit empty string is not
+	// dropped by omitempty. RefusalSet distinguishes that empty value from absence.
+	Refusal          json.RawMessage   `json:"-"`
+	RefusalSet       bool              `json:"-"`
 	ReasoningContent string            `json:"reasoning_content,omitempty"`
 	Reasoning        json.RawMessage   `json:"reasoning,omitempty"`
 	ReasoningDetails []json.RawMessage `json:"reasoning_details,omitempty"`
@@ -41,9 +45,45 @@ type chatMessage struct {
 	ToolCallID       string            `json:"tool_call_id,omitempty"`
 }
 
+func (m *chatMessage) UnmarshalJSON(data []byte) error {
+	type plain chatMessage
+	var raw struct {
+		plain
+		Refusal json.RawMessage `json:"refusal"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*m = chatMessage(raw.plain)
+	if !isNullishRaw(raw.Refusal) {
+		var s string
+		if err := json.Unmarshal(raw.Refusal, &s); err != nil {
+			return err
+		}
+		m.Refusal = append(json.RawMessage(nil), raw.Refusal...)
+		m.RefusalSet = true
+	}
+	return nil
+}
+
+func (m chatMessage) MarshalJSON() ([]byte, error) {
+	type plain chatMessage
+	raw, err := json.Marshal(plain(m))
+	if err != nil || !m.RefusalSet {
+		return raw, err
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	obj["refusal"] = append(json.RawMessage(nil), m.Refusal...)
+	return json.Marshal(obj)
+}
+
 type chatPart struct {
-	Type     string        `json:"type"` // text | image_url | file
+	Type     string        `json:"type"` // text | refusal | image_url | file
 	Text     string        `json:"text,omitempty"`
+	Refusal  string        `json:"refusal,omitempty"`
 	ImageURL *chatImageURL `json:"image_url,omitempty"`
 	File     *chatFile     `json:"file,omitempty"`
 }
@@ -104,7 +144,10 @@ type chatRespMessage struct {
 	Role string `json:"role"`
 	// Pointer so an absent text body marshals to null (OpenAI's convention when
 	// the turn is only tool calls).
-	Content          *string           `json:"content"`
+	Content *string `json:"content"`
+	// Refusal is the native refusal field. Nil means absent. An explicit empty
+	// string is retained and is not copied into Content.
+	Refusal          *string           `json:"refusal,omitempty"` // pointer keeps an explicit empty string
 	ReasoningContent string            `json:"reasoning_content,omitempty"`
 	Reasoning        json.RawMessage   `json:"reasoning,omitempty"`
 	ReasoningDetails []json.RawMessage `json:"reasoning_details,omitempty"`

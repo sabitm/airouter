@@ -75,6 +75,10 @@ type reasoningSummary struct {
 	// including an explicit empty string. Absent text is a placeholder, not
 	// proof that a retained part is empty.
 	TextSet bool `json:"-"`
+	// Refusal is the native refusal explanation on a content-part frame. The
+	// same object also decodes reasoning summary parts, which ignore this field.
+	Refusal    string `json:"refusal"`
+	RefusalSet bool   `json:"-"`
 }
 
 // UnmarshalJSON rejects a null or non-object summary entry. A null entry would
@@ -86,13 +90,14 @@ func (p *reasoningSummary) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("responses: reasoning summary entry must be an object")
 	}
 	var raw struct {
-		Type json.RawMessage `json:"type"`
-		Text json.RawMessage `json:"text"`
+		Type    json.RawMessage `json:"type"`
+		Text    json.RawMessage `json:"text"`
+		Refusal json.RawMessage `json:"refusal"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	p.Type, p.Text, p.TextSet = "", "", false
+	p.Type, p.Text, p.TextSet, p.Refusal, p.RefusalSet = "", "", false, "", false
 	if !isNullish(raw.Type) {
 		if err := json.Unmarshal(raw.Type, &p.Type); err != nil {
 			return err
@@ -104,13 +109,24 @@ func (p *reasoningSummary) UnmarshalJSON(data []byte) error {
 		}
 		p.TextSet = true
 	}
+	if !isNullish(raw.Refusal) {
+		if err := json.Unmarshal(raw.Refusal, &p.Refusal); err != nil {
+			return err
+		}
+		p.RefusalSet = true
+	}
 	return nil
 }
 
 type contentPart struct {
-	Type     string          `json:"type"` // input_text | output_text | text | input_image | input_file
-	Text     string          `json:"text"`
-	ImageURL json.RawMessage `json:"image_url"` // string or {url}
+	Type    string `json:"type"` // input_text | output_text | text | refusal | input_image | input_file
+	Text    string `json:"text"`
+	TextSet bool   `json:"-"`
+	Refusal string `json:"refusal"`
+	// RefusalSet reports a non-null refusal field, including an explicit empty
+	// string. Absent and JSON null are not an empty refusal.
+	RefusalSet bool            `json:"-"`
+	ImageURL   json.RawMessage `json:"image_url"` // string or {url}
 	// input_file fields (flat on the part in the public Responses shape).
 	// FileID is also input_image.file_id. The two part types are exclusive, so
 	// one JSON field is safe; a second file_id tag would drop the value.
@@ -118,4 +134,46 @@ type contentPart struct {
 	FileURL  string `json:"file_url,omitempty"`
 	Filename string `json:"filename,omitempty"`
 	FileID   string `json:"file_id,omitempty"`
+}
+
+// UnmarshalJSON records text and refusal presence. A refusal part with a
+// non-string refusal field fails closed; other part kinds keep lenient field
+// decoding so an unrelated malformed sibling is not a new rejection.
+func (p *contentPart) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type     string          `json:"type"`
+		Text     json.RawMessage `json:"text"`
+		Refusal  json.RawMessage `json:"refusal"`
+		ImageURL json.RawMessage `json:"image_url"`
+		FileData string          `json:"file_data"`
+		FileURL  string          `json:"file_url"`
+		Filename string          `json:"filename"`
+		FileID   string          `json:"file_id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*p = contentPart{
+		Type: raw.Type, ImageURL: raw.ImageURL, FileData: raw.FileData,
+		FileURL: raw.FileURL, Filename: raw.Filename, FileID: raw.FileID,
+	}
+	if !isNullish(raw.Text) {
+		if err := json.Unmarshal(raw.Text, &p.Text); err != nil {
+			if raw.Type == "refusal" || raw.Type == "input_text" || raw.Type == "output_text" || raw.Type == "text" {
+				return err
+			}
+		} else {
+			p.TextSet = true
+		}
+	}
+	if !isNullish(raw.Refusal) {
+		if err := json.Unmarshal(raw.Refusal, &p.Refusal); err != nil {
+			if raw.Type == "refusal" {
+				return err
+			}
+		} else {
+			p.RefusalSet = true
+		}
+	}
+	return nil
 }
