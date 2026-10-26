@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -68,11 +69,11 @@ func BuildCosyHeaders(body []byte, requestURL string, creds Creds) (map[string]s
 	}
 
 	cosyKey, info, err := encryptUserInfo(map[string]string{
-		"uid":                   creds.UserID,
-		"security_oauth_token":  creds.AuthToken,
-		"name":                  creds.Name,
-		"aid":                   "",
-		"email":                 creds.Email,
+		"uid":                  creds.UserID,
+		"security_oauth_token": creds.AuthToken,
+		"name":                 creds.Name,
+		"aid":                  "",
+		"email":                creds.Email,
 	})
 	if err != nil {
 		return nil, err
@@ -109,32 +110,52 @@ func BuildCosyHeaders(body []byte, requestURL string, creds Creds) (map[string]s
 
 	machineID := creds.MachineID
 	if machineID == "" {
+		// Connections without a stored machine id (PAT-style or incomplete
+		// credentials) previously looked like a new device on every request
+		// and rejoined the back of the model queue each time. Derive a stable
+		// one from the user id; a stored id always wins.
+		machineID = DeriveMachineID(creds.UserID)
+	}
+	if machineID == "" {
 		machineID = newUUID()
 	}
 	bodyHash := md5Hex(body)
 	bodyLength := fmt.Sprintf("%d", len(body))
 
 	return map[string]string{
-		"Authorization":           "Bearer COSY." + payloadB64 + "." + sig,
-		"Cosy-Key":                cosyKey,
-		"Cosy-User":               creds.UserID,
-		"Cosy-Date":               timestamp,
-		"Cosy-Version":            IDEVersion,
-		"Cosy-Machineid":          machineID,
-		"Cosy-Machinetoken":       machineID,
-		"Cosy-Machinetype":        MachineType,
-		"Cosy-Machineos":          MachineOS,
-		"Cosy-Clienttype":         ClientType,
-		"Cosy-Clientip":           "127.0.0.1",
-		"Cosy-Bodyhash":           bodyHash,
-		"Cosy-Bodylength":         bodyLength,
-		"Cosy-Sigpath":            sigPath,
-		"Cosy-Data-Policy":        DataPolicy,
-		"Cosy-Organization-Id":    "",
-		"Cosy-Organization-Tags":  "",
-		"Login-Version":           LoginVersion,
-		"X-Request-Id":            newUUID(),
+		"Authorization":          "Bearer COSY." + payloadB64 + "." + sig,
+		"Cosy-Key":               cosyKey,
+		"Cosy-User":              creds.UserID,
+		"Cosy-Date":              timestamp,
+		"Cosy-Version":           IDEVersion,
+		"Cosy-Machineid":         machineID,
+		"Cosy-Machinetoken":      machineID,
+		"Cosy-Machinetype":       MachineType,
+		"Cosy-Machineos":         MachineOS,
+		"Cosy-Clienttype":        ClientType,
+		"Cosy-Clientip":          "127.0.0.1",
+		"Cosy-Bodyhash":          bodyHash,
+		"Cosy-Bodylength":        bodyLength,
+		"Cosy-Sigpath":           sigPath,
+		"Cosy-Data-Policy":       DataPolicy,
+		"Cosy-Organization-Id":   "",
+		"Cosy-Organization-Tags": "",
+		"Login-Version":          LoginVersion,
+		"X-Request-Id":           newUUID(),
 	}, nil
+}
+
+// DeriveMachineID returns the reference-compatible stable machine id for a
+// user id: sha256 over "qoder-machine" NUL seed, formatted as a UUID so it is
+// indistinguishable from a generated id. An empty seed returns empty; the
+// caller decides the last-resort fallback.
+func DeriveMachineID(userID string) string {
+	if strings.TrimSpace(userID) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("qoder-machine\x00" + userID))
+	h := hex.EncodeToString(sum[:])
+	return h[0:8] + "-" + h[8:12] + "-5" + h[13:16] + "-a" + h[17:20] + "-" + h[20:32]
 }
 
 func encryptUserInfo(userInfo map[string]string) (cosyKeyB64, infoB64 string, err error) {

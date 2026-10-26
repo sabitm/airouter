@@ -12,6 +12,10 @@ type StreamFailure struct {
 	Type    string // e.g. service_unavailable_error
 	Code    string // e.g. server_is_overloaded
 	Message string
+	// Status is the optional embedded upstream HTTP status. Zero keeps the
+	// caller's default mappings (502, or 503 for service-unavailable shapes);
+	// a valid 4xx/5xx status is preserved for pre-commit failover.
+	Status int
 }
 
 // ProtocolError is a payload-free stream sequencing failure. Message must

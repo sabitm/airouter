@@ -153,6 +153,16 @@ func quotaMeta(q usage.Quota) string {
 	return ""
 }
 
+// quotaResetText distinguishes an upstream "never expires" sentinel from an
+// unknown reset. A nil reset without the marker means the upstream sent no
+// usable time; the countdown stays "-" instead of inventing one.
+func quotaResetText(q usage.Quota) string {
+	if q.NeverExpires {
+		return "Never expires"
+	}
+	return formatResetCountdown(q.ResetAt)
+}
+
 func quotaPctOnly(q usage.Quota) bool {
 	return q.RemainingPct != nil && q.Total == 0 && q.Used == 0
 }

@@ -140,3 +140,53 @@ func TestEncryptUserInfo(t *testing.T) {
 		}
 	})
 }
+
+func TestDeriveMachineID(t *testing.T) {
+	t.Run("reference fixture", func(t *testing.T) {
+		// sha256("qoder-machine\0user-1") formatted as a UUID, matching the
+		// reference deriveMachineId.
+		const want = "f3cc36cf-b8d4-5764-a4cb-86c71da6925a"
+		if got := DeriveMachineID("user-1"); got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("stable across calls", func(t *testing.T) {
+		if DeriveMachineID("acct-9") != DeriveMachineID("acct-9") {
+			t.Fatal("fallback is not stable")
+		}
+		if DeriveMachineID("acct-9") == DeriveMachineID("acct-10") {
+			t.Fatal("different seeds produced the same id")
+		}
+	})
+	t.Run("empty seed empty", func(t *testing.T) {
+		if got := DeriveMachineID(""); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+}
+
+func TestBuildCosyHeadersMachineIDFallback(t *testing.T) {
+	t.Run("stored machine id wins", func(t *testing.T) {
+		headers, err := BuildCosyHeaders([]byte("body"), ChatURL, Creds{UserID: "u", AuthToken: "tok", MachineID: "stored-id"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if headers["Cosy-Machineid"] != "stored-id" || headers["Cosy-Machinetoken"] != "stored-id" {
+			t.Fatalf("machine headers = %q/%q", headers["Cosy-Machineid"], headers["Cosy-Machinetoken"])
+		}
+	})
+	t.Run("missing machine id derives stable fallback", func(t *testing.T) {
+		h1, err := BuildCosyHeaders([]byte("body"), ChatURL, Creds{UserID: "u", AuthToken: "tok"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h2, err := BuildCosyHeaders([]byte("body"), ChatURL, Creds{UserID: "u", AuthToken: "tok"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := DeriveMachineID("u")
+		if h1["Cosy-Machineid"] != want || h2["Cosy-Machineid"] != want {
+			t.Fatalf("fallback = %q/%q, want %q", h1["Cosy-Machineid"], h2["Cosy-Machineid"], want)
+		}
+	})
+}

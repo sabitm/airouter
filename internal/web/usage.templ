@@ -188,7 +188,7 @@ templ quotaRow(q usage.Quota) {
 		</div>
 		<div class="quota-row-foot">
 			<span class="quota-used">{ quotaUsedText(q) }</span>
-			<span class="quota-reset">{ formatResetCountdown(q.ResetAt) }</span>
+			<span class="quota-reset">{ quotaResetText(q) }</span>
 		</div>
 	</div>
 }

@@ -202,7 +202,9 @@ func retryableStreamDecode(err error) attemptResult {
 
 // retryableStreamFailure maps a structured upstream stream failure to a
 // pre-commit failover result. Client/history get the upstream message; terminal
-// logs get a generic string only.
+// logs get a generic string only. A failure carrying a valid embedded upstream
+// status preserves it; without one the default mappings stand (502, or 503 for
+// service-unavailable shapes).
 func retryableStreamFailure(err error) attemptResult {
 	status := http.StatusBadGateway
 	errMsg := "upstream stream failed"
@@ -210,7 +212,9 @@ func retryableStreamFailure(err error) attemptResult {
 		if sf.Message != "" {
 			errMsg = sf.Message
 		}
-		if isServiceUnavailableFailure(sf) {
+		if sf.Status >= 400 && sf.Status <= 599 {
+			status = sf.Status
+		} else if isServiceUnavailableFailure(sf) {
 			status = http.StatusServiceUnavailable
 		}
 	} else if err != nil && err.Error() != "" {

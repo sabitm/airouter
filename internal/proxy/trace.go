@@ -18,6 +18,11 @@ import (
 // QoderModelKey/Source are set by prepareUpstreamRequest for the Qoder backend
 // so applyUpstreamHeaders can emit X-Model-Key / X-Model-Source after COSY sign.
 //
+// QoderRequestID/SetID/SessionID are the identity fields of the prepared body.
+// The queue-status poll must correlate with the original inference, and the
+// queue is keyed by request_set_id, so the same values must survive across
+// queue replays. IDs are metadata only; bodies stay out of the trace.
+//
 // ClaudeCodeSessionID is the per-request session id the claude-code backend
 // prepare path generates, carried as X-Claude-Code-Session-Id and embedded in
 // metadata.user_id.session_id (the two must match upstream). Empty for
@@ -27,6 +32,9 @@ type TraceInfo struct {
 	CodexSessionID      string
 	QoderModelKey       string
 	QoderModelSource    string
+	QoderRequestID      string
+	QoderRequestSetID   string
+	QoderSessionID      string
 	ClaudeCodeSessionID string
 	// OpencodeSessionID is the conversation-stable x-opencode-session resolved
 	// in prepareUpstreamRequest (client identity, else namespaced fallback);

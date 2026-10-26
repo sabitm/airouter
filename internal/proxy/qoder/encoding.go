@@ -46,3 +46,33 @@ func EncodeBody(plaintext []byte) []byte {
 	}
 	return out
 }
+
+// DecodeWireBody reverses EncodeBody. Tests use it to inspect the plaintext
+// behind a captured wire body; it exists so assertions can verify identity
+// fields without duplicating the alphabet transform.
+func DecodeWireBody(wire []byte) ([]byte, error) {
+	if len(wire) == 0 {
+		return nil, nil
+	}
+	var c2s [128]byte
+	for i := range c2s {
+		c2s[i] = 0xff
+	}
+	for i := 0; i < 64; i++ {
+		c2s[customAlphabet[i]] = stdAlphabet[i]
+	}
+	c2s['$'] = '='
+	std := make([]byte, len(wire))
+	for i, c := range wire {
+		if c < 128 && c2s[c] != 0xff {
+			std[i] = c2s[c]
+		} else {
+			std[i] = c
+		}
+	}
+	n := len(std)
+	a := n / 3
+	// original = head + mid + tail where wire = tail + mid + head
+	reordered := string(std[n-a:]) + string(std[a:n-a]) + string(std[:a])
+	return base64.StdEncoding.DecodeString(reordered)
+}

@@ -122,22 +122,27 @@ func prepareUpstreamRequest(ctx context.Context, p *Proxy, backend codec, provid
 		body = kiro.InjectProfileArn(body, kiro.ProfileArnForBody(id))
 		return kiro.InjectRuntimeAgentMode(body, id.AgentMode), nil
 	case "qoder":
-		wire, err := qoder.PrepareWireBody(ctx, provider, body)
+		requested := 0
+		if req != nil {
+			requested = req.MaxTokens
+		}
+		prep, err := qoder.PrepareWireBody(ctx, provider, requested, body)
 		if err != nil {
 			return nil, err
 		}
-		// Stash model key/source from plaintext before encode for header emission.
-		// PrepareWireBody already encoded; re-read key from original body.
+		// Identity and model headers ride the trace: the encoded wire bytes
+		// cannot be re-read for them, and queue recovery needs the same values.
 		if t := traceInfoFrom(ctx); t != nil {
-			t.QoderModelKey = qoder.ModelKeyFromBody(body)
-			if cfg, lerr := qoder.LookupModelConfig(ctx, provider, t.QoderModelKey); lerr == nil {
-				t.QoderModelSource = qoder.ModelSourceFromConfig(cfg)
-			}
+			t.QoderModelKey = prep.ModelKey
+			t.QoderModelSource = prep.ModelSource
+			t.QoderRequestID = prep.RequestID
+			t.QoderRequestSetID = prep.RequestSetID
+			t.QoderSessionID = prep.SessionID
 			if t.QoderModelSource == "" {
 				t.QoderModelSource = "system"
 			}
 		}
-		return wire, nil
+		return prep.Wire, nil
 	case "antigravity":
 		return antigravity.InjectProjectID(body, antigravityProjectID(provider))
 	case "claude-code":
@@ -1109,7 +1114,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 	if accept == "" {
 		accept = "text/event-stream"
 	}
-	send := func() (*http.Response, error) {
+	send := func(ctx context.Context) (*http.Response, error) {
 		started := time.Now()
 		wire, err := claudeWireBody(ctx, provider, path, body)
 		if err != nil {
@@ -1159,14 +1164,14 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 			"error", "OAuth token resolution failed",
 		)
 	}
-	resp, err := send()
+	resp, err := send(ctx)
 	if err != nil {
 		return resp, err
 	}
 	if isAuthFailure(resp.StatusCode) && provider.Method() == domain.AuthOAuth {
 		if rerr := p.resolveToken(ctx, provider, true); rerr == nil {
 			resp.Body.Close()
-			return send()
+			return send(ctx)
 		} else {
 			observability.Logger(ctx, p.logger).Debug("oauth_forced_refresh_failed",
 				"event", "oauth_forced_refresh_failed",
@@ -1176,6 +1181,12 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 				"error", "OAuth forced refresh failed",
 			)
 		}
+	}
+	// Qoder answers model-queue refusals as a 200 SSE whose first frame is a
+	// 10605 envelope. Recovery replays the same prepared body with fresh
+	// signing until the model drains or the recovery budget expires.
+	if provider.Protocol == domain.ProtocolQoder && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return p.recoverQoderQueue(ctx, provider, send, resp)
 	}
 	return resp, nil
 }

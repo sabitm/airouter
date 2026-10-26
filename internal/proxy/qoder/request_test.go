@@ -435,28 +435,32 @@ func TestToolResultPlain(t *testing.T) {
 	})
 }
 
-func TestClampMaxTokens(t *testing.T) {
+func TestApplyOutputLimit(t *testing.T) {
 	cfg := json.RawMessage(`{"max_output_tokens":50}`)
 
 	t.Run("no parameters unchanged", func(t *testing.T) {
 		body := []byte(`{"model":"x"}`)
-		if got := clampMaxTokens(body, cfg); string(got) != `{"model":"x"}` {
+		if got := applyOutputLimit(body, cfg, 0); string(got) != `{"model":"x"}` {
 			t.Errorf("got %s", got)
 		}
 	})
-	t.Run("max_tokens absent clamped to cap", func(t *testing.T) {
-		body := []byte(`{"parameters":{"max_tokens":0}}`)
-		got := clampMaxTokens(body, cfg)
-		var m map[string]any
-		_ = json.Unmarshal(got, &m)
-		params, _ := m["parameters"].(map[string]any)
-		if params == nil || params["max_tokens"].(float64) != 50 {
-			t.Errorf("got %s, want max_tokens=50", got)
+	t.Run("absent or zero set to catalog cap", func(t *testing.T) {
+		for _, in := range []string{
+			`{"parameters":{}}`,
+			`{"parameters":{"max_tokens":0}}`,
+		} {
+			got := applyOutputLimit([]byte(in), cfg, 0)
+			var m map[string]any
+			_ = json.Unmarshal(got, &m)
+			params, _ := m["parameters"].(map[string]any)
+			if params == nil || params["max_tokens"] == nil || params["max_tokens"].(float64) != 50 {
+				t.Errorf("input %s -> %s, want max_tokens=50", in, got)
+			}
 		}
 	})
-	t.Run("max_tokens over cap clamped", func(t *testing.T) {
+	t.Run("caller above catalog clamped down", func(t *testing.T) {
 		body := []byte(`{"parameters":{"max_tokens":100}}`)
-		got := clampMaxTokens(body, cfg)
+		got := applyOutputLimit(body, cfg, 100)
 		var m map[string]any
 		_ = json.Unmarshal(got, &m)
 		params, _ := m["parameters"].(map[string]any)
@@ -464,28 +468,48 @@ func TestClampMaxTokens(t *testing.T) {
 			t.Errorf("got %s, want max_tokens=50", got)
 		}
 	})
-	t.Run("max_tokens in range unchanged", func(t *testing.T) {
-		body := []byte(`{"parameters":{"max_tokens":30}}`)
-		got := clampMaxTokens(body, cfg)
-		if string(got) != `{"parameters":{"max_tokens":30}}` {
-			t.Errorf("got %s, want unchanged", got)
+	t.Run("caller below catalog wins", func(t *testing.T) {
+		body := []byte(`{"parameters":{"max_tokens":100}}`)
+		got := applyOutputLimit(body, cfg, 30)
+		var m map[string]any
+		_ = json.Unmarshal(got, &m)
+		params, _ := m["parameters"].(map[string]any)
+		if params["max_tokens"].(float64) != 30 {
+			t.Errorf("got %s, want max_tokens=30", got)
 		}
 	})
-	t.Run("invalid config unchanged", func(t *testing.T) {
+	t.Run("missing catalog raises above encoder default", func(t *testing.T) {
+		// The encoder wrote min(32768, requested); a catalog limit above the
+		// default must raise the final value.
+		body := []byte(`{"parameters":{"max_tokens":32768}}`)
+		got := applyOutputLimit(body, json.RawMessage(`{"max_output_tokens":65536}`), 40000)
+		if !strings.Contains(string(got), `"max_tokens":40000`) {
+			t.Errorf("got %s, want max_tokens=40000", got)
+		}
+	})
+	t.Run("missing catalog entry falls back to default", func(t *testing.T) {
+		body := []byte(`{"parameters":{"max_tokens":40000}}`)
+		got := applyOutputLimit(body, json.RawMessage(`{}`), 40000)
+		if !strings.Contains(string(got), `"max_tokens":32768`) {
+			t.Errorf("got %s, want max_tokens=32768", got)
+		}
+	})
+	t.Run("invalid config falls back to default", func(t *testing.T) {
 		body := []byte(`{"parameters":{"max_tokens":100}}`)
-		if got := clampMaxTokens(body, json.RawMessage(`{bad`)); string(got) != `{"parameters":{"max_tokens":100}}` {
-			t.Errorf("got %s, want unchanged for bad config", got)
+		got := applyOutputLimit(body, json.RawMessage(`{bad`), 0)
+		if !strings.Contains(string(got), `"max_tokens":32768`) {
+			t.Errorf("got %s, want max_tokens=32768", got)
 		}
 	})
 	t.Run("invalid body unchanged", func(t *testing.T) {
 		body := []byte(`not json`)
-		if got := clampMaxTokens(body, cfg); string(got) != `not json` {
+		if got := applyOutputLimit(body, cfg, 0); string(got) != `not json` {
 			t.Errorf("got %s, want unchanged for bad body", got)
 		}
 	})
 	t.Run("preserves large sibling while clamping", func(t *testing.T) {
 		body := []byte(`{"parameters":{"max_tokens":100,"n":9050000000000000001,"huge":1e400}}`)
-		got := clampMaxTokens(body, cfg)
+		got := applyOutputLimit(body, cfg, 0)
 		s := string(got)
 		if !strings.Contains(s, `"max_tokens":50`) {
 			t.Errorf("cap not written: %s", got)
@@ -499,13 +523,13 @@ func TestClampMaxTokens(t *testing.T) {
 	})
 	t.Run("fractional max_tokens unchanged", func(t *testing.T) {
 		body := []byte(`{"parameters":{"max_tokens":12.5}}`)
-		if got := clampMaxTokens(body, cfg); string(got) != string(body) {
+		if got := applyOutputLimit(body, cfg, 0); string(got) != string(body) {
 			t.Errorf("got %s, want fractional unchanged", got)
 		}
 	})
 	t.Run("unparsable max_tokens unchanged", func(t *testing.T) {
 		body := []byte(`{"parameters":{"max_tokens":"high"}}`)
-		if got := clampMaxTokens(body, cfg); string(got) != string(body) {
+		if got := applyOutputLimit(body, cfg, 0); string(got) != string(body) {
 			t.Errorf("got %s, want unparsable unchanged", got)
 		}
 	})
@@ -953,7 +977,8 @@ func TestPrepareWireBodySessionIDReferenceFixture(t *testing.T) {
 	p := qoderTestProvider("fixture-user-1", "tok")
 	seedQoderCatalog(t, p, map[string]string{"qmodel_latest": `{"key":"qmodel_latest"}`})
 	plain := mustEncodeQoderRequest(t, "qoder/qmodel_latest")
-	wire, err := PrepareWireBody(context.Background(), p, plain)
+	prep1, err := PrepareWireBody(context.Background(), p, 0, plain)
+	wire := prep1.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -973,11 +998,13 @@ func TestPrepareWireBodySessionIDScopedByAccount(t *testing.T) {
 	seedQoderCatalog(t, pb, cfg)
 	plain := mustEncodeQoderRequest(t, "qoder/m1")
 
-	wa, err := PrepareWireBody(context.Background(), pa, plain)
+	prep2, err := PrepareWireBody(context.Background(), pa, 0, plain)
+	wa := prep2.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
-	wb, err := PrepareWireBody(context.Background(), pb, plain)
+	prep3, err := PrepareWireBody(context.Background(), pb, 0, plain)
+	wb := prep3.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -998,11 +1025,13 @@ func TestPrepareWireBodySessionIDStableForAccount(t *testing.T) {
 	seedQoderCatalog(t, p, map[string]string{"m1": `{"key":"m1"}`})
 	plain := mustEncodeQoderRequest(t, "qoder/m1")
 
-	first, err := PrepareWireBody(context.Background(), p, plain)
+	prep4, err := PrepareWireBody(context.Background(), p, 0, plain)
+	first := prep4.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := PrepareWireBody(context.Background(), p, plain)
+	prep5, err := PrepareWireBody(context.Background(), p, 0, plain)
+	second := prep5.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1014,11 +1043,13 @@ func TestPrepareWireBodySessionIDStableForAccount(t *testing.T) {
 func TestPrepareWireBodySessionIDVariesByModel(t *testing.T) {
 	p := qoderTestProvider("acct-1", "tok")
 	seedQoderCatalog(t, p, map[string]string{"m1": `{"key":"m1"}`, "m2": `{"key":"m2"}`})
-	w1, err := PrepareWireBody(context.Background(), p, mustEncodeQoderRequest(t, "qoder/m1"))
+	prep6, err := PrepareWireBody(context.Background(), p, 0, mustEncodeQoderRequest(t, "qoder/m1"))
+	w1 := prep6.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
-	w2, err := PrepareWireBody(context.Background(), p, mustEncodeQoderRequest(t, "qoder/m2"))
+	prep7, err := PrepareWireBody(context.Background(), p, 0, mustEncodeQoderRequest(t, "qoder/m2"))
+	w2 := prep7.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1035,11 +1066,13 @@ func TestPrepareWireBodySessionIDSameAcrossProviderRows(t *testing.T) {
 	seedQoderCatalog(t, p1, map[string]string{"m1": `{"key":"m1"}`})
 	plain := mustEncodeQoderRequest(t, "qoder/m1")
 
-	w1, err := PrepareWireBody(context.Background(), p1, plain)
+	prep8, err := PrepareWireBody(context.Background(), p1, 0, plain)
+	w1 := prep8.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
-	w2, err := PrepareWireBody(context.Background(), p2, plain)
+	prep9, err := PrepareWireBody(context.Background(), p2, 0, plain)
+	w2 := prep9.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1062,7 +1095,8 @@ func TestPrepareWireBodyOverwritesPlaceholderSession(t *testing.T) {
 		t.Fatalf("precondition: placeholder = %q", got)
 	}
 
-	wire, err := PrepareWireBody(context.Background(), p, plain)
+	prep10, err := PrepareWireBody(context.Background(), p, 0, plain)
+	wire := prep10.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1082,7 +1116,8 @@ func TestPrepareWireBodyDoesNotMutateInputs(t *testing.T) {
 	plain := mustEncodeQoderRequest(t, "qoder/m1")
 	original := append([]byte(nil), plain...)
 
-	wire, err := PrepareWireBody(context.Background(), p, plain)
+	prep11, err := PrepareWireBody(context.Background(), p, 0, plain)
+	wire := prep11.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1104,7 +1139,8 @@ func TestPrepareWireBodyEmptyUserIDUsesEmptyComponent(t *testing.T) {
 	p := qoderTestProvider("", "tok")
 	seedQoderCatalog(t, p, map[string]string{"m1": `{"key":"m1"}`})
 	plain := mustEncodeQoderRequest(t, "qoder/m1")
-	wire, err := PrepareWireBody(context.Background(), p, plain)
+	prep12, err := PrepareWireBody(context.Background(), p, 0, plain)
+	wire := prep12.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1144,9 +1180,9 @@ func TestPrepareWireBodyPreservesUnrelatedWireFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	origRecordID := string(top["chat_record_id"])
-	origRequestSetID := string(top["request_set_id"])
 
-	wire, err := PrepareWireBody(context.Background(), p, plain)
+	prep13, err := PrepareWireBody(context.Background(), p, 0, plain)
+	wire := prep13.Wire
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1175,11 +1211,36 @@ func TestPrepareWireBodyPreservesUnrelatedWireFields(t *testing.T) {
 	if !bytes.Contains(got["tools"], []byte("9223372036854775807")) {
 		t.Errorf("tool raw schema lost: %s", got["tools"])
 	}
-	if string(got["chat_record_id"]) != origRecordID {
-		t.Errorf("chat_record_id = %s, want %s", got["chat_record_id"], origRecordID)
+	if string(got["chat_record_id"]) == origRecordID {
+		t.Errorf("chat_record_id = %s, want recomputed for the final effective max_tokens", got["chat_record_id"])
 	}
-	if string(got["request_set_id"]) != origRequestSetID {
-		t.Errorf("request_set_id = %s, want %s", got["request_set_id"], origRequestSetID)
+	if string(got["request_set_id"]) != string(got["chat_record_id"]) {
+		t.Errorf("request_set_id = %s, want equal to chat_record_id %s", got["request_set_id"], got["chat_record_id"])
+	}
+	// The recomputed id must equal the id the encoder itself derives for the
+	// same effective request: equal effective wire content, equal record id.
+	limitedRequest := func() *ir.Request {
+		return &ir.Request{
+			Model:     "qoder/m1",
+			Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+			MaxTokens: 50,
+			Tools: []ir.Tool{{
+				Name:        "fn",
+				Description: "d",
+				Parameters:  json.RawMessage(`{"type":"object","maximum":9223372036854775807}`),
+			}},
+		}
+	}
+	limitedBody, err := EncodeRequest(limitedRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var limitedTop map[string]json.RawMessage
+	if err := json.Unmarshal(limitedBody, &limitedTop); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["chat_record_id"]) != string(limitedTop["chat_record_id"]) {
+		t.Errorf("prepared record id %s != encoder id for the same effective request %s", got["chat_record_id"], limitedTop["chat_record_id"])
 	}
 	// Nested chat_context.extra.modelConfig.is_reasoning must be updated too.
 	var cc, extra, nested map[string]json.RawMessage
@@ -1199,12 +1260,12 @@ func TestPrepareWireBodyPreservesUnrelatedWireFields(t *testing.T) {
 
 func TestPrepareWireBodyMissingModelNoWire(t *testing.T) {
 	p := qoderTestProvider("acct-1", "tok")
-	wire, err := PrepareWireBody(context.Background(), p, []byte(`{"foo":1}`))
+	prep14, err := PrepareWireBody(context.Background(), p, 0, []byte(`{"foo":1}`))
 	if err == nil {
 		t.Fatal("expected error for missing model key")
 	}
-	if wire != nil {
-		t.Fatalf("wire = %q, want nil on preparation error", wire)
+	if prep14 != nil && prep14.Wire != nil {
+		t.Fatalf("wire = %q, want nil on preparation error", prep14.Wire)
 	}
 }
 
@@ -1212,11 +1273,140 @@ func TestPrepareWireBodyCatalogErrorNoWire(t *testing.T) {
 	// No credentials: catalog resolution fails locally without a network call.
 	ClearCatalogForTest()
 	t.Cleanup(ClearCatalogForTest)
-	wire, err := PrepareWireBody(context.Background(), &domain.Provider{}, mustEncodeQoderRequest(t, "qoder/m1"))
+	prep15, err := PrepareWireBody(context.Background(), &domain.Provider{}, 0, mustEncodeQoderRequest(t, "qoder/m1"))
 	if err == nil {
 		t.Fatal("expected catalog error")
 	}
-	if wire != nil {
-		t.Fatalf("wire = %q, want nil on catalog error", wire)
+	if prep15 != nil && prep15.Wire != nil {
+		t.Fatalf("wire = %q, want nil on catalog error", prep15.Wire)
 	}
+}
+
+// TestPrepareWireBodyCatalogOutputLimitCoversQ08: the catalog output limit
+// raises the default above 32768, a lower caller limit wins, and the record
+// ids track the final effective max_tokens.
+func TestPrepareWireBodyCatalogOutputLimitCoversQ08(t *testing.T) {
+	// The same simple request mustEncodeQoderRequest builds, with an explicit
+	// effective limit, so prepared ids can be compared against encoder ids.
+	request := func(maxTokens int) *ir.Request {
+		return &ir.Request{
+			Model:     "qoder/m1",
+			Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "hi"}}}},
+			MaxTokens: maxTokens,
+		}
+	}
+	recordID := func(t *testing.T, body []byte) string {
+		t.Helper()
+		var f struct {
+			Chat string `json:"chat_record_id"`
+		}
+		if err := json.Unmarshal(body, &f); err != nil {
+			t.Fatal(err)
+		}
+		return f.Chat
+	}
+	maxTokensOf := func(t *testing.T, plain []byte) int {
+		t.Helper()
+		var f struct {
+			Parameters struct {
+				MaxTokens int `json:"max_tokens"`
+			} `json:"parameters"`
+		}
+		if err := json.Unmarshal(plain, &f); err != nil {
+			t.Fatal(err)
+		}
+		return f.Parameters.MaxTokens
+	}
+
+	t.Run("catalog limit above default with no caller limit", func(t *testing.T) {
+		p := qoderTestProvider("u1", "tok")
+		seedQoderCatalog(t, p, map[string]string{"m1": `{"key":"m1","max_output_tokens":65536}`})
+		t.Cleanup(func() { ClearCatalogForTest(); SeedCatalogForTest(p, nil, nil); ClearCatalogForTest() })
+		prep, err := PrepareWireBody(context.Background(), p, 0, mustEncodeQoderRequest(t, "qoder/m1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := maxTokensOf(t, mustDecodeWire(t, prep.Wire)); got != 65536 {
+			t.Fatalf("max_tokens = %d, want catalog 65536", got)
+		}
+		// The record id must describe the 65536-token request: it differs from
+		// the encoder's 32768-based id and stays stable across preparations.
+		same, err := PrepareWireBody(context.Background(), p, 0, mustEncodeQoderRequest(t, "qoder/m1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		preparedID := recordID(t, mustDecodeWire(t, prep.Wire))
+		if preparedID != recordID(t, mustDecodeWire(t, same.Wire)) {
+			t.Fatal("prepared record id is not stable across preparations")
+		}
+		three2700, err := EncodeRequest(request(32768))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if preparedID == recordID(t, three2700) {
+			t.Fatal("record id did not change with the raised effective max_tokens")
+		}
+	})
+	t.Run("caller limit below catalog wins", func(t *testing.T) {
+		p := qoderTestProvider("u1", "tok")
+		seedQoderCatalog(t, p, map[string]string{"m1": `{"key":"m1","max_output_tokens":65536}`})
+		t.Cleanup(func() { ClearCatalogForTest(); SeedCatalogForTest(p, nil, nil); ClearCatalogForTest() })
+		prep, err := PrepareWireBody(context.Background(), p, 4096, mustEncodeQoderRequest(t, "qoder/m1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := maxTokensOf(t, mustDecodeWire(t, prep.Wire)); got != 4096 {
+			t.Fatalf("max_tokens = %d, want caller 4096", got)
+		}
+		same, err := EncodeRequest(request(4096))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if recordID(t, mustDecodeWire(t, prep.Wire)) != recordID(t, same) {
+			t.Fatal("record id does not track the caller limit")
+		}
+	})
+	t.Run("caller limit above catalog clamps down", func(t *testing.T) {
+		p := qoderTestProvider("u1", "tok")
+		seedQoderCatalog(t, p, map[string]string{"m1": `{"key":"m1","max_output_tokens":8192}`})
+		t.Cleanup(func() { ClearCatalogForTest(); SeedCatalogForTest(p, nil, nil); ClearCatalogForTest() })
+		prep, err := PrepareWireBody(context.Background(), p, 100000, mustEncodeQoderRequest(t, "qoder/m1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := maxTokensOf(t, mustDecodeWire(t, prep.Wire)); got != 8192 {
+			t.Fatalf("max_tokens = %d, want catalog 8192", got)
+		}
+	})
+	t.Run("missing catalog limit keeps encoder default and id", func(t *testing.T) {
+		p := qoderTestProvider("u1", "tok")
+		seedQoderCatalog(t, p, map[string]string{"m1": `{"key":"m1"}`})
+		t.Cleanup(func() { ClearCatalogForTest(); SeedCatalogForTest(p, nil, nil); ClearCatalogForTest() })
+		plain := mustEncodeQoderRequest(t, "qoder/m1")
+		prep, err := PrepareWireBody(context.Background(), p, 0, plain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := maxTokensOf(t, mustDecodeWire(t, prep.Wire)); got != DefaultMaxTokens {
+			t.Fatalf("max_tokens = %d, want default %d", got, DefaultMaxTokens)
+		}
+		var plainIDs struct {
+			Chat string `json:"chat_record_id"`
+		}
+		if err := json.Unmarshal(plain, &plainIDs); err != nil {
+			t.Fatal(err)
+		}
+		if recordID(t, mustDecodeWire(t, prep.Wire)) != plainIDs.Chat {
+			t.Fatal("record id changed without an effective request change")
+		}
+	})
+}
+
+func mustDecodeWire(t *testing.T, wire []byte) []byte {
+	t.Helper()
+	plain, err := DecodeWireBody(wire)
+	if err != nil {
+		t.Fatalf("decode wire: %v", err)
+	}
+	return plain
 }

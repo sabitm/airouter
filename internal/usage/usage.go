@@ -20,6 +20,9 @@ type Quota struct {
 	Remaining    float64
 	RemainingPct *float64
 	ResetAt      *time.Time
+	// NeverExpires marks an upstream "no reset" sentinel. It is distinct from
+	// a nil ResetAt, which means the reset time is simply unknown.
+	NeverExpires bool
 	Unlimited    bool
 	Unit         string
 }

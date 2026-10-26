@@ -935,9 +935,9 @@ func quotaRow(q usage.Quota) templ.Component {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var46 string
-		templ_7745c5c3_Var46, templ_7745c5c3_Err = templ.JoinStringErrs(formatResetCountdown(q.ResetAt))
+		templ_7745c5c3_Var46, templ_7745c5c3_Err = templ.JoinStringErrs(quotaResetText(q))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/usage.templ`, Line: 191, Col: 62}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/web/usage.templ`, Line: 191, Col: 48}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var46))
 		if templ_7745c5c3_Err != nil {

@@ -373,6 +373,11 @@ type Proxy struct {
 	// native session ids. Restart and LRU eviction reset generated affinity.
 	// Paid and probe resolution does not use it.
 	opencodeSessions *opencode.SessionMap
+
+	// qoderQueuePolicy overrides Qoder queue-recovery timing for tests. The
+	// zero value uses production defaults (see qoderQueueDefaults). Read-only
+	// while requests run; tests set it before serving.
+	qoderQueuePolicy qoderQueuePolicy
 }
 
 // backoffState tracks a provider's consecutive pre-commit failures and the number

@@ -42,7 +42,8 @@ XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`
 
 // StaticModels is the fallback catalog when live /model/list is unavailable.
-// Keys match 9router's registry; chat still requires a live model_config block.
+// Keys match the reference registry; chat still requires a live model_config
+// block, and these suggestions never imply account entitlement.
 var StaticModels = []string{
 	"auto",
 	"ultimate",
@@ -51,9 +52,15 @@ var StaticModels = []string{
 	"lite",
 	"qmodel",
 	"qmodel_latest",
+	"qmodel_38max",
+	"qfmodel",
+	"kmodel_latest",
+	"kmodel",
+	"gmodel",
+	"gfmodel",
 	"dmodel",
 	"dfmodel",
-	"gm51model",
-	"kmodel",
 	"mmodel",
+	"smodel",
+	"cmodel",
 }

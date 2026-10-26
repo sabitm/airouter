@@ -670,3 +670,90 @@ func TestFormatResetCountdown(t *testing.T) {
 		t.Fatalf("2d 2h = %q", got)
 	}
 }
+
+// qoderUsageProvider builds a Qoder protocol row for card rendering tests.
+func qoderUsageProvider(name string) *domain.Provider {
+	return &domain.Provider{
+		Name: name, Protocol: domain.ProtocolQoder,
+		AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "t"},
+	}
+}
+
+// TestUsageCardNeverExpiresVsUnknown covers the quota-reset column: the
+// upstream "never expires" sentinel renders as text, an unknown reset stays
+// "-", and other rows keep the countdown form.
+func TestUsageCardNeverExpiresVsUnknown(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"userQuota":  map[string]any{"total": 100, "used": 10, "remaining": 90, "unit": "credits"},
+			"addOnQuota": map[string]any{"total": 500, "used": 50, "remaining": 450, "unit": "credits"},
+			"expiresAt":  253402214400000,
+		})
+	}))
+	t.Cleanup(up.Close)
+	prev := usage.QoderUsageURL
+	usage.QoderUsageURL = up.URL
+	t.Cleanup(func() { usage.QoderUsageURL = prev })
+
+	h := testHandler(t)
+	p := qoderUsageProvider("qoder-live")
+	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(p.ID, 10)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage/card/"+id, nil)
+	req.SetPathValue("id", id)
+	h.usageCard(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "Never expires") {
+		t.Fatalf("card missing never-expires text: %s", body)
+	}
+	// The add-on row has no expiry from this API: unknown stays "-".
+	if !strings.Contains(body, "Add-on") {
+		t.Fatalf("card missing add-on row: %s", body)
+	}
+	// A year-9999 date must never be rendered for the sentinel.
+	if strings.Contains(body, "9999") {
+		t.Fatalf("sentinel rendered as a date: %s", body)
+	}
+}
+
+// TestUsageCardUnknownResetStaysDash keeps a missing reset as "-", and finite
+// rows keep their countdown, so the sentinel text is unambiguous.
+func TestUsageCardUnknownResetStaysDash(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"userQuota": map[string]any{"total": 100, "used": 10, "remaining": 90, "unit": "credits"},
+		})
+	}))
+	t.Cleanup(up.Close)
+	prev := usage.QoderUsageURL
+	usage.QoderUsageURL = up.URL
+	t.Cleanup(func() { usage.QoderUsageURL = prev })
+
+	h := testHandler(t)
+	p := qoderUsageProvider("qoder-unknown")
+	if err := h.store.CreateProvider(httptest.NewRequest(http.MethodGet, "/", nil).Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(p.ID, 10)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/usage/card/"+id, nil)
+	req.SetPathValue("id", id)
+	h.usageCard(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "Never expires") {
+		t.Fatalf("unknown reset rendered as never expires: %s", body)
+	}
+	if !strings.Contains(body, "Personal") {
+		t.Fatalf("card missing personal row: %s", body)
+	}
+}
