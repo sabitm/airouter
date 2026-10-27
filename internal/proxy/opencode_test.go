@@ -4994,6 +4994,24 @@ func requireAbsentKey(t *testing.T, path string, m map[string]any, key string) {
 	}
 }
 
+// requireEnvAppended verifies the free-tier environment section was appended
+// after the caller text. Host-specific field values are not hardcoded.
+func requireEnvAppended(t *testing.T, path, text, caller string) {
+	t.Helper()
+	heading := "Here is some useful information about the environment you are running in:"
+	if !strings.HasPrefix(text, caller+"\n\n"+heading+"\n<env>\n") {
+		t.Fatalf("%s: missing environment prefix: %q", path, text)
+	}
+	if !strings.HasSuffix(text, "\n</env>") {
+		t.Fatalf("%s: missing environment suffix: %q", path, text)
+	}
+	for _, field := range []string{"\n  Working directory: ", "\n  Workspace root folder: ", "\n  Is directory a git repo: ", "\n  Platform: "} {
+		if !strings.Contains(text, field) {
+			t.Fatalf("%s: environment field %q missing: %q", path, field, text)
+		}
+	}
+}
+
 // TestOpencodeMessagesCacheControlPipeline covers the complete Anthropic
 // ingress path into the real OpenCode Messages encoder for paid Zen/Go rows and
 // the free Zen minimax row. Caller markers survive tool canonicalization and
@@ -5054,8 +5072,11 @@ func assertAnthropicCachePipeline(t *testing.T, tc anthropicCacheCase, stream bo
 	} else {
 		requireAbsentKey(t, "body", got, "stream")
 	}
-	// System stays a flat string; no system block hints.
-	if got["system"] != "sys" {
+	// System stays a flat string; no system block hints. Free rows carry the
+	// environment section after the caller prompt.
+	if tc.free {
+		requireEnvAppended(t, "system", got["system"].(string), "sys")
+	} else if got["system"] != "sys" {
 		t.Fatalf("system = %#v, want flat string", got["system"])
 	}
 	if bytes.Count(out, []byte("cache_control")) != 7 {
@@ -5219,7 +5240,12 @@ func TestOpencodeMessagesSystemCacheControlPipeline(t *testing.T) {
 				}
 				requireAbsentKey(t, "system[0]", first, "cache_control")
 				second := mustMapAny(t, "system[1]", sys[1])
-				if second["type"] != "text" || second["text"] != " sys two" {
+				if tc.free {
+					if second["type"] != "text" {
+						t.Fatalf("system[1] = %#v", second)
+					}
+					requireEnvAppended(t, "system[1]", second["text"].(string), " sys two")
+				} else if second["type"] != "text" || second["text"] != " sys two" {
 					t.Fatalf("system[1] = %#v", second)
 				}
 				requireMapMarker(t, "system[1]", second["cache_control"], "ephemeral", "1h")

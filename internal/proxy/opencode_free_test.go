@@ -1892,3 +1892,171 @@ func TestOpencodeLegacyEndpointAliasInTraceAndHAR(t *testing.T) {
 		})
 	}
 }
+
+// TestOpencodeFreeTierClientSelection pins the upstream client choice: only
+// official free-model inference POSTs take the impersonated-TLS client, and a
+// test-replaced client always wins.
+func TestOpencodeFreeTierClientSelection(t *testing.T) {
+	px := New(nil, nil)
+	freeURL := opencode.ZenBaseURL + opencode.ChatPath
+	freeBody := []byte(`{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}`)
+	paidBody := []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	zen := opencodeTestProvider()
+	goProvider := opencodeTestProvider()
+	goProvider.BaseURL = opencode.GoBaseURL
+	legacy := opencodeTestProvider()
+	legacy.BaseURL = opencode.LegacyZenBaseURL
+	custom := &domain.Provider{Name: "mirror", BaseURL: "https://mirror.test/v1", Protocol: domain.ProtocolOpencode}
+
+	if got := px.upstreamClient(zen, freeURL, freeBody, true); got != px.freeTierClient {
+		t.Fatalf("official free stream client = %v, want freeTierClient", got)
+	}
+	if got := px.upstreamClient(zen, freeURL, freeBody, false); got != px.freeTierClient {
+		t.Fatalf("official free unary client = %v, want freeTierClient", got)
+	}
+	// Legacy stored base aliases to the official endpoint at send time.
+	if got := px.upstreamClient(legacy, opencode.ZenBaseURL+opencode.ChatPath, freeBody, true); got != px.freeTierClient {
+		t.Fatalf("legacy free client = %v, want freeTierClient", got)
+	}
+	// Selection is scoped to the opencode protocol: another protocol stored on
+	// the official URL keeps the standard client even for a free model.
+	wrongProto := &domain.Provider{Name: "openai", BaseURL: opencode.ZenBaseURL, Protocol: domain.ProtocolOpenAI}
+	if got := px.upstreamClient(wrongProto, freeURL, freeBody, true); got != px.streamClient {
+		t.Fatalf("non-opencode protocol client = %v, want streamClient", got)
+	}
+	// A custom port on the official host is not the free endpoint.
+	if got := px.upstreamClient(zen, "https://opencode.ai:8443"+opencode.ChatPath, freeBody, true); got != px.streamClient {
+		t.Fatalf("custom port client = %v, want streamClient", got)
+	}
+	if got := px.upstreamClient(zen, freeURL, paidBody, true); got != px.streamClient {
+		t.Fatalf("paid model client = %v, want streamClient", got)
+	}
+	if got := px.upstreamClient(goProvider, freeURL, freeBody, true); got != px.streamClient {
+		t.Fatalf("paid endpoint client = %v, want streamClient", got)
+	}
+	if got := px.upstreamClient(custom, "https://mirror.test/v1/chat/completions", freeBody, true); got != px.streamClient {
+		t.Fatalf("custom endpoint client = %v, want streamClient", got)
+	}
+	if got := px.upstreamClient(zen, "https://opencode.ai/zen/go/v1/chat/completions", freeBody, true); got != px.streamClient {
+		t.Fatalf("paid path client = %v, want streamClient", got)
+	}
+
+	// A replaced streamClient wins verbatim: tests inject capture transports
+	// and must never be routed to the real endpoint. The still-default unary
+	// client keeps its own selection meanwhile.
+	injected := &http.Client{}
+	px.streamClient = injected
+	if got := px.upstreamClient(zen, freeURL, freeBody, true); got != injected {
+		t.Fatalf("injected stream client bypassed: %v", got)
+	}
+	if got := px.upstreamClient(zen, freeURL, freeBody, false); got != px.freeTierClient {
+		t.Fatalf("unary client after stream injection = %v, want freeTierClient", got)
+	}
+	px.client = injected
+	if got := px.upstreamClient(zen, freeURL, freeBody, false); got != injected {
+		t.Fatalf("injected unary client bypassed: %v", got)
+	}
+}
+
+// TestOpencodeFreeTierEnvironmentPreparation verifies the environment section
+// lands in the prepared wire body for all three free codecs, is absent for
+// paid rows, and stays idempotent when preparation runs twice.
+func TestOpencodeFreeTierEnvironmentPreparation(t *testing.T) {
+	px := New(nil, nil)
+	p := opencodeTestProvider()
+	bodies := []struct {
+		codec codec
+		in    string
+	}{
+		{backendCodec(domain.ProtocolOpencode, "big-pickle"), `{"model":"big-pickle","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`},
+		{backendCodec(domain.ProtocolOpencode, "muse-spark-1.3-contributor-free"), `{"model":"muse-spark-1.3-contributor-free","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{backendCodec(domain.ProtocolOpencode, "minimax-m3-free"), `{"model":"minimax-m3-free","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`},
+	}
+	for _, tc := range bodies {
+		trace := &TraceInfo{}
+		out, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), trace), tc.codec, p, []byte(tc.in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(out), "Here is some useful information about the environment you are running in:") {
+			t.Fatalf("%s: environment section missing: %s", tc.codec.id, out)
+		}
+		// The wire escapes < and >, so count the marker in decoded strings.
+		decoded := decodeJSONMap(t, out)
+		if got := countJSONStrings(decoded, "<env>"); got != 1 {
+			t.Fatalf("%s: env marker count = %d, want 1", tc.codec.id, got)
+		}
+		again, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), tc.codec, p, out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(again) != string(out) {
+			t.Fatalf("%s: preparation is not idempotent", tc.codec.id)
+		}
+	}
+
+	paidBody := []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	out, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backendCodec(domain.ProtocolOpencode, "deepseek-v4-pro"), p, paidBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "Here is some useful information about the environment you are running in:") {
+		t.Fatalf("paid row carries environment section: %s", out)
+	}
+}
+
+// TestOpencodeFreeTierPassthroughEnvironmentKept verifies a caller that
+// already carries an environment block (real CLI passthrough) is forwarded
+// without a second block. The fixture is built with json.Marshal because the
+// block contains literal newlines, which raw JSON strings cannot hold.
+func TestOpencodeFreeTierPassthroughEnvironmentKept(t *testing.T) {
+	px := New(nil, nil)
+	p := opencodeTestProvider()
+	callerEnv := "Here is some useful information about the environment you are running in:\n<env>\n  Working directory: /caller\n</env>"
+	in := mustJSON(map[string]any{
+		"model": "big-pickle", "stream": true, "max_tokens": 16,
+		"messages": []any{
+			map[string]any{"role": "system", "content": callerEnv},
+			map[string]any{"role": "user", "content": "hi"},
+		},
+	})
+	out, err := px.prepareUpstreamRequest(WithTraceInfo(context.Background(), &TraceInfo{}), backendCodec(domain.ProtocolOpencode, "big-pickle"), p, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeJSONMap(t, out)
+	if got := countJSONStrings(got, "<env>"); got != 1 {
+		t.Fatalf("env marker count = %d, want 1", got)
+	}
+	msgs := got["messages"].([]any)
+	sys := msgs[0].(map[string]any)
+	if sys["content"] != callerEnv {
+		t.Fatalf("caller environment block changed: %#v", sys["content"])
+	}
+	if msgs[1].(map[string]any)["content"] != "hi" {
+		t.Fatalf("user message changed: %#v", msgs[1])
+	}
+}
+
+// countJSONStrings counts needle across every decoded JSON string so the wire
+// escaping of < and > cannot hide occurrences.
+func countJSONStrings(v any, needle string) int {
+	switch x := v.(type) {
+	case string:
+		return strings.Count(x, needle)
+	case []any:
+		n := 0
+		for _, item := range x {
+			n += countJSONStrings(item, needle)
+		}
+		return n
+	case map[string]any:
+		n := 0
+		for _, value := range x {
+			n += countJSONStrings(value, needle)
+		}
+		return n
+	default:
+		return 0
+	}
+}

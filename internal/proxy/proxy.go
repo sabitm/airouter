@@ -346,7 +346,17 @@ type Proxy struct {
 	// SSE streams are governed by the request context instead.
 	client       *http.Client
 	streamClient *http.Client
-	logger       *slog.Logger
+	// baseUnaryClient and baseStreamClient are the clients built in New. A
+	// caller that replaces client or streamClient (tests inject capture and
+	// redirect transports) is detected by pointer inequality and wins verbatim,
+	// so the OpenCode free-tier TLS client below never bypasses injection.
+	baseUnaryClient  *http.Client
+	baseStreamClient *http.Client
+	// freeTierClient speaks the OpenCode free-tier TLS fingerprint for official
+	// free-model inference POSTs only. It has no total timeout: stream lifetime
+	// is governed by the request context.
+	freeTierClient *http.Client
+	logger         *slog.Logger
 	// kiroCatalog resolves live Kiro model capabilities. It is not a global cache.
 	kiroCatalog *kirocatalog.Service
 
@@ -430,11 +440,16 @@ func NewWithDeps(s *store.Store, logger *slog.Logger, oauthSvc *oauth.Service, c
 	if err != nil {
 		panic("proxy: generate OpenCode session nonce: " + err.Error())
 	}
+	baseUnary := &http.Client{Timeout: 5 * time.Minute}
+	baseStream := &http.Client{}
 	return &Proxy{
 		store:            s,
 		oauth:            oauthSvc,
-		client:           &http.Client{Timeout: 5 * time.Minute},
-		streamClient:     &http.Client{},
+		client:           baseUnary,
+		streamClient:     baseStream,
+		baseUnaryClient:  baseUnary,
+		baseStreamClient: baseStream,
+		freeTierClient:   opencode.NewFreeTierClient(),
 		logger:           logger,
 		kiroCatalog:      catalog,
 		rr:               map[int64]uint64{},

@@ -785,7 +785,10 @@ func prepareOpencodeFreeTier(ctx context.Context, backend codec, provider *domai
 	if st != nil {
 		st.tools = mapping
 	}
-	return out, nil
+	// The free gate also requires the CLI environment section in the system
+	// prompt. Insertion is fail-open and idempotent; an existing caller block
+	// (real CLI passthrough) is never duplicated.
+	return opencode.AppendEnvironment(out, backend.id), nil
 }
 
 func opencodeToolMapFrom(ctx context.Context) opencode.ToolMap {
@@ -980,6 +983,37 @@ func newUUID() string {
 		hex.EncodeToString(b[6:8]) + "-" + hex.EncodeToString(b[8:10]) + "-" + hex.EncodeToString(b[10:16])
 }
 
+// upstreamClient selects the HTTP client for one upstream send. Official
+// OpenCode free-tier inference requests from opencode-protocol providers use
+// the impersonated-TLS client (see internal/proxy/opencode/transport.go);
+// every other request, including other protocols stored on an official URL,
+// keeps the configured client unchanged. A replaced client or streamClient
+// (tests inject capture and redirect transports) is detected by pointer
+// inequality against the New-built clients and always wins, so injection is
+// never bypassed.
+func (p *Proxy) upstreamClient(provider *domain.Provider, url string, body []byte, stream bool) *http.Client {
+	client := p.streamClient
+	base := p.baseStreamClient
+	if !stream {
+		client = p.client
+		base = p.baseUnaryClient
+	}
+	if client == nil {
+		return nil
+	}
+	if base != nil && client != base {
+		return client
+	}
+	if p.freeTierClient != nil &&
+		provider != nil &&
+		provider.Protocol == domain.ProtocolOpencode &&
+		opencode.IsOfficialFreeTierURL(url) &&
+		opencode.NeedsFreeTier(effectiveProviderBaseURL(provider), reqModelFromBody(body)) {
+		return p.freeTierClient
+	}
+	return client
+}
+
 // forward sends the prepared body to the provider's upstream endpoint for the
 // given backend protocol, setting the protocol-appropriate auth headers.
 // clientHeaders, when non-nil (passthrough), are forwarded under the denylist.
@@ -1008,7 +1042,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if harRecorder(ctx) != nil {
 			harHdr = req.Header.Clone()
 		}
-		resp, err := p.client.Do(req)
+		resp, err := p.upstreamClient(provider, url, wire, false).Do(req)
 		if err != nil {
 			if harRecorder(ctx) != nil {
 				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, 0, nil, nil, "", 0, err.Error())
@@ -1132,7 +1166,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		if harRecorder(ctx) != nil {
 			harHdr = req.Header.Clone()
 		}
-		resp, err := p.streamClient.Do(req)
+		resp, err := p.upstreamClient(provider, url, wire, true).Do(req)
 		if err != nil {
 			if harRecorder(ctx) != nil {
 				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, 0, nil, nil, "", 0, err.Error())
