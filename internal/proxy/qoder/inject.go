@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/ir"
 )
 
 // Prepared carries the encoded wire body plus the identity fields the proxy
@@ -20,13 +21,22 @@ type Prepared struct {
 	SessionID    string
 }
 
-// PrepareWireBody injects the live model_config into the plaintext Qoder JSON,
-// sets the account-scoped session id, selects the final effective max_tokens,
-// and applies WAF body encoding. The returned Wire bytes are what COSY must
-// sign and what the HTTP client posts. requestedMaxTokens is the caller's
-// explicit output limit from the IR; it is not written into the plaintext as
-// private metadata, only used to select the final effective value.
+// PrepareWireBody injects the live model_config into a plaintext Qoder JSON
+// body with no reasoning intent. See PrepareWireBodyWithThinking.
 func PrepareWireBody(ctx context.Context, provider *domain.Provider, requestedMaxTokens int, plainBody []byte) (*Prepared, error) {
+	return PrepareWireBodyWithThinking(ctx, provider, requestedMaxTokens, nil, plainBody)
+}
+
+// PrepareWireBodyWithThinking injects the live model_config into the plaintext
+// Qoder JSON, sets the account-scoped session id, selects the final effective
+// max_tokens, resolves and applies the native reasoning controls from the
+// caller's IR thinking intent (already suffix-merged by the shared apply path;
+// nil means the client expressed no intent), and applies WAF body encoding.
+// The returned Wire bytes are what COSY must sign and what the HTTP client
+// posts. requestedMaxTokens is the caller's explicit output limit from the IR;
+// it is not written into the plaintext as private metadata, only used to
+// select the final effective value.
+func PrepareWireBodyWithThinking(ctx context.Context, provider *domain.Provider, requestedMaxTokens int, t *ir.Thinking, plainBody []byte) (*Prepared, error) {
 	key := ModelKeyFromBody(plainBody)
 	if key == "" {
 		return nil, fmt.Errorf("qoder: missing model key in request body")
@@ -47,10 +57,18 @@ func PrepareWireBody(ctx context.Context, provider *domain.Provider, requestedMa
 		return nil, err
 	}
 	injected = applyOutputLimit(injected, cfg, requestedMaxTokens)
+	// Reasoning selection needs the live catalog, so it happens here and not in
+	// the encoder. Errors are client errors and must precede any WAF encoding
+	// or signing.
+	injected, err = applyThinkingControls(injected, cfg, key, t)
+	if err != nil {
+		return nil, err
+	}
 	// The effective max_tokens can move after the catalog lookup (a catalog
 	// limit above the 32768 encoder default, or a caller limit between the
-	// two). The record ids must describe the final effective request, so
-	// recompute them here; unchanged requests keep their embedded id.
+	// two), and the effective reasoning controls are chosen here too. The
+	// record ids must describe the final effective request, so recompute them
+	// after both; unchanged requests keep their embedded id.
 	injected, err = refreshRecordIDs(injected)
 	if err != nil {
 		return nil, err
@@ -115,41 +133,7 @@ func InjectModelConfig(body []byte, config json.RawMessage) ([]byte, error) {
 			isReasoning = b
 		}
 	}
-	if ccRaw, ok := m["chat_context"]; ok {
-		var cc map[string]json.RawMessage
-		if json.Unmarshal(ccRaw, &cc) == nil && cc != nil {
-			if extraRaw, ok := cc["extra"]; ok {
-				var extra map[string]json.RawMessage
-				if json.Unmarshal(extraRaw, &extra) == nil && extra != nil {
-					if mcRaw, ok := extra["modelConfig"]; ok {
-						var mc map[string]json.RawMessage
-						if json.Unmarshal(mcRaw, &mc) == nil && mc != nil {
-							iraw, err := json.Marshal(isReasoning)
-							if err != nil {
-								return nil, err
-							}
-							mc["is_reasoning"] = iraw
-							mcBytes, err := json.Marshal(mc)
-							if err != nil {
-								return nil, err
-							}
-							extra["modelConfig"] = mcBytes
-							extraBytes, err := json.Marshal(extra)
-							if err != nil {
-								return nil, err
-							}
-							cc["extra"] = extraBytes
-							ccBytes, err := json.Marshal(cc)
-							if err != nil {
-								return nil, err
-							}
-							m["chat_context"] = ccBytes
-						}
-					}
-				}
-			}
-		}
-	}
+	setModelConfigMirrorReasoning(m, isReasoning)
 	out, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
@@ -239,12 +223,14 @@ func refreshRecordIDs(body []byte) ([]byte, error) {
 		return nil, fmt.Errorf("qoder: refresh record ids: not a JSON object")
 	}
 	maxTokens, maxOK := 0, false
+	reasoning := recordReasoning{}
 	if paramsRaw, ok := m["parameters"]; ok {
 		var params map[string]json.RawMessage
 		if json.Unmarshal(paramsRaw, &params) == nil && params != nil {
 			if mt, ok := rawJSONInt(params["max_tokens"]); ok {
 				maxTokens, maxOK = mt, true
 			}
+			reasoning = reasoningIdentityFromParams(params)
 		}
 	}
 	if !maxOK {
@@ -264,7 +250,7 @@ func refreshRecordIDs(body []byte) ([]byte, error) {
 	if raw, ok := m["system"]; ok {
 		_ = json.Unmarshal(raw, &system)
 	}
-	id, err := stableChatRecordID(ModelKeyFromBody(body), system, msgs, tools, maxTokens)
+	id, err := stableChatRecordID(ModelKeyFromBody(body), system, msgs, tools, maxTokens, reasoning)
 	if err != nil {
 		return nil, err
 	}

@@ -129,40 +129,57 @@ func TestStableChatRecordID(t *testing.T) {
 	msgs := []map[string]any{{"role": "user", "content": "hello"}}
 	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "f"}}}
 
-	base, err := stableChatRecordID("m", "sys", msgs, tools, 100)
+	base, err := stableChatRecordID("m", "sys", msgs, tools, 100, recordReasoning{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(base) != 16 {
 		t.Errorf("len = %d, want 16", len(base))
 	}
-	if got, err := stableChatRecordID("m", "sys", msgs, tools, 100); err != nil || got != base {
+	if got, err := stableChatRecordID("m", "sys", msgs, tools, 100, recordReasoning{}); err != nil || got != base {
 		t.Errorf("not deterministic: %q, %v", got, err)
 	}
 	// Different model -> different id.
-	if got, _ := stableChatRecordID("m2", "sys", msgs, tools, 100); got == base {
+	if got, _ := stableChatRecordID("m2", "sys", msgs, tools, 100, recordReasoning{}); got == base {
 		t.Error("different model produced same id")
 	}
 	// Different system -> different id.
-	if got, _ := stableChatRecordID("m", "other", msgs, tools, 100); got == base {
+	if got, _ := stableChatRecordID("m", "other", msgs, tools, 100, recordReasoning{}); got == base {
 		t.Error("different system produced same id")
 	}
 	// Different message content -> different id.
 	msgs2 := []map[string]any{{"role": "user", "content": "bye"}}
-	if got, _ := stableChatRecordID("m", "sys", msgs2, tools, 100); got == base {
+	if got, _ := stableChatRecordID("m", "sys", msgs2, tools, 100, recordReasoning{}); got == base {
 		t.Error("different message content produced same id")
 	}
 	// Different maxTokens -> different id.
-	if got, _ := stableChatRecordID("m", "sys", msgs, tools, 200); got == base {
+	if got, _ := stableChatRecordID("m", "sys", msgs, tools, 200, recordReasoning{}); got == base {
 		t.Error("different maxTokens produced same id")
 	}
 	// Different tools -> different id.
-	if got, _ := stableChatRecordID("m", "sys", msgs, nil, 100); got == base {
+	if got, _ := stableChatRecordID("m", "sys", msgs, nil, 100, recordReasoning{}); got == base {
 		t.Error("tools present vs absent produced same id")
+	}
+	// Effective reasoning controls are part of the identity.
+	if got, _ := stableChatRecordID("m", "sys", msgs, tools, 100, recordReasoning{State: "on", Effort: "high"}); got == base {
+		t.Error("enabled reasoning produced same id")
+	}
+	offID, _ := stableChatRecordID("m", "sys", msgs, tools, 100, recordReasoning{State: "off"})
+	if offID == base {
+		t.Error("disabled reasoning produced same id")
+	}
+	// none and off collapse to one disabled identity; the writer always emits
+	// effort "none" with enable false and the projection drops the spelling.
+	if got, _ := stableChatRecordID("m", "sys", msgs, tools, 100, recordReasoning{State: "off"}); got != offID {
+		t.Error("disabled identity not stable")
+	}
+	// Different effective effort -> different id.
+	if got, _ := stableChatRecordID("m", "sys", msgs, tools, 100, recordReasoning{State: "on", Effort: "xhigh"}); got == offID {
+		t.Error("different effort produced same id as disabled")
 	}
 	// An unparsable raw schema propagates instead of hashing a partial input.
 	badTools := []map[string]any{{"function": map[string]any{"parameters": json.RawMessage(`{bad`)}}}
-	if got, err := stableChatRecordID("m", "sys", msgs, badTools, 100); err == nil {
+	if got, err := stableChatRecordID("m", "sys", msgs, badTools, 100, recordReasoning{}); err == nil {
 		t.Errorf("expected error for invalid raw schema, got %q", got)
 	}
 }
@@ -248,6 +265,22 @@ func TestEncodeRequestRecordIdentity(t *testing.T) {
 		{"message order", func(r *ir.Request) { r.Messages[0], r.Messages[1] = r.Messages[1], r.Messages[0] }, true},
 		{"message text", func(r *ir.Request) { r.Messages[0].Content[0].Text = "forecast?" }, true},
 		{"assistant text", func(r *ir.Request) { r.Messages[1].Content[0].Text = "invoking" }, true},
+		// Requested reasoning intent changes the placeholder identity; the
+		// catalog-effective controls refresh it at prepare time.
+		{"thinking level", func(r *ir.Request) {
+			r.Thinking = &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"}
+		}, true},
+		{"thinking disable", func(r *ir.Request) {
+			r.Thinking = &ir.Thinking{Mode: ir.ThinkingNone, Enable: ir.ThinkingEnableDisabled}
+		}, true},
+		// Auto states no intensity and budget never reaches the wire, so the
+		// placeholder stays unset.
+		{"thinking auto", func(r *ir.Request) {
+			r.Thinking = &ir.Thinking{Mode: ir.ThinkingAuto}
+		}, false},
+		{"thinking budget", func(r *ir.Request) {
+			r.Thinking = &ir.Thinking{Mode: ir.ThinkingBudget, Budget: 1024}
+		}, false},
 		// BlockImage is not sent to Qoder; attachment preflight rejects media before
 		// encode, so it must not perturb the record identity.
 		{"unsupported image block", func(r *ir.Request) {

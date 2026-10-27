@@ -41,6 +41,15 @@ type qoderUpstream struct {
 	pollStatus    int
 	pollBody      string
 	pollStall     time.Duration
+	// pollScript, when set, overrides the static pollStatus/pollBody pair:
+	// entries are consumed in order and the last repeats forever.
+	pollScript []qoderPollResponse
+}
+
+// qoderPollResponse is one scripted queue-status answer.
+type qoderPollResponse struct {
+	status int
+	body   string
 }
 
 type qoderResponse struct {
@@ -74,7 +83,14 @@ func (u *qoderUpstream) recordPoll(r *http.Request) (int, string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.polls = append(u.polls, qoderPoll{path: r.URL.String(), requestID: r.Header.Get("X-Request-ID"), sessionID: r.Header.Get("X-Session-ID")})
-	return u.pollStatus, u.pollBody
+	if len(u.pollScript) == 0 {
+		return u.pollStatus, u.pollBody
+	}
+	i := len(u.polls) - 1
+	if i >= len(u.pollScript) {
+		i = len(u.pollScript) - 1
+	}
+	return u.pollScript[i].status, u.pollScript[i].body
 }
 
 func (u *qoderUpstream) chatCount() int {
@@ -434,11 +450,13 @@ func TestQoderQueueBudgetExpiresWithRetryable503(t *testing.T) {
 	if !strings.Contains(e.Error.Message, "still queued") {
 		t.Fatalf("message = %q", e.Error.Message)
 	}
-	if u.chatCount() < 2 {
-		t.Fatalf("chat sends = %d, want retries before budget expiry", u.chatCount())
+	// A usable queued status keeps the request queued: the original inference
+	// is never resent, the budget is spent on repeated polls instead.
+	if u.chatCount() != 1 {
+		t.Fatalf("chat sends = %d, want only the original refused send", u.chatCount())
 	}
-	if u.pollCount() < 1 {
-		t.Fatal("no status polls attempted")
+	if u.pollCount() < 2 {
+		t.Fatalf("polls = %d, want repeated polling while queued", u.pollCount())
 	}
 }
 
@@ -526,15 +544,226 @@ func TestQoderQueueUnknownStatusEndpointFallsBackToTimedReplay(t *testing.T) {
 	}
 }
 
-func TestQoderQueueFalseReadyFallsBackToTimedReplays(t *testing.T) {
+// TestQoderQueueReadyContradictionResumesPolling covers a ready status whose
+// replay is refused again: the endpoint is polled immediately anew instead of
+// being distrusted after one contradiction, and every ready hint is waited
+// (clamped here to 60ms per hint by maxDelay) before each replay.
+func TestQoderQueueReadyContradictionResumesPolling(t *testing.T) {
 	u := &qoderUpstream{
 		chatResponses: []qoderResponse{
 			{status: 200, sse: qoderRefusalSSE(t, 5)},
 			{status: 200, sse: qoderRefusalSSE(t, 5)},
 			{status: 200, sse: qoderSuccessSSE},
 		},
+		pollScript: []qoderPollResponse{
+			{status: 200, body: `{"isQueued":false,"serviceAvailable":true,"retryAfterSeconds":2,"queueType":"p3"}`},
+			{status: 200, body: `{"isQueued":true,"queueCount":2,"queueType":"p3"}`},
+			{status: 200, body: `{"isQueued":false,"serviceAvailable":true,"retryAfterSeconds":2,"queueType":"p3"}`},
+		},
+	}
+	base, token := qoderQueueHarness(t, u, nil, qoderPolicy(
+		3*time.Second, time.Millisecond, 60*time.Millisecond, time.Millisecond, time.Millisecond, 100*time.Millisecond))
+	start := time.Now()
+	resp, body := postStream(t, base+"/v1/chat/completions", token, qoderStreamRequest())
+	elapsed := time.Since(start)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if text, _ := collectStreamText(t, "/v1/chat/completions", body); text != "hello" {
+		t.Fatalf("text = %q", text)
+	}
+	// Refusal, refused ready replay, then the successful replay after the
+	// endpoint was polled again: three sends, three polls.
+	if u.chatCount() != 3 {
+		t.Fatalf("chat sends = %d, want 3", u.chatCount())
+	}
+	if u.pollCount() != 3 {
+		t.Fatalf("polls = %d, want the endpoint re-polled after the refused replay", u.pollCount())
+	}
+	// Both ready hints were waited (2s each, clamped to 60ms): the request
+	// took at least two clamped waits and far less than the raw hints.
+	if elapsed < 110*time.Millisecond {
+		t.Fatalf("elapsed = %v; the ready hints were not waited before replay", elapsed)
+	}
+	if elapsed >= 2500*time.Millisecond {
+		t.Fatalf("elapsed = %v; the ready hints ran past the maxDelay clamp", elapsed)
+	}
+}
+
+// TestQoderQueueQueuedStatusPollsInsteadOfSending proves a usable queued
+// status never triggers an inference resend: the recovery polls until the
+// budget expires and answers the retryable 503. queueCount=0 alone does not
+// mean ready.
+func TestQoderQueueQueuedStatusPollsInsteadOfSending(t *testing.T) {
+	u := &qoderUpstream{
+		chatResponses: []qoderResponse{{status: 200, sse: qoderRefusalSSE(t, 5)}},
+		pollStatus:    200,
+		pollBody:      `{"isQueued":true,"queueCount":0,"queueType":"p3"}`,
+	}
+	base, token := qoderQueueHarness(t, u, nil, qoderPolicy(
+		500*time.Millisecond, time.Millisecond, 2*time.Millisecond, time.Millisecond, time.Millisecond, 200*time.Millisecond))
+	resp, body := postStream(t, base+"/v1/chat/completions", token, qoderStreamRequest())
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "still queued") {
+		t.Fatalf("body = %s, want the queue budget envelope", body)
+	}
+	if u.chatCount() != 1 {
+		t.Fatalf("chat sends = %d, want only the original refused send", u.chatCount())
+	}
+	if u.pollCount() < 3 {
+		t.Fatalf("polls = %d, want repeated polling while queued", u.pollCount())
+	}
+}
+
+// TestQoderQueueQueuedThenReadyHonorsHint runs the full queued-to-ready
+// sequence: no inference while queued, and the positive ready hint (2s,
+// clamped to 60ms by maxDelay) is waited before the single successful replay.
+func TestQoderQueueQueuedThenReadyHonorsHint(t *testing.T) {
+	u := &qoderUpstream{
+		chatResponses: []qoderResponse{
+			{status: 200, sse: qoderRefusalSSE(t, 5)},
+			{status: 200, sse: qoderSuccessSSE},
+		},
+		pollScript: []qoderPollResponse{
+			{status: 200, body: `{"isQueued":true,"queueCount":2,"queueType":"p3"}`},
+			{status: 200, body: `{"isQueued":false,"serviceAvailable":true,"retryAfterSeconds":2,"queueType":"p3"}`},
+		},
+	}
+	base, token := qoderQueueHarness(t, u, nil, qoderPolicy(
+		2*time.Second, time.Millisecond, 60*time.Millisecond, time.Millisecond, time.Millisecond, 100*time.Millisecond))
+	start := time.Now()
+	resp, body := postStream(t, base+"/v1/chat/completions", token, qoderStreamRequest())
+	elapsed := time.Since(start)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if text, _ := collectStreamText(t, "/v1/chat/completions", body); text != "hello" {
+		t.Fatalf("text = %q", text)
+	}
+	if u.chatCount() != 2 {
+		t.Fatalf("chat sends = %d, want refusal plus one replay after ready", u.chatCount())
+	}
+	if u.pollCount() != 2 {
+		t.Fatalf("polls = %d, want one queued poll plus the ready poll", u.pollCount())
+	}
+	if elapsed < 55*time.Millisecond {
+		t.Fatalf("elapsed = %v; the ready hint was not waited", elapsed)
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Fatalf("elapsed = %v; the ready hint ran past the maxDelay clamp", elapsed)
+	}
+}
+
+// TestQoderQueueNegativeAdmissionKeepsPolling proves isQueued=false with
+// serviceAvailable=false never schedules a replay: the request keeps polling
+// until the status truly turns ready, and only then replays once.
+func TestQoderQueueNegativeAdmissionKeepsPolling(t *testing.T) {
+	u := &qoderUpstream{
+		chatResponses: []qoderResponse{
+			{status: 200, sse: qoderRefusalSSE(t, 5)},
+			{status: 200, sse: qoderSuccessSSE},
+		},
+		pollScript: []qoderPollResponse{
+			{status: 200, body: `{"isQueued":false,"serviceAvailable":false,"queueCount":0,"queueType":"p3"}`},
+			{status: 200, body: `{"isQueued":false,"serviceAvailable":true,"retryAfterSeconds":2,"queueType":"p3"}`},
+		},
+	}
+	base, token := qoderQueueHarness(t, u, nil, qoderPolicy(
+		2*time.Second, time.Millisecond, 60*time.Millisecond, time.Millisecond, time.Millisecond, 100*time.Millisecond))
+	start := time.Now()
+	resp, body := postStream(t, base+"/v1/chat/completions", token, qoderStreamRequest())
+	elapsed := time.Since(start)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if text, _ := collectStreamText(t, "/v1/chat/completions", body); text != "hello" {
+		t.Fatalf("text = %q", text)
+	}
+	// The negative-admission poll must not have triggered the replay: two
+	// polls happened, and the replay only followed the ready status.
+	if u.pollCount() != 2 {
+		t.Fatalf("polls = %d, want the negative-admission status polled again", u.pollCount())
+	}
+	if u.chatCount() != 2 {
+		t.Fatalf("chat sends = %d, want refusal plus one replay after ready", u.chatCount())
+	}
+	if elapsed < 55*time.Millisecond {
+		t.Fatalf("elapsed = %v; the ready hint was not waited", elapsed)
+	}
+}
+
+// TestQoderQueueReadyHintClampedToBudget proves a ready hint larger than the
+// remaining budget is bounded by it: the wait is cut to the budget, the
+// budget 503 is returned, and no replay happens.
+func TestQoderQueueReadyHintClampedToBudget(t *testing.T) {
+	u := &qoderUpstream{
+		chatResponses: []qoderResponse{{status: 200, sse: qoderRefusalSSE(t, 5)}},
+		pollStatus:    200,
+		pollBody:      `{"isQueued":false,"serviceAvailable":true,"retryAfterSeconds":5,"queueType":"p3"}`,
+	}
+	base, token := qoderQueueHarness(t, u, nil, qoderPolicy(
+		80*time.Millisecond, time.Millisecond, 10*time.Second, time.Millisecond, time.Millisecond, 50*time.Millisecond))
+	start := time.Now()
+	resp, _ := postStream(t, base+"/v1/chat/completions", token, qoderStreamRequest())
+	elapsed := time.Since(start)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want budget 503", resp.StatusCode)
+	}
+	if elapsed >= 5*time.Second {
+		t.Fatalf("elapsed = %v; the ready hint ran past the budget", elapsed)
+	}
+	if u.chatCount() != 1 {
+		t.Fatalf("chat sends = %d, want no replay after budget expiry", u.chatCount())
+	}
+	if u.pollCount() != 1 {
+		t.Fatalf("polls = %d, want the single ready poll", u.pollCount())
+	}
+}
+
+// TestQoderQueueCallerCancelDuringReadyDelay proves a caller cancellation
+// during a ready-hint wait ends the recovery immediately, before any replay.
+func TestQoderQueueCallerCancelDuringReadyDelay(t *testing.T) {
+	u := &qoderUpstream{
+		chatResponses: []qoderResponse{{status: 200, sse: qoderRefusalSSE(t, 5)}},
+		pollStatus:    200,
+		pollBody:      `{"isQueued":false,"serviceAvailable":true,"retryAfterSeconds":2,"queueType":"p3"}`,
+	}
+	base, token := qoderQueueHarness(t, u, nil, qoderPolicy(
+		10*time.Second, time.Millisecond, 10*time.Second, time.Millisecond, time.Millisecond, 100*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/chat/completions", strings.NewReader(qoderStreamRequest()))
+	req.Header.Set("Authorization", "Bearer "+token)
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err := http.DefaultClient.Do(req)
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("err = %v, want the caller's cancellation", err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("elapsed = %v; cancellation did not end the ready-hint wait", elapsed)
+	}
+	if u.chatCount() != 1 {
+		t.Fatalf("chat sends = %d, want no replay after cancellation", u.chatCount())
+	}
+}
+
+// TestQoderQueueMalformedStatusFallsBackToTimedReplay proves a malformed but
+// HTTP-successful status body disables polling and preserves the timed
+// replay fallback.
+func TestQoderQueueMalformedStatusFallsBackToTimedReplay(t *testing.T) {
+	u := &qoderUpstream{
+		chatResponses: []qoderResponse{
+			{status: 200, sse: qoderRefusalSSE(t, 5)},
+			{status: 200, sse: qoderSuccessSSE},
+		},
 		pollStatus: 200,
-		pollBody:   `{"isQueued":false,"retryAfterSeconds":2}`,
+		pollBody:   `garbage{{no json`,
 	}
 	base, token := qoderQueueHarness(t, u, nil, shortQoderQueuePolicy())
 	resp, body := postStream(t, base+"/v1/chat/completions", token, qoderStreamRequest())
@@ -544,14 +773,43 @@ func TestQoderQueueFalseReadyFallsBackToTimedReplays(t *testing.T) {
 	if text, _ := collectStreamText(t, "/v1/chat/completions", body); text != "hello" {
 		t.Fatalf("text = %q", text)
 	}
-	// Sends: refusal, one trusted ready replay (refused again), then a timed
-	// replay that succeeds. After the contradiction the endpoint is no longer
-	// polled, so exactly two polls happened.
-	if u.chatCount() != 3 {
-		t.Fatalf("chat sends = %d, want 3", u.chatCount())
+	if u.chatCount() != 2 {
+		t.Fatalf("chat sends = %d, want timed replay after the unusable endpoint", u.chatCount())
 	}
+	if u.pollCount() != 1 {
+		t.Fatalf("polls = %d, want polling disabled after the malformed answer", u.pollCount())
+	}
+}
+
+// TestQoderQueueStatusUnavailableAfterQueuedFallsBack proves the transition
+// from valid queued polls to an erroring endpoint: polling turns off and the
+// recovery finishes through the timed replay fallback.
+func TestQoderQueueStatusUnavailableAfterQueuedFallsBack(t *testing.T) {
+	u := &qoderUpstream{
+		chatResponses: []qoderResponse{
+			{status: 200, sse: qoderRefusalSSE(t, 5)},
+			{status: 200, sse: qoderSuccessSSE},
+		},
+		pollScript: []qoderPollResponse{
+			{status: 200, body: `{"isQueued":true,"queueCount":2,"queueType":"p3"}`},
+			{status: 503, body: `upstream exploded`},
+		},
+	}
+	base, token := qoderQueueHarness(t, u, nil, shortQoderQueuePolicy())
+	resp, body := postStream(t, base+"/v1/chat/completions", token, qoderStreamRequest())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if text, _ := collectStreamText(t, "/v1/chat/completions", body); text != "hello" {
+		t.Fatalf("text = %q", text)
+	}
+	// One valid queued poll, then the failed poll disables polling and the
+	// timed fallback replay succeeds.
 	if u.pollCount() != 2 {
-		t.Fatalf("polls = %d, want 2", u.pollCount())
+		t.Fatalf("polls = %d, want one queued poll plus the failed one", u.pollCount())
+	}
+	if u.chatCount() != 2 {
+		t.Fatalf("chat sends = %d, want refusal plus the fallback replay", u.chatCount())
 	}
 }
 

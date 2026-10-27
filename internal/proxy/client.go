@@ -123,10 +123,12 @@ func prepareUpstreamRequest(ctx context.Context, p *Proxy, backend codec, provid
 		return kiro.InjectRuntimeAgentMode(body, id.AgentMode), nil
 	case "qoder":
 		requested := 0
+		var wantThinking *ir.Thinking
 		if req != nil {
 			requested = req.MaxTokens
+			wantThinking = req.Thinking
 		}
-		prep, err := qoder.PrepareWireBody(ctx, provider, requested, body)
+		prep, err := qoder.PrepareWireBodyWithThinking(ctx, provider, requested, wantThinking, body)
 		if err != nil {
 			return nil, err
 		}

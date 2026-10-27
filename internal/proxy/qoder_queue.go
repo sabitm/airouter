@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -26,8 +27,10 @@ const (
 	qoderQueuePollTimeout = 10 * time.Second
 	// qoderQueueDelay* mirror the reference client's retry clamps. The
 	// status endpoint has been observed answering isQueued:false while the
-	// inference call is still refused, so a status-derived delay never drops
-	// below the floor and only one ready hint is trusted.
+	// inference call is still refused, so a queued status delay never drops
+	// below the floor, and serviceAvailable=false next to isQueued=false
+	// counts as still queued. A ready status's positive retry hint is
+	// honored without the floor and capped only by maxDelay.
 	qoderQueueDelayDefault = 30 * time.Second
 	qoderQueueDelayMin     = 15 * time.Second
 	qoderQueueDelayMax     = 60 * time.Second
@@ -74,20 +77,17 @@ func (p *Proxy) qoderQueueDefaults() qoderQueuePolicy {
 	return pol
 }
 
-// delay computes the wait before the next replay. Two hint sources feed this
-// and they are not equally trustworthy: the inference refusal describes the
-// queue the request actually sits in, so its hint is honored; a status-derived
-// delay never drops below the floor. Both are clamped into min..max.
-func (pol qoderQueuePolicy) delay(info *qoder.QueueInfo, fromStatus bool) time.Duration {
+// delay computes the wait before the next timed replay when the status
+// endpoint is unusable. The inference refusal describes the queue the request
+// actually sits in, so its hint is honored and clamped into min..max; the
+// status-derived delay lives in delayFromStatus.
+func (pol qoderQueuePolicy) delay(info *qoder.QueueInfo) time.Duration {
 	d := pol.defaultDelay
 	switch {
 	case info.RetryAfterSeconds != nil:
-		d = time.Duration(*info.RetryAfterSeconds) * time.Second
+		d = qoderSecondsToDelay(*info.RetryAfterSeconds)
 	case info.WaitTime != nil:
-		d = time.Duration(*info.WaitTime) * time.Second
-	}
-	if fromStatus && d < pol.statusFloor {
-		d = pol.statusFloor
+		d = qoderSecondsToDelay(*info.WaitTime)
 	}
 	if d < pol.minDelay {
 		d = pol.minDelay
@@ -211,12 +211,18 @@ func closeAfterDelay(body io.Closer, d time.Duration) (fired func() bool) {
 }
 
 // recoverQoderQueue watches a Qoder stream for the model-queue refusal on its
-// first frame and replays the exact same prepared body until the model drains
-// or the recovery budget expires. Across replays the body bytes, request id,
-// request set id, and session id never change; each send re-resolves the
-// effective token through the oauth seam and re-signs the exact wire bytes
-// with fresh COSY credentials. A successful stream is returned exactly once —
-// the peeked prefix is replayed, never re-sent.
+// first frame and drives recovery until the model drains or the recovery
+// budget expires. While a usable status endpoint reports the request queued
+// (or denies readiness via serviceAvailable=false) it keeps polling instead
+// of resending inference; when the status turns ready it waits the hinted
+// delay and replays the exact same prepared body; without a usable status
+// endpoint it falls back to timed replays. After a refused replay the
+// endpoint is polled again immediately rather than distrusted. Across
+// replays the body bytes, request id, request set id, and session id never
+// change; each send re-resolves the effective token through the oauth seam
+// and re-signs the exact wire bytes with fresh COSY credentials. A
+// successful stream is returned exactly once — the peeked prefix is
+// replayed, never re-sent.
 //
 // The recovery budget starts before the initial refusal inspection and bounds
 // every step of recovery: waits, status polls, replay header sends, and
@@ -271,7 +277,6 @@ func (p *Proxy) recoverQoderQueue(ctx context.Context, provider *domain.Provider
 		"model_key", info.ModelKey,
 	)
 	statusPollsEnabled := true
-	readyReplayUsed := false
 	lastInfo := info
 	for {
 		if err := ctx.Err(); err != nil {
@@ -280,7 +285,13 @@ func (p *Proxy) recoverQoderQueue(ctx context.Context, provider *domain.Provider
 		if remaining := deadline.Sub(pol.now()); remaining <= 0 {
 			return qoderQueueBudgetResponse(lastInfo, pol.now().Sub(startedAt)), nil
 		}
-		delay := pol.delay(lastInfo, false)
+		// Each round either polls (while the endpoint stays usable) or falls
+		// back to timed replays. A queued status — or the contradictory
+		// isQueued=false with serviceAvailable=false — never schedules a
+		// replay; only a ready status does, and its positive hint is waited
+		// as asked.
+		delay := time.Duration(0)
+		replay := true
 		if statusPollsEnabled {
 			polled, ok := p.pollQoderQueueStatus(ctx, pol, provider, lastInfo, deadline.Sub(pol.now()))
 			if !ok {
@@ -290,24 +301,17 @@ func (p *Proxy) recoverQoderQueue(ctx context.Context, provider *domain.Provider
 					"event", "qoder_queue_status_unavailable",
 					"provider", provider.Name,
 				)
-			} else if polled.IsQueued != nil && !*polled.IsQueued {
-				// The status endpoint says ready, but it has been observed
-				// saying that while the inference call is still refused.
-				// Trust one ready hint; after one contradicting replay stop
-				// trusting the endpoint for this recovery.
-				if readyReplayUsed {
-					statusPollsEnabled = false
-					logger.Debug("qoder_queue_status_untrusted",
-						"event", "qoder_queue_status_untrusted",
-						"provider", provider.Name,
-					)
-				} else {
-					readyReplayUsed = true
-					delay = 0
-				}
+				delay = pol.delay(lastInfo)
+			} else if qoderStatusReady(polled) {
+				delay = pol.readyDelay(polled)
 			} else {
+				// Still queued: wait out the status delay and poll again
+				// instead of resending inference on every round.
+				replay = false
 				delay = pol.delayFromStatus(polled)
 			}
+		} else {
+			delay = pol.delay(lastInfo)
 		}
 		if delay > 0 {
 			// No wait may outlive the budget, however large the retry hint.
@@ -323,13 +327,17 @@ func (p *Proxy) recoverQoderQueue(ctx context.Context, provider *domain.Provider
 				}
 			}
 		}
-		// Budget recheck directly before every replay; the ready path skips
-		// the sleep, so this is the only gate for it.
+		// Budget recheck after the poll and any sleep: a poll may consume
+		// the whole remaining budget, and the ready path can skip the sleep,
+		// so this is the only gate before a replay.
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if remaining := deadline.Sub(pol.now()); remaining <= 0 {
 			return qoderQueueBudgetResponse(lastInfo, pol.now().Sub(startedAt)), nil
+		}
+		if !replay {
+			continue
 		}
 		// Replay sends run on a context bounded by the remaining budget, so a
 		// blocked header send or first-frame read cannot exceed it. The
@@ -408,7 +416,9 @@ func (p *Proxy) recoverQoderQueue(ctx context.Context, provider *domain.Provider
 			next.Body = &qoderReplayBody{replay: consumed2, live: next.Body, peekErr: peekErr2, onClose: cancelSend}
 			return next, nil
 		}
-		// Another refusal: close the queued response before waiting again.
+		// Another refusal: close the queued response and poll immediately
+		// anew. A ready status that contradicted one replay is re-polled for
+		// the next round rather than distrusted for the rest of recovery.
 		sendTimer.Stop()
 		cancelSend()
 		_ = next.Body.Close()
@@ -416,15 +426,51 @@ func (p *Proxy) recoverQoderQueue(ctx context.Context, provider *domain.Provider
 	}
 }
 
-// delayFromStatus computes a status-poll-derived delay, which never drops
-// below the floor because the endpoint's ready hints are unreliable.
+// qoderStatusReady reports whether a parsed status marks the request ready to
+// replay. isQueued=false paired with serviceAvailable=false is the endpoint's
+// negative admission — it has answered that while inference was still
+// refused — so it keeps the request queued. A missing serviceAvailable stays
+// ready, and queueCount alone never means ready.
+func qoderStatusReady(st *qoder.QueueStatus) bool {
+	if st == nil || st.IsQueued == nil || *st.IsQueued {
+		return false
+	}
+	return st.ServiceAvailable == nil || *st.ServiceAvailable
+}
+
+// readyDelay honors a ready status's retry hint without the queued-status
+// floor: a positive retryAfterSeconds (or, absent that, a positive waitTime)
+// is waited as asked, capped only by maxDelay. A missing or non-positive
+// hint replays immediately; the recovery loop's budget checks still bound
+// every wait, so a hint-free endpoint cannot loop past the budget.
+func (pol qoderQueuePolicy) readyDelay(st *qoder.QueueStatus) time.Duration {
+	secs := 0
+	if st.RetryAfterSeconds != nil {
+		secs = *st.RetryAfterSeconds
+	} else if st.WaitTime != nil {
+		secs = *st.WaitTime
+	}
+	if secs <= 0 {
+		return 0
+	}
+	d := qoderSecondsToDelay(secs)
+	if d > pol.maxDelay {
+		d = pol.maxDelay
+	}
+	return d
+}
+
+// delayFromStatus computes the wait between polls while the status endpoint
+// still reports the request queued (or denies readiness); it never drops
+// below the floor because the endpoint's timing hints are not admission
+// signals.
 func (pol qoderQueuePolicy) delayFromStatus(st *qoder.QueueStatus) time.Duration {
 	d := pol.defaultDelay
 	switch {
 	case st.RetryAfterSeconds != nil:
-		d = time.Duration(*st.RetryAfterSeconds) * time.Second
+		d = qoderSecondsToDelay(*st.RetryAfterSeconds)
 	case st.WaitTime != nil:
-		d = time.Duration(*st.WaitTime) * time.Second
+		d = qoderSecondsToDelay(*st.WaitTime)
 	}
 	if d < pol.statusFloor {
 		d = pol.statusFloor
@@ -436,6 +482,19 @@ func (pol qoderQueuePolicy) delayFromStatus(st *qoder.QueueStatus) time.Duration
 		d = pol.maxDelay
 	}
 	return d
+}
+
+// qoderSecondsToDelay converts an untrusted seconds hint into a duration
+// without int64 overflow; non-positive hints become zero.
+func qoderSecondsToDelay(secs int) time.Duration {
+	if secs <= 0 {
+		return 0
+	}
+	const maxSeconds = int(math.MaxInt64 / int64(time.Second))
+	if secs > maxSeconds {
+		return time.Duration(maxSeconds) * time.Second
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // pollQoderQueueStatus queries the signed queue-status endpoint keyed by the

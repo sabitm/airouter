@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/qoder"
 )
 
 var errReplay = errors.New("replay read failure")
@@ -399,5 +401,107 @@ func TestQoderReplayErrorBodyBoundedByRemainingBudget(t *testing.T) {
 	}
 	if got := live.closeCount(); got != 1 {
 		t.Fatalf("live closes = %d, want exactly 1", got)
+	}
+}
+
+// --- ready gate and retry-hint timing helpers ---
+
+// TestQoderQueueReadyStatusGate pins the readiness classification: only
+// isQueued=false without a negative serviceAvailable admission is ready;
+// queueCount alone never means ready.
+func TestQoderQueueReadyStatusGate(t *testing.T) {
+	yes, no := true, false
+	zero, one := 0, 1
+	cases := []struct {
+		name string
+		st   qoder.QueueStatus
+		want bool
+	}{
+		{"queued flag", qoder.QueueStatus{IsQueued: &yes}, false},
+		{"ready with service missing", qoder.QueueStatus{IsQueued: &no}, true},
+		{"ready with service available", qoder.QueueStatus{IsQueued: &no, ServiceAvailable: &yes}, true},
+		{"negative admission keeps queued", qoder.QueueStatus{IsQueued: &no, ServiceAvailable: &no}, false},
+		{"queued flag beats available", qoder.QueueStatus{IsQueued: &yes, ServiceAvailable: &yes}, false},
+		{"queue count alone is not ready", qoder.QueueStatus{IsQueued: &no, ServiceAvailable: &no, QueueCount: &one}, false},
+		{"zero queue count is not ready", qoder.QueueStatus{IsQueued: &no, ServiceAvailable: &no, QueueCount: &zero}, false},
+	}
+	for _, tc := range cases {
+		if got := qoderStatusReady(&tc.st); got != tc.want {
+			t.Fatalf("%s: ready = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if qoderStatusReady(nil) {
+		t.Fatal("nil status must not count as ready")
+	}
+}
+
+// TestQoderQueueReadyDelayHintSemantics proves the ready path honors a
+// positive hint without the queued floor, falls back to a positive waitTime,
+// and never invents a delay from a missing or non-positive hint. Huge hints
+// clamp to maxDelay instead of overflowing int64 nanoseconds.
+func TestQoderQueueReadyDelayHintSemantics(t *testing.T) {
+	two, four, zero, neg, over, huge := 2, 4, 0, -1, 120, math.MaxInt64
+	pol := qoderQueuePolicy{
+		minDelay:     15 * time.Second,
+		maxDelay:     60 * time.Second,
+		defaultDelay: 30 * time.Second,
+		statusFloor:  30 * time.Second,
+	}
+	cases := []struct {
+		name string
+		st   qoder.QueueStatus
+		want time.Duration
+	}{
+		{"hint honored without floor", qoder.QueueStatus{RetryAfterSeconds: &two}, 2 * time.Second},
+		{"waitTime zero with retry keeps retry", qoder.QueueStatus{RetryAfterSeconds: &two, WaitTime: &zero}, 2 * time.Second},
+		{"missing retry falls back to waitTime", qoder.QueueStatus{WaitTime: &four}, 4 * time.Second},
+		{"no hint replays immediately", qoder.QueueStatus{}, 0},
+		{"zero hint replays immediately", qoder.QueueStatus{RetryAfterSeconds: &zero}, 0},
+		{"negative hint must not invent a delay", qoder.QueueStatus{RetryAfterSeconds: &neg, WaitTime: &four}, 0},
+		{"hint above max clamps", qoder.QueueStatus{RetryAfterSeconds: &over}, 60 * time.Second},
+		{"huge hint clamps without overflow", qoder.QueueStatus{RetryAfterSeconds: &huge}, 60 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := pol.readyDelay(&tc.st); got != tc.want {
+			t.Fatalf("%s: readyDelay = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestQoderQueueQueuedStatusDelayKeepsFloor pins the queued-status clamp:
+// its delay never drops below the status floor and still caps at maxDelay,
+// so a tiny status hint cannot speed up polling.
+func TestQoderQueueQueuedStatusDelayKeepsFloor(t *testing.T) {
+	two, over := 2, 120
+	pol := qoderQueuePolicy{
+		minDelay:     15 * time.Second,
+		maxDelay:     60 * time.Second,
+		defaultDelay: 30 * time.Second,
+		statusFloor:  30 * time.Second,
+	}
+	if got := pol.delayFromStatus(&qoder.QueueStatus{RetryAfterSeconds: &two}); got != 30*time.Second {
+		t.Fatalf("delayFromStatus(2s hint) = %v, want the 30s floor", got)
+	}
+	if got := pol.delayFromStatus(&qoder.QueueStatus{}); got != 30*time.Second {
+		t.Fatalf("delayFromStatus(no hint) = %v, want the default", got)
+	}
+	if got := pol.delayFromStatus(&qoder.QueueStatus{RetryAfterSeconds: &over}); got != 60*time.Second {
+		t.Fatalf("delayFromStatus(120s hint) = %v, want the 60s cap", got)
+	}
+}
+
+// TestQoderQueueFallbackDelayOverflowSafe proves the timed-replay fallback
+// survives an untrusted huge hint from the inference refusal: it clamps to
+// maxDelay instead of wrapping into a negative duration.
+func TestQoderQueueFallbackDelayOverflowSafe(t *testing.T) {
+	huge := math.MaxInt64
+	pol := qoderQueuePolicy{
+		minDelay:     15 * time.Second,
+		maxDelay:     60 * time.Second,
+		defaultDelay: 30 * time.Second,
+		statusFloor:  30 * time.Second,
+	}
+	if got := pol.delay(&qoder.QueueInfo{RetryAfterSeconds: &huge}); got != 60*time.Second {
+		t.Fatalf("delay(huge hint) = %v, want the 60s cap", got)
 	}
 }
