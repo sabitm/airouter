@@ -32,10 +32,6 @@ import (
 const (
 	// freeTierHost is the only host the impersonated transport dials.
 	freeTierHost = "opencode.ai"
-	// inferencePathPrefix is the current official free-tier endpoint. The
-	// retired /zen/v1 base is aliased to this prefix before send, so stored
-	// legacy rows are covered; custom endpoints on other hosts are not.
-	inferencePathPrefix = "/inference/v1"
 	// handshakeBudget bounds TCP dialing and the transport-level TLS handshake
 	// timeout. Phase bounds that run on the caller context use phaseBudget
 	// instead, so tests can shorten them without touching the dialer.
@@ -48,19 +44,25 @@ const (
 // production code must not reassign it.
 var phaseBudget = handshakeBudget
 
-// inferenceEndpoints lists the official free-tier POST endpoints. Other paths
-// on the host (paid /zen routes, /models, the bare prefix) and any custom port,
-// scheme, or userinfo variant keep the standard transport.
+// inferenceEndpoints lists the official free-tier POST paths. Old legacy paths
+// remain accepted for stored rows and accepted redirects. Go paths, /models,
+// and the bare family prefix keep the standard transport.
 var inferenceEndpoints = map[string]bool{
-	inferencePathPrefix + ChatPath:      true,
-	inferencePathPrefix + ResponsesPath: true,
-	inferencePathPrefix + MessagesPath:  true,
+	"/inference/openai/v1" + ChatPath:        true,
+	"/inference/openai/v1" + ResponsesPath:   true,
+	"/inference/anthropic/v1" + MessagesPath: true,
+	"/inference/v1" + ChatPath:               true,
+	"/inference/v1" + ResponsesPath:          true,
+	"/inference/v1" + MessagesPath:           true,
+	"/zen/v1" + ChatPath:                     true,
+	"/zen/v1" + ResponsesPath:                true,
+	"/zen/v1" + MessagesPath:                 true,
 }
 
 // IsOfficialFreeTierURL reports whether rawURL targets an official OpenCode
-// inference endpoint over HTTPS on the default port, without userinfo. Paid
-// Zen (/zen/go), Go tier, custom mirrors, and other hosts return false, so
-// their transport behavior is unchanged.
+// free-tier inference endpoint over HTTPS on the default port, without
+// userinfo. Go bases, custom mirrors, and other hosts return false, so their
+// transport behavior is unchanged.
 func IsOfficialFreeTierURL(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.User != nil {
@@ -72,7 +74,7 @@ func IsOfficialFreeTierURL(rawURL string) bool {
 	if port := u.Port(); port != "" && port != "443" {
 		return false
 	}
-	return inferenceEndpoints[strings.TrimSuffix(u.Path, "/")]
+	return inferenceEndpoints[strings.TrimSuffix(u.EscapedPath(), "/")]
 }
 
 // NewFreeTierTransport builds an http.Transport whose TLS handshake mimics the

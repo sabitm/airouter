@@ -44,10 +44,18 @@ func TestIsOfficialFreeTierURL(t *testing.T) {
 		url  string
 		want bool
 	}{
+		{"https://opencode.ai/inference/openai/v1/chat/completions", true},
+		{"https://opencode.ai/inference/openai/v1/responses", true},
+		{"https://opencode.ai/inference/anthropic/v1/messages", true},
+		{"https://opencode.ai/inference/openai/v1/chat/completions/", true},
+		// Legacy and previous inference paths stay accepted so a stored row or an
+		// accepted official redirect is not downgraded to the standard transport.
 		{"https://opencode.ai/inference/v1/chat/completions", true},
 		{"https://opencode.ai/inference/v1/responses", true},
 		{"https://opencode.ai/inference/v1/messages", true},
-		{"https://opencode.ai/inference/v1/chat/completions/", true},
+		{"https://opencode.ai/zen/v1/chat/completions", true},
+		{"https://opencode.ai/zen/v1/responses", true},
+		{"https://opencode.ai/zen/v1/messages", true},
 		{"https://OPENCODE.AI/inference/v1/chat/completions", true},
 		{"https://opencode.ai:443/inference/v1/chat/completions", true},
 		// Custom ports, userinfo, and everything off the three endpoint paths
@@ -58,11 +66,9 @@ func TestIsOfficialFreeTierURL(t *testing.T) {
 		{"https://opencode.ai/inference/v1/", false},
 		{"https://opencode.ai/inference/v1/models", false},
 		{"https://opencode.ai/inference/v1/chat/completions/extra", false},
-		// Legacy rows alias to /inference/v1 before send, so the stored path
-		// never reaches transport selection; a literal /zen/v1 URL is not the
-		// documented free endpoint.
-		{"https://opencode.ai/zen/v1/chat/completions", false},
 		{"https://opencode.ai/zen/go/v1/chat/completions", false},
+		{"https://opencode.ai/inference/go/openai/v1/chat/completions", false},
+		{"https://opencode.ai/inference/go/anthropic/v1/messages", false},
 		{"http://opencode.ai/inference/v1/chat/completions", false},
 		{"https://opencode.example.com/inference/v1/chat/completions", false},
 		{"https://mirror.test/v1/chat/completions", false},
@@ -868,4 +874,55 @@ func TestFreeTierTransportConcurrentReuse(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestIsOfficialFreeTierURLAllFamilies pins every accepted official path and
+// the current Go and family-prefix exclusions in one place.
+func TestIsOfficialFreeTierURLAllFamilies(t *testing.T) {
+	allowed := []string{
+		"https://opencode.ai/inference/openai/v1/chat/completions",
+		"https://opencode.ai/inference/openai/v1/responses",
+		"https://opencode.ai/inference/anthropic/v1/messages",
+		"https://opencode.ai/inference/v1/chat/completions",
+		"https://opencode.ai/inference/v1/responses",
+		"https://opencode.ai/inference/v1/messages",
+		"https://opencode.ai/zen/v1/chat/completions",
+		"https://opencode.ai/zen/v1/responses",
+		"https://opencode.ai/zen/v1/messages",
+	}
+	for _, raw := range allowed {
+		if !IsOfficialFreeTierURL(raw) {
+			t.Errorf("official free-tier path rejected: %s", raw)
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := freeTierRedirectPolicy(&http.Request{URL: u}, nil); err != nil {
+			t.Errorf("official redirect refused: %s: %v", raw, err)
+		}
+	}
+	refused := []string{
+		"https://opencode.ai/inference/go/openai/v1/chat/completions",
+		"https://opencode.ai/inference/go/openai/v1/responses",
+		"https://opencode.ai/inference/go/anthropic/v1/messages",
+		"https://opencode.ai/zen/go/v1/chat/completions",
+		"https://opencode.ai/inference/openai/v1",
+		"https://opencode.ai/inference/anthropic/v1",
+		"https://opencode.ai/inference/openai/v1/models",
+		"https://opencode.ai/inference/v1/models",
+		"https://opencode.ai/inference/go/v1/models",
+	}
+	for _, raw := range refused {
+		if IsOfficialFreeTierURL(raw) {
+			t.Errorf("non-free-tier path accepted: %s", raw)
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := freeTierRedirectPolicy(&http.Request{URL: u}, nil); err == nil {
+			t.Errorf("non-free-tier redirect allowed: %s", raw)
+		}
+	}
 }

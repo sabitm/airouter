@@ -326,8 +326,8 @@ func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain
 	return true, fmt.Sprintf("OK - /models accepted the credential (%d models). This does not prove Messages requests will be accepted.", len(parsed.Data))
 }
 
-// checkOpencodeUpstream validates a zen/go tier credential against the
-// opencode.ai /models endpoint with the shared fingerprinted model query.
+// checkOpencodeUpstream probes the opencode.ai model-discovery endpoint with the
+// shared fingerprinted query. Only discovery is proven; inference access is not.
 func checkOpencodeUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
 	models, pr, err := queryOpencodeModels(ctx, logger, p, "check_opencode")
 	if err != nil {
@@ -346,7 +346,7 @@ func checkOpencodeUpstream(ctx context.Context, logger *slog.Logger, p *domain.P
 			return false, "could not reach URL: " + err.Error()
 		}
 	}
-	return true, fmt.Sprintf("OK - reachable, key accepted (%d models)", len(models))
+	return true, fmt.Sprintf("OK - model discovery succeeded (%d models). This does not confirm inference or model access.", len(models))
 }
 
 // checkQoderUpstream validates a Qoder device token against openapi userinfo.

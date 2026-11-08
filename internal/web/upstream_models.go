@@ -171,6 +171,8 @@ func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 
 // queryOpencodeModels is the shared OpenCode model probe used by Check and
 // discovery so authentication, fingerprinting, and response parsing stay equal.
+// Discovery uses the tier base, not the API-family inference base, because
+// /models has no family segment.
 func queryOpencodeModels(ctx context.Context, logger *slog.Logger, p *domain.Provider, operation string) ([]string, probeResult, error) {
 	url := strings.TrimRight(opencode.EffectiveBaseURL(p.BaseURL), "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

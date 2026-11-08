@@ -303,8 +303,13 @@ func TestOpencodeModelQueriesShareRequestAndParsing(t *testing.T) {
 				}
 			} else {
 				ok, msg := checkOpencodeUpstream(context.Background(), logger, p)
-				if !ok || !strings.Contains(msg, "(2 models)") {
+				if !ok || !strings.Contains(msg, "model discovery succeeded (2 models)") {
 					t.Fatalf("check ok=%v msg=%q", ok, msg)
+				}
+				for _, claim := range []string{"key accepted", "inference access", "models available"} {
+					if strings.Contains(msg, claim) {
+						t.Fatalf("check message overclaims %q: %q", claim, msg)
+					}
 				}
 			}
 			if err != nil {
@@ -339,7 +344,12 @@ func TestOpencodeModelQueriesRouteMigratedEndpoints(t *testing.T) {
 		{"new zen", opencode.ZenBaseURL, opencode.ZenBaseURL + "/models"},
 		{"legacy zen", opencode.LegacyZenBaseURL, opencode.ZenBaseURL + "/models"},
 		{"legacy zen trailing slash", opencode.LegacyZenBaseURL + "/", opencode.ZenBaseURL + "/models"},
+		{"zen openai family", opencode.ZenOpenAIBaseURL, opencode.ZenBaseURL + "/models"},
+		{"zen anthropic family", opencode.ZenAnthropicBaseURL, opencode.ZenBaseURL + "/models"},
 		{"go", opencode.GoBaseURL, opencode.GoBaseURL + "/models"},
+		{"legacy go", opencode.LegacyGoBaseURL, opencode.GoBaseURL + "/models"},
+		{"go openai family", opencode.GoOpenAIBaseURL, opencode.GoBaseURL + "/models"},
+		{"go anthropic family", opencode.GoAnthropicBaseURL, opencode.GoBaseURL + "/models"},
 		{"custom", "https://models.example/v1/", "https://models.example/v1/models"},
 		{"custom zen path", "http://127.0.0.1:9/zen/v1", "http://127.0.0.1:9/zen/v1/models"},
 	}
@@ -366,7 +376,7 @@ func TestOpencodeModelQueriesRouteMigratedEndpoints(t *testing.T) {
 					}
 				} else {
 					ok, msg := checkOpencodeUpstream(context.Background(), nil, p)
-					if !ok || !strings.Contains(msg, "(2 models)") {
+					if !ok || !strings.Contains(msg, "model discovery succeeded (2 models)") {
 						t.Fatalf("check ok=%v msg=%q", ok, msg)
 					}
 				}
@@ -400,7 +410,7 @@ func TestOpencodeModelQueriesResponseSemantics(t *testing.T) {
 			t.Fatalf("models=%v err=%v", models, err)
 		}
 		ok, msg := checkOpencodeUpstream(context.Background(), nil, p)
-		if !ok || !strings.Contains(msg, "(0 models)") {
+		if !ok || !strings.Contains(msg, "model discovery succeeded (0 models)") {
 			t.Fatalf("check ok=%v msg=%q", ok, msg)
 		}
 	})
@@ -434,7 +444,7 @@ func TestOpencodeModelQueriesResponseSemantics(t *testing.T) {
 			return opencodeModelsHTTPResponse(http.StatusFound, `{"data":[]}`), nil
 		})
 		ok, msg := checkOpencodeUpstream(context.Background(), nil, p)
-		if !ok || !strings.Contains(msg, "(0 models)") {
+		if !ok || !strings.Contains(msg, "model discovery succeeded (0 models)") {
 			t.Fatalf("check ok=%v msg=%q", ok, msg)
 		}
 		if _, err := fetchOpencodeModels(context.Background(), nil, p); err == nil || err.Error() != "HTTP 302" {

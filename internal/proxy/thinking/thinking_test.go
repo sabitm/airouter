@@ -995,7 +995,19 @@ func TestApplyWireOpencodeQwen38FlashEffort(t *testing.T) {
 		}
 	}
 
-	for _, model := range []string{"qwen3.8-max", "qwen3.8-flash-next", "unknown-model"} {
+	max, err := ApplyWire("oai-chat", body, "qwen3.8-max", &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpencode, domain.ReasoningOpencode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maxBody map[string]any
+	if err := json.Unmarshal(max, &maxBody); err != nil {
+		t.Fatal(err)
+	}
+	if maxBody["reasoning_effort"] != "xhigh" {
+		t.Fatalf("qwen3.8-max effort = %v, want xhigh: %s", maxBody["reasoning_effort"], max)
+	}
+
+	for _, model := range []string{"qwen3.8-flash-next", "unknown-model"} {
 		out, err := ApplyWire("oai-chat", body, model, &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpencode, domain.ReasoningOpencode)
 		if err != nil {
 			t.Fatal(err)
@@ -1049,6 +1061,116 @@ func TestApplyWireOpencodeQwen38FlashEffort(t *testing.T) {
 	}
 	if _, ok := suffixBody["thinking"]; ok {
 		t.Fatalf("suffix wrote thinking: %s", suffix)
+	}
+}
+
+// TestApplyWireOpencodeQwenEffortOnlyTiers pins the two pinned Qwen ids that
+// write only output_config.effort. Zen serves qwen3.8-max over Chat, so that
+// tier keeps reasoning_effort. A sibling output_config field survives.
+func TestApplyWireOpencodeQwenEffortOnlyTiers(t *testing.T) {
+	raw := []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"}],"output_config":{"format":{"type":"json_object"}}}`)
+	for _, model := range []string{"qwen3.8-flash", "qwen3.8-max"} {
+		for _, tc := range []struct{ in, want string }{
+			{"low", "low"},
+			{"medium", "medium"},
+			{"xhigh", "xhigh"},
+			{"high", "xhigh"},
+		} {
+			out, err := ApplyWireForTier("anth-msg", raw, model, &Config{Mode: ModeLevel, Level: tc.in}, domain.ProtocolOpencode, domain.ReasoningOpencode, "go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			oc, _ := got["output_config"].(map[string]any)
+			if oc["effort"] != tc.want {
+				t.Fatalf("%s %s effort = %v, want %s: %s", model, tc.in, oc["effort"], tc.want, out)
+			}
+			if _, ok := got["thinking"]; ok {
+				t.Fatalf("%s %s wrote thinking: %s", model, tc.in, out)
+			}
+			if _, ok := got["reasoning_effort"]; ok {
+				t.Fatalf("%s %s wrote reasoning_effort: %s", model, tc.in, out)
+			}
+			if format, _ := oc["format"].(map[string]any); format["type"] != "json_object" {
+				t.Fatalf("%s %s lost output_config sibling: %s", model, tc.in, out)
+			}
+		}
+	}
+
+	// Zen qwen3.8-max is a Chat row: the effort list still writes
+	// reasoning_effort and no output_config.
+	zen, err := ApplyWireForTier("oai-chat", raw, "qwen3.8-max", &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpencode, domain.ReasoningOpencode, "zen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var zenBody map[string]any
+	if err := json.Unmarshal(zen, &zenBody); err != nil {
+		t.Fatal(err)
+	}
+	if zenBody["reasoning_effort"] != "xhigh" {
+		t.Fatalf("zen qwen3.8-max effort = %v, want xhigh: %s", zenBody["reasoning_effort"], zen)
+	}
+	if _, ok := zenBody["thinking"]; ok {
+		t.Fatalf("zen qwen3.8-max wrote thinking: %s", zen)
+	}
+
+	// No intent writes nothing, and an assistant-final request writes nothing.
+	plain, err := ApplyWireForTier("anth-msg", raw, "qwen3.8-max", nil, domain.ProtocolOpencode, domain.ReasoningOpencode, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plainBody map[string]any
+	if err := json.Unmarshal(plain, &plainBody); err != nil {
+		t.Fatal(err)
+	}
+	if oc, ok := plainBody["output_config"].(map[string]any); ok {
+		if _, has := oc["effort"]; has {
+			t.Fatalf("no intent wrote effort: %s", plain)
+		}
+	}
+	if _, ok := plainBody["thinking"]; ok {
+		t.Fatalf("no intent wrote thinking: %s", plain)
+	}
+
+	assistant := []byte(`{"model":"combo","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"done"}]}`)
+	out, err := ApplyWireForTier("anth-msg", assistant, "qwen3.8-max", &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpencode, domain.ReasoningOpencode, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gated map[string]any
+	if err := json.Unmarshal(out, &gated); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gated["thinking"]; ok {
+		t.Fatalf("assistant-final wrote thinking: %s", out)
+	}
+	if oc, ok := gated["output_config"].(map[string]any); ok {
+		if _, has := oc["effort"]; has {
+			t.Fatalf("assistant-final wrote effort: %s", out)
+		}
+	}
+
+	// Neighboring ids stay on their own rows.
+	for _, model := range []string{"qwen3.8-flash-next", "qwen3.8-max-next"} {
+		out, err := ApplyWireForTier("anth-msg", raw, model, &Config{Mode: ModeLevel, Level: "high"}, domain.ProtocolOpencode, domain.ReasoningOpencode, "go")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		if oc, ok := got["output_config"].(map[string]any); ok {
+			if _, has := oc["effort"]; has {
+				t.Fatalf("%s wrote effort: %s", model, out)
+			}
+		}
+		if _, ok := got["thinking"]; ok {
+			t.Fatalf("%s wrote thinking: %s", model, out)
+		}
 	}
 }
 

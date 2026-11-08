@@ -23,8 +23,11 @@ func TestAnthropicEffortShapes(t *testing.T) {
 		{"qwen3.8-flash", AnthropicEffortOnly},
 		{"alibaba/qwen3.8-flash", AnthropicEffortOnly},
 		{"qwen3.8-flash(high)", AnthropicEffortOnly},
-		{"qwen3.8-max", AnthropicEffortNone},
+		{"qwen3.8-max", AnthropicEffortOnly},
+		{"qwen3.8-max(low)", AnthropicEffortOnly},
 		{"qwen3.8-flash-next", AnthropicEffortNone},
+		{"qwen3.8-max-next", AnthropicEffortNone},
+		{"qwen3.7-max", AnthropicEffortNone},
 	}
 	for _, tc := range cases {
 		if got := AnthropicEffort(tc.model); got != tc.want {
@@ -33,6 +36,32 @@ func TestAnthropicEffortShapes(t *testing.T) {
 	}
 	if got := Opus45BudgetTokens(64000); got != 16000 {
 		t.Fatalf("opus budget = %d, want 16000", got)
+	}
+}
+
+// TestQwenEffortOnlyCatalogRows pins the tier split that makes the effort-only
+// shape a Messages-only rule. Zen serves qwen3.8-max over Chat, so only the Go
+// row and the Qwen flash rows are Anthropic SDK rows.
+func TestQwenEffortOnlyCatalogRows(t *testing.T) {
+	cases := []struct {
+		tier, model, sdk string
+		shape            AnthropicEffortShape
+	}{
+		{zenTier, "qwen3.8-max", sdkCompat, AnthropicEffortOnly},
+		{zenTier, "qwen3.8-flash", sdkAnthropic, AnthropicEffortOnly},
+		{goTier, "qwen3.8-max", sdkAnthropic, AnthropicEffortOnly},
+		{goTier, "qwen3.8-flash", sdkAnthropic, AnthropicEffortOnly},
+		{goTier, "qwen3.7-plus", sdkAnthropic, AnthropicEffortNone},
+		{zenTier, "qwen3.6-plus", sdkAnthropic, AnthropicEffortNone},
+	}
+	for _, tc := range cases {
+		spec, ok := Lookup(tc.tier, tc.model)
+		if !ok || spec.SDK != tc.sdk {
+			t.Fatalf("%s/%s spec=%+v ok=%v", tc.tier, tc.model, spec, ok)
+		}
+		if got := AnthropicEffort(spec.ID); got != tc.shape {
+			t.Fatalf("%s/%s effort = %q, want %q", tc.tier, tc.model, got, tc.shape)
+		}
 	}
 }
 
@@ -57,14 +86,106 @@ func TestIsResponsesModel(t *testing.T) {
 }
 
 func TestTier(t *testing.T) {
-	if got := Tier("https://opencode.ai/zen/v1"); got != "zen" {
-		t.Errorf("zen base = %q", got)
+	cases := []struct {
+		name, in, want string
+	}{
+		{"legacy zen", "https://opencode.ai/zen/v1", "zen"},
+		{"previous go", LegacyGoBaseURL, "go"},
+		{"inference zen", ZenBaseURL, "zen"},
+		{"console zen base", "https://opencode.ai/inference", "zen"},
+		{"console go base", "https://opencode.ai/inference/go", "go"},
+		{"zen openai family", ZenOpenAIBaseURL, "zen"},
+		{"zen anthropic family", ZenAnthropicBaseURL, "zen"},
+		{"legacy go", "https://opencode.ai/zen/go/v1", "go"},
+		{"go discovery", GoBaseURL, "go"},
+		{"go openai family", GoOpenAIBaseURL, "go"},
+		{"go anthropic family", GoAnthropicBaseURL, "go"},
+		{"custom", "https://custom.example/v1", "zen"},
+		// Custom hosts keep the historical substring rule, including a host that
+		// merely contains opencode.ai.
+		{"custom go substring", "https://mirror.test/zen/go/v1", "go"},
+		{"custom inference go substring", "https://mirror.test/inference/go/v1", "go"},
+		{"custom near match", "https://opencode.ai.example.test/zen/v1", "zen"},
+		{"uppercase official", "https://OPENCODE.AI/zen/v1", "zen"},
 	}
-	if got := Tier("https://opencode.ai/zen/go/v1"); got != "go" {
-		t.Errorf("go base = %q", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Tier(tc.in); got != tc.want {
+				t.Fatalf("Tier(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
-	if got := Tier("https://custom.example/v1"); got != "zen" {
-		t.Errorf("custom base = %q, want zen-style default", got)
+}
+
+// TestInferenceBaseURL covers all tiers and codec families, trailing slashes,
+// and the custom URLs that must never be rewritten.
+func TestInferenceBaseURL(t *testing.T) {
+	cases := []struct {
+		name, base, path, want string
+	}{
+		{"console zen chat", "https://opencode.ai/inference", ChatPath, ZenOpenAIBaseURL},
+		{"console zen messages", "https://opencode.ai/inference/", MessagesPath, ZenAnthropicBaseURL},
+		{"console go chat", "https://opencode.ai/inference/go", ChatPath, GoOpenAIBaseURL},
+		{"console go responses", "https://opencode.ai/inference/go", ResponsesPath, GoOpenAIBaseURL},
+		{"previous go messages", LegacyGoBaseURL, MessagesPath, GoAnthropicBaseURL},
+		{"legacy zen chat", LegacyZenBaseURL, ChatPath, ZenOpenAIBaseURL},
+		{"legacy zen responses", LegacyZenBaseURL, ResponsesPath, ZenOpenAIBaseURL},
+		{"legacy zen messages", LegacyZenBaseURL, MessagesPath, ZenAnthropicBaseURL},
+		{"inference zen chat", ZenBaseURL, ChatPath, ZenOpenAIBaseURL},
+		{"inference zen messages", ZenBaseURL, MessagesPath, ZenAnthropicBaseURL},
+		{"legacy go chat", LegacyGoBaseURL, ChatPath, GoOpenAIBaseURL},
+		{"legacy go messages", LegacyGoBaseURL, MessagesPath, GoAnthropicBaseURL},
+		{"go discovery chat", GoBaseURL, ChatPath, GoOpenAIBaseURL},
+		{"go discovery messages", GoBaseURL, MessagesPath, GoAnthropicBaseURL},
+		{"current zen openai", ZenOpenAIBaseURL, ResponsesPath, ZenOpenAIBaseURL},
+		{"current zen anthropic", ZenAnthropicBaseURL, MessagesPath, ZenAnthropicBaseURL},
+		{"current go openai", GoOpenAIBaseURL, ChatPath, GoOpenAIBaseURL},
+		{"current go anthropic", GoAnthropicBaseURL, MessagesPath, GoAnthropicBaseURL},
+		{"legacy trailing slash", LegacyZenBaseURL + "///", ChatPath, ZenOpenAIBaseURL},
+		{"go trailing slash", GoBaseURL + "/", MessagesPath, GoAnthropicBaseURL},
+		{"family trailing slash", ZenAnthropicBaseURL + "/", MessagesPath, ZenAnthropicBaseURL},
+		{"unknown path", ZenBaseURL, "/embeddings", ZenBaseURL},
+		{"custom host", "https://custom.example/v1", ChatPath, "https://custom.example/v1"},
+		{"custom localhost", "http://127.0.0.1:8080/zen/v1", ChatPath, "http://127.0.0.1:8080/zen/v1"},
+		{"custom zen path", "https://example.test/zen/v1", ChatPath, "https://example.test/zen/v1"},
+		{"http official host", "http://opencode.ai/zen/v1", ChatPath, "http://opencode.ai/zen/v1"},
+		{"alternate port", "https://opencode.ai:8443/zen/v1", ChatPath, "https://opencode.ai:8443/zen/v1"},
+		{"userinfo", "https://user:pass@opencode.ai/zen/v1", ChatPath, "https://user:pass@opencode.ai/zen/v1"},
+		{"query", "https://opencode.ai/zen/v1?x=1", ChatPath, "https://opencode.ai/zen/v1?x=1"},
+		{"uppercase host", "https://OpenCode.ai/zen/v1", ChatPath, ZenOpenAIBaseURL},
+		{"empty query", "https://opencode.ai/zen/v1?", ChatPath, "https://opencode.ai/zen/v1?"},
+		{"near match host", "https://opencode.ai.example.test/zen/v1", ChatPath, "https://opencode.ai.example.test/zen/v1"},
+		{"longer path", "https://opencode.ai/zen/v1/chat", ChatPath, "https://opencode.ai/zen/v1/chat"},
+		{"empty", "", ChatPath, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := InferenceBaseURL(tc.base, tc.path); got != tc.want {
+				t.Fatalf("InferenceBaseURL(%q, %q) = %q, want %q", tc.base, tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDiscoveryBaseURL(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"zen legacy", LegacyZenBaseURL, ZenBaseURL},
+		{"zen family", ZenAnthropicBaseURL, ZenBaseURL},
+		{"go legacy", LegacyGoBaseURL, GoBaseURL},
+		{"go family", GoOpenAIBaseURL, GoBaseURL},
+		{"trailing slashes", LegacyGoBaseURL + "//", GoBaseURL},
+		{"custom", "https://custom.example/v1/", "https://custom.example/v1/"},
+		{"near match", "https://opencode.ai.example.test/zen/v1", "https://opencode.ai.example.test/zen/v1"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EffectiveBaseURL(tc.in); got != tc.want {
+				t.Fatalf("EffectiveBaseURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -75,11 +196,20 @@ func TestEffectiveBaseURL(t *testing.T) {
 		want string
 	}{
 		{"new default", ZenBaseURL, ZenBaseURL},
+		{"console zen base", "https://opencode.ai/inference", ZenBaseURL},
+		{"console go base", "https://opencode.ai/inference/go", GoBaseURL},
 		{"exact legacy", LegacyZenBaseURL, ZenBaseURL},
 		{"legacy one trailing slash", LegacyZenBaseURL + "/", ZenBaseURL},
 		{"legacy multiple trailing slashes", LegacyZenBaseURL + "///", ZenBaseURL},
-		{"legacy go", GoBaseURL, GoBaseURL},
-		{"legacy go trailing slash", GoBaseURL + "/", GoBaseURL + "/"},
+		{"go", GoBaseURL, GoBaseURL},
+		{"go trailing slash", GoBaseURL + "/", GoBaseURL},
+		{"legacy go", LegacyGoBaseURL, GoBaseURL},
+		{"legacy go trailing slash", LegacyGoBaseURL + "/", GoBaseURL},
+		{"zen chat family", ZenOpenAIBaseURL, ZenBaseURL},
+		{"zen anthropic family", ZenAnthropicBaseURL, ZenBaseURL},
+		{"go chat family", GoOpenAIBaseURL, GoBaseURL},
+		{"go anthropic family", GoAnthropicBaseURL, GoBaseURL},
+		{"zen base trailing slash", ZenBaseURL + "/", ZenBaseURL},
 		{"custom host", "https://custom.example/v1", "https://custom.example/v1"},
 		{"custom localhost", "http://127.0.0.1:8080/zen/v1", "http://127.0.0.1:8080/zen/v1"},
 		{"custom example zen path", "https://example.test/zen/v1", "https://example.test/zen/v1"},
@@ -87,7 +217,8 @@ func TestEffectiveBaseURL(t *testing.T) {
 		{"alternate port", "https://opencode.ai:8443/zen/v1", "https://opencode.ai:8443/zen/v1"},
 		{"longer path", "https://opencode.ai/zen/v1/chat", "https://opencode.ai/zen/v1/chat"},
 		{"query string", "https://opencode.ai/zen/v1?x=1", "https://opencode.ai/zen/v1?x=1"},
-		{"uppercase host", "https://OpenCode.ai/zen/v1", "https://OpenCode.ai/zen/v1"},
+		{"uppercase host", "https://OpenCode.ai/zen/v1", ZenBaseURL},
+		{"empty query", "https://opencode.ai/zen/v1?", "https://opencode.ai/zen/v1?"},
 		{"empty", "", ""},
 	}
 	for _, tc := range cases {
@@ -717,5 +848,90 @@ func TestFingerprintFreeHeaders(t *testing.T) {
 	}
 	if channel.Get(SessionIDHeader) != native {
 		t.Fatalf("native fallback not mirrored: %q", channel.Get(SessionIDHeader))
+	}
+}
+
+// TestCatalogConfiguredFreeModels pins the two free rows added from the live
+// snapshot. Both normalize through the existing suffix helper and expose the
+// live output ceiling and effort list.
+func TestCatalogConfiguredFreeModels(t *testing.T) {
+	cases := []struct {
+		query  string
+		id     string
+		output int
+		want   []string
+		toggle bool
+	}{
+		{"deepseek-v4.1-flash-free", "deepseek-v4.1-flash-free", 32000, []string{"low", "high", "max"}, true},
+		{"opencode/deepseek-v4.1-flash-free(max)", "deepseek-v4.1-flash-free", 32000, []string{"low", "high", "max"}, true},
+		{"glm-5.3-flash-free", "glm-5.3-flash-free", 32000, []string{"low", "high", "max"}, false},
+		{"zai/glm-5.3-flash-free(max)", "glm-5.3-flash-free", 32000, []string{"low", "high", "max"}, false},
+	}
+	for _, tc := range cases {
+		spec, ok := Lookup(zenTier, tc.query)
+		if !ok || spec.ID != tc.id || spec.SDK != sdkCompat {
+			t.Fatalf("%q spec=%+v ok=%v", tc.query, spec, ok)
+		}
+		if spec.Output != tc.output || !spec.OptionsKnown || spec.Toggle != tc.toggle {
+			t.Fatalf("%q output/options/toggle = %d/%v/%v", tc.query, spec.Output, spec.OptionsKnown, spec.Toggle)
+		}
+		if strings.Join(spec.Efforts, ",") != strings.Join(tc.want, ",") {
+			t.Fatalf("%q efforts = %v, want %v", tc.query, spec.Efforts, tc.want)
+		}
+		if got, valid := MapEffort("max", spec.Efforts); !valid || got != "max" {
+			t.Fatalf("%q max effort = %q valid=%v", tc.query, got, valid)
+		}
+		if effort, ok := BudgetTokens(spec, "max"); ok || effort != 0 {
+			t.Fatalf("%q unexpectedly produced a budget: %d", tc.query, effort)
+		}
+	}
+}
+
+// TestCatalogPinnedRetiredGoRows proves retired Go targets still resolve to a
+// known family after a snapshot refresh, so they do not fall back to unknown
+// Chat. New targets must use a live row instead.
+func TestCatalogPinnedRetiredGoRows(t *testing.T) {
+	cases := []struct {
+		model, endpoint string
+	}{
+		{"glm-5", EndpointChat},
+		{"qwen3.7-max", EndpointChat},
+		{"grok-4.5", EndpointResponses},
+		{"grok-4.6", EndpointResponses},
+		{"minimax-m2.5", EndpointMessages},
+	}
+	for _, tc := range cases {
+		if got := Endpoint(goTier, tc.model); got != tc.endpoint {
+			t.Fatalf("Endpoint(go, %q) = %q, want %q", tc.model, got, tc.endpoint)
+		}
+	}
+}
+
+// TestCatalogEndpointFamilies pins the changed native families. Anthropic rows
+// must not fall back to Chat, and new Responses rows must select Responses.
+func TestCatalogEndpointFamilies(t *testing.T) {
+	cases := []struct {
+		tier, model, endpoint string
+	}{
+		{zenTier, "qwen3.5-plus", EndpointMessages},
+		{zenTier, "qwen3.6-plus", EndpointMessages},
+		{zenTier, "claude-haiku-5-5", EndpointMessages},
+		{zenTier, "claude-sonnet-5-5", EndpointMessages},
+		{zenTier, "gpt-6.1-sol", EndpointResponses},
+		{zenTier, "crouton-alpha-free", EndpointResponses},
+		{zenTier, "muse-wonder-1.0", EndpointResponses},
+		{zenTier, "mistral-large-4", EndpointChat},
+		{zenTier, "deepseek-v4.1-flash-free", EndpointChat},
+		{zenTier, "glm-5.3-flash-free", EndpointChat},
+		{goTier, "qwen3.7-plus", EndpointMessages},
+		{goTier, "qwen3.8-max", EndpointMessages},
+		{goTier, "claude-haiku-5-5", EndpointMessages},
+		{goTier, "minimax-m3.1-flash", EndpointChat},
+		{goTier, "kimi-k3.1-pro", EndpointChat},
+	}
+	for _, tc := range cases {
+		if got := Endpoint(tc.tier, tc.model); got != tc.endpoint {
+			t.Fatalf("Endpoint(%q, %q) = %q, want %q", tc.tier, tc.model, got, tc.endpoint)
+		}
 	}
 }

@@ -1,6 +1,6 @@
-// Package opencode implements the opencode.ai Zen backend: one provider row
-// whose wire format depends on the model. Most models speak OpenAI Chat
-// Completions; muse-spark models are OpenAI Responses-only. The free tier
+// Package opencode implements the opencode.ai backend: one provider row whose
+// wire format depends on the model. The catalog SDK selects OpenAI Chat
+// Completions, OpenAI Responses, or Anthropic Messages. The free tier
 // authenticates with the literal key "public" and gates on a client
 // fingerprint, so every upstream request carries the opencode identity.
 package opencode
@@ -9,20 +9,31 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	// ZenBaseURL is the free tier: Bearer "public" plus client fingerprint.
+	// ZenBaseURL is the Zen model-discovery base. It is also an accepted legacy
+	// inference alias; InferenceBaseURL maps it to the current API-family base.
 	ZenBaseURL = "https://opencode.ai/inference/v1"
-	// LegacyZenBaseURL is the retired free-tier endpoint. Provider rows saved
-	// before the move still store it; EffectiveBaseURL aliases it at send time
-	// so stored rows and custom URLs are never rewritten.
+	// LegacyZenBaseURL is the previous free-tier base. Provider rows saved
+	// before the move still store it; official aliases resolve at send time so
+	// stored rows and custom URLs are never rewritten.
 	LegacyZenBaseURL = "https://opencode.ai/zen/v1"
-	// GoBaseURL is the paid tier: a real opencode.ai API key.
-	GoBaseURL = "https://opencode.ai/zen/go/v1"
+	// GoBaseURL is the current Go model-discovery base.
+	GoBaseURL = "https://opencode.ai/inference/go/v1"
+	// LegacyGoBaseURL is the previous Go base.
+	LegacyGoBaseURL = "https://opencode.ai/zen/go/v1"
+
+	// Current official inference bases, split by tier and API family. The proxy
+	// selects the family from the target model's catalog SDK.
+	ZenOpenAIBaseURL    = "https://opencode.ai/inference/openai/v1"
+	ZenAnthropicBaseURL = "https://opencode.ai/inference/anthropic/v1"
+	GoOpenAIBaseURL     = "https://opencode.ai/inference/go/openai/v1"
+	GoAnthropicBaseURL  = "https://opencode.ai/inference/go/anthropic/v1"
 	// PublicKey is the zen tier's literal credential.
 	PublicKey = "public"
 	// UserAgent is the default versioned OpenCode fingerprint. Bare "opencode"
@@ -65,26 +76,98 @@ func Endpoint(tier, model string) string {
 	return EndpointFor(spec, ok)
 }
 
-// Tier classifies a provider base URL. Base URLs other than the two known ones
-// (custom/self-hosted) are treated as zen-style: the fingerprint headers are
-// required on the free tier and harmless elsewhere.
+// Tier classifies a provider base URL. Recognized official aliases use their
+// exact tier; custom URLs keep the historical Go path-substring behavior and
+// otherwise default to zen-style fingerprinting.
 func Tier(baseURL string) string {
-	if strings.Contains(baseURL, "/zen/go") {
-		return "go"
+	if tier, ok := officialTier(baseURL); ok {
+		return tier
 	}
-	return "zen"
+	if isCustomGoBase(baseURL) {
+		return goTier
+	}
+	return zenTier
 }
 
-// EffectiveBaseURL returns the wire base URL for a stored provider base URL.
-// Only the exact official legacy Zen base aliases to the current inference
-// endpoint; trailing slashes normalize the same way forwarding trims them.
-// Custom, Go, and new Zen URLs are returned unchanged, so a custom /zen/v1
-// route is never silently migrated.
-func EffectiveBaseURL(baseURL string) string {
-	if strings.TrimRight(baseURL, "/") == LegacyZenBaseURL {
-		return ZenBaseURL
+// isCustomGoBase keeps the historical custom-URL tier guess for both the old
+// and current Go path prefixes. Official bases never reach it.
+func isCustomGoBase(baseURL string) bool {
+	return strings.Contains(baseURL, "/zen/go") || strings.Contains(baseURL, "/inference/go")
+}
+
+// InferenceBaseURL returns the current wire base for a stored provider base and
+// backend path. Recognized official legacy or family-specific aliases resolve to
+// the tier and API family. Any other URL is returned unchanged, so custom
+// mirrors, ports, userinfo, and near-match paths are never rewritten.
+func InferenceBaseURL(baseURL, path string) string {
+	tier, ok := officialTier(baseURL)
+	if !ok {
+		return baseURL
 	}
-	return baseURL
+	family := apiFamily(path)
+	if family == "" {
+		return baseURL
+	}
+	if tier == goTier {
+		if family == "anthropic" {
+			return GoAnthropicBaseURL
+		}
+		return GoOpenAIBaseURL
+	}
+	if family == "anthropic" {
+		return ZenAnthropicBaseURL
+	}
+	return ZenOpenAIBaseURL
+}
+
+// EffectiveBaseURL returns the current model-discovery base for a stored
+// provider base URL. Recognized official aliases, including the retired Zen
+// and Go bases, resolve by tier with trailing slashes normalized. Custom
+// mirrors, ports, userinfo, and near-match paths are returned unchanged.
+func EffectiveBaseURL(baseURL string) string {
+	tier, ok := officialTier(baseURL)
+	if !ok {
+		return baseURL
+	}
+	if tier == goTier {
+		return GoBaseURL
+	}
+	return ZenBaseURL
+}
+
+func apiFamily(path string) string {
+	switch path {
+	case ChatPath, ResponsesPath:
+		return "openai"
+	case MessagesPath:
+		return "anthropic"
+	default:
+		return ""
+	}
+}
+
+// officialTier recognizes exact official bases only: HTTPS, opencode.ai,
+// default port, no userinfo, query, fragment, or trailing slash. The path must
+// be a documented console base, a known legacy base, or an API-family base.
+func officialTier(baseURL string) (string, bool) {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Host == "" {
+		return "", false
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || !strings.EqualFold(u.Hostname(), "opencode.ai") {
+		return "", false
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		return "", false
+	}
+	path := strings.TrimRight(u.EscapedPath(), "/")
+	switch path {
+	case "/inference", "/inference/v1", "/zen/v1", "/inference/openai/v1", "/inference/anthropic/v1":
+		return zenTier, true
+	case "/inference/go", "/inference/go/v1", "/zen/go/v1", "/inference/go/openai/v1", "/inference/go/anthropic/v1":
+		return goTier, true
+	}
+	return "", false
 }
 
 // DeriveSessionID hashes seed and transcript into a native-shaped ses_ id.

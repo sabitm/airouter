@@ -1012,11 +1012,13 @@ func reconcileOpencodeMessagesBudget(body []byte, req *ir.Request, backend codec
 }
 
 // restoreOpencodeQwenCap restores a positive caller cap after the generic
-// encoder changes max_tokens. It runs only for the exact qwen3.8-flash final
-// effort-only or disabled shape. An omitted or nonpositive IR cap, and every
-// other shape, stays unchanged.
+// encoder changes max_tokens. It runs only for the final effort-only or
+// disabled shape of a pinned Qwen Anthropic Messages row. An omitted or
+// nonpositive IR cap, and every other shape, stays unchanged. The
+// qwen3.8-max form also allows preserved output_config siblings, which are
+// not reasoning controls.
 func restoreOpencodeQwenCap(body []byte, req *ir.Request, backend codec, provider *domain.Provider) ([]byte, error) {
-	if !qwen38FlashFinal(body, req, backend, provider) {
+	if !qwenEffortOnlyFinal(body, req, backend, provider) {
 		return body, nil
 	}
 	var doc map[string]json.RawMessage
@@ -1146,18 +1148,27 @@ func opencodeClaudeDisableFinal(body []byte, req *ir.Request, backend codec, pro
 	return disabledThinkingShape(doc)
 }
 
-func qwen38FlashFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
+// qwenEffortOnlyFinal reports the final effort-only or disabled shape of a
+// pinned Qwen Anthropic Messages row. qwen3.8-flash keeps the exact
+// effort-only shape. qwen3.8-max also tolerates output_config siblings such as
+// format and task_budget because they are not reasoning controls. The model
+// must match the catalog row in the selected tier, not only the requested id,
+// so the Zen Chat qwen3.8-max row stays out of this Anthropic-only cap restore.
+func qwenEffortOnlyFinal(body []byte, req *ir.Request, backend codec, provider *domain.Provider) bool {
 	if provider == nil || provider.Protocol != domain.ProtocolOpencode || backend.id != codecOpencodeMessages || req == nil || req.MaxTokens <= 0 {
 		return false
 	}
 	tier := opencode.Tier(provider.BaseURL)
 	spec, ok := opencode.Lookup(tier, req.Model)
-	if !ok || opencode.NormalizeModelID(req.Model) != "qwen3.8-flash" || opencode.AnthropicEffort(spec.ID) != opencode.AnthropicEffortOnly {
+	if !ok || spec.SDK != "anthropic" || spec.ID != opencode.NormalizeModelID(req.Model) || opencode.AnthropicEffort(spec.ID) != opencode.AnthropicEffortOnly {
 		return false
 	}
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return false
+	}
+	if spec.ID == "qwen3.8-max" {
+		return effortOnlyOutputConfigWithSiblings(doc) || disabledThinkingShape(doc)
 	}
 	return effortOnlyOutputConfig(doc) || disabledThinkingShape(doc)
 }
@@ -1201,6 +1212,33 @@ func effortOnlyOutputConfig(doc map[string]json.RawMessage) bool {
 	}
 	var oc map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &oc); err != nil || len(oc) != 1 {
+		return false
+	}
+	effort := oc["effort"]
+	if len(effort) == 0 || effort[0] != '"' {
+		return false
+	}
+	var value string
+	if err := json.Unmarshal(effort, &value); err != nil || strings.TrimSpace(value) == "" {
+		return false
+	}
+	return true
+}
+
+// effortOnlyOutputConfigWithSiblings requires the same effort-only reasoning
+// shape but allows other output_config members. A preserved format or task
+// budget is caller data, not a reasoning control, so it must not disable cap
+// restoration.
+func effortOnlyOutputConfigWithSiblings(doc map[string]json.RawMessage) bool {
+	if len(doc["thinking"]) > 0 && string(doc["thinking"]) != "null" {
+		return false
+	}
+	raw := doc["output_config"]
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var oc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &oc); err != nil {
 		return false
 	}
 	effort := oc["effort"]

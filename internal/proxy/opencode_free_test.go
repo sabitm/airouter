@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1092,6 +1093,88 @@ func TestOpencodeFreeMessagesThinkingUnary(t *testing.T) {
 	}
 }
 
+// TestOpencodeFreeConfiguredModelsPreparedEffort drives the two pinned free
+// Chat rows through the complete request pipeline for all three ingress
+// formats. The live snapshot lists low/high/max for both, so a max body or a
+// (max) suffix must reach the prepared upstream body as reasoning_effort=max
+// with the caller cap intact and the model normalized. Both free rows are
+// stream-only, so the unary ingress still produces a stream body.
+func TestOpencodeFreeConfiguredModelsPreparedEffort(t *testing.T) {
+	ingresses := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "chat", path: "/v1/chat/completions", body: `{"model":"default","reasoning_effort":"%s","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Find one record","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]}`},
+		{name: "responses", path: "/v1/responses", body: `{"model":"default","reasoning":{"effort":"%s"},"max_output_tokens":%d,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[{"type":"function","name":"lookup","description":"Find one record","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}]}`},
+		{name: "messages", path: "/v1/messages", body: `{"model":"default","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"%s"},"tools":[{"name":"lookup","description":"Find one record","input_schema":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}]}`},
+	}
+	cases := []struct {
+		name       string
+		upstream   string
+		model      string
+		bodyEffort string
+		effort     string
+		cap        int
+	}{
+		{name: "body-max", upstream: "deepseek-v4.1-flash-free", model: "deepseek-v4.1-flash-free", bodyEffort: "max", effort: "max", cap: 32000},
+		{name: "suffix-max", upstream: "deepseek-v4.1-flash-free(max)", model: "deepseek-v4.1-flash-free", bodyEffort: "low", effort: "max", cap: 4096},
+		{name: "body-max-glm", upstream: "glm-5.3-flash-free", model: "glm-5.3-flash-free", bodyEffort: "max", effort: "max", cap: 32000},
+		{name: "suffix-max-glm", upstream: "glm-5.3-flash-free(max)", model: "glm-5.3-flash-free", bodyEffort: "low", effort: "max", cap: 4096},
+	}
+	for _, tc := range cases {
+		for _, ing := range ingresses {
+			for _, stream := range []bool{false, true} {
+				name := fmt.Sprintf("%s/%s/%s/stream=%v", tc.model, tc.name, ing.name, stream)
+				t.Run(name, func(t *testing.T) {
+					var cap freeUpstreamCapture
+					base, token, _ := setupOpencodeProvider(t, tc.upstream, "public", opencode.ZenBaseURL, func(w http.ResponseWriter, r *http.Request) {
+						body, _ := io.ReadAll(r.Body)
+						cap.record(r, body)
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, freeChatTextSSE())
+					})
+					var body string
+					if ing.name == "messages" {
+						body = fmt.Sprintf(ing.body, tc.cap, tc.bodyEffort)
+					} else {
+						body = fmt.Sprintf(ing.body, tc.bodyEffort, tc.cap)
+					}
+					if stream {
+						body = withStream(body)
+					}
+					resp, out := post(t, base+ing.path, token, body)
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+					}
+					got := cap.snapshot()
+					var root map[string]any
+					if err := json.Unmarshal(got.body, &root); err != nil {
+						t.Fatalf("upstream body: %v: %s", err, got.body)
+					}
+					if root["model"] != tc.model {
+						t.Fatalf("upstream model = %#v, want %s", root["model"], tc.model)
+					}
+					if root["reasoning_effort"] != tc.effort {
+						t.Fatalf("upstream effort = %#v, want %s: %s", root["reasoning_effort"], tc.effort, got.body)
+					}
+					if root["max_tokens"] != float64(tc.cap) {
+						t.Fatalf("upstream cap = %#v, want %d: %s", root["max_tokens"], tc.cap, got.body)
+					}
+					for _, field := range []string{"thinking", "enable_thinking", "thinking_budget", "reasoning", "output_config"} {
+						if _, ok := root[field]; ok {
+							t.Fatalf("%s present: %s", field, got.body)
+						}
+					}
+					if spec, ok := opencode.Lookup("zen", tc.model); !ok || spec.Output != 32000 {
+						t.Fatalf("catalog output = %+v ok=%v", spec, ok)
+					}
+				})
+			}
+		}
+	}
+}
+
 // --- helpers ---
 
 func assertFreeUpstreamShape(t *testing.T, cap freeUpstreamSnapshot, codecID, auth string, callerTools bool) {
@@ -1246,7 +1329,7 @@ func routeByPath(zenURL, goURL string) roundTripFunc {
 	gu, _ := url.Parse(goURL)
 	return func(req *http.Request) (*http.Response, error) {
 		target := zu
-		if strings.Contains(req.URL.Path, "/zen/go/") {
+		if strings.Contains(req.URL.Path, "/zen/go/") || strings.Contains(req.URL.Path, "/inference/go/") {
 			target = gu
 		}
 		req.URL.Scheme = target.Scheme
@@ -1789,7 +1872,7 @@ func TestOpencodeEndpointMigrationOnWire(t *testing.T) {
 						}
 					}
 
-					want := opencode.ZenBaseURL + backend.upstreamPath
+					want := opencode.InferenceBaseURL(base.base, backend.upstreamPath) + backend.upstreamPath
 					urls := rec.snapshot()
 					if len(urls) != 1 || urls[0] != want {
 						t.Fatalf("wire URLs = %v, want [%s]", urls, want)
@@ -1818,11 +1901,17 @@ func TestOpencodeEndpointAliasScopedToProtocol(t *testing.T) {
 		path     string
 		want     string
 	}{
-		{"legacy zen opencode", &domain.Provider{BaseURL: opencode.LegacyZenBaseURL, Protocol: domain.ProtocolOpencode}, opencode.ChatPath, opencode.ZenBaseURL + opencode.ChatPath},
+		{"legacy zen opencode", &domain.Provider{BaseURL: opencode.LegacyZenBaseURL, Protocol: domain.ProtocolOpencode}, opencode.ChatPath, opencode.ZenOpenAIBaseURL + opencode.ChatPath},
 		{"legacy zen other protocol", &domain.Provider{BaseURL: opencode.LegacyZenBaseURL, Protocol: domain.ProtocolOpenAI}, opencode.ChatPath, opencode.LegacyZenBaseURL + opencode.ChatPath},
-		{"new zen opencode", &domain.Provider{BaseURL: opencode.ZenBaseURL, Protocol: domain.ProtocolOpencode}, opencode.ResponsesPath, opencode.ZenBaseURL + opencode.ResponsesPath},
-		{"legacy go opencode", &domain.Provider{BaseURL: opencode.GoBaseURL, Protocol: domain.ProtocolOpencode}, opencode.MessagesPath, opencode.GoBaseURL + opencode.MessagesPath},
+		{"new zen opencode", &domain.Provider{BaseURL: opencode.ZenBaseURL, Protocol: domain.ProtocolOpencode}, opencode.ResponsesPath, opencode.ZenOpenAIBaseURL + opencode.ResponsesPath},
+		{"zen messages opencode", &domain.Provider{BaseURL: opencode.ZenBaseURL, Protocol: domain.ProtocolOpencode}, opencode.MessagesPath, opencode.ZenAnthropicBaseURL + opencode.MessagesPath},
+		{"legacy go opencode", &domain.Provider{BaseURL: opencode.LegacyGoBaseURL, Protocol: domain.ProtocolOpencode}, opencode.MessagesPath, opencode.GoAnthropicBaseURL + opencode.MessagesPath},
+		{"go chat opencode", &domain.Provider{BaseURL: opencode.GoBaseURL, Protocol: domain.ProtocolOpencode}, opencode.ChatPath, opencode.GoOpenAIBaseURL + opencode.ChatPath},
 		{"custom zen path opencode", &domain.Provider{BaseURL: "https://example.test/zen/v1", Protocol: domain.ProtocolOpencode}, opencode.ChatPath, "https://example.test/zen/v1" + opencode.ChatPath},
+		{"custom opencode.ai host", &domain.Provider{BaseURL: "https://opencode.ai.example.test/zen/v1", Protocol: domain.ProtocolOpencode}, opencode.MessagesPath, "https://opencode.ai.example.test/zen/v1" + opencode.MessagesPath},
+		{"custom port", &domain.Provider{BaseURL: "https://opencode.ai:8443/zen/v1", Protocol: domain.ProtocolOpencode}, opencode.ChatPath, "https://opencode.ai:8443/zen/v1" + opencode.ChatPath},
+		{"custom userinfo", &domain.Provider{BaseURL: "https://user:pass@opencode.ai/zen/v1", Protocol: domain.ProtocolOpencode}, opencode.ChatPath, "https://user:pass@opencode.ai/zen/v1" + opencode.ChatPath},
+		{"custom go substring", &domain.Provider{BaseURL: "https://mirror.test/zen/go/v1", Protocol: domain.ProtocolOpencode}, opencode.ChatPath, "https://mirror.test/zen/go/v1" + opencode.ChatPath},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1837,7 +1926,7 @@ func TestOpencodeEndpointAliasScopedToProtocol(t *testing.T) {
 // recorded in TraceInfo and HAR matches the migrated endpoint, not the stored
 // legacy value, for both the unary and streaming clients.
 func TestOpencodeLegacyEndpointAliasInTraceAndHAR(t *testing.T) {
-	want := opencode.ZenBaseURL + opencode.ChatPath
+	want := opencode.ZenOpenAIBaseURL + opencode.ChatPath
 	provider := &domain.Provider{Name: "zen", BaseURL: opencode.LegacyZenBaseURL, APIKey: opencode.PublicKey, Protocol: domain.ProtocolOpencode}
 	for _, stream := range []bool{false, true} {
 		name := "unary"
@@ -1939,6 +2028,27 @@ func TestOpencodeFreeTierClientSelection(t *testing.T) {
 	}
 	if got := px.upstreamClient(zen, "https://opencode.ai/zen/go/v1/chat/completions", freeBody, true); got != px.streamClient {
 		t.Fatalf("paid path client = %v, want streamClient", got)
+	}
+	// Current family-specific free endpoints take the impersonated transport;
+	// current Go family endpoints never do.
+	for _, freePath := range []string{
+		opencode.ZenOpenAIBaseURL + opencode.ChatPath,
+		opencode.ZenOpenAIBaseURL + opencode.ResponsesPath,
+		opencode.ZenAnthropicBaseURL + opencode.MessagesPath,
+	} {
+		if got := px.upstreamClient(zen, freePath, freeBody, true); got != px.freeTierClient {
+			t.Fatalf("current free path client for %s = %v, want freeTierClient", freePath, got)
+		}
+	}
+	for _, goPath := range []string{
+		opencode.GoOpenAIBaseURL + opencode.ChatPath,
+		opencode.GoOpenAIBaseURL + opencode.ResponsesPath,
+		opencode.GoAnthropicBaseURL + opencode.MessagesPath,
+		opencode.GoBaseURL + "/models",
+	} {
+		if got := px.upstreamClient(goProvider, goPath, freeBody, true); got != px.streamClient {
+			t.Fatalf("go path client for %s = %v, want streamClient", goPath, got)
+		}
 	}
 
 	// A replaced streamClient wins verbatim: tests inject capture transports

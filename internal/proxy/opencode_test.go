@@ -961,8 +961,12 @@ func TestOpencodeCatalogEffortWire(t *testing.T) {
 		t.Fatalf("glm-5.3 medium = %v, want high", medium["reasoning_effort"])
 	}
 	kimi := prepareOpencodeTranslated(t, openaiCodec, chat, "kimi-k3")
-	if kimi["reasoning_effort"] != "max" {
-		t.Fatalf("kimi-k3 effort = %v, want max", kimi["reasoning_effort"])
+	if kimi["reasoning_effort"] != "low" {
+		t.Fatalf("kimi-k3 low = %v, want low", kimi["reasoning_effort"])
+	}
+	kimiHigh := prepareOpencodeTranslated(t, openaiCodec, []byte(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`), "kimi-k3")
+	if kimiHigh["reasoning_effort"] != "high" {
+		t.Fatalf("kimi-k3 high = %v, want high", kimiHigh["reasoning_effort"])
 	}
 	k25 := prepareOpencodeTranslated(t, openaiCodec, chat, "kimi-k2.5")
 	assertNoRecognizedReasoningControls(t, k25)
@@ -1194,18 +1198,26 @@ func prepareQwen38Flash(t *testing.T, base string, ingress codec, body []byte, s
 // before encode, then compared after the complete finalizer and prepare path.
 func prepareQwen38FlashRaw(t *testing.T, base string, ingress codec, body []byte, stream bool) (map[string]any, []byte, *ir.Request, *domain.Provider) {
 	t.Helper()
+	return prepareOpencodeModelPipeline(t, base, ingress, body, "qwen3.8-flash", codecOpencodeMessages, stream)
+}
+
+// prepareOpencodeModelPipeline runs decode, encode, the finalizer, and upstream
+// preparation for one upstream model. The caller body, IR request, provider
+// copy, and encoded bytes are snapshotted and compared after the run.
+func prepareOpencodeModelPipeline(t *testing.T, base string, ingress codec, body []byte, model, wantCodec string, stream bool) (map[string]any, []byte, *ir.Request, *domain.Provider) {
+	t.Helper()
 	rawInput := append([]byte(nil), body...)
 	p := opencodeTestProvider()
 	p.BaseURL = base
-	req := decodeOpencodeIngress(t, ingress, body, "qwen3.8-flash")
+	req := decodeOpencodeIngress(t, ingress, body, model)
 	if stream {
 		req.Stream = true
 	}
 	reqBefore := snapshotIR(t, req)
 	providerBefore := snapshotProvider(t, p)
 	backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
-	if backend.id != codecOpencodeMessages {
-		t.Fatalf("codec = %s", backend.id)
+	if backend.id != wantCodec {
+		t.Fatalf("codec = %s, want %s", backend.id, wantCodec)
 	}
 	encoded, err := backend.encodeRequest(req)
 	if err != nil {
@@ -1257,8 +1269,16 @@ func finalizeAndPrepareQwenObserved(t *testing.T, p *domain.Provider, req *ir.Re
 
 func assertQwenEffortOnly(t *testing.T, got map[string]any, effort string, cap int, stream bool) {
 	t.Helper()
-	if got["model"] != "qwen3.8-flash" || got["max_tokens"] != float64(cap) {
-		t.Fatalf("model/cap = %v/%v, want qwen3.8-flash/%d", got["model"], got["max_tokens"], cap)
+	assertQwenEffortOnlyFor(t, got, "qwen3.8-flash", effort, cap, stream)
+}
+
+// assertQwenEffortOnlyFor checks one pinned effort-only Anthropic Messages body.
+// output_config must carry exactly the effort value: no thinking block and no
+// stale budget from the generic Anthropic encoder.
+func assertQwenEffortOnlyFor(t *testing.T, got map[string]any, model, effort string, cap int, stream bool) {
+	t.Helper()
+	if got["model"] != model || got["max_tokens"] != float64(cap) {
+		t.Fatalf("model/cap = %v/%v, want %s/%d", got["model"], got["max_tokens"], model, cap)
 	}
 	if gotStream, _ := got["stream"].(bool); gotStream != stream {
 		t.Fatalf("stream = %v, want %v", gotStream, stream)
@@ -1296,6 +1316,326 @@ func assertQwenTool(t *testing.T, got map[string]any) {
 	if _, ok := tool["parameters"]; ok || tool["type"] != nil {
 		t.Fatalf("tool kept Chat envelope: %#v", tool)
 	}
+}
+
+// TestOpencodeGoQwenMaxEffortOnlyPipeline pins the Go qwen3.8-max row, which
+// the live snapshot serves over Anthropic Messages. Official OpenCode writes
+// only output_config.effort for this model (no thinking block) and keeps the
+// caller max_tokens. The generic Anthropic encoder still runs first, so the
+// finalizer must strip its budget thinking and restore the caller cap.
+func TestOpencodeGoQwenMaxEffortOnlyPipeline(t *testing.T) {
+	ingresses := []struct {
+		name       string
+		c          codec
+		body       string
+		completion bool
+	}{
+		{name: "chat", c: openaiCodec, body: `{"model":"combo","reasoning_effort":"%s","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Find one record","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]}`},
+		{name: "chat-completion", c: openaiCodec, completion: true, body: `{"model":"combo","reasoning_effort":"%s","max_completion_tokens":%d,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "responses", c: responsesCodec, body: `{"model":"combo","reasoning":{"effort":"%s"},"max_output_tokens":%d,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{name: "anthropic", c: anthropicCodec, body: `{"model":"combo","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000},"output_config":{"effort":"%s"}}`},
+	}
+	efforts := []struct{ in, want string }{
+		{in: "low", want: "low"},
+		{in: "high", want: "xhigh"},
+		{in: "max", want: "xhigh"},
+	}
+	caps := []int{128, 4096, 100000}
+	for _, ingress := range ingresses {
+		for _, effort := range efforts {
+			for _, cap := range caps {
+				for _, stream := range []bool{false, true} {
+					name := fmt.Sprintf("%s/%s/cap%d/stream%v", ingress.name, effort.in, cap, stream)
+					t.Run(name, func(t *testing.T) {
+						body := qwenIngressBody(ingress.body, ingress.name == "anthropic", effort.in, cap)
+						got, _, req, prov := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, ingress.c, body, "qwen3.8-max", codecOpencodeMessages, stream)
+						assertQwenEffortOnlyFor(t, got, "qwen3.8-max", effort.want, cap, stream)
+						if req.MaxTokens != cap || req.Model != "qwen3.8-max" || req.Stream != stream || prov.APIKey != opencode.PublicKey {
+							t.Fatalf("state req=%+v key=%s", req, prov.APIKey)
+						}
+						if ingress.name == "chat" {
+							assertQwenTool(t, got)
+						}
+						if ingress.completion {
+							if _, ok := got["max_completion_tokens"]; ok {
+								t.Fatalf("completion alias survived: %#v", got["max_completion_tokens"])
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+
+	// A model suffix wins over body intent and normalizes the outgoing model.
+	suffixes := []struct{ in, want string }{
+		{in: "low", want: "low"},
+		{in: "medium", want: "medium"},
+		{in: "high", want: "xhigh"},
+		{in: "max", want: "xhigh"},
+	}
+	for _, ingress := range ingresses {
+		for _, suffix := range suffixes {
+			for _, stream := range []bool{false, true} {
+				name := fmt.Sprintf("suffix/%s/%s/stream%v", ingress.name, suffix.in, stream)
+				t.Run(name, func(t *testing.T) {
+					body := qwenIngressBody(ingress.body, ingress.name == "anthropic", "low", 4096)
+					got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, ingress.c, body, "qwen3.8-max("+suffix.in+")", codecOpencodeMessages, stream)
+					assertQwenEffortOnlyFor(t, got, "qwen3.8-max", suffix.want, 4096, stream)
+					if req.Model != "qwen3.8-max" || req.MaxTokens != 4096 || req.Stream != stream {
+						t.Fatalf("suffix mutated request: %+v", req)
+					}
+				})
+			}
+		}
+	}
+
+	t.Run("explicit disable follows effort list", func(t *testing.T) {
+		// qwen3.8-max is not in the approved Claude disable scope. An explicit
+		// disable therefore maps to the lowest positive listed effort, as it does
+		// for every other effort-list row without its own disable path.
+		body := []byte(`{"model":"combo","reasoning_effort":"none","enable_thinking":false,"max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, "qwen3.8-max", codecOpencodeMessages, false)
+		assertQwenEffortOnlyFor(t, got, "qwen3.8-max", "low", 128, false)
+		if req.MaxTokens != 128 {
+			t.Fatalf("disable changed cap: %+v", req)
+		}
+	})
+
+	t.Run("explicit enable keeps the positive effort", func(t *testing.T) {
+		// enable_thinking:true is an enablement statement, not an intensity.
+		// The listed effort still wins, and no enabled budget is written.
+		body := []byte(`{"model":"combo","reasoning_effort":"high","enable_thinking":true,"max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, "qwen3.8-max", codecOpencodeMessages, true)
+		assertQwenEffortOnlyFor(t, got, "qwen3.8-max", "xhigh", 128, true)
+		if req.MaxTokens != 128 {
+			t.Fatalf("enable changed cap: %+v", req)
+		}
+	})
+
+	t.Run("assistant-final writes no control and keeps encoder cap", func(t *testing.T) {
+		// The Anthropic-side gate drops thinking for an assistant-final request.
+		// The finalizer then writes no effort, so no cap restore may run.
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"done"}]}`)
+		got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, "qwen3.8-max", codecOpencodeMessages, false)
+		assertNoRecognizedReasoningControls(t, got)
+		// The encoder sees no assistant-final thinking, so it writes the caller
+		// cap unchanged and no restore path runs.
+		if got["max_tokens"] != float64(128) || req.MaxTokens != 128 {
+			t.Fatalf("assistant-final cap = %v, ir %d", got["max_tokens"], req.MaxTokens)
+		}
+	})
+
+	t.Run("no intent writes no control", func(t *testing.T) {
+		body := []byte(`{"model":"combo","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, "qwen3.8-max", codecOpencodeMessages, false)
+		assertNoRecognizedReasoningControls(t, got)
+		if got["max_tokens"] != float64(128) || req.MaxTokens != 128 {
+			t.Fatalf("no-intent cap = %v, ir %d", got["max_tokens"], req.MaxTokens)
+		}
+	})
+
+	t.Run("omitted cap follows encoded default", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`)
+		got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, "qwen3.8-max", codecOpencodeMessages, false)
+		assertQwenEffortOnlyFor(t, got, "qwen3.8-max", "low", 4096, false)
+		if req.MaxTokens != 0 {
+			t.Fatalf("omitted cap mutated: %+v", req)
+		}
+	})
+
+	t.Run("zen chat row unchanged", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.ZenBaseURL, openaiCodec, body, "qwen3.8-max", opencodeChatCodec.id, false)
+		if got["reasoning_effort"] != "xhigh" || got["max_tokens"] != float64(128) {
+			t.Fatalf("zen qwen3.8-max = %#v", got)
+		}
+		assertNoAnthropicEffortShape(t, got)
+		if req.MaxTokens != 128 {
+			t.Fatalf("zen cap mutated: %+v", req)
+		}
+	})
+
+	t.Run("explicit different dialect unchanged", func(t *testing.T) {
+		// Claude dialect on the OpenCode protocol keeps the generic Claude budget
+		// shape. The narrow effort-only restore must not run, so the existing
+		// budget-versus-cap rejection still applies.
+		p := &domain.Provider{Protocol: domain.ProtocolOpencode, ReasoningDialect: domain.ReasoningClaude, BaseURL: opencode.GoBaseURL, APIKey: "k"}
+		body := []byte(`{"model":"combo","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"high"}}`)
+		req := decodeOpencodeIngress(t, anthropicCodec, body, "qwen3.8-max")
+		reqBefore := snapshotIR(t, req)
+		backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+		encoded, err := backend.encodeRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := finalizeEncodedBody(encoded, req, backend, p); !errors.Is(err, errOpencodeThinkingBudget) {
+			t.Fatalf("dialect error = %v, want existing budget rejection", err)
+		}
+		if !reflect.DeepEqual(snapshotIR(t, req), reqBefore) {
+			t.Fatal("dialect rejection changed the request")
+		}
+	})
+
+	t.Run("non-opencode protocol unchanged", func(t *testing.T) {
+		// The OpenCode dialect on another protocol keeps its preexisting shape:
+		// the generic encoder budget may survive, and no cap restore runs.
+		p := &domain.Provider{Protocol: domain.ProtocolAnthropic, ReasoningDialect: domain.ReasoningOpencode, APIKey: "k"}
+		body := []byte(`{"model":"combo","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"high"}}`)
+		got := prepareOpencodeTranslatedOn(t, p, anthropicCodec, body, "qwen3.8-max")
+		if got["max_tokens"] != float64(25600) || got["reasoning_effort"] != "xhigh" {
+			t.Fatalf("non-opencode protocol = %#v", got)
+		}
+	})
+
+	t.Run("near-name neighbors unchanged", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+		for _, model := range []string{"qwen3.8-max-next", "qwen3.8-flash-next"} {
+			got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, model, opencodeChatCodec.id, false)
+			assertNoRecognizedReasoningControls(t, got)
+			if got["max_tokens"] != float64(128) || req.MaxTokens != 128 {
+				t.Fatalf("%s cap = %v ir %d", model, got["max_tokens"], req.MaxTokens)
+			}
+		}
+	})
+}
+
+func assertNoAnthropicEffortShape(t *testing.T, got map[string]any) {
+	t.Helper()
+	if _, ok := got["output_config"]; ok {
+		t.Fatalf("wrote Anthropic effort shape: %#v", got["output_config"])
+	}
+	if _, ok := got["thinking"]; ok {
+		t.Fatalf("wrote Anthropic thinking shape: %#v", got["thinking"])
+	}
+}
+
+// TestOpencodeGoQwenMaxCapWithOutputConfigSiblings pins caller cap
+// preservation when the final Max body also carries output_config siblings.
+// A format or task budget is caller data, not a reasoning control, so it must
+// not disable the restore. Flash keeps its exact-shape boundary test above.
+func TestOpencodeGoQwenMaxCapWithOutputConfigSiblings(t *testing.T) {
+	const large = "9007199254740993"
+	caps := []int{128, 4096}
+
+	assertMaxCap := func(t *testing.T, got map[string]any, cap int) {
+		t.Helper()
+		if got["model"] != "qwen3.8-max" || got["max_tokens"] != float64(cap) {
+			t.Fatalf("model/cap = %v/%v, want qwen3.8-max/%d", got["model"], got["max_tokens"], cap)
+		}
+		if effortOf(t, got) != "xhigh" {
+			t.Fatalf("effort = %v, want xhigh", effortOf(t, got))
+		}
+		for _, field := range []string{"thinking", "reasoning_effort", "enable_thinking", "thinking_budget", "reasoning"} {
+			if _, ok := got[field]; ok {
+				t.Fatalf("%s present: %#v", field, got[field])
+			}
+		}
+	}
+
+	t.Run("anthropic format and task budget", func(t *testing.T) {
+		for _, cap := range caps {
+			body := []byte(fmt.Sprintf(`{"model":"combo","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1000},"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}},"task_budget":{"type":"tokens","total":1000,"remaining":0}}}`, cap))
+			got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, anthropicCodec, body, "qwen3.8-max", codecOpencodeMessages, false)
+			assertMaxCap(t, got, cap)
+			oc, _ := got["output_config"].(map[string]any)
+			format, _ := oc["format"].(map[string]any)
+			budget, _ := oc["task_budget"].(map[string]any)
+			if format["type"] != "json_schema" || budget["type"] != "tokens" || budget["total"] != float64(1000) || budget["remaining"] != float64(0) {
+				t.Fatalf("cap %d siblings = %#v", cap, oc)
+			}
+			if req.MaxTokens != cap {
+				t.Fatalf("cap %d IR = %d", cap, req.MaxTokens)
+			}
+		}
+	})
+
+	t.Run("chat response format", func(t *testing.T) {
+		for _, cap := range caps {
+			body := []byte(fmt.Sprintf(`{"model":"combo","reasoning_effort":"high","max_tokens":%d,"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"Out","schema":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}}}`, cap))
+			got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, "qwen3.8-max", codecOpencodeMessages, false)
+			assertMaxCap(t, got, cap)
+			oc, _ := got["output_config"].(map[string]any)
+			format, _ := oc["format"].(map[string]any)
+			if format["type"] != "json_schema" {
+				t.Fatalf("cap %d format = %#v", cap, oc)
+			}
+			if req.MaxTokens != cap {
+				t.Fatalf("cap %d IR = %d", cap, req.MaxTokens)
+			}
+		}
+	})
+
+	t.Run("no intent keeps encoder cap", func(t *testing.T) {
+		body := []byte(`{"model":"combo","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"Out","schema":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}}}`)
+		got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, "qwen3.8-max", codecOpencodeMessages, false)
+		assertNoRecognizedReasoningControls(t, got)
+		oc, _ := got["output_config"].(map[string]any)
+		format, _ := oc["format"].(map[string]any)
+		if got["max_tokens"] != float64(128) || format["type"] != "json_schema" || req.MaxTokens != 128 {
+			t.Fatalf("no-intent body = %#v", got)
+		}
+	})
+
+	t.Run("assistant final keeps encoder cap", func(t *testing.T) {
+		body := []byte(`{"model":"combo","reasoning_effort":"high","max_tokens":128,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"done"}],"response_format":{"type":"json_schema","json_schema":{"name":"Out","schema":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}}}`)
+		got, _, req, _ := prepareOpencodeModelPipeline(t, opencode.GoBaseURL, openaiCodec, body, "qwen3.8-max", codecOpencodeMessages, false)
+		assertNoRecognizedReasoningControls(t, got)
+		oc, _ := got["output_config"].(map[string]any)
+		format, _ := oc["format"].(map[string]any)
+		if got["max_tokens"] != float64(128) || format["type"] != "json_schema" || req.MaxTokens != 128 {
+			t.Fatalf("assistant-final body = %#v", got)
+		}
+	})
+
+	t.Run("non-opencode protocol unchanged", func(t *testing.T) {
+		p := &domain.Provider{Protocol: domain.ProtocolAnthropic, ReasoningDialect: domain.ReasoningOpencode, APIKey: "k"}
+		body := []byte(`{"model":"combo","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"high","format":{"type":"json_object"}}}`)
+		got := prepareOpencodeTranslatedOn(t, p, anthropicCodec, body, "qwen3.8-max")
+		oc, _ := got["output_config"].(map[string]any)
+		format, _ := oc["format"].(map[string]any)
+		if got["max_tokens"] != float64(25600) || got["reasoning_effort"] != "xhigh" || format["type"] != "json_object" {
+			t.Fatalf("non-opencode protocol = %#v", got)
+		}
+	})
+
+	t.Run("finalizer seam keeps unknown siblings and exact numbers", func(t *testing.T) {
+		p := opencodeTestProvider()
+		p.BaseURL = opencode.GoBaseURL
+		p.APIKey = "boundary-key"
+		encoded := []byte(`{"model":"qwen3.8-max","max_tokens":25600,"messages":[{"role":"user","content":[{"type":"text","text":"boundary-user"}]}],"thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"effort":"low","format":{"type":"json_schema","schema":{"type":"object","properties":{"n":{"type":"integer","minimum":` + large + `}},"required":["n"]}},"task_budget":{"type":"tokens","total":1000,"remaining":0},"raw":{"n":` + large + `},"flag":true},"metadata":{"keep":` + large + `}}`)
+		for _, cap := range caps {
+			req := &ir.Request{
+				Model:     "qwen3.8-max",
+				MaxTokens: cap,
+				Thinking:  &ir.Thinking{Mode: ir.ThinkingLevel, Level: "high"},
+				Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: "boundary-user"}}}},
+			}
+			backend := backendCodecFor(p.Protocol, p.BaseURL, req.Model)
+			finalized, out := finalizeAndPrepareQwenObserved(t, p, req, backend, encoded)
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			assertMaxCap(t, got, cap)
+			oc, _ := got["output_config"].(map[string]any)
+			format, _ := oc["format"].(map[string]any)
+			raw, _ := oc["raw"].(map[string]any)
+			budget, _ := oc["task_budget"].(map[string]any)
+			if format["type"] != "json_schema" || oc["flag"] != true || raw["n"] != float64(9007199254740992) || budget["total"] != float64(1000) || budget["remaining"] != float64(0) {
+				t.Fatalf("cap %d finalizer siblings = %#v", cap, oc)
+			}
+			meta, _ := got["metadata"].(map[string]any)
+			if meta["keep"] != float64(9007199254740992) || p.APIKey != "boundary-key" || req.MaxTokens != cap {
+				t.Fatalf("cap %d state = %#v key=%s cap=%d", cap, got, p.APIKey, req.MaxTokens)
+			}
+			for _, wire := range [][]byte{finalized, out} {
+				assertExactJSONNumber(t, wire, []string{"output_config", "raw", "n"}, large)
+				assertExactJSONNumber(t, wire, []string{"output_config", "format", "schema", "properties", "n", "minimum"}, large)
+				assertExactJSONNumber(t, wire, []string{"metadata", "keep"}, large)
+			}
+		}
+	})
 }
 
 func TestOpencodeQwen38FlashDisableBothTiers(t *testing.T) {
@@ -1447,12 +1787,18 @@ func TestOpencodeQwen38FlashDisableBothTiers(t *testing.T) {
 
 	t.Run("neighbors unchanged", func(t *testing.T) {
 		body := []byte(`{"model":"combo","reasoning_effort":"none","enable_thinking":false,"max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
-		for _, model := range []string{"qwen3.8-max", "qwen3.8-flash-next"} {
+		for _, model := range []string{"qwen3.8-flash-next", "qwen3.8-max-next"} {
 			got := prepareOpencodeTranslated(t, openaiCodec, body, model)
 			assertNoRecognizedReasoningControls(t, got)
 			if got["max_tokens"] != float64(128) {
 				t.Fatalf("%s cap = %v", model, got["max_tokens"])
 			}
+		}
+		// qwen3.8-max is a current Zen Chat row with a listed effort set, so an
+		// explicit disable maps to its lowest positive effort like other Chat rows.
+		qwenMax := prepareOpencodeTranslated(t, openaiCodec, body, "qwen3.8-max")
+		if qwenMax["reasoning_effort"] != "low" || qwenMax["max_tokens"] != float64(128) {
+			t.Fatalf("qwen3.8-max = %#v", qwenMax)
 		}
 		// qwen3.6-plus remains budget-only. none still maps to its positive budget,
 		// which cannot fit this caller cap. The new disable must not change that row.
@@ -5584,12 +5930,12 @@ func TestOpencodeTierHTTPLifecycle(t *testing.T) {
 		endpoint string
 		prefix   string
 	}{
-		{"zen paid chat", opencode.ZenBaseURL, "deepseek-v4-pro", "sk-zen", false, "/chat/completions", "/inference/v1"},
-		{"zen paid responses", opencode.ZenBaseURL, "gpt-5.6-luna", "sk-zen", false, "/responses", "/inference/v1"},
-		{"zen free chat", opencode.ZenBaseURL, "deepseek-v4-flash-free", opencode.PublicKey, true, "/chat/completions", "/inference/v1"},
-		{"zen free responses", opencode.ZenBaseURL, "muse-spark-1.3-contributor-free", opencode.PublicKey, true, "/responses", "/inference/v1"},
-		{"go paid chat", opencode.GoBaseURL, "glm-5", "sk-go", false, "/chat/completions", "/zen/go/v1"},
-		{"go paid responses", opencode.GoBaseURL, "muse-spark-1.2-contributor", "sk-go", false, "/responses", "/zen/go/v1"},
+		{"zen paid chat", opencode.ZenBaseURL, "deepseek-v4-pro", "sk-zen", false, "/chat/completions", "/inference/openai/v1"},
+		{"zen paid responses", opencode.ZenBaseURL, "gpt-5.6-luna", "sk-zen", false, "/responses", "/inference/openai/v1"},
+		{"zen free chat", opencode.ZenBaseURL, "deepseek-v4-flash-free", opencode.PublicKey, true, "/chat/completions", "/inference/openai/v1"},
+		{"zen free responses", opencode.ZenBaseURL, "muse-spark-1.3-contributor-free", opencode.PublicKey, true, "/responses", "/inference/openai/v1"},
+		{"go paid chat", opencode.LegacyGoBaseURL, "glm-5", "sk-go", false, "/chat/completions", "/inference/go/openai/v1"},
+		{"go paid responses", opencode.LegacyGoBaseURL, "muse-spark-1.2-contributor", "sk-go", false, "/responses", "/inference/go/openai/v1"},
 	}
 	const tools = `"tools":[{"type":"function","name":"Read","parameters":{"type":"object","properties":{}}}]`
 	for _, tc := range cases {
@@ -6398,9 +6744,9 @@ func TestOpencodeTierEncryptedHistoryHTTPLifecycle(t *testing.T) {
 		free     bool
 		prefix   string
 	}{
-		{"zen paid responses", opencode.ZenBaseURL, "gpt-5.6-luna", "sk-zen", "Read", false, "/inference/v1"},
-		{"zen free muse responses", opencode.ZenBaseURL, "muse-spark-1.3-contributor-free", opencode.PublicKey, "read", true, "/inference/v1"},
-		{"go paid muse responses", opencode.GoBaseURL, "muse-spark-1.2-contributor", "sk-go", "Read", false, "/zen/go/v1"},
+		{"zen paid responses", opencode.ZenBaseURL, "gpt-5.6-luna", "sk-zen", "Read", false, "/inference/openai/v1"},
+		{"zen free muse responses", opencode.ZenBaseURL, "muse-spark-1.3-contributor-free", opencode.PublicKey, "read", true, "/inference/openai/v1"},
+		{"go paid muse responses", opencode.GoBaseURL, "muse-spark-1.2-contributor", "sk-go", "Read", false, "/inference/go/openai/v1"},
 	}
 	for _, tc := range cases {
 		for _, stream := range []bool{false, true} {
@@ -6540,6 +6886,271 @@ func TestOpencodeTierEncryptedHistoryHTTPLifecycle(t *testing.T) {
 					t.Fatalf("upstream hits = %d, want 3", up.count())
 				}
 			})
+		}
+	}
+}
+
+// nativeUpstreamFixture is one native backend family. Each family answers with
+// its own unary body or SSE so the proxy must translate per target endpoint.
+type nativeUpstreamFixture struct {
+	unary  string
+	stream string
+}
+
+// TestOpencodeNativeFamilyHTTPLifecycle drives ingress -> IR -> native OpenCode
+// upstream for all three ingress formats and all three backend families over
+// unary and SSE, against the current tier aliases. It checks the wire path,
+// Authorization, model, tool preservation, usage, and that the response text
+// reaches the client.
+func TestOpencodeNativeFamilyHTTPLifecycle(t *testing.T) {
+	fixtures := map[string]nativeUpstreamFixture{
+		"chat": {
+			unary:  openaiUpstreamBody,
+			stream: openaiSSE,
+		},
+		"responses": {
+			unary:  responsesUpstreamBody,
+			stream: responsesSSE,
+		},
+		"messages": {
+			unary:  anthropicUpstreamBody,
+			stream: anthropicSSE,
+		},
+	}
+	type target struct {
+		name, base, model, key, family, wantPath string
+	}
+	targets := []target{
+		{"zen chat", opencode.ZenBaseURL, "deepseek-v4.1-flash-free", opencode.PublicKey, "chat", "/inference/openai/v1/chat/completions"},
+		{"zen responses", opencode.LegacyZenBaseURL, "gpt-6.1-sol", "sk-zen", "responses", "/inference/openai/v1/responses"},
+		{"zen messages", opencode.ZenBaseURL, "qwen3.8-flash", "sk-zen", "messages", "/inference/anthropic/v1/messages"},
+		{"go chat", opencode.GoBaseURL, "step-5-preview-free", "sk-go", "chat", "/inference/go/openai/v1/chat/completions"},
+		{"go responses", opencode.LegacyGoBaseURL, "gpt-6-luna", "sk-go", "responses", "/inference/go/openai/v1/responses"},
+		{"go messages", opencode.GoBaseURL, "minimax-m3", "sk-go", "messages", "/inference/go/anthropic/v1/messages"},
+	}
+	ingresses := []struct {
+		name string
+		path string
+		body func(stream bool) string
+	}{
+		{
+			name: "chat",
+			path: "/v1/chat/completions",
+			body: func(stream bool) string {
+				return fmt.Sprintf(`{"model":"default","stream":%t,"max_tokens":64,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Find one","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]}`, stream)
+			},
+		},
+		{
+			name: "responses",
+			path: "/v1/responses",
+			body: func(stream bool) string {
+				return fmt.Sprintf(`{"model":"default","stream":%t,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[{"type":"function","name":"lookup","description":"Find one","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}]}`, stream)
+			},
+		},
+		{
+			name: "messages",
+			path: "/v1/messages",
+			body: func(stream bool) string {
+				return fmt.Sprintf(`{"model":"default","stream":%t,"max_tokens":64,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"lookup","description":"Find one","input_schema":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}]}`, stream)
+			},
+		},
+	}
+	for _, tg := range targets {
+		fixture := fixtures[tg.family]
+		for _, ing := range ingresses {
+			for _, stream := range []bool{false, true} {
+				name := fmt.Sprintf("%s/%s/stream=%t", tg.name, ing.name, stream)
+				t.Run(name, func(t *testing.T) {
+					var (
+						mu           sync.Mutex
+						gotURL       string
+						gotAuth      string
+						gotBody      map[string]any
+						servedStream bool
+					)
+					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						raw, _ := io.ReadAll(r.Body)
+						var body map[string]any
+						_ = json.Unmarshal(raw, &body)
+						isStream := r.Header.Get("Accept") == "text/event-stream"
+						mu.Lock()
+						gotURL = r.URL.Path
+						gotAuth = r.Header.Get("Authorization")
+						gotBody = body
+						servedStream = isStream
+						mu.Unlock()
+						if isStream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = io.WriteString(w, fixture.stream)
+							return
+						}
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, fixture.unary)
+					}))
+					t.Cleanup(upstream.Close)
+
+					st := newTestStore(t)
+					ctx := context.Background()
+					prov := &domain.Provider{Name: "p", BaseURL: tg.base, APIKey: tg.key, Protocol: domain.ProtocolOpencode}
+					if err := st.CreateProvider(ctx, prov); err != nil {
+						t.Fatal(err)
+					}
+					if err := st.CreateCombo(ctx, &domain.Combo{Name: "default", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{{ProviderID: prov.ID, UpstreamModel: tg.model, Enabled: true}}}); err != nil {
+						t.Fatal(err)
+					}
+					access, err := st.NewAccessKey(ctx, "test")
+					if err != nil {
+						t.Fatal(err)
+					}
+					px := New(st, nil)
+					redirect := redirectTransport(upstream.URL)
+					px.client = &http.Client{Transport: redirect, Timeout: 5 * time.Second}
+					px.streamClient = &http.Client{Transport: redirect}
+					mux := http.NewServeMux()
+					px.Mount(mux)
+					ts := httptest.NewServer(mux)
+					t.Cleanup(ts.Close)
+
+					requestBody := ing.body(stream)
+					var resp *http.Response
+					var out []byte
+					if stream {
+						var text string
+						resp, text = postStream(t, ts.URL+ing.path, access.Token, requestBody)
+						out = []byte(text)
+					} else {
+						resp, out = post(t, ts.URL+ing.path, access.Token, requestBody)
+					}
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+					}
+					if stream && !strings.Contains(string(out), "event:") && !strings.Contains(string(out), "data:") {
+						t.Fatalf("stream response is not SSE: %s", out)
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if gotURL != tg.wantPath {
+						t.Fatalf("upstream path = %q, want %q", gotURL, tg.wantPath)
+					}
+					if gotAuth != "Bearer "+tg.key {
+						t.Fatalf("upstream auth = %q", gotAuth)
+					}
+					if gotBody["model"] != tg.model {
+						t.Fatalf("upstream model = %#v, want %q", gotBody["model"], tg.model)
+					}
+					assertUpstreamToolsPreserved(t, tg.family, gotBody)
+					// Free Zen models are stream-only, so a unary ingress still
+					// receives the SSE body through the unary collector.
+					assertIngressAssistantText(t, ing.name, tg.family, servedStream, string(out), stream)
+					if stream {
+						assertIngressStreamUsage(t, ing.name, string(out))
+					} else {
+						assertIngressUsage(t, ing.name, out)
+					}
+				})
+			}
+		}
+	}
+}
+
+// assertIngressAssistantText checks that the upstream assistant text reached
+// the client in the ingress format. Unary bodies carry a fixed sentence per
+// backend family; every SSE fixture streams "Hello world".
+func assertIngressAssistantText(t *testing.T, ingress, family string, servedStream bool, out string, stream bool) {
+	t.Helper()
+	want := "Hello world"
+	if !servedStream {
+		switch family {
+		case "chat":
+			want = "hello from openai"
+		case "responses":
+			want = "hello from responses"
+		case "messages":
+			want = "hello from anthropic"
+		}
+	}
+	var got string
+	if stream {
+		got, _ = collectStreamText(t, "/v1/"+ingress, out)
+		if ingress == "responses" {
+			text, completed, _, _ := collectResponsesStream(t, out)
+			if !completed {
+				t.Fatalf("%s stream did not complete: %s", ingress, out)
+			}
+			got = text
+		}
+	} else {
+		switch ingress {
+		case "responses":
+			got = parseResponsesText(t, []byte(out))
+		default:
+			got = extractText(t, "/v1/"+ingress, []byte(out))
+		}
+	}
+	if got != want {
+		t.Fatalf("%s text = %q, want %q: %s", ingress, got, want, out)
+	}
+}
+
+// assertIngressUsage checks that non-zero token usage from the native body
+// reached the client in the ingress format's own envelope. Exact input totals
+// depend on cache accounting, so only positive presence is pinned.
+func assertIngressUsage(t *testing.T, ingress string, out []byte) {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("response is not JSON: %v: %s", err, out)
+	}
+	usage, _ := doc["usage"].(map[string]any)
+	if len(usage) == 0 {
+		t.Fatalf("response lost usage: %s", out)
+	}
+	inField, outField := "input_tokens", "output_tokens"
+	if ingress == "chat" {
+		inField, outField = "prompt_tokens", "completion_tokens"
+	}
+	in, _ := usage[inField].(float64)
+	output, _ := usage[outField].(float64)
+	if in <= 0 || output <= 0 {
+		t.Fatalf("%s usage = %#v", ingress, usage)
+	}
+}
+
+// assertIngressStreamUsage checks that the terminal stream event carries usage
+// rather than dropping the upstream accounting.
+func assertIngressStreamUsage(t *testing.T, ingress, body string) {
+	t.Helper()
+	needles := map[string][]string{
+		"chat":      {`"usage"`, `"completion_tokens"`},
+		"responses": {`"usage"`, `"output_tokens"`},
+		"messages":  {`"usage"`, `"output_tokens"`},
+	}
+	for _, needle := range needles[ingress] {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("%s stream lost %s: %s", ingress, needle, body)
+		}
+	}
+}
+
+// assertUpstreamToolsPreserved checks that the caller tool survived the ingress
+// encoding for the selected native family. It intentionally does not assert a
+// specific envelope beyond the family's own tool field.
+func assertUpstreamToolsPreserved(t *testing.T, family string, body map[string]any) {
+	t.Helper()
+	tools, _ := body["tools"].([]any)
+	if len(tools) == 0 {
+		t.Fatalf("upstream %s body lost tools: %#v", family, body)
+	}
+	first, _ := tools[0].(map[string]any)
+	switch family {
+	case "chat":
+		fn, _ := first["function"].(map[string]any)
+		if fn["name"] != "lookup" {
+			t.Fatalf("chat tool name = %#v", fn["name"])
+		}
+	case "responses", "messages":
+		if first["name"] != "lookup" {
+			t.Fatalf("%s tool name = %#v", family, first["name"])
 		}
 	}
 }

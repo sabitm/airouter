@@ -21,7 +21,7 @@ const (
 
 // AnthropicEffort reports the official effort body for an Anthropic model id.
 // Opus 4.5 uses enabled plus a fixed budget. 4.6 uses adaptive. Claude 4.7+
-// uses adaptive with summarized display. qwen3.8-flash uses effort only.
+// uses adaptive with summarized display. The pinned Qwen rows use effort only.
 // Other ids, including other non-Claude Anthropic rows, send no effort field.
 func AnthropicEffort(model string) AnthropicEffortShape {
 	id := strings.ToLower(model)
@@ -34,10 +34,17 @@ func AnthropicEffort(model string) AnthropicEffortShape {
 	if anthropicAdaptive46(id) {
 		return AnthropicEffortAdaptive
 	}
-	if NormalizeModelID(id) == "qwen3.8-flash" {
+	if qwenEffortOnlyID(NormalizeModelID(id)) {
 		return AnthropicEffortOnly
 	}
 	return AnthropicEffortNone
+}
+
+// qwenEffortOnlyID reports the exact catalog ids whose Anthropic Messages shape
+// carries only output_config.effort. Zen serves qwen3.8-max over Chat, where the
+// SDK row is not Anthropic, so the lookup tier still keeps that row unchanged.
+func qwenEffortOnlyID(id string) bool {
+	return id == "qwen3.8-flash" || id == "qwen3.8-max"
 }
 
 // Opus45BudgetTokens is the official fixed budget for Opus 4.5 effort.

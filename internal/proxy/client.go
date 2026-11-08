@@ -1022,7 +1022,7 @@ func (p *Proxy) upstreamClient(provider *domain.Provider, url string, body []byt
 // when near expiry) before the first send; on a 401/403 the token is forcibly
 // refreshed and the request retried once.
 func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path string, body []byte, clientHeaders http.Header) (int, []byte, error) {
-	url := strings.TrimRight(effectiveProviderBaseURL(provider), "/") + path
+	url := upstreamURL(provider, path)
 	if t := traceInfoFrom(ctx); t != nil {
 		t.UpstreamURL = url
 	}
@@ -1107,7 +1107,8 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 // (http/https) is used verbatim — backends whose chat host differs from the
 // provider's base URL (Cursor AgentService) supply one — unless the provider
 // carries a non-Cursor base URL, which then overrides the absolute host
-// (self-hosted mirrors and tests).
+// (self-hosted mirrors and tests). OpenCode official aliases resolve by tier
+// and API family; custom OpenCode URLs are appended unchanged.
 func upstreamURL(provider *domain.Provider, path string) string {
 	if provider != nil && provider.Protocol == domain.ProtocolKiro && kiro.UseRuntime(kiro.IdentityFromProvider(provider)) {
 		return kiro.ChatURL(provider.BaseURL, kiro.IdentityFromProvider(provider))
@@ -1124,13 +1125,17 @@ func upstreamURL(provider *domain.Provider, path string) string {
 		}
 		return path
 	}
+	if provider != nil && provider.Protocol == domain.ProtocolOpencode {
+		return strings.TrimRight(opencode.InferenceBaseURL(provider.BaseURL, path), "/") + path
+	}
 	return strings.TrimRight(effectiveProviderBaseURL(provider), "/") + path
 }
 
-// effectiveProviderBaseURL returns the provider's stored base URL with
-// backend-specific endpoint migrations applied. Only OpenCode rows move; every
-// other protocol keeps its stored URL byte-for-byte, and the provider record
-// itself is never mutated.
+// effectiveProviderBaseURL returns a stable base URL for backend-specific
+// identity and detection helpers. OpenCode official aliases resolve to the
+// model-discovery base; forwarding uses upstreamURL, which resolves the
+// API-family inference base. Other protocols keep their stored URL
+// byte-for-byte, and the provider record itself is never mutated.
 func effectiveProviderBaseURL(provider *domain.Provider) string {
 	if provider == nil {
 		return ""
