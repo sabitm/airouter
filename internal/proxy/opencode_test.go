@@ -2924,7 +2924,7 @@ func assertMiniMaxCallerTool(t *testing.T, got map[string]any, free bool) {
 		switch name {
 		case "lookup":
 			caller = tool
-		case "bash", "glob", "grep", "read":
+		case "read", "shell":
 			decoys[name] = true
 		default:
 			t.Fatalf("unexpected tool %q", name)
@@ -2951,7 +2951,7 @@ func assertMiniMaxCallerTool(t *testing.T, got map[string]any, free bool) {
 		}
 		return
 	}
-	if len(tools) != 5 || len(decoys) != 4 {
+	if len(tools) != 3 || len(decoys) != 2 {
 		t.Fatalf("free tools = %#v", tools)
 	}
 }
@@ -5095,8 +5095,8 @@ func TestOpencodeResponsesStoreIncludePreserved(t *testing.T) {
 
 					tools := mustListAny(t, "tools", got["tools"])
 					if model.free {
-						if len(tools) != 5 {
-							t.Fatalf("free tools = %d, want 5", len(tools))
+						if len(tools) != 3 {
+							t.Fatalf("free tools = %d, want caller plus 2 placeholders", len(tools))
 						}
 					} else if len(tools) != 1 {
 						t.Fatalf("paid tools = %d, want 1", len(tools))
@@ -5345,8 +5345,20 @@ func requireAbsentKey(t *testing.T, path string, m map[string]any, key string) {
 func requireEnvAppended(t *testing.T, path, text, caller string) {
 	t.Helper()
 	heading := "Here is some useful information about the environment you are running in:"
-	if !strings.HasPrefix(text, caller+"\n\n"+heading+"\n<env>\n") {
-		t.Fatalf("%s: missing environment prefix: %q", path, text)
+	prefix := caller + "\n\n"
+	rest, ok := strings.CutPrefix(text, prefix)
+	if !ok {
+		t.Fatalf("%s: caller text prefix changed: %q", path, text)
+	}
+	if strings.HasPrefix(rest, "Do not call the ") {
+		note, tail, found := strings.Cut(rest, "\n\n")
+		if !found || !strings.HasSuffix(note, "they are placeholders that do nothing. Use the other tools you have been given instead.") {
+			t.Fatalf("%s: invalid placeholder note: %q", path, note)
+		}
+		rest = tail
+	}
+	if !strings.HasPrefix(rest, heading+"\n<env>\n") || strings.Count(text, "<env>") != 1 {
+		t.Fatalf("%s: missing or repeated environment prefix: %q", path, text)
 	}
 	if !strings.HasSuffix(text, "\n</env>") {
 		t.Fatalf("%s: missing environment suffix: %q", path, text)
@@ -5441,9 +5453,6 @@ func assertAnthropicCachePipeline(t *testing.T, tc anthropicCacheCase, stream bo
 		t.Fatalf("caller tool lookup missing: %v", byName)
 	}
 	readName := "Read"
-	if tc.free {
-		readName = "read"
-	}
 	read, ok := byName[readName]
 	if !ok {
 		t.Fatalf("caller tool %q missing: %v", readName, byName)
@@ -5463,10 +5472,10 @@ func assertAnthropicCachePipeline(t *testing.T, tc anthropicCacheCase, stream bo
 		t.Fatalf("lookup required changed: %#v", required)
 	}
 	if tc.free {
-		if len(tools) != 5 {
-			t.Fatalf("free tools = %d, want caller 2 + decoys 3", len(tools))
+		if len(tools) != 4 {
+			t.Fatalf("free tools = %d, want caller 2 + placeholders 2", len(tools))
 		}
-		for _, name := range []string{"bash", "glob", "grep"} {
+		for _, name := range []string{"read", "shell"} {
 			decoy, ok := byName[name]
 			if !ok {
 				t.Fatalf("free decoy %q missing: %v", name, byName)
@@ -5994,8 +6003,8 @@ func TestOpencodeTierHTTPLifecycle(t *testing.T) {
 					return name
 				}
 				if tc.free {
-					if got := toolName(); got != "read" {
-						t.Fatalf("free canonical tool name = %q", got)
+					if got := toolName(); got != "Read" {
+						t.Fatalf("free caller tool spelling = %q, want Read", got)
 					}
 					if list, _ := up.body["tools"].([]any); len(list) < 2 {
 						t.Fatalf("free preparation injected no decoys: %#v", up.body["tools"])
@@ -6159,9 +6168,8 @@ func TestOpencodeResponsesEncryptedHistoryPrepareMatrix(t *testing.T) {
 				wantName := "Read"
 				tools := mustListAny(t, "tools", got["tools"])
 				if tc.free {
-					wantName = "read"
-					if len(tools) != 4 {
-						t.Fatalf("free tools = %d, want caller plus 3 decoys", len(tools))
+					if len(tools) != 3 {
+						t.Fatalf("free tools = %d, want caller plus 2 placeholders", len(tools))
 					}
 				} else if len(tools) != 1 {
 					t.Fatalf("paid tools = %d, want 1", len(tools))
@@ -6745,7 +6753,7 @@ func TestOpencodeTierEncryptedHistoryHTTPLifecycle(t *testing.T) {
 		prefix   string
 	}{
 		{"zen paid responses", opencode.ZenBaseURL, "gpt-5.6-luna", "sk-zen", "Read", false, "/inference/openai/v1"},
-		{"zen free muse responses", opencode.ZenBaseURL, "muse-spark-1.3-contributor-free", opencode.PublicKey, "read", true, "/inference/openai/v1"},
+		{"zen free muse responses", opencode.ZenBaseURL, "muse-spark-1.3-contributor-free", opencode.PublicKey, "Read", true, "/inference/openai/v1"},
 		{"go paid muse responses", opencode.GoBaseURL, "muse-spark-1.2-contributor", "sk-go", "Read", false, "/inference/go/openai/v1"},
 	}
 	for _, tc := range cases {
@@ -6782,12 +6790,8 @@ func TestOpencodeTierEncryptedHistoryHTTPLifecycle(t *testing.T) {
 					t.Fatalf("upstream cache key = %#v", body1["prompt_cache_key"])
 				}
 				assertPreparedEncryptedHistory(t, raw1, tc.toolName)
-				if tc.free {
-					if !bytes.Contains(raw1, []byte(`"name":"read"`)) {
-						t.Fatalf("free upstream did not canonicalize the caller tool: %s", raw1)
-					}
-				} else if !bytes.Contains(raw1, []byte(`"name":"Read"`)) {
-					t.Fatalf("paid upstream changed the caller tool: %s", raw1)
+				if !bytes.Contains(raw1, []byte(`"name":"Read"`)) {
+					t.Fatalf("upstream changed the caller tool spelling: %s", raw1)
 				}
 				if up.hosts[0] != "opencode.ai" || up.paths[0] != tc.prefix+"/responses" {
 					t.Fatalf("upstream destination = %s%s", up.hosts[0], up.paths[0])

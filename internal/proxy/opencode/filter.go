@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"io"
+	"sort"
 
 	"airouter/internal/proxy/ir"
 )
@@ -11,6 +12,11 @@ import (
 func FilterResponse(resp *ir.Response, mapping ToolMap) (*ir.Response, error) {
 	if resp == nil || !mapping.Active() {
 		return resp, nil
+	}
+	if mapping.Allowed != nil {
+		clone := *resp
+		clone.Content = append([]ir.ContentBlock(nil), resp.Content...)
+		resp = &clone
 	}
 	for i := range resp.Content {
 		b := &resp.Content[i]
@@ -215,6 +221,9 @@ func DecodeStream(decode func(io.Reader, func(ir.StreamEvent) error) error, mapp
 	if decode == nil || !mapping.Active() {
 		return decode
 	}
+	if mapping.Allowed != nil {
+		return decodeV2Stream(decode, mapping)
+	}
 	return func(r io.Reader, emit func(ir.StreamEvent) error) error {
 		f := newToolFilter(mapping)
 		err := decode(r, func(ev ir.StreamEvent) error {
@@ -227,6 +236,86 @@ func DecodeStream(decode func(io.Reader, func(ir.StreamEvent) error) error, mapp
 			return ir.ProtocolError("tool call ended without a name")
 		}
 		return nil
+	}
+}
+
+func decodeV2Stream(decode func(io.Reader, func(ir.StreamEvent) error) error, mapping ToolMap) func(io.Reader, func(ir.StreamEvent) error) error {
+	return func(r io.Reader, emit func(ir.StreamEvent) error) error {
+		type heldCall struct {
+			id, name string
+			args     []string
+		}
+		calls := map[int]*heldCall{}
+		heldBytes, fragments, finished := 0, 0, false
+		err := decode(r, func(ev ir.StreamEvent) error {
+			if finished {
+				return ir.ProtocolError("opencode: event after finish")
+			}
+			switch ev.Kind {
+			case ir.EventToolCallStart, ir.EventToolCallDelta:
+				call := calls[ev.Index]
+				if ev.Index < 0 || call == nil && len(calls) >= maxHeldToolIndices {
+					return errHeldBudget
+				}
+				if call == nil {
+					call = &heldCall{}
+					calls[ev.Index] = call
+				}
+				heldBytes += len(ev.ToolName) + len(ev.ToolID) + len(ev.ArgsFrag)
+				fragments++
+				if heldBytes > maxHeldToolBytes || fragments > maxHeldToolFragments {
+					return errHeldBudget
+				}
+				if ev.ToolID != "" {
+					if call.id != "" && call.id != ev.ToolID {
+						return ir.ProtocolError("opencode: tool identity changed")
+					}
+					call.id = ev.ToolID
+				}
+				if ev.ToolName != "" {
+					if mapping.FragmentNames {
+						call.name += ev.ToolName
+					} else if call.name == "" || call.name == ev.ToolName {
+						call.name = ev.ToolName
+					} else {
+						return ir.ProtocolError("opencode: tool identity changed")
+					}
+				}
+				if ev.ArgsFrag != "" {
+					call.args = append(call.args, ev.ArgsFrag)
+				}
+				return nil
+			case ir.EventFinish:
+				indices := make([]int, 0, len(calls))
+				// Validate every call before releasing any held identity or argument.
+				for index, call := range calls {
+					name, err := RestoreCallerName(call.name, mapping)
+					if err != nil {
+						return err
+					}
+					call.name = name
+					indices = append(indices, index)
+				}
+				sort.Ints(indices)
+				for _, index := range indices {
+					call := calls[index]
+					if err := emit(ir.StreamEvent{Kind: ir.EventToolCallStart, Index: index, ToolID: call.id, ToolName: call.name}); err != nil {
+						return err
+					}
+					for _, arg := range call.args {
+						if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: index, ArgsFrag: arg}); err != nil {
+							return err
+						}
+					}
+				}
+				finished = true
+			}
+			return emit(ev)
+		})
+		if err == nil && !finished && len(calls) != 0 {
+			return ir.ProtocolError("opencode: incomplete tool stream")
+		}
+		return err
 	}
 }
 

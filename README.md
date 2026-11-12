@@ -60,38 +60,15 @@ Provider credentials and OAuth tokens are encrypted in SQLite using
 
 ### OpenCode notes
 
-One provider row covers both opencode.ai tiers; the dashboard tier selector
-(zen / go) fixes the discovery base URL (`https://opencode.ai/inference/v1` or
-`https://opencode.ai/inference/go/v1`) and the credential (`public` for zen, a
-real API key for go). The documented console bases
-(`https://opencode.ai/inference` and `https://opencode.ai/inference/go`) and the
-previous bases (`https://opencode.ai/zen/v1` and
-`https://opencode.ai/zen/go/v1`) resolve at send time and are never rewritten
-in the database.
+Select the Zen or Go tier in the dashboard. Zen uses the key `public`; Go
+requires an opencode.ai API key. airouter selects the upstream API format and
+endpoint for each model automatically. Custom and self-hosted URLs are used
+unchanged.
 
-The wire format and path are model-dependent, not fixed. The proxy selects the
-model's native API family from the embedded catalog and sends requests to the
-matching official endpoint:
-
-| Family | Zen | Go |
-|---|---|---|
-| OpenAI Chat Completions | `/inference/openai/v1/chat/completions` | `/inference/go/openai/v1/chat/completions` |
-| OpenAI Responses | `/inference/openai/v1/responses` | `/inference/go/openai/v1/responses` |
-| Anthropic Messages | `/inference/anthropic/v1/messages` | `/inference/go/anthropic/v1/messages` |
-
-Model discovery stays on `/inference/v1/models` or
-`/inference/go/v1/models`, not on a family base. Custom and self-hosted base
-URLs are used unchanged, including their path and discoverable `/models`.
-
-All upstream requests carry the opencode client fingerprint (the zen tier
-rate-limits traffic without it), and reasoning levels are clamped to what each
-upstream model accepts. A successful dashboard Check confirms only that model
-discovery succeeded; it does not prove inference or model access.
-
-Free-tier chat models are restricted by OpenCode to the OpenCode client.
-Other clients are documented to receive HTTP 403, and free access through this
-proxy is not guaranteed. Paid Zen models and OpenCode Go are the supported
-paths for third-party clients.
+A successful dashboard Check confirms model discovery, not inference access.
+Free-model access depends on OpenCode's upstream restrictions and is not
+guaranteed. Paid Zen models and OpenCode Go are the supported paths for
+third-party clients.
 
 ## Client API
 
@@ -180,6 +157,13 @@ Flags override environment variables.
 Debug logs never include request or response bodies. Capture full exchanges from
 **Dashboard > Settings**, or use `-har-file`. HAR files include prompts,
 responses, authorization headers, and provider credentials.
+
+### OpenCode session diagnostics
+
+With `-debug=2`, official OpenCode free-model requests log session and connection
+metadata without adding requests or retries. Session identifiers are masked;
+prompts, bodies, and credentials are not logged. Keep these logs private because
+they can link requests within one server run.
 
 ## Security and data
 

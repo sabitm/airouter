@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNormalizeIdentity(t *testing.T) {
@@ -320,6 +321,81 @@ func TestSessionMapLRUEvictsLeastRecent(t *testing.T) {
 	}
 	if got := m.ClientSession("b"); got == second {
 		t.Fatal("least-recent key survived eviction")
+	}
+}
+
+func TestSessionMapLookupMetadata(t *testing.T) {
+	m := NewSessionMap(2)
+	before := time.Now()
+	first, miss := m.ClientSessionWithLookup("a")
+	if !miss.Mapped || miss.Hit || miss.CreatedAt.Before(before) || miss.CreatedAt.After(time.Now()) {
+		t.Fatalf("first lookup = %+v", miss)
+	}
+	again, hit := m.ClientSessionWithLookup("a")
+	if again != first || !hit.Mapped || !hit.Hit || !hit.CreatedAt.Equal(miss.CreatedAt) {
+		t.Fatalf("repeat lookup = %q %+v, first = %q %+v", again, hit, first, miss)
+	}
+	if m.ClientSession("a") != first {
+		t.Fatal("legacy helper changed mapping")
+	}
+	second, _ := m.ClientSessionWithLookup("b")
+	m.ClientSessionWithLookup("a")
+	m.ClientSessionWithLookup("c")
+	if m.ClientSession("a") != first {
+		t.Fatal("diagnostic lookup did not update LRU recency")
+	}
+	replaced, miss := m.ClientSessionWithLookup("b")
+	if replaced == second || miss.Hit || !miss.Mapped || m.Len() != 2 {
+		t.Fatalf("evicted lookup = %q %+v len=%d", replaced, miss, m.Len())
+	}
+
+	fallback, fmiss := m.FallbackSessionWithLookup("nonce", 1, ZenBaseURL, "public", "")
+	fagain, fhit := m.FallbackSessionWithLookup("nonce", 1, ZenBaseURL, "public", "")
+	if fallback != fagain || fmiss.Hit || !fmiss.Mapped || !fhit.Hit || !fhit.CreatedAt.Equal(fmiss.CreatedAt) {
+		t.Fatalf("fallback lookup mismatch: %+v %+v", fmiss, fhit)
+	}
+	if m.FallbackSession("nonce", 1, ZenBaseURL, "public", "") != fallback {
+		t.Fatal("legacy fallback helper changed mapping")
+	}
+	for _, candidate := range []string{"", "ses_0123456789abABCDEFGHIJKLMN"} {
+		got, lookup := m.ClientSessionWithLookup(candidate)
+		if got != candidate || lookup != (SessionLookup{}) {
+			t.Fatalf("unmapped candidate = %q %+v", got, lookup)
+		}
+	}
+	var absent *SessionMap
+	if got, lookup := absent.ClientSessionWithLookup("a"); got != "" || lookup != (SessionLookup{}) {
+		t.Fatalf("nil client map = %q %+v", got, lookup)
+	}
+	if got, lookup := absent.FallbackSessionWithLookup("nonce", 1, ZenBaseURL, "public", ""); got != "" || lookup != (SessionLookup{}) {
+		t.Fatalf("nil fallback map = %q %+v", got, lookup)
+	}
+}
+
+func TestSessionMapLookupConcurrent(t *testing.T) {
+	m := NewSessionMap(8)
+	var wg sync.WaitGroup
+	ids := make([]string, 32)
+	lookups := make([]SessionLookup, len(ids))
+	for i := range ids {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], lookups[i] = m.ClientSessionWithLookup("same")
+		}(i)
+	}
+	wg.Wait()
+	misses := 0
+	for i, lookup := range lookups {
+		if ids[i] != ids[0] || !lookup.Mapped || !lookup.CreatedAt.Equal(lookups[0].CreatedAt) {
+			t.Fatalf("concurrent lookup %d diverged: %q %+v", i, ids[i], lookup)
+		}
+		if !lookup.Hit {
+			misses++
+		}
+	}
+	if misses != 1 || m.Len() != 1 {
+		t.Fatalf("misses=%d len=%d", misses, m.Len())
 	}
 }
 

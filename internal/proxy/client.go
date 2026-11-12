@@ -670,6 +670,10 @@ func applyOpencodeHeaders(req *http.Request, provider *domain.Provider, ctx cont
 		if sid != "" {
 			req.Header.Set("x-opencode-session", sid)
 		}
+		if provider != nil && provider.Protocol == domain.ProtocolOpencode && opencode.UseV2Profile(req.URL.String(), reqModelFromBody(body)) {
+			opencode.FingerprintV2Headers(req.Header, req.Header.Get("x-opencode-session"))
+			return
+		}
 		// Drop an unvalidated mirror before free fingerprinting. The helper then
 		// writes only the session resolved above, so a conflicting copy cannot drift.
 		req.Header.Del(opencode.SessionIDHeader)
@@ -683,9 +687,11 @@ func applyOpencodeHeaders(req *http.Request, provider *domain.Provider, ctx cont
 // resolved for the current upstream attempt. Client Session stays on identity;
 // session is rewritten per provider so failover does not reuse a fallback.
 type opencodeReqState struct {
-	identity opencode.Identity
-	nonce    string
-	session  string
+	identity          opencode.Identity
+	nonce             string
+	session           string
+	sessionLookup     opencode.SessionLookup
+	sessionResolution string
 	// sessions is the Proxy that owns this request. Nil keeps deterministic
 	// ResolveSession, including direct header helpers without a Proxy.
 	sessions *opencode.SessionMap
@@ -753,17 +759,26 @@ func prepareOpencodeSession(ctx context.Context, provider *domain.Provider, body
 	}
 	transcript := opencode.AccumulateAssistantText(body)
 	sid := opencode.ResolveSession(id, nonce, providerID, baseURL, apiKey, transcript)
+	resolution := "fallback"
+	if opencode.IsNativeSessionID(id.Session) {
+		resolution = "native"
+	} else if id.Session != "" {
+		resolution = "mapped_client"
+	}
+	var lookup opencode.SessionLookup
 	if st != nil && st.sessions != nil && opencode.NeedsFreeTier(baseURL, reqModelFromBody(body)) {
 		if opencode.IsNativeSessionID(id.Session) {
 			sid = id.Session
 		} else if id.Session != "" {
-			sid = st.sessions.ClientSession(id.Session)
+			sid, lookup = st.sessions.ClientSessionWithLookup(id.Session)
 		} else {
-			sid = st.sessions.FallbackSession(nonce, providerID, baseURL, apiKey, transcript)
+			sid, lookup = st.sessions.FallbackSessionWithLookup(nonce, providerID, baseURL, apiKey, transcript)
 		}
 	}
 	if st != nil {
 		st.session = sid
+		st.sessionLookup = lookup
+		st.sessionResolution = resolution
 	}
 	if t := traceInfoFrom(ctx); t != nil {
 		t.OpencodeSessionID = sid
@@ -778,7 +793,14 @@ func prepareOpencodeFreeTier(ctx context.Context, backend codec, provider *domai
 	if provider == nil || !opencode.NeedsFreeTier(provider.BaseURL, reqModelFromBody(body)) {
 		return body, nil
 	}
-	out, mapping, err := opencode.PrepareFreeTierBody(body, backend.id)
+	var out []byte
+	var mapping opencode.ToolMap
+	var err error
+	if provider.Protocol == domain.ProtocolOpencode && opencode.UseV2Profile(upstreamURL(provider, backend.upstreamPath), reqModelFromBody(body)) {
+		out, mapping, err = opencode.PrepareV2Body(body, backend.id)
+	} else {
+		out, mapping, err = opencode.PrepareFreeTierBody(body, backend.id)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1042,7 +1064,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if harRecorder(ctx) != nil {
 			harHdr = req.Header.Clone()
 		}
-		resp, err := p.upstreamClient(provider, url, wire, false).Do(req)
+		resp, err := p.doUpstreamRequest(req, provider, wire, false)
 		if err != nil {
 			if harRecorder(ctx) != nil {
 				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, 0, nil, nil, "", 0, err.Error())
@@ -1171,7 +1193,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		if harRecorder(ctx) != nil {
 			harHdr = req.Header.Clone()
 		}
-		resp, err := p.upstreamClient(provider, url, wire, true).Do(req)
+		resp, err := p.doUpstreamRequest(req, provider, wire, true)
 		if err != nil {
 			if harRecorder(ctx) != nil {
 				p.recordUpstreamHAR(ctx, started, time.Since(started), req.Method, url, harHdr, wire, 0, nil, nil, "", 0, err.Error())

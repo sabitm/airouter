@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"airouter/internal/proxy/ir"
 )
 
 // FingerprintTools are the lowercase names the Zen free-tier gate expects.
@@ -24,11 +26,15 @@ var decoyToolSchema = json.RawMessage(`{"type":"object","properties":{}}`)
 type ToolMap struct {
 	SentToCaller map[string]string
 	Decoys       map[string]bool
+	// Allowed is non-nil only for the v2 profile. Names match exactly, not by case.
+	Allowed       map[string]bool
+	NoTools       bool
+	FragmentNames bool
 }
 
 // Active reports whether response restoration or decoy rejection must run.
 func (m ToolMap) Active() bool {
-	return len(m.SentToCaller) > 0 || len(m.Decoys) > 0
+	return m.Allowed != nil || len(m.SentToCaller) > 0 || len(m.Decoys) > 0
 }
 
 // NeedsFreeTier reports whether a Zen request for model must carry the free
@@ -390,9 +396,8 @@ func rewriteChatToolCalls(raw json.RawMessage, mapping ToolMap) (json.RawMessage
 			continue
 		}
 		name := rawString(fn["name"])
-		key := fingerprintKey(name)
-		caller, ok := mapping.SentToCaller[key]
-		if !ok || caller != name {
+		key := callerWireName(name, mapping)
+		if key == "" {
 			continue
 		}
 		fn["name"], _ = json.Marshal(key)
@@ -458,9 +463,8 @@ func rewriteFunctionCallItem(raw json.RawMessage, mapping ToolMap) (json.RawMess
 		return raw, false
 	}
 	name := rawString(item["name"])
-	key := fingerprintKey(name)
-	caller, ok := mapping.SentToCaller[key]
-	if !ok || caller != name {
+	key := callerWireName(name, mapping)
+	if key == "" {
 		return raw, false
 	}
 	item["name"], _ = json.Marshal(key)
@@ -534,9 +538,8 @@ func rewriteContentToolUses(content json.RawMessage, mapping ToolMap) (json.RawM
 			continue
 		}
 		name := rawString(block["name"])
-		key := fingerprintKey(name)
-		caller, ok := mapping.SentToCaller[key]
-		if !ok || caller != name {
+		key := callerWireName(name, mapping)
+		if key == "" {
 			continue
 		}
 		block["name"], _ = json.Marshal(key)
@@ -663,6 +666,18 @@ func ambiguousToolError(key, a, b string) error {
 // Decoy calls return an error so the caller never sees an injected tool.
 // Unknown names pass through.
 func RestoreCallerName(name string, mapping ToolMap) (string, error) {
+	if mapping.Allowed != nil {
+		if mapping.NoTools || mapping.Decoys[name] {
+			return "", ir.ProtocolError("opencode: model called unavailable tool")
+		}
+		if !mapping.Allowed[name] {
+			return "", ir.ProtocolError("opencode: model called undeclared tool")
+		}
+		if caller, ok := mapping.SentToCaller[name]; ok {
+			return caller, nil
+		}
+		return name, nil
+	}
 	key := fingerprintKey(name)
 	if key == "" {
 		key = strings.TrimSpace(name)
@@ -677,6 +692,22 @@ func RestoreCallerName(name string, mapping ToolMap) (string, error) {
 		return caller, nil
 	}
 	return name, nil
+}
+
+func callerWireName(name string, mapping ToolMap) string {
+	if mapping.Allowed != nil {
+		for wire, caller := range mapping.SentToCaller {
+			if caller == name {
+				return wire
+			}
+		}
+		return ""
+	}
+	key := fingerprintKey(name)
+	if caller, ok := mapping.SentToCaller[key]; ok && caller == name {
+		return key
+	}
+	return ""
 }
 
 func canonicalOr(name, key string) string {

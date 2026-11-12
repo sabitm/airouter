@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/crypto/cryptobyte"
 )
 
 func freeTierRootPool(t *testing.T, srv *httptest.Server) *x509.CertPool {
@@ -346,24 +348,21 @@ func TestFreeTierTransportProxyRefusalIsError(t *testing.T) {
 	}
 }
 
-// TestClientHelloSpecGolden pins the mirrored ClientHello against the captured
-// CLI-runtime handshake. The free gate keys on these details; any change here
-// requires a live probe of big-pickle before landing.
-func TestClientHelloSpecGolden(t *testing.T) {
-	spec := newClientHelloSpec()
-	expect := []uint16{
+// These values come from the initial OpenCode 1.19.5 / Bun 1.4.4 capture.
+// Keep literal IDs independent of the production spec so drift fails tests.
+func assertNativeClientHelloSpec(t *testing.T, spec *utls.ClientHelloSpec) {
+	t.Helper()
+	wantCiphers := []uint16{
 		0x1301, 0x1302, 0x1303,
 		0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8,
 		0xc009, 0xc013, 0xc00a, 0xc014,
 		0x009c, 0x009d, 0x002f, 0x0035,
 	}
-	if len(spec.CipherSuites) != len(expect) {
-		t.Fatalf("cipher suites = %x, want %x", spec.CipherSuites, expect)
+	if !slices.Equal(spec.CipherSuites, wantCiphers) {
+		t.Fatalf("cipher suites = %x, want %x", spec.CipherSuites, wantCiphers)
 	}
-	for i := range expect {
-		if spec.CipherSuites[i] != expect[i] {
-			t.Fatalf("cipher suite %d = %04x, want %04x (full %x)", i, spec.CipherSuites[i], expect[i], spec.CipherSuites)
-		}
+	if !slices.Equal(spec.CompressionMethods, []byte{0}) {
+		t.Fatalf("compression = %x, want [0]", spec.CompressionMethods)
 	}
 	wantExtTypes := []string{
 		"*tls.SNIExtension",
@@ -388,12 +387,129 @@ func TestClientHelloSpecGolden(t *testing.T) {
 			t.Fatalf("extension %d = %s, want %s", i, gotType, wantType)
 		}
 	}
-	alpn, ok := spec.Extensions[6].(*utls.ALPNExtension)
-	if !ok {
-		t.Fatalf("extension 6 = %T, want ALPN", spec.Extensions[6])
+	curves := spec.Extensions[3].(*utls.SupportedCurvesExtension).Curves
+	if !slices.Equal(curves, []utls.CurveID{4588, 29, 23, 24}) {
+		t.Fatalf("supported groups = %v, want [4588 29 23 24]", curves)
 	}
-	if len(alpn.AlpnProtocols) != 1 || alpn.AlpnProtocols[0] != "http/1.1" {
-		t.Fatalf("ALPN = %v, want [http/1.1]", alpn.AlpnProtocols)
+	points := spec.Extensions[4].(*utls.SupportedPointsExtension).SupportedPoints
+	if !slices.Equal(points, []byte{0}) {
+		t.Fatalf("point formats = %v, want [0]", points)
+	}
+	alpn := spec.Extensions[6].(*utls.ALPNExtension).AlpnProtocols
+	if !slices.Equal(alpn, []string{"http/1.1"}) {
+		t.Fatalf("ALPN = %v, want [http/1.1]", alpn)
+	}
+	signatures := spec.Extensions[8].(*utls.SignatureAlgorithmsExtension).SupportedSignatureAlgorithms
+	wantSignatures := []utls.SignatureScheme{
+		0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501,
+		0x0806, 0x0601, 0x0807, 0x0603, 0x0201,
+	}
+	if !slices.Equal(signatures, wantSignatures) {
+		t.Fatalf("signature algorithms = %x, want %x", signatures, wantSignatures)
+	}
+	shares := spec.Extensions[10].(*utls.KeyShareExtension).KeyShares
+	if len(shares) != 2 || shares[0].Group != 4588 || shares[1].Group != 29 {
+		t.Fatal("key shares must be X25519MLKEM768 followed by X25519")
+	}
+	modes := spec.Extensions[11].(*utls.PSKKeyExchangeModesExtension).Modes
+	if !slices.Equal(modes, []byte{1}) {
+		t.Fatalf("PSK modes = %v, want [1]", modes)
+	}
+	versions := spec.Extensions[12].(*utls.SupportedVersionsExtension).Versions
+	if !slices.Equal(versions, []uint16{0x0304, 0x0303}) {
+		t.Fatalf("supported versions = %x, want [0304 0303]", versions)
+	}
+}
+
+func TestClientHelloSpecGolden(t *testing.T) {
+	assertNativeClientHelloSpec(t, newClientHelloSpec())
+}
+
+func TestClientHelloWireGolden(t *testing.T) {
+	client, server := net.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	conn := newFreeTierUConn(client, "opencode.ai", nil)
+	done := make(chan error, 1)
+	go func() { done <- conn.HandshakeContext(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		client.Close()
+		server.Close()
+		<-done
+	})
+	if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(server, header); err != nil {
+		t.Fatal(err)
+	}
+	if header[0] != 22 || binary.BigEndian.Uint16(header[1:3]) != 0x0301 {
+		t.Fatalf("TLS record header = %x, want handshake with version 0301", header)
+	}
+	payload := make([]byte, binary.BigEndian.Uint16(header[3:5]))
+	if _, err := io.ReadFull(server, payload); err != nil {
+		t.Fatal(err)
+	}
+	// Pin structure and lengths only; random values and public keys vary per connection.
+	record := append(header, payload...)
+	if len(record) != 1502 {
+		t.Fatalf("ClientHello record length = %d, want 1502", len(record))
+	}
+	if payload[0] != 1 || int(payload[1])<<16|int(payload[2])<<8|int(payload[3]) != len(payload)-4 {
+		t.Fatal("invalid ClientHello handshake framing")
+	}
+	spec, err := (&utls.Fingerprinter{}).RawClientHello(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNativeClientHelloSpec(t, spec)
+
+	hello := cryptobyte.String(payload[4:])
+	var version uint16
+	var session, ciphers, compression, extensions cryptobyte.String
+	if !hello.ReadUint16(&version) || !hello.Skip(32) ||
+		!hello.ReadUint8LengthPrefixed(&session) || !hello.ReadUint16LengthPrefixed(&ciphers) ||
+		!hello.ReadUint8LengthPrefixed(&compression) || !hello.ReadUint16LengthPrefixed(&extensions) || !hello.Empty() {
+		t.Fatal("invalid ClientHello fields")
+	}
+	if version != 0x0303 || len(session) != 32 {
+		t.Fatalf("legacy version = %04x, session ID length = %d, want 0303 and 32", version, len(session))
+	}
+	for !extensions.Empty() {
+		var kind uint16
+		var data cryptobyte.String
+		if !extensions.ReadUint16(&kind) || !extensions.ReadUint16LengthPrefixed(&data) {
+			t.Fatal("invalid ClientHello extension framing")
+		}
+		switch kind {
+		case 0:
+			var names, name cryptobyte.String
+			var nameType uint8
+			if !data.ReadUint16LengthPrefixed(&names) || !data.Empty() ||
+				!names.ReadUint8(&nameType) || !names.ReadUint16LengthPrefixed(&name) || !names.Empty() ||
+				nameType != 0 || string(name) != "opencode.ai" {
+				t.Fatal("SNI must contain only opencode.ai")
+			}
+		case 51:
+			var shares cryptobyte.String
+			if !data.ReadUint16LengthPrefixed(&shares) || !data.Empty() {
+				t.Fatal("invalid key-share vector")
+			}
+			var got [][2]int
+			for !shares.Empty() {
+				var group uint16
+				var key cryptobyte.String
+				if !shares.ReadUint16(&group) || !shares.ReadUint16LengthPrefixed(&key) {
+					t.Fatal("invalid key-share entry")
+				}
+				got = append(got, [2]int{int(group), len(key)})
+			}
+			want := [][2]int{{4588, 1216}, {29, 32}}
+			if !slices.Equal(got, want) {
+				t.Fatalf("key-share groups and lengths = %v, want %v", got, want)
+			}
+		}
 	}
 }
 

@@ -19,15 +19,10 @@ import (
 	netproxy "golang.org/x/net/proxy"
 )
 
-// The Zen free-tier gate refuses inference POSTs whose TLS ClientHello looks
-// like a stock HTTP library. Measured against the live endpoint: default Go
-// net/http and a Go crypto/tls cipher override both receive 429
-// FreeUsageLimitError while the official CLI passes, and a uTLS handshake that
-// mirrors the CLI runtime's BoringSSL ClientHello passes with the identical
-// body and headers. The clientHelloSpec below reproduces that ClientHello
-// byte-for-byte (same cipher list and order, same extensions and order, ALPN
-// http/1.1 only, no GREASE and no post-quantum groups), so it must only be
-// adjusted together with a live probe.
+// OpenCode free-tier admission can depend on the TLS ClientHello. Keep the
+// initial profile aligned with passive captures of the native CLI: MITM
+// connections can be rejected even when direct CLI connections succeed.
+// Matching the captured fields does not guarantee free-tier access.
 
 const (
 	// freeTierHost is the only host the impersonated transport dials.
@@ -202,10 +197,9 @@ func newFreeTierUConn(conn net.Conn, host string, rootCAs *x509.CertPool) *utls.
 	return uconn
 }
 
-// newClientHelloSpec mirrors the CLI runtime's BoringSSL ClientHello: exact
-// cipher list and order, exact extension list and order, single X25519 key
-// share, no GREASE, no post-quantum groups. Verified live against the free
-// gate; do not reorder or extend without a live probe.
+// newClientHelloSpec matches the initial ClientHello captured from OpenCode
+// 1.19.5 / Bun 1.4.4. Cipher, extension, group, signature, and key-share order
+// are intentional. Session resumption is separate from this initial profile.
 func newClientHelloSpec() *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		CipherSuites: []uint16{
@@ -232,7 +226,7 @@ func newClientHelloSpec() *utls.ClientHelloSpec {
 			&utls.SNIExtension{},
 			&utls.ExtendedMasterSecretExtension{},
 			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
-			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{utls.X25519, utls.CurveP256, utls.CurveP384}},
+			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{utls.X25519MLKEM768, utls.X25519, utls.CurveP256, utls.CurveP384}},
 			&utls.SupportedPointsExtension{SupportedPoints: []byte{0x00}},
 			&utls.SessionTicketExtension{},
 			&utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}},
@@ -246,10 +240,12 @@ func newClientHelloSpec() *utls.ClientHelloSpec {
 				utls.PKCS1WithSHA384,
 				utls.PSSWithSHA512,
 				utls.PKCS1WithSHA512,
+				utls.Ed25519,
+				utls.ECDSAWithP521AndSHA512,
 				utls.PKCS1WithSHA1,
 			}},
 			&utls.SCTExtension{},
-			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519}}},
+			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519MLKEM768}, {Group: utls.X25519}}},
 			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{1}},
 			&utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13, utls.VersionTLS12}},
 		},

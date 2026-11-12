@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const maxIdentityBytes = 256
@@ -313,8 +314,17 @@ const (
 )
 
 type sessionEntry struct {
-	key [32]byte
-	sid string
+	key       [32]byte
+	sid       string
+	createdAt time.Time
+}
+
+// SessionLookup describes the existing map lookup, not upstream admission.
+// CreatedAt measures local entry age, not the age encoded in a native ID.
+type SessionLookup struct {
+	Mapped    bool
+	Hit       bool
+	CreatedAt time.Time
 }
 
 // SessionMap is a per-Proxy LRU of generated free-tier session ids. Keys are
@@ -343,11 +353,17 @@ func NewSessionMap(capacity int) *SessionMap {
 // An explicit native id is returned unchanged and is not stored. Empty input
 // stays empty. The same candidate is stable until eviction or restart.
 func (m *SessionMap) ClientSession(candidate string) string {
+	sid, _ := m.ClientSessionWithLookup(candidate)
+	return sid
+}
+
+// ClientSessionWithLookup returns the same mapping plus lookup metadata.
+func (m *SessionMap) ClientSessionWithLookup(candidate string) (string, SessionLookup) {
 	if candidate == "" || m == nil {
-		return ""
+		return "", SessionLookup{}
 	}
 	if IsNativeSessionID(candidate) {
-		return candidate
+		return candidate, SessionLookup{}
 	}
 	return m.sessionFor(clientSessionKey(candidate))
 }
@@ -356,8 +372,14 @@ func (m *SessionMap) ClientSession(candidate string) string {
 // Equal nonce, provider, stored base URL, API key, and transcript inputs stay
 // stable. Those inputs are hashed before storage.
 func (m *SessionMap) FallbackSession(nonce string, providerID int64, baseURL, apiKey, transcript string) string {
+	sid, _ := m.FallbackSessionWithLookup(nonce, providerID, baseURL, apiKey, transcript)
+	return sid
+}
+
+// FallbackSessionWithLookup returns the same mapping plus lookup metadata.
+func (m *SessionMap) FallbackSessionWithLookup(nonce string, providerID int64, baseURL, apiKey, transcript string) (string, SessionLookup) {
 	if m == nil {
-		return ""
+		return "", SessionLookup{}
 	}
 	return m.sessionFor(fallbackSessionKey(nonce, providerID, baseURL, apiKey, transcript))
 }
@@ -372,15 +394,17 @@ func (m *SessionMap) Len() int {
 	return m.order.Len()
 }
 
-func (m *SessionMap) sessionFor(key [32]byte) string {
+func (m *SessionMap) sessionFor(key [32]byte) (string, SessionLookup) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if el, ok := m.index[key]; ok {
 		m.order.MoveToFront(el)
-		return el.Value.(*sessionEntry).sid
+		entry := el.Value.(*sessionEntry)
+		return entry.sid, SessionLookup{Mapped: true, Hit: true, CreatedAt: entry.createdAt}
 	}
 	sid := NewSessionID()
-	el := m.order.PushFront(&sessionEntry{key: key, sid: sid})
+	createdAt := time.Now()
+	el := m.order.PushFront(&sessionEntry{key: key, sid: sid, createdAt: createdAt})
 	m.index[key] = el
 	for m.order.Len() > m.capacity {
 		old := m.order.Back()
@@ -390,7 +414,7 @@ func (m *SessionMap) sessionFor(key [32]byte) string {
 		m.order.Remove(old)
 		delete(m.index, old.Value.(*sessionEntry).key)
 	}
-	return sid
+	return sid, SessionLookup{Mapped: true, CreatedAt: createdAt}
 }
 
 func clientSessionKey(candidate string) [32]byte {

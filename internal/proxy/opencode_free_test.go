@@ -244,8 +244,8 @@ func TestOpencodeFreeTierMatrix(t *testing.T) {
 		sse     func() string
 	}{
 		{name: "chat-backend", model: "big-pickle", codecID: "opencode-chat", sse: func() string { return freeChatToolSSE("bash", freeToolArgs) }},
-		{name: "responses-backend", model: "muse-spark-1.3-contributor-free", codecID: "opencode-responses", sse: func() string { return freeResponsesToolSSE("bash", freeToolArgs) }},
-		{name: "messages-backend", model: "minimax-m3-free", codecID: "opencode-messages", sse: func() string { return freeAnthropicToolSSE("bash", freeToolArgs) }},
+		{name: "responses-backend", model: "muse-spark-1.3-contributor-free", codecID: "opencode-responses", sse: func() string { return freeResponsesToolSSE("Bash", freeToolArgs) }},
+		{name: "messages-backend", model: "minimax-m3-free", codecID: "opencode-messages", sse: func() string { return freeAnthropicToolSSE("Bash", freeToolArgs) }},
 	}
 	for _, backend := range backends {
 		for _, ing := range ingresses {
@@ -311,13 +311,21 @@ func TestOpencodeFreeToolLessBackends(t *testing.T) {
 				t.Fatal(err)
 			}
 			var tools []json.RawMessage
-			if err := json.Unmarshal(root["tools"], &tools); err != nil || len(tools) != 4 {
+			wantCount := 4
+			if got.ua == opencode.V2UserAgent {
+				wantCount = 2
+			}
+			if err := json.Unmarshal(root["tools"], &tools); err != nil || len(tools) != wantCount {
 				t.Fatalf("decoy count = %d body=%s", len(tools), got.body)
 			}
 			if backend.codecID != "opencode-messages" {
 				var choice string
 				if err := json.Unmarshal(root["tool_choice"], &choice); err != nil || choice != "none" {
 					t.Fatalf("tool_choice = %s body=%s", root["tool_choice"], got.body)
+				}
+			} else if got.ua == opencode.V2UserAgent {
+				if !bytes.Equal(root["tool_choice"], []byte(`{"type":"none"}`)) {
+					t.Fatal("tool-less Messages choice changed")
 				}
 			} else if len(root["tool_choice"]) != 0 {
 				t.Fatalf("messages invented tool_choice: %s", got.body)
@@ -445,7 +453,11 @@ func TestOpencodeFreeIdentityAllBackends(t *testing.T) {
 				if !opencode.IsNativeSessionID(got.session) || got.session == opencode.NativeSessionID("client-session") || got.session == otherSes {
 					t.Fatalf("generic session was not proxy-mapped: %q", got.session)
 				}
-				if got.ua != "opencode/1.2.3" || got.client != "my-cli" || got.request != nativeReq || got.sessionID != got.session || len(got.sessionIDValues) != 1 {
+				wantUA, wantRequest := "opencode/1.2.3", nativeReq
+				if ing.model != "big-pickle" {
+					wantUA, wantRequest = opencode.V2UserAgent, ""
+				}
+				if got.ua != wantUA || got.client != "my-cli" || got.request != wantRequest || got.sessionID != got.session || len(got.sessionIDValues) != 1 {
 					t.Fatalf("caller identity = ua=%q client=%q request=%q session=%q mirror=%q values=%v", got.ua, got.client, got.request, got.session, got.sessionID, got.sessionIDValues)
 				}
 				if got.session == otherSes {
@@ -487,7 +499,11 @@ func TestOpencodeFreeIdentityAllBackends(t *testing.T) {
 					t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 				}
 				got := cap.snapshot()
-				if got.ua != opencode.FreeUserAgent || got.client != opencode.FreeClient {
+				wantUA := opencode.FreeUserAgent
+				if ing.model != "big-pickle" {
+					wantUA = opencode.V2UserAgent
+				}
+				if got.ua != wantUA || got.client != opencode.FreeClient {
 					t.Fatalf("malformed identity not replaced: ua=%q client=%q", got.ua, got.client)
 				}
 				if !opencode.IsNativeSessionID(got.session) || got.session == nativeSes || strings.ContainsAny(got.session, "\r\n") {
@@ -628,7 +644,11 @@ func TestOpencodeFreeHeadersPreservePreparedBody(t *testing.T) {
 			if !opencode.IsNativeSessionID(wantSession) || wire.session != wantSession || wire.sessionID != wantSession || len(wire.sessionIDValues) != 1 {
 				t.Fatalf("session=%q mirror=%q values=%v want=%q", wire.session, wire.sessionID, wire.sessionIDValues, wantSession)
 			}
-			if tc.caller {
+			if opencode.UseV2Profile(opencode.ZenBaseURL+tc.path, reqModelFromBody(prepared)) {
+				if wire.ua != opencode.V2UserAgent || wire.request != "" {
+					t.Fatal("v2 header identity mismatch")
+				}
+			} else if tc.caller {
 				if wire.ua != "opencode/1.2.3" || wire.client != "my-cli" || wire.request != nativeReq {
 					t.Fatalf("caller identity lost: ua=%q client=%q request=%q", wire.ua, wire.client, wire.request)
 				}
@@ -1190,10 +1210,11 @@ func assertFreeUpstreamShape(t *testing.T, cap freeUpstreamSnapshot, codecID, au
 	if cap.accept != "text/event-stream" {
 		t.Fatalf("accept = %q", cap.accept)
 	}
-	if !opencode.IsNativeSessionID(cap.session) || !opencode.IsNativeRequestID(cap.request) {
+	v2 := cap.ua == opencode.V2UserAgent
+	if !opencode.IsNativeSessionID(cap.session) || !v2 && !opencode.IsNativeRequestID(cap.request) || v2 && cap.request != "" {
 		t.Fatalf("identity session=%q request=%q", cap.session, cap.request)
 	}
-	if cap.ua != opencode.FreeUserAgent {
+	if !v2 && cap.ua != opencode.FreeUserAgent {
 		t.Fatalf("UA = %q, want %q", cap.ua, opencode.FreeUserAgent)
 	}
 	if cap.client != opencode.FreeClient {
@@ -1251,6 +1272,17 @@ func assertFreeUpstreamShape(t *testing.T, cap freeUpstreamSnapshot, codecID, au
 			}
 		}
 		byName[name] = info
+	}
+	if v2 {
+		if callerTools && (byName["Bash"].desc != "caller-bash" || !strings.Contains(string(byName["Bash"].schema), "city") || byName["shell_client"].desc != "caller-shell") {
+			t.Fatal("v2 caller tool contract changed")
+		}
+		for _, name := range []string{"read", "shell"} {
+			if byName[name].desc == "" || len(byName[name].schema) == 0 {
+				t.Fatal("v2 reference definition missing")
+			}
+		}
+		return
 	}
 	if callerTools {
 		if byName["bash"].desc != "caller-bash" || !strings.Contains(string(byName["bash"].schema), "city") {
