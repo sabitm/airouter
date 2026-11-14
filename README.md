@@ -157,6 +157,47 @@ before a successful response is sent. Reported token usage is preserved and is
 not estimated from image bytes. HAR capture remains opt-in and truncates each
 body at 1 MiB, so a captured image can be incomplete.
 
+### Agent skill
+
+The distributable [`image-generation` skill](skills/image-generation/SKILL.md)
+uses this endpoint without adding tools to chat requests. It saves decoded PNGs
+in the agent's workspace. The chat provider does not need image-generation
+support. The image combo still requires an enabled Codex target.
+
+Copy the complete `skills/image-generation/` directory into your harness's skill
+location. Pi supports `.agents/skills/image-generation/` inside a project or
+`~/.agents/skills/image-generation/` for the current user. Other harnesses may
+use different locations. Reload skills or restart the harness after installing.
+In Pi, invoke `/skill:image-generation` explicitly if automatic selection does
+not load it. Installation does not change Airouter or install a runtime.
+
+The skill checks for Python 3.10+ first, then Node.js 22+. Both bundled helpers
+use built-in libraries only and accept the same arguments. If neither runtime
+is present, install one separately. Do not switch runtimes and resend after a
+generation failure because the first request may already have incurred charges.
+
+From this repository, generate one image with either command:
+
+```sh
+python3 skills/image-generation/scripts/generate_image.py --prompt "A cabin beside a lake, watercolor" --output images/cabin.png
+node skills/image-generation/scripts/generate_image.mjs --prompt "A cabin beside a lake, watercolor" --output images/cabin-node.png
+```
+
+Use only one command for each requested image. On Windows, use `py -3` or
+`python` instead of `python3` when that is the supported interpreter. Set
+`AIROUTER_URL`, `AIROUTER_IMAGE_MODEL`, and optional `AIROUTER_API_KEY` in the
+agent environment. The URL and combo default to `http://localhost:31415` and
+`image`. `--url` and `--model` override those defaults. No key is sent in open
+mode when `AIROUTER_API_KEY` is unset. Keep remote authenticated connections on
+HTTPS. The helpers connect directly without environment proxies or redirects.
+
+For batches, pass `--batch jobs.json` with a JSON array of `prompt`/`output`
+objects. Jobs may override `quality` and `background`. Relative output paths
+resolve from the process working directory. The queue runs serially, preserves
+successful files, and reports each result as one JSON line without base64 data.
+It never overwrites outputs or retries a failed job. See the skill for batch
+examples, supported controls, limits, and timeout guidance.
+
 ## Routing
 
 - A **provider** is an upstream URL, protocol, and credential. Optional tags
@@ -242,5 +283,16 @@ templ generate   # after editing internal/web/*.templ
 go test ./...
 go vet ./...
 ```
+
+Validate both skill helpers against local mock servers with Python 3.10+ and
+Node.js 22+ installed:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 skills/image-generation/tests/test_helpers.py
+```
+
+The suite reports when Node.js is unavailable and only the Python contract ran.
+It does not call a live provider. Windows users can omit the environment prefix
+and use their Python command.
 
 [MIT License](LICENSE)
