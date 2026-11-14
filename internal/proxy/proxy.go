@@ -75,6 +75,7 @@ type codec struct {
 	// request. Empty means text/event-stream; Kiro sets the binary EventStream
 	// media type. Ignored when this codec is an ingress.
 	streamAccept string
+	image        *imageCodec
 }
 
 var openaiCodec = codec{
@@ -544,6 +545,7 @@ func (p *Proxy) Mount(mux *http.ServeMux) {
 		{"POST", "/chat/completions", serve(openaiCodec)},
 		{"POST", "/messages", serve(anthropicCodec)},
 		{"POST", "/responses", serve(responsesCodec)},
+		{"POST", "/images/generations", serve(imagesCodec)},
 		{"GET", "/models", p.handleModels},
 	}
 	for _, rt := range routes {

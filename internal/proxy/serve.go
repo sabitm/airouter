@@ -367,6 +367,11 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		rec.Provider = targets[0].Provider.Name
 		rec.UpstreamModel = targets[0].UpstreamModel
 	}
+	if ingress.image != nil {
+		rec.Stream = false
+		p.serveImages(w, r, res, rec, ingress, combo, body)
+		return
+	}
 	// Inventory recognized attachments once before health ordering. Invalid
 	// media is a client error with zero upstream contact. Structural transport
 	// incompatibility filters targets before backoff skip credits are consumed.
@@ -732,8 +737,13 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 			return nil, msg
 		}
 	}
-	if len(compatible) == 1 {
-		return compatible, ""
+	return p.orderCompatibleTargets(combo, compatible), ""
+}
+
+// orderCompatibleTargets receives only structurally compatible active targets.
+func (p *Proxy) orderCompatibleTargets(combo *domain.Combo, compatible []domain.ComboTarget) []domain.ComboTarget {
+	if len(compatible) <= 1 {
+		return compatible
 	}
 	base := compatible
 	if combo.Strategy == domain.StrategyRoundRobin {
@@ -761,7 +771,7 @@ func (p *Proxy) orderTargets(ctx context.Context, combo *domain.Combo, ingress c
 			healthy = append(healthy, t)
 		}
 	}
-	return append(healthy, backedOff...), ""
+	return append(healthy, backedOff...)
 }
 
 // servePassthrough forwards the body unchanged except for the model rewrite,

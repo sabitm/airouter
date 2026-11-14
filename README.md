@@ -77,6 +77,7 @@ third-party clients.
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/images/generations` | OpenAI-compatible Images generation (Codex only) |
 | `GET /v1/models` | Configured combos |
 
 The same routes are available without `/v1`. Use a combo name as the request's
@@ -104,6 +105,57 @@ headers are the authoritative conversation identity for Codex caching. When no
 identity arrives, Airouter derives a fallback from an available initial
 conversation prefix. If no safe bounded anchor is available, Airouter uses a
 request-local key.
+
+## Codex image generation
+
+Use an existing Codex provider and create a combo whose upstream model is an
+image model. No separate credential is needed. For example, configure a combo
+named `image` with the upstream model `gpt-image-2.6-flare`:
+
+```sh
+curl http://localhost:31415/v1/images/generations \
+  -H "Authorization: Bearer sk-air-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"image","prompt":"Draw a cabin beside a lake"}'
+```
+
+The response contains one PNG image in `data[0].b64_json`. Decode that base64
+string to save the image. The route is also available as `/images/generations`.
+The configured upstream model ID is sent unchanged. Model availability depends
+on the provider and account. The linked references list `gpt-image-2`,
+`gpt-image-2.6-flare`, and `gpt-image-2.6-sunburst`; this does not establish an
+account entitlement or a bare `gpt-image-2.6` alias.
+
+| Field | Supported values |
+|---|---|
+| `model` | Required combo name |
+| `prompt` | Required nonempty string |
+| `n` | `1` (default) |
+| `size` | `auto` (default) |
+| `quality` | `auto` (default), `low`, `medium`, `high` |
+| `background` | `auto` (default), `opaque` |
+| `output_format` | `png` (default) |
+| `response_format` | `b64_json` (default) |
+| `stream` | Omitted or `false` |
+| `user` | Optional string, accepted locally but not sent upstream |
+
+Unsupported fields and controls return HTTP 400 before an upstream send. This
+version does not support edits, reference images, masks, fixed sizes, multiple
+images, transparent backgrounds, alternate formats, compression, streaming, or
+image-generation tools through `/v1/responses`. Accepted controls follow the
+native request format; live behavior can still depend on the upstream.
+
+Only enabled targets using the Codex protocol can serve this route. Incompatible
+targets are skipped without a health penalty. Existing combo round-robin and
+provider backoff rules still apply. Image failures can defer the same provider
+for later chat requests. Failover before a response is sent can generate and
+bill twice if an earlier upstream completed but its response was lost.
+
+Image requests use the five-minute unary timeout and the existing 64 MiB request
+and upstream-response limits. Returned base64 and its PNG signature are checked
+before a successful response is sent. Reported token usage is preserved and is
+not estimated from image bytes. HAR capture remains opt-in and truncates each
+body at 1 MiB, so a captured image can be incomplete.
 
 ## Routing
 

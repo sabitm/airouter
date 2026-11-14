@@ -349,7 +349,7 @@ func newRequestID() string {
 // new ingress route must be added here to be traced.
 func isProxyPath(p string) bool {
 	switch strings.TrimPrefix(p, "/v1") {
-	case "/messages", "/chat/completions", "/responses", "/models":
+	case "/messages", "/chat/completions", "/responses", "/models", "/images/generations":
 		return true
 	}
 	return false
