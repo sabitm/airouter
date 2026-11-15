@@ -275,7 +275,8 @@ func TestIsProxyPath(t *testing.T) {
 		{"/responses", true},
 		{"/models", true},
 		{"/images/generations", true},
-		{"/v1/images/edits", false},
+		{"/v1/images/edits", true},
+		{"/images/edits", true},
 		{"/dashboard/providers", false},
 		{"/dashboard", false},
 		{"/v1/unknown", false},
@@ -388,6 +389,108 @@ func TestImagesCORSAndPinnedHAR(t *testing.T) {
 			for _, sentinel := range []string{prompt, "provider-image-secret", png[:100]} {
 				if strings.Contains(logs.String(), sentinel) {
 					t.Fatal("image/auth payload leaked into terminal logs")
+				}
+			}
+		})
+	}
+}
+
+func TestImageEditsCORSAndPinnedHAR(t *testing.T) {
+	for _, path := range []string{"/v1/images/edits", "/images/edits"} {
+		t.Run(path, func(t *testing.T) {
+			ctrl := harlog.NewController(false, "image-edits", nil)
+			if err := ctrl.Start(); err != nil {
+				t.Fatal(err)
+			}
+			var logs bytes.Buffer
+			logger := observability.NewLogger(2, &logs)
+			st := newTestStore(t)
+			var requestID string
+			pngBytes := append([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, bytes.Repeat([]byte("image-payload"), harlog.MaxBody/8)...)
+			png := base64.StdEncoding.EncodeToString(pngBytes)
+			ref := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7X8AAAAASUVORK5CYII="
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				if r.URL.Path != "/images/edits" || r.Header.Get("Authorization") != "Bearer provider-image-secret" ||
+					!bytes.Contains(raw, []byte(ref)) || bytes.Contains(raw, []byte("output_format")) || bytes.Contains(raw, []byte("private-user")) {
+					t.Errorf("upstream request=%s body=%s", r.URL, raw)
+				}
+				if err := ctrl.Stop(); err != nil {
+					t.Error(err)
+				}
+				if state := ctrl.Status(); state.State != harlog.StateStopping || state.InFlight != 1 {
+					t.Errorf("request lease was not pinned: %+v", state)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"created": 123, "data": []any{map[string]any{"b64_json": png}}})
+			}))
+			t.Cleanup(up.Close)
+			provider := &domain.Provider{Name: "codex-image", BaseURL: up.URL, APIKey: "provider-image-secret", Protocol: domain.ProtocolOpenAICodex}
+			if err := st.CreateProvider(t.Context(), provider); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateCombo(t.Context(), &domain.Combo{Name: "image-combo", Targets: []domain.ComboTarget{{ProviderID: provider.ID, UpstreamModel: "gpt-image-2.6-flare", Enabled: true}}}); err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			proxy.New(st, logger).Mount(mux)
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestID = observability.RequestID(r.Context())
+				mux.ServeHTTP(w, r)
+			})
+			h := requestMiddleware(logger, ctrl, cors(inner))
+			preflight := httptest.NewRequest(http.MethodOptions, path, nil)
+			preflight.Header.Set("Origin", "https://image-client.example")
+			preflight.Header.Set("Access-Control-Request-Method", "POST")
+			pre := httptest.NewRecorder()
+			cors(inner).ServeHTTP(pre, preflight)
+			if pre.Code != 204 || pre.Header().Get("Access-Control-Allow-Origin") != "https://image-client.example" {
+				t.Fatalf("edit preflight=%d %v", pre.Code, pre.Header())
+			}
+			const prompt = "private-image-prompt-sentinel"
+			r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"image-combo","prompt":"`+prompt+`","user":"private-user","images":[{"image_url":"`+ref+`"}]}`))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Origin", "https://image-client.example")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != 200 || requestID == "" || w.Header().Get(requestIDHeader) != requestID ||
+				w.Header().Get("Access-Control-Allow-Origin") != "https://image-client.example" {
+				t.Fatalf("edit response=%d %s %v", w.Code, w.Body.String(), w.Header())
+			}
+			if state := ctrl.Status(); state.State != harlog.StateStopped || state.Entries != 2 || state.Pages != 1 {
+				t.Fatalf("HAR state=%+v", state)
+			}
+			data, err := ctrl.Download()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc struct {
+				Log struct {
+					Entries []struct {
+						PageRef  string `json:"pageref"`
+						Response struct {
+							Content struct {
+								Text string `json:"text"`
+								Size int    `json:"size"`
+							} `json:"content"`
+						} `json:"response"`
+					} `json:"entries"`
+				} `json:"log"`
+			}
+			if err := json.Unmarshal(data, &doc); err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range doc.Log.Entries {
+				if entry.PageRef != "page_"+requestID || len(entry.Response.Content.Text) != harlog.MaxBody || entry.Response.Content.Size <= harlog.MaxBody {
+					t.Fatalf("HAR page/capture mismatch: page=%s bytes=%d size=%d", entry.PageRef, len(entry.Response.Content.Text), entry.Response.Content.Size)
+				}
+			}
+			if !strings.Contains(logs.String(), "request_id="+requestID) || !strings.Contains(logs.String(), "event=ingress_exchange") {
+				t.Fatalf("missing correlated trace metadata: %s", logs.String())
+			}
+			for _, sentinel := range []string{prompt, "provider-image-secret", png[:80], ref} {
+				if strings.Contains(logs.String(), sentinel) {
+					t.Fatal("edit image/auth payload leaked into terminal logs")
 				}
 			}
 		})

@@ -46,6 +46,7 @@ def success(**overrides):
 class MockServer:
     def __init__(self, respond=None):
         self.requests = []
+        self.entries = []
         self.active = 0
         self.max_active = 0
         self.lock = threading.Lock()
@@ -54,8 +55,13 @@ class MockServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
+                with mock.lock:
+                    mock.entries.append(self.path)
                 raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-                body = json.loads(raw)
+                try:
+                    body = json.loads(raw)
+                except (ValueError, UnicodeError):
+                    return
                 with mock.lock:
                     mock.requests.append({"path": self.path, "body": body, "headers": dict(self.headers)})
                     mock.active += 1
@@ -111,6 +117,7 @@ class HelperContract(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("image_helper", PYTHON_HELPER)
         helper = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(helper)
+        cls.helper = helper
         cls.png_dimensions = staticmethod(helper.png_dimensions)
         print("Helper runtimes: " + ", ".join(name for name, _ in cls.runtimes), file=sys.stderr)
 
@@ -142,6 +149,7 @@ class HelperContract(unittest.TestCase):
                 result = self.run_helper(command, ["--help"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("--batch", result.stdout)
+                self.assertIn("--image", result.stdout)
                 result = self.run_helper(command, ["--private-prompt"])
                 self.assertEqual(result.returncode, 2)
                 self.assert_private(result)
@@ -488,6 +496,470 @@ class HelperContract(unittest.TestCase):
                     self.assertEqual(len(mock.requests), 1)
                     for job in jobs:
                         self.assertFalse((self.root / job["output"]).exists())
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+
+
+    def data_url(self, mime, raw):
+        return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+    def write_ref(self, name, raw):
+        path = self.root / name
+        path.write_bytes(raw)
+        return path
+
+    def test_edit_contract_order_and_prefixes(self):
+        jpeg = b"\xff\xd8\xff\x00"
+        webp = b"RIFF" + struct.pack("<I", 4) + b"WEBP"
+        for name, command in self.runtimes:
+            for prefix in ("", "/v1/", "/proxy/v1"):
+                with self.subTest(runtime=name, prefix=prefix), MockServer() as mock:
+                    self.write_ref("first.png", PNG)
+                    self.write_ref("second.jpg", jpeg)
+                    self.write_ref("third.webp", webp)
+                    prompt = '  private-prompt edit "lake"\n'
+                    result = self.run_helper(command, ["--prompt", prompt, "--output", f"{name}-edit-{len(prefix)}.png",
+                                                      "--image", "first.png", "--image", "second.jpg", "--image", "third.webp",
+                                                      "--quality", "high", "--background", "opaque"],
+                                             {"AIROUTER_URL": mock.url + prefix, "AIROUTER_IMAGE_MODEL": "configured-image",
+                                              "AIROUTER_API_KEY": "test-api-secret"})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(mock.requests[0]["path"], "/proxy/v1/images/edits" if prefix.startswith("/proxy") else "/v1/images/edits")
+                    self.assertEqual(mock.requests[0]["headers"]["Authorization"], "Bearer test-api-secret")
+                    self.assertEqual(mock.requests[0]["body"], {
+                        "model": "configured-image", "prompt": prompt,
+                        "images": [{"image_url": self.data_url("image/png", PNG)},
+                                    {"image_url": self.data_url("image/jpeg", jpeg)},
+                                    {"image_url": self.data_url("image/webp", webp)}],
+                        "n": 1, "size": "auto", "quality": "high", "background": "opaque"})
+                    self.assertNotIn("private-input", result.stdout + result.stderr)
+                    self.assert_private(result)
+
+    def test_image_flag_rejected_with_batch_and_count_limits(self):
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name, case="flag"), MockServer() as mock:
+                result = self.run_helper(command, ["--image", "missing.png", "--batch", "missing.json", "--url", mock.url])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+                self.assertNotIn("missing.png", result.stdout + result.stderr)
+            with self.subTest(runtime=name, case="count"), MockServer() as mock:
+                args = ["--url", mock.url, "--prompt", "p", "--output", "out.png"]
+                for i in range(6):
+                    args.extend(["--image", f"ref-{i}.png"])
+                result = self.run_helper(command, args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+                self.assertFalse((self.root / "out.png").exists())
+
+    def test_mixed_batch_continues_and_does_not_fallback(self):
+        def respond(handler, body):
+            if body["prompt"] == "failure":
+                MockServer.send(handler, {"error": {"message": "private-upstream-body"}}, 500)
+            else:
+                MockServer.send(handler, success())
+
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name), MockServer(respond) as mock:
+                self.write_ref("ref.png", PNG)
+                self.write_ref("other.png", PNG + b"\x00")
+                jobs = [{"prompt": "generated", "output": f"{name}-gen.png"},
+                        {"prompt": "edited", "output": f"{name}-edit.png", "images": ["ref.png"], "quality": "low"},
+                        {"prompt": "failure", "output": f"{name}-fail.png", "images": ["other.png"]},
+                        {"prompt": "after", "output": f"{name}-after.png", "background": "opaque"}]
+                batch = self.root / "mixed.json"
+                batch.write_text(json.dumps(jobs), encoding="utf-8")
+                result = self.run_helper(command, ["--url", mock.url, "--batch", str(batch)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual([row["ok"] for row in self.rows(result)], [True, True, False, True])
+                self.assertEqual(self.rows(result)[2]["error"], "http_error")
+                self.assertEqual([item["path"] for item in mock.requests],
+                                 ["/v1/images/generations", "/v1/images/edits", "/v1/images/edits", "/v1/images/generations"])
+                self.assertEqual(mock.requests[1]["body"]["images"], [{"image_url": self.data_url("image/png", PNG)}])
+                self.assertNotIn("output_format", mock.requests[1]["body"])
+                self.assertEqual(mock.requests[0]["body"]["output_format"], "png")
+                self.assertEqual(mock.max_active, 1)
+                self.assertFalse((self.root / f"{name}-fail.png").exists())
+                self.assertTrue((self.root / f"{name}-edit.png").is_file())
+                self.assert_private(result)
+
+    def test_invalid_later_reference_sends_nothing(self):
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name), MockServer() as mock:
+                self.write_ref("ref.png", PNG)
+                jobs = [{"prompt": "first", "output": "first.png", "images": ["ref.png"]},
+                        {"prompt": "second", "output": "second.png", "images": ["missing-private-input.png"]}]
+                batch = self.root / "later.json"
+                batch.write_text(json.dumps(jobs), encoding="utf-8")
+                result = self.run_helper(command, ["--url", mock.url, "--batch", str(batch)])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+                self.assertFalse((self.root / "first.png").exists())
+                self.assertNotIn("missing-private-input.png", result.stdout + result.stderr)
+
+    def test_changed_reference_is_not_sent_and_queue_continues(self):
+        ref = self.write_ref("ref.png", PNG)
+
+        def respond(handler, body):
+            if body["prompt"] == "first":
+                data = bytearray(ref.read_bytes())
+                data[-1] ^= 1
+                ref.write_bytes(data)
+            MockServer.send(handler, success())
+
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name), MockServer(respond) as mock:
+                ref.write_bytes(PNG)
+                jobs = [{"prompt": "first", "output": f"{name}-first.png"},
+                        {"prompt": "second", "output": f"{name}-second.png", "images": ["ref.png"]},
+                        {"prompt": "third", "output": f"{name}-third.png"}]
+                batch = self.root / "mutate.json"
+                batch.write_text(json.dumps(jobs), encoding="utf-8")
+                result = self.run_helper(command, ["--url", mock.url, "--batch", str(batch)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                rows = self.rows(result)
+                self.assertEqual([row["ok"] for row in rows], [True, False, True])
+                self.assertEqual(rows[1]["error"], "reference_changed")
+                self.assertEqual([item["body"]["prompt"] for item in mock.requests], ["first", "third"])
+                self.assertFalse(any(item["path"].endswith("/images/edits") for item in mock.requests))
+                self.assertFalse((self.root / f"{name}-second.png").exists())
+                self.assertNotIn("ref.png", result.stdout + result.stderr)
+
+    def test_reference_aliases_symlinks_and_nonregular_files(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        for name, command in self.runtimes:
+            ref = self.write_ref("ref.png", PNG)
+            with self.subTest(runtime=name, case="duplicate"), MockServer() as mock:
+                jobs = [{"prompt": "p", "output": "out.png", "images": ["ref.png", "./ref.png"]}]
+                (self.root / "dup.json").write_text(json.dumps(jobs), encoding="utf-8")
+                result = self.run_helper(command, ["--url", mock.url, "--batch", str(self.root / "dup.json")])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+            with self.subTest(runtime=name, case="hardlink"), MockServer() as mock:
+                linked = self.root / f"{name}-linked.png"
+                try:
+                    if not linked.exists():
+                        os.link(ref, linked)
+                except OSError:
+                    self.skipTest("hardlinks unavailable")
+                jobs = [{"prompt": "p", "output": f"{name}-hard.png", "images": ["ref.png", linked.name]}]
+                (self.root / "link.json").write_text(json.dumps(jobs), encoding="utf-8")
+                result = self.run_helper(command, ["--url", mock.url, "--batch", str(self.root / "link.json")])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+            with self.subTest(runtime=name, case="same-output"), MockServer() as mock:
+                result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", "ref.png", "--output", "ref.png"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(ref.read_bytes(), PNG)
+                self.assertEqual(mock.requests, [])
+            with self.subTest(runtime=name, case="symlink"), MockServer() as mock:
+                link = self.root / f"{name}-link.png"
+                try:
+                    if not link.exists() and not link.is_symlink():
+                        link.symlink_to(ref)
+                except OSError:
+                    self.skipTest("symlinks not permitted")
+                result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", str(link), "--output", "out.png"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(mock.requests, [])
+            with self.subTest(runtime=name, case="parent-symlink-alias"), MockServer() as mock:
+                real = self.root / "real"
+                real.mkdir(exist_ok=True)
+                (real / "ref.png").write_bytes(PNG)
+                linkdir = self.root / "linkdir"
+                if not linkdir.exists():
+                    linkdir.symlink_to(real, target_is_directory=True)
+                result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", "real/ref.png", "--output", "linkdir/ref.png"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual((real / "ref.png").read_bytes(), PNG)
+                self.assertEqual(mock.requests, [])
+            with self.subTest(runtime=name, case="parent-symlink-file"), MockServer() as mock:
+                result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", "linkdir/ref.png", "--output", f"{name}-via-link.png"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(mock.requests[0]["path"], "/v1/images/edits")
+                self.assertEqual(mock.requests[0]["body"]["images"][0]["image_url"], self.data_url("image/png", PNG))
+            with self.subTest(runtime=name, case="directory"), MockServer() as mock:
+                directory = self.root / "dirref"
+                directory.mkdir(exist_ok=True)
+                result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", str(directory), "--output", "out.png"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+            if os.name == "posix":
+                with self.subTest(runtime=name, case="fifo"), MockServer() as mock:
+                    fifo = self.root / f"{name}.fifo"
+                    if not fifo.exists():
+                        os.mkfifo(fifo)
+                    result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", str(fifo), "--output", "out.png"])
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(mock.requests, [])
+                with self.subTest(runtime=name, case="device"), MockServer() as mock:
+                    result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", "/dev/null", "--output", "out.png"])
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn("/dev/null", result.stdout + result.stderr)
+                    self.assertEqual(mock.requests, [])
+
+    def test_reference_format_and_budget_rejections(self):
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name, case="gif"), MockServer() as mock:
+                self.write_ref("anim.gif", b"GIF89a" + b"\x00" * 8)
+                result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", "anim.gif", "--output", "out.png"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+            with self.subTest(runtime=name, case="file-budget"), MockServer() as mock:
+                huge = self.root / "huge.png"
+                with huge.open("wb") as stream:
+                    stream.write(b"\x89PNG\r\n\x1a\n")
+                    stream.seek((10 << 20))
+                    stream.write(b"\x00")
+                result = self.run_helper(command, ["--url", mock.url, "--prompt", "p", "--image", str(huge), "--output", "out.png"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+                self.assertFalse((self.root / "out.png").exists())
+            with self.subTest(runtime=name, case="total-budget"), MockServer() as mock:
+                paths = []
+                for i in range(4):
+                    item = self.root / f"part-{i}.png"
+                    with item.open("wb") as stream:
+                        stream.write(b"\x89PNG\r\n\x1a\n")
+                        stream.seek((9 << 20) - 1)
+                        stream.write(b"\x00")
+                    paths.append(item.name)
+                jobs = [{"prompt": "p", "output": "out.png", "images": paths}]
+                (self.root / "budget.json").write_text(json.dumps(jobs), encoding="utf-8")
+                result = self.run_helper(command, ["--url", mock.url, "--batch", str(self.root / "budget.json")])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(mock.requests, [])
+            with self.subTest(runtime=name, case="shared-reference"), MockServer() as mock:
+                self.write_ref("shared.png", PNG)
+                jobs = [{"prompt": "one", "output": f"{name}-one.png", "images": ["shared.png"]},
+                        {"prompt": "two", "output": f"{name}-two.png", "images": ["shared.png"]}]
+                (self.root / "shared.json").write_text(json.dumps(jobs), encoding="utf-8")
+                result = self.run_helper(command, ["--url", mock.url, "--batch", str(self.root / "shared.json")])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(mock.requests), 2)
+                self.assertTrue(all(item["path"] == "/v1/images/edits" for item in mock.requests))
+
+    def test_batch_references_resolve_from_cwd(self):
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name), MockServer() as mock:
+                batch_dir = self.root / "jobs"
+                batch_dir.mkdir(exist_ok=True)
+                (batch_dir / "ref.png").write_bytes(b"GIF89a-decoy")
+                self.write_ref("ref.png", PNG)
+                (batch_dir / "jobs.json").write_text(json.dumps([
+                    {"prompt": "p", "output": f"{name}-from-cwd.png", "images": ["ref.png"]}
+                ]), encoding="utf-8")
+                result = self.run_helper(command, ["--url", mock.url, "--batch", str(batch_dir / "jobs.json")])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(mock.requests[0]["body"]["images"][0]["image_url"], self.data_url("image/png", PNG))
+
+    def test_request_limit_constants(self):
+        self.assertEqual(self.helper.MAX_REQUEST_BYTES, 64 << 20)
+        self.assertEqual(self.helper.MAX_REFERENCE_BYTES, 10 << 20)
+        self.assertEqual(self.helper.MAX_REFERENCE_TOTAL_BYTES, 32 << 20)
+        self.assertFalse(self.helper.request_exceeds_limit(b"x"))
+        self.assertTrue(self.helper.request_exceeds_limit(bytes(self.helper.MAX_REQUEST_BYTES + 1)))
+        node = next((command[0] for runtime, command in self.runtimes if runtime == "node"), None)
+        if node is None:
+            return
+        script = """
+import { MAX_REQUEST_BYTES, MAX_REFERENCE_BYTES, MAX_REFERENCE_TOTAL_BYTES, requestExceedsLimit } from './scripts/generate_image.mjs';
+if (MAX_REQUEST_BYTES !== 67108864 || MAX_REFERENCE_BYTES !== 10485760 || MAX_REFERENCE_TOTAL_BYTES !== 33554432) process.exit(3);
+if (requestExceedsLimit(Buffer.alloc(1)) || !requestExceedsLimit(Buffer.alloc(MAX_REQUEST_BYTES + 1))) process.exit(4);
+"""
+        result = subprocess.run([node, "--input-type=module", "-e", script], cwd=ROOT, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def run_instrumented_helper(self, name, command, phase, action, args):
+        reference = self.root / "ref.png"
+        transport = self.root / f"{name}-transport.txt"
+        if name == "python":
+            script = r'''
+import os
+from pathlib import Path
+import runpy
+import signal
+import sys
+import urllib.request
+
+helper, reference, transport, phase, action = sys.argv[1:6]
+phase = int(phase)
+original_open, original_read, original_close = os.open, os.read, os.close
+opened = 0
+tracked = {}
+fired = False
+
+def open_reference(filename, flags, *args, **kwargs):
+    global opened
+    fd = original_open(filename, flags, *args, **kwargs)
+    if os.path.abspath(filename) == reference and not flags & (os.O_WRONLY | os.O_RDWR):
+        opened += 1
+        tracked[fd] = opened
+    return fd
+
+def read_reference(fd, size):
+    global fired
+    data = original_read(fd, size)
+    if data and tracked.get(fd) == phase and not fired:
+        fired = True
+        if action == "signal":
+            os.kill(os.getpid(), signal.SIGTERM)
+        else:
+            with open(reference, "ab") as stream:
+                stream.write(b"appended-during-read")
+    return data
+
+def close_reference(fd):
+    tracked.pop(fd, None)
+    return original_close(fd)
+
+original_send = urllib.request.OpenerDirector.open
+
+def send(opener, *args, **kwargs):
+    with open(transport, "a") as stream:
+        stream.write("request\n")
+    return original_send(opener, *args, **kwargs)
+
+os.open, os.read, os.close = open_reference, read_reference, close_reference
+urllib.request.OpenerDirector.open = send
+sys.argv = [helper] + sys.argv[6:]
+runpy.run_path(helper, run_name="__main__")
+'''
+            instrumented = [command[0], "-c", script, command[1], str(reference), str(transport), str(phase), action]
+        else:
+            script = r'''
+import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
+import path from 'node:path';
+const { reference, transport, phase, action } = CONFIG;
+const originalOpen = fs.openSync, originalRead = fs.readSync, originalClose = fs.closeSync;
+let opened = 0, fired = false;
+const tracked = new Map();
+fs.openSync = function(filename, flags, ...args) {
+  const fd = originalOpen.call(this, filename, flags, ...args);
+  const readable = typeof flags === 'number' ? !(flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) : flags === 'r';
+  if (path.resolve(String(filename)) === reference && readable) tracked.set(fd, ++opened);
+  return fd;
+};
+fs.readSync = function(fd, ...args) {
+  const count = originalRead.call(this, fd, ...args);
+  if (count && tracked.get(fd) === phase && !fired) {
+    fired = true;
+    if (action === 'signal') process.kill(process.pid, 'SIGTERM');
+    else fs.appendFileSync(reference, 'appended-during-read');
+  }
+  return count;
+};
+fs.closeSync = function(fd) {
+  tracked.delete(fd);
+  return originalClose.call(this, fd);
+};
+for (const client of [http, https]) {
+  const original = client.request;
+  client.request = function(...args) {
+    fs.appendFileSync(transport, 'request\n');
+    return original.apply(this, args);
+  };
+}
+'''
+            script = script.replace("CONFIG", json.dumps({"reference": str(reference), "transport": str(transport),
+                                                          "phase": phase, "action": action}))
+            preload = "data:text/javascript;base64," + base64.b64encode(script.encode()).decode("ascii")
+            instrumented = [command[0], "--import", preload, command[1]]
+        result = self.run_helper(instrumented, args)
+        sends = transport.read_text().splitlines() if transport.exists() else []
+        return result, sends
+
+    def test_reference_preflight_interruption_sends_nothing(self):
+        if os.name != "posix":
+            self.skipTest("POSIX signal delivery test")
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name), MockServer() as mock:
+                self.write_ref("ref.png", PNG)
+                output = f"{name}-preflight-stop.png"
+                result, sends = self.run_instrumented_helper(name, command, 1, "signal", [
+                    "--url", mock.url, "--prompt", "private-prompt", "--image", "ref.png", "--output", output])
+                self.assertEqual(result.returncode, 130, result.stderr)
+                self.assertEqual(sends, [])
+                self.assertEqual(mock.entries, [])
+                self.assertFalse((self.root / output).exists())
+                self.assert_private(result)
+
+    def test_final_reference_read_interruption_sends_nothing(self):
+        if os.name != "posix":
+            self.skipTest("POSIX signal delivery test")
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name), MockServer() as mock:
+                self.write_ref("ref.png", PNG)
+                output = f"{name}-final-stop.png"
+                result, sends = self.run_instrumented_helper(name, command, 2, "signal", [
+                    "--url", mock.url, "--prompt", "private-prompt", "--image", "ref.png", "--output", output])
+                self.assertEqual(result.returncode, 130, result.stderr)
+                self.assertEqual(self.rows(result)[0]["error"], "interrupted")
+                self.assertEqual(sends, [])
+                self.assertEqual(mock.entries, [])
+                self.assertFalse((self.root / output).exists())
+                self.assert_private(result)
+
+    def test_reference_growth_during_final_read_is_not_sent(self):
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name), MockServer() as mock:
+                reference = self.write_ref("ref.png", PNG)
+                jobs = [{"prompt": "private-prompt", "images": ["ref.png"], "output": f"{name}-grew.png"},
+                        {"prompt": "next", "output": f"{name}-after-growth.png"}]
+                batch = self.root / f"{name}-growth.json"
+                batch.write_text(json.dumps(jobs), encoding="utf-8")
+                result, sends = self.run_instrumented_helper(name, command, 2, "append", [
+                    "--url", mock.url, "--batch", str(batch)])
+                self.assertGreater(reference.stat().st_size, len(PNG))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual([row["ok"] for row in self.rows(result)], [False, True])
+                self.assertEqual(self.rows(result)[0]["error"], "reference_changed")
+                self.assertEqual(sends, ["request"])
+                self.assertEqual(mock.entries, ["/v1/images/generations"])
+                self.assertEqual([item["body"]["prompt"] for item in mock.requests], ["next"])
+                self.assertFalse((self.root / jobs[0]["output"]).exists())
+                self.assertTrue((self.root / jobs[1]["output"]).is_file())
+                self.assert_private(result)
+
+    def test_edit_interruption_cleans_reservations(self):
+        if os.name != "posix":
+            self.skipTest("POSIX signal delivery test")
+        started = threading.Event()
+
+        def delayed(handler, body):
+            started.set()
+            handler.send_response(200)
+            handler.send_header("Content-Length", "100")
+            handler.end_headers()
+            handler.wfile.write(b'{"data":')
+            handler.wfile.flush()
+            time.sleep(0.5)
+
+        for name, command in self.runtimes:
+            with self.subTest(runtime=name), MockServer(delayed) as mock:
+                started.clear()
+                self.write_ref("ref.png", PNG)
+                jobs = [{"prompt": str(i), "output": f"{name}-stop-{i}.png", "images": ["ref.png"]} for i in range(3)]
+                batch = self.root / "stop.json"
+                batch.write_text(json.dumps(jobs), encoding="utf-8")
+                proc = subprocess.Popen(command + ["--url", mock.url, "--batch", str(batch)], cwd=self.root,
+                                        env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertTrue(started.wait(5))
+                    proc.send_signal(signal.SIGTERM)
+                    stdout, stderr = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 130, stderr)
+                    self.assertEqual(json.loads(stdout)["error"], "interrupted")
+                    self.assertEqual(mock.requests[0]["path"], "/v1/images/edits")
+                    self.assertEqual(len(mock.requests), 1)
+                    for job in jobs:
+                        self.assertFalse((self.root / job["output"]).exists())
+                    self.assertTrue((self.root / "ref.png").is_file())
                 finally:
                     if proc.poll() is None:
                         proc.kill()

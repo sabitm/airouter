@@ -7,7 +7,14 @@ import (
 )
 
 func EncodeCodexRequest(req *ir.ImageGenerationRequest) ([]byte, error) {
-	if err := validateControls(req); err != nil {
+	if req == nil {
+		return nil, ir.InvalidRequest("images: model and prompt must be nonempty strings")
+	}
+	if err := validateControls(imageControls{
+		Model: req.Model, Prompt: req.Prompt, N: req.N, Size: req.Size,
+		Quality: req.Quality, Background: req.Background,
+		OutputFormat: req.OutputFormat, ResponseFormat: req.ResponseFormat,
+	}); err != nil {
 		return nil, err
 	}
 	return json.Marshal(struct {

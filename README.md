@@ -78,6 +78,7 @@ third-party clients.
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/images/generations` | OpenAI-compatible Images generation (Codex only) |
+| `POST /v1/images/edits` | JSON image edits with local data-URL references (Codex only) |
 | `GET /v1/models` | Configured combos |
 
 The same routes are available without `/v1`. Use a combo name as the request's
@@ -139,11 +140,12 @@ account entitlement or a bare `gpt-image-2.6` alias.
 | `stream` | Omitted or `false` |
 | `user` | Optional string, accepted locally but not sent upstream |
 
-Unsupported fields and controls return HTTP 400 before an upstream send. This
-version does not support edits, reference images, masks, fixed sizes, multiple
-images, transparent backgrounds, alternate formats, compression, streaming, or
-image-generation tools through `/v1/responses`. Accepted controls follow the
-native request format; live behavior can still depend on the upstream.
+Unsupported fields and controls return HTTP 400 before an upstream send.
+Generation rejects reference fields. Masks, fixed sizes, multiple outputs,
+transparent backgrounds, alternate formats, compression, streaming, and
+image-generation tools through `/v1/responses` are not supported. Accepted
+controls follow the native request format. Live behavior can still depend on
+the upstream.
 
 Only enabled targets using the Codex protocol can serve this route. Incompatible
 targets are skipped without a health penalty. Existing combo round-robin and
@@ -157,12 +159,51 @@ before a successful response is sent. Reported token usage is preserved and is
 not estimated from image bytes. HAR capture remains opt-in and truncates each
 body at 1 MiB, so a captured image can be incomplete.
 
+### Codex image edits
+
+`POST /v1/images/edits` and `/images/edits` accept the same fixed controls as
+generation, plus a required `images` array. This is a restricted JSON contract.
+It is not OpenAI multipart compatibility. Each item must be an object with only
+`image_url`, and that value must be a base64 data URL. Send 1-5 references in
+order. PNG, JPEG, and WebP are accepted. `image/jpg` is normalized to
+`image/jpeg`. The detected signature must match the declared type.
+
+```sh
+curl http://localhost:31415/v1/images/edits \
+  -H "Authorization: Bearer sk-air-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"image","prompt":"Add a red roof","images":[{"image_url":"data:image/png;base64,iVBORw0KGgo..."}]}'
+```
+
+The upstream body is `model`, `prompt`, `images`, `n=1`, `size=auto`,
+`quality`, and `background`. Airouter does not send `output_format`,
+`response_format`, `stream`, or `user`. Codex CLI omits `n`; this proxy sends
+`n=1`. That choice follows the typed request. It does not prove that every
+account accepts the field.
+
+Reference limits are local safety caps, not provider entitlements. Each decoded
+reference can be at most 10 MiB. All references together can be at most 32 MiB.
+The HTTP body remains limited to 64 MiB. These caps apply together. A request
+over a reference or body cap returns HTTP 413 and does not contact upstream.
+Malformed references, remote URLs, file IDs, GIF, masks, and the singular
+`image` field return HTTP 400 with no upstream contact and no health penalty.
+
+Base64 must be canonical padded standard encoding with no whitespace. URL-safe
+and raw unpadded forms are rejected. The response decoder is the same PNG
+decoder used for generation. Missing usage stays missing. A configured model
+string is not proof that the account can edit images.
+
+Local reference images are sent through Airouter to the configured provider.
+Enabled HAR capture can contain reference image data, truncated at 1 MiB per
+body. Check references for private content before sending. A timeout or canceled
+edit may still be billed. Do not resend without approval.
+
 ### Agent skill
 
 The distributable [`image-generation` skill](skills/image-generation/SKILL.md)
-uses this endpoint without adding tools to chat requests. It saves decoded PNGs
-in the agent's workspace. The chat provider does not need image-generation
-support. The image combo still requires an enabled Codex target.
+uses these endpoints without adding tools to chat requests. It saves decoded
+PNGs in the agent's workspace. The chat provider does not need image support.
+The image combo still requires an enabled Codex target.
 
 Copy the complete `skills/image-generation/` directory into your harness's skill
 location. Pi supports `.agents/skills/image-generation/` inside a project or
@@ -192,11 +233,14 @@ mode when `AIROUTER_API_KEY` is unset. Keep remote authenticated connections on
 HTTPS. The helpers connect directly without environment proxies or redirects.
 
 For batches, pass `--batch jobs.json` with a JSON array of `prompt`/`output`
-objects. Jobs may override `quality` and `background`. Relative output paths
-resolve from the process working directory. The queue runs serially, preserves
-successful files, and reports each result as one JSON line without base64 data.
-It never overwrites outputs or retries a failed job. See the skill for batch
-examples, supported controls, limits, and timeout guidance.
+objects. Jobs may override `quality` and `background`. An optional `images`
+array of 1-5 local paths selects an edit for that job. Omit it to generate.
+Repeat `--image PATH` for one prompt. Do not combine `--image` with `--batch`.
+Relative reference and output paths resolve from the process working directory,
+not from the batch file. The queue runs serially, preserves successful files,
+and reports each result as one JSON line without base64 data or input paths.
+It never overwrites outputs, retries a failed job, or falls back from an edit
+to generation. See the skill for examples, limits, and timeout guidance.
 
 ## Routing
 

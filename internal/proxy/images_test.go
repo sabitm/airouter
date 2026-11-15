@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -598,5 +599,296 @@ func TestImagesHARUsesPinnedRecorderAndMasksTerminalPayloads(t *testing.T) {
 		if strings.Contains(terminal.String(), sentinel) {
 			t.Fatalf("terminal leaked %s", sentinel)
 		}
+	}
+}
+
+func editDataURL(raw []byte) string {
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
+}
+
+func editRequest(t *testing.T, refs []string, extra map[string]any) string {
+	t.Helper()
+	objects := make([]any, len(refs))
+	for i, ref := range refs {
+		objects[i] = map[string]string{"image_url": ref}
+	}
+	fields := map[string]any{"model": "image-combo", "prompt": "edit the lake", "images": objects}
+	for key, value := range extra {
+		fields[key] = value
+	}
+	body, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func TestImageEditsRoutesEnvelopeOrderAndCodecIDs(t *testing.T) {
+	png := "data:image/png;base64," + imagePNG
+	secondRaw := append([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, 0x22)
+	second := editDataURL(secondRaw)
+	if png == second {
+		t.Fatal("reference fixtures are not distinct")
+	}
+	for _, path := range []string{"/v1/images/edits", "/images/edits"} {
+		t.Run(path, func(t *testing.T) {
+			provider := &domain.Provider{Name: "codex", BaseURL: "https://provider.example/codex", Protocol: domain.ProtocolOpenAICodex,
+				AuthMethod: domain.AuthAPIKey, AuthScheme: domain.AuthBearer, APIKey: "up-secret",
+				OAuthCreds: &domain.OAuthCreds{AccountID: "account-1", AccessToken: "must-not-replace-static-key"}}
+			p, st, _ := imageTestProxy(t, provider)
+			var captured http.Header
+			var rawBodies [][]byte
+			p.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.String() != "https://provider.example/codex/images/edits" {
+					t.Errorf("upstream URL = %s", req.URL)
+				}
+				captured = req.Header.Clone()
+				raw, _ := io.ReadAll(req.Body)
+				rawBodies = append(rawBodies, raw)
+				return imageTestTransport(200, `{"data":[{"b64_json":"`+imagePNG+`"}]}`).RoundTrip(req)
+			})}
+			p.streamClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				t.Fatal("edits used streaming transport")
+				return nil, nil
+			})}
+			body := editRequest(t, []string{png, second}, map[string]any{
+				"user": "private-user", "stream": false, "output_format": "png", "response_format": "b64_json", "quality": "low",
+			})
+			mux := http.NewServeMux()
+			p.Mount(mux)
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer client-secret")
+			req.Header.Set("X-Codex-Image-Turn-Id", "caller-turn")
+			req.Header.Set("X-Private-Header", "must-not-forward")
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != 200 || len(rawBodies) != 1 {
+				t.Fatalf("status=%d sends=%d body=%s", w.Code, len(rawBodies), w.Body.String())
+			}
+			var got map[string]any
+			if err := json.Unmarshal(rawBodies[0], &got); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]bool{"model": true, "prompt": true, "images": true, "n": true, "size": true, "quality": true, "background": true}
+			for key := range got {
+				if !want[key] {
+					t.Fatalf("unexpected key %s in %s", key, rawBodies[0])
+				}
+				delete(want, key)
+			}
+			images, _ := got["images"].([]any)
+			first, _ := images[0].(map[string]any)
+			secondItem, _ := images[1].(map[string]any)
+			if len(want) != 0 || got["model"] != "gpt-image-2.6-flare" || got["prompt"] != "edit the lake" ||
+				got["n"] != float64(1) || got["size"] != "auto" || got["quality"] != "low" || got["background"] != "auto" ||
+				len(images) != 2 || first["image_url"] != png || secondItem["image_url"] != second {
+				t.Fatalf("upstream = %s", rawBodies[0])
+			}
+			if captured.Get("Authorization") != "Bearer up-secret" || captured.Get("Chatgpt-Account-Id") != "account-1" ||
+				captured.Get("Session_id") == "" || captured.Get("Session_id") != captured.Get("X-Codex-Image-Turn-Id") ||
+				captured.Get("X-Codex-Image-Turn-Id") == "caller-turn" || captured.Get("X-Private-Header") != "" {
+				t.Fatalf("headers=%v", captured)
+			}
+			if strings.Contains(w.Body.String(), `"usage"`) {
+				t.Fatalf("missing usage invented: %s", w.Body.String())
+			}
+			logs := waitForLogs(t, st, 1)
+			if logs[0].Format != "oai-images-edits" || logs[0].InputTokens != 0 || logs[0].OutputTokens != 0 || logs[0].UsageEstimated || logs[0].Stream {
+				t.Fatalf("logs=%+v", logs)
+			}
+		})
+	}
+	if imagesEditsCodec.id != "oai-images-edits" || codexImagesEditsCodec.id != "oai-codex-images-edits" ||
+		codexImagesEditsCodec.upstreamPath != "/images/edits" || imagesEditsCodec.id == imagesCodec.id ||
+		codexImagesEditsCodec.id == codexImagesCodec.id || codexImagesEditsCodec.id == codexCodec.id ||
+		backendCodec(domain.ProtocolOpenAICodex, "gpt-image-2").id != codexCodec.id {
+		t.Fatal("edit codec identity collided with generation or chat")
+	}
+}
+
+func TestImageEditsLocalRejectionsDoNotSendOrPenalize(t *testing.T) {
+	p, _, _ := imageTestProxy(t, &domain.Provider{Name: "codex", BaseURL: "https://provider.example", Protocol: domain.ProtocolOpenAICodex})
+	p.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("rejected edit sent upstream")
+		return nil, nil
+	})}
+	valid := editRequest(t, []string{"data:image/png;base64," + imagePNG}, nil)
+	for _, tc := range []struct {
+		body   string
+		status int
+	}{
+		{`{`, 400}, {`{"model":"image-combo","prompt":"edit"}`, 400},
+		{`{"model":"image-combo","prompt":"edit","images":[]}`, 400},
+		{`{"model":"image-combo","prompt":"edit","image":"data:image/png;base64,` + imagePNG + `"}`, 400},
+		{`{"model":"image-combo","prompt":"edit","images":[{"image_url":"https://secret.example/private-ref.png"}]}`, 400},
+		{`{"model":"image-combo","prompt":"edit","images":[{"file_id":"file-secret"}]}`, 400},
+		{`{"model":"image-combo","prompt":"edit","images":[{"image_url":"data:image/png;base64,` + imagePNG + `"}],"mask":"mask-secret"}`, 400},
+		{`{"model":"image-combo","prompt":"edit","images":[{"image_url":"data:image/gif;base64,R0lGODlhAQABAAAAACw="}]}`, 400},
+		{`{"model":"image-combo","prompt":"edit","images":[{"image_url":"data:image/png;base64,` + imagePNG + `"}],"stream":true}`, 400},
+		{editRequest(t, []string{"data:image/png;base64," + imagePNG, "data:image/png;base64," + imagePNG, "data:image/png;base64," + imagePNG, "data:image/png;base64," + imagePNG, "data:image/png;base64," + imagePNG, "data:image/png;base64," + imagePNG}, nil), 400},
+	} {
+		w := imageTestRequest(t, p, "/images/edits", tc.body, "")
+		if w.Code != tc.status || !strings.Contains(w.Body.String(), `"error"`) {
+			t.Fatalf("status=%d body=%s response=%s", w.Code, tc.body, w.Body.String())
+		}
+		for _, secret := range []string{"secret.example", "private-ref", "file-secret", "mask-secret", "edit the lake"} {
+			if strings.Contains(w.Body.String(), secret) {
+				t.Fatalf("payload leaked: %s", w.Body.String())
+			}
+		}
+	}
+	mux := http.NewServeMux()
+	p.Mount(mux)
+	r := httptest.NewRequest(http.MethodPost, "/images/edits", strings.NewReader(valid))
+	r.Header.Set("Content-Type", "multipart/form-data")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != 400 || len(p.bo) != 0 || len(p.rr) != 0 {
+		t.Fatalf("multipart rejection touched health: %d bo=%v rr=%v", w.Code, p.bo, p.rr)
+	}
+	r = httptest.NewRequest(http.MethodPost, "/images/edits", io.LimitReader(zeroReader{}, maxBodyBytes+1))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != 413 || len(p.bo) != 0 {
+		t.Fatalf("wire limit=%d bo=%v", w.Code, p.bo)
+	}
+	if w := imageTestRequest(t, p, "/images/generations", valid, ""); w.Code != 400 {
+		t.Fatalf("generation accepted references: %d %s", w.Code, w.Body.String())
+	}
+	incompatible, _, _ := imageTestProxy(t, &domain.Provider{Name: "chat", BaseURL: "https://chat.example", Protocol: domain.ProtocolOpenAI})
+	incompatible.client = p.client
+	if w := imageTestRequest(t, incompatible, "/images/edits", valid, ""); w.Code != 400 || len(incompatible.bo) != 0 {
+		t.Fatalf("incompatible target status=%d bo=%v", w.Code, incompatible.bo)
+	}
+}
+
+func TestImageEditsReferenceBudgetDoesNotSend(t *testing.T) {
+	p, _, _ := imageTestProxy(t, &domain.Provider{Name: "codex", BaseURL: "https://provider.example", Protocol: domain.ProtocolOpenAICodex})
+	p.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("oversized reference sent upstream")
+		return nil, nil
+	})}
+	raw := make([]byte, 10<<20+1)
+	copy(raw, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	w := imageTestRequest(t, p, "/v1/images/edits", editRequest(t, []string{editDataURL(raw)}, nil), "")
+	if w.Code != 413 || !strings.Contains(w.Body.String(), `"error"`) || strings.Contains(w.Body.String(), "AAAA") || len(p.bo) != 0 {
+		t.Fatalf("status=%d bo=%v body=%s", w.Code, p.bo, w.Body.String())
+	}
+}
+
+func TestImageEditsFailoverKeepsReferencesAndUsage(t *testing.T) {
+	first := &domain.Provider{Name: "bad", BaseURL: "https://bad.example", Protocol: domain.ProtocolOpenAICodex}
+	second := &domain.Provider{Name: "good", BaseURL: "https://good.example", Protocol: domain.ProtocolOpenAICodex}
+	p, st, _ := imageTestProxy(t, first, second)
+	var logs bytes.Buffer
+	p.logger = observability.NewLogger(2, &logs)
+	var bodies []string
+	var paths []string
+	p.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(req.Body)
+		bodies = append(bodies, string(raw))
+		paths = append(paths, req.URL.Path)
+		if req.URL.Host == "bad.example" {
+			return imageTestTransport(200, `{"data":[],"usage":{"input_tokens":9,"output_tokens":800}}`).RoundTrip(req)
+		}
+		return imageTestTransport(200, imageUpstreamBody).RoundTrip(req)
+	})}
+	png := "data:image/png;base64," + imagePNG
+	w := imageTestRequest(t, p, "/images/edits", editRequest(t, []string{png}, map[string]any{"prompt": "private-prompt"}), "")
+	if w.Code != 200 || len(bodies) != 2 || bodies[0] != bodies[1] || paths[0] != "/images/edits" || paths[1] != "/images/edits" {
+		t.Fatalf("status=%d paths=%v same=%v", w.Code, paths, len(bodies) == 2 && bodies[0] == bodies[1])
+	}
+	if !strings.Contains(bodies[0], png) || strings.Contains(bodies[0], "output_format") || strings.Contains(bodies[0], "private-user") {
+		t.Fatal("edit payload changed across failover")
+	}
+	for _, sentinel := range []string{"private-prompt", imagePNG} {
+		if strings.Contains(logs.String(), sentinel) {
+			t.Fatalf("terminal leaked payload: %s", logs.String())
+		}
+	}
+	if !strings.Contains(logs.String(), "format=oai-codex-images-edits") {
+		t.Fatalf("failure metadata used the wrong backend: %s", logs.String())
+	}
+	rows := waitForLogs(t, st, 2)
+	for _, row := range rows {
+		if row.Provider == "bad" && (row.InputTokens != 9 || row.OutputTokens != 800 || row.UsageEstimated || row.Format != "oai-images-edits") {
+			t.Fatalf("failed edit usage/format lost: %+v", row)
+		}
+	}
+}
+
+func TestImageEditsAuthOAuthAndCancellation(t *testing.T) {
+	p, st, _ := imageTestProxy(t, &domain.Provider{Name: "codex", BaseURL: "https://provider.example", Protocol: domain.ProtocolOpenAICodex, AuthScheme: domain.AuthXAPIKey, APIKey: "up-key"})
+	var calls int
+	p.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if req.URL.Path != "/images/edits" || req.Header.Get("X-Api-Key") != "up-key" || req.Header.Get("Authorization") != "" {
+			t.Errorf("auth/path = %s %v", req.URL.Path, req.Header)
+		}
+		return imageTestTransport(200, imageUpstreamBody).RoundTrip(req)
+	})}
+	body := editRequest(t, []string{"data:image/png;base64," + imagePNG}, nil)
+	if w := imageTestRequest(t, p, "/images/edits", body, ""); w.Code != 200 {
+		t.Fatalf("open mode=%d %s", w.Code, w.Body.String())
+	}
+	key, err := st.NewAccessKey(context.Background(), "edits")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := imageTestRequest(t, p, "/images/edits", body, "wrong"); w.Code != 401 {
+		t.Fatalf("auth=%d", w.Code)
+	}
+	if calls != 1 {
+		t.Fatalf("unauthorized calls=%d", calls)
+	}
+	mux := http.NewServeMux()
+	p.Mount(mux)
+	r := httptest.NewRequest(http.MethodPost, "/images/edits", strings.NewReader(body))
+	r.Header.Set("X-Api-Key", key.Token)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("x-api-key=%d %s", w.Code, w.Body.String())
+	}
+
+	te := newTokenEndpoint(t, "tok-good")
+	provider := &domain.Provider{Name: "codex-oauth", BaseURL: "https://provider.example", Protocol: domain.ProtocolOpenAICodex, AuthMethod: domain.AuthOAuth,
+		OAuthCreds: &domain.OAuthCreds{Mode: domain.OAuthAuto, AccessToken: "tok-old", RefreshToken: "rt-old", ExpiresAt: time.Now().Add(time.Hour).Unix(), TokenURL: te.server.URL, ClientID: "cid", PKCE: true, AccountID: "account-1"}}
+	op, _, _ := imageTestProxy(t, provider)
+	var identities []string
+	var oauthBodies []string
+	op.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(req.Body)
+		oauthBodies = append(oauthBodies, string(raw))
+		identities = append(identities, req.Header.Get("Session_id"))
+		if req.URL.Path != "/images/edits" || req.Header.Get("X-Codex-Image-Turn-Id") != identities[0] {
+			t.Errorf("retry identity changed: %s %v", req.URL, req.Header)
+		}
+		if req.Header.Get("Authorization") != "Bearer tok-good" {
+			return imageTestTransport(401, `{"error":{"message":"token rejected"}}`).RoundTrip(req)
+		}
+		return imageTestTransport(200, imageUpstreamBody).RoundTrip(req)
+	})}
+	if w := imageTestRequest(t, op, "/images/edits", body, ""); w.Code != 200 || len(oauthBodies) != 2 || oauthBodies[0] != oauthBodies[1] || identities[0] == "" || identities[0] != identities[1] || te.hits.Load() != 1 {
+		t.Fatalf("oauth status=%d sends=%d refreshes=%d", w.Code, len(oauthBodies), te.hits.Load())
+	}
+
+	cancelProxy, _, _ := imageTestProxy(t,
+		&domain.Provider{Name: "first", BaseURL: "https://first.example", Protocol: domain.ProtocolOpenAICodex},
+		&domain.Provider{Name: "second", BaseURL: "https://second.example", Protocol: domain.ProtocolOpenAICodex})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls = 0
+	cancelProxy.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, context.Canceled
+	})}
+	r = httptest.NewRequest(http.MethodPost, "/images/edits", strings.NewReader(body)).WithContext(ctx)
+	w = httptest.NewRecorder()
+	cancelProxy.serveImages(w, r, &reqResult{}, &domain.RequestLog{}, imagesEditsCodec, &domain.Combo{Targets: []domain.ComboTarget{
+		{ProviderID: 1, Enabled: true, UpstreamModel: "gpt-image-2", Provider: &domain.Provider{Protocol: domain.ProtocolOpenAICodex}},
+	}}, []byte(body))
+	if calls != 0 || w.Code != 502 || len(cancelProxy.bo) != 0 {
+		t.Fatalf("canceled calls=%d status=%d bo=%v", calls, w.Code, cancelProxy.bo)
 	}
 }

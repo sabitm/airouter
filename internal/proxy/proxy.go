@@ -546,6 +546,7 @@ func (p *Proxy) Mount(mux *http.ServeMux) {
 		{"POST", "/messages", serve(anthropicCodec)},
 		{"POST", "/responses", serve(responsesCodec)},
 		{"POST", "/images/generations", serve(imagesCodec)},
+		{"POST", "/images/edits", serve(imagesEditsCodec)},
 		{"GET", "/models", p.handleModels},
 	}
 	for _, rt := range routes {

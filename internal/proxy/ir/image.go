@@ -14,6 +14,29 @@ type ImageGenerationRequest struct {
 	User           *string
 }
 
+// ImageReference is one ordered edit input. MIME is the canonical image type
+// and Base64 is padded standard encoding. Remote URLs and provider file IDs
+// are not stored.
+type ImageReference struct {
+	MIME   string
+	Base64 string
+}
+
+// ImageEditRequest is the native edit operation. It is separate from
+// generation so reference fields cannot change generation behavior.
+type ImageEditRequest struct {
+	Model          string
+	Prompt         string
+	Images         []ImageReference
+	N              int
+	Size           string
+	Quality        string
+	Background     string
+	OutputFormat   string
+	ResponseFormat string
+	User           *string
+}
+
 type GeneratedImage struct {
 	Data         string
 	GenerationID string

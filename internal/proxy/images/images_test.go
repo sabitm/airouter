@@ -1,6 +1,7 @@
 package images
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -183,6 +184,168 @@ func TestCodexResponseRejectsInvalidImages(t *testing.T) {
 		if _, err := DecodeCodexResponse(body); err == nil {
 			t.Fatalf("accepted invalid image %q", data)
 		}
+	}
+}
+
+func editDataURL(mime string, raw []byte) string {
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(raw)
+}
+
+func signedImage(sig []byte, n int) []byte {
+	raw := bytes.Repeat([]byte{0x11}, n)
+	copy(raw, sig)
+	return raw
+}
+
+var (
+	pngSig  = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	jpegSig = []byte{0xff, 0xd8, 0xff}
+	webpSig = []byte("RIFF\x00\x00\x00\x00WEBP")
+	gifSig  = []byte("GIF89a")
+)
+
+func editBody(t *testing.T, refs []string, extra map[string]any) []byte {
+	t.Helper()
+	fields := map[string]any{"model": "combo", "prompt": "edit the lake", "images": refsToObjects(refs)}
+	for key, value := range extra {
+		fields[key] = value
+	}
+	body, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func refsToObjects(refs []string) []any {
+	out := make([]any, len(refs))
+	for i, ref := range refs {
+		out[i] = map[string]string{"image_url": ref}
+	}
+	return out
+}
+
+func TestDecodeEditRequestCanonicalOrderAndEnvelope(t *testing.T) {
+	png := editDataURL("image/png", signedImage(pngSig, 8))
+	jpeg := editDataURL("image/jpg", signedImage(jpegSig, 4))
+	webp := editDataURL("IMAGE/WEBP", signedImage(webpSig, 12))
+	req, err := DecodeEditRequest(editBody(t, []string{png, jpeg, webp}, map[string]any{
+		"user": "local-user", "stream": false, "output_format": "PNG", "quality": "high", "background": "opaque",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.User == nil || *req.User != "local-user" || req.N != 1 || req.OutputFormat != "png" || len(req.Images) != 3 {
+		t.Fatalf("request = %+v", req)
+	}
+	if req.Images[0].MIME != "image/png" || req.Images[1].MIME != "image/jpeg" || req.Images[2].MIME != "image/webp" {
+		t.Fatalf("mime order = %+v", req.Images)
+	}
+	req.Model = "gpt-image-2.6-flare"
+	body, err := EncodeCodexEditRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	wantKeys := map[string]bool{"model": true, "prompt": true, "images": true, "n": true, "size": true, "quality": true, "background": true}
+	for key := range got {
+		if !wantKeys[key] {
+			t.Fatalf("unexpected upstream key %s in %s", key, body)
+		}
+		delete(wantKeys, key)
+	}
+	if len(wantKeys) != 0 || got["n"] != float64(1) || got["size"] != "auto" || got["quality"] != "high" || got["background"] != "opaque" {
+		t.Fatalf("envelope = %s", body)
+	}
+	images, _ := got["images"].([]any)
+	if len(images) != 3 {
+		t.Fatal(body)
+	}
+	for i, want := range []string{"image/png", "image/jpeg", "image/webp"} {
+		item, _ := images[i].(map[string]any)
+		if len(item) != 1 || item["image_url"] != "data:"+want+";base64,"+req.Images[i].Base64 {
+			t.Fatalf("image %d = %+v", i, item)
+		}
+	}
+	if _, err := EncodeCodexEditRequest(nil); err == nil {
+		t.Fatal("nil edit accepted")
+	}
+}
+
+func TestDecodeEditRequestRejectsMalformedSources(t *testing.T) {
+	valid := editDataURL("image/png", signedImage(pngSig, 8))
+	cases := []string{
+		`null`, `[]`, `{`, `{"model":"combo","prompt":"edit"}`,
+		`{"model":"combo","prompt":"edit","images":null}`,
+		`{"model":"combo","prompt":"edit","images":[]}`,
+		`{"model":"combo","prompt":"edit","images":"` + valid + `"}`,
+		`{"model":"combo","prompt":"edit","image":"` + valid + `"}`,
+		`{"model":"combo","prompt":"edit","images":[{}]}`,
+		`{"model":"combo","prompt":"edit","images":[null]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":null}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":1}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"file_id":"file-secret"}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"` + valid + `","file_id":"file-secret"}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"https://secret.example/private-ref.png"}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"file-secret"}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"` + valid + `"}],"mask":"mask-secret"}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"` + valid + `"}],"stream":true}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"` + editDataURL("image/gif", gifSig) + `"}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"` + editDataURL("image/png", jpegSig) + `"}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"data:image/png;base64,` + strings.TrimPrefix(valid, "data:image/png;base64,")[:8] + `-abc="}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"data:image/png;base64,` + strings.TrimRight(strings.TrimPrefix(valid, "data:image/png;base64,"), "=") + `"}]}`,
+		`{"model":"combo","prompt":"edit","images":[{"image_url":"data:image/png;base64,` + strings.TrimPrefix(valid, "data:image/png;base64,")[:4] + "\n" + strings.TrimPrefix(valid, "data:image/png;base64,")[4:] + `"}]}`,
+	}
+	for i := 0; i <= 6; i++ {
+		refs := make([]string, i)
+		for j := range refs {
+			refs[j] = valid
+		}
+		body, _ := json.Marshal(map[string]any{"model": "combo", "prompt": "edit", "images": refsToObjects(refs)})
+		_, err := DecodeEditRequest(body)
+		if (err == nil) != (i >= 1 && i <= 5) {
+			t.Fatalf("count %d err=%v", i, err)
+		}
+	}
+	for i, body := range cases {
+		t.Run(string(rune('a'+i)), func(t *testing.T) {
+			_, err := DecodeEditRequest([]byte(body))
+			if _, ok := ir.AsRequestValidation(err); !ok || IsBudgetExceeded(err) {
+				t.Fatalf("expected validation error, got %v", err)
+			}
+			for _, secret := range []string{"file-secret", "secret.example", "private-ref", "mask-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("payload leaked: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestDecodeEditRequestBounds(t *testing.T) {
+	exact := signedImage(pngSig, maxEditImageBytes)
+	req, err := DecodeEditRequest(editBody(t, []string{editDataURL("image/png", exact)}, nil))
+	if err != nil || len(req.Images) != 1 {
+		t.Fatalf("exact per-file limit: %+v %v", req, err)
+	}
+	exact = nil
+	_, err = DecodeEditRequest(editBody(t, []string{editDataURL("image/png", signedImage(pngSig, maxEditImageBytes+1))}, nil))
+	if !IsBudgetExceeded(err) {
+		t.Fatalf("per-file overflow = %v", err)
+	}
+	parts := make([]string, 4)
+	for i := range parts {
+		parts[i] = editDataURL("image/png", signedImage(pngSig, maxEditTotalBytes/4))
+	}
+	if _, err := DecodeEditRequest(editBody(t, parts, nil)); err != nil {
+		t.Fatalf("exact total limit: %v", err)
+	}
+	parts[3] = editDataURL("image/png", signedImage(pngSig, maxEditTotalBytes/4+1))
+	if _, err := DecodeEditRequest(editBody(t, parts, nil)); !IsBudgetExceeded(err) {
+		t.Fatalf("total overflow = %v", err)
 	}
 }
 

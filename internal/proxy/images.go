@@ -13,22 +13,83 @@ import (
 	"airouter/internal/proxy/openai"
 )
 
+// preparedImage is a validated generation or edit whose controls and references
+// stay immutable across attempts. encode substitutes only the upstream model.
+type preparedImage interface {
+	encode(model string) ([]byte, error)
+}
+
 type imageCodec struct {
-	decodeRequest  func([]byte) (*ir.ImageGenerationRequest, error)
-	encodeRequest  func(*ir.ImageGenerationRequest) ([]byte, error)
-	decodeResponse func([]byte) (*ir.ImageGenerationResponse, error)
+	prepare        func([]byte) (preparedImage, error)
 	encodeResponse func(*ir.ImageGenerationResponse) ([]byte, error)
+	decodeResponse func([]byte) (*ir.ImageGenerationResponse, error)
+	// backend is the explicit Codex operation for the upstream path, response
+	// decode, and failure metadata. Ingress codecs set it in init.
+	backend *codec
+}
+
+type preparedGeneration struct {
+	req *ir.ImageGenerationRequest
+}
+
+func (p preparedGeneration) encode(model string) ([]byte, error) {
+	req := *p.req
+	req.Model = model
+	return images.EncodeCodexRequest(&req)
+}
+
+type preparedEdit struct {
+	req *ir.ImageEditRequest
+}
+
+func (p preparedEdit) encode(model string) ([]byte, error) {
+	// Copy the header only. Reference elements are not mutated across attempts.
+	req := *p.req
+	req.Model = model
+	return images.EncodeCodexEditRequest(&req)
+}
+
+func prepareGeneration(body []byte) (preparedImage, error) {
+	req, err := images.DecodeRequest(body)
+	if err != nil {
+		return nil, err
+	}
+	return preparedGeneration{req: req}, nil
+}
+
+func prepareEdit(body []byte) (preparedImage, error) {
+	req, err := images.DecodeEditRequest(body)
+	if err != nil {
+		return nil, err
+	}
+	return preparedEdit{req: req}, nil
 }
 
 var imagesCodec = codec{
 	id: "oai-images", encodeError: openai.EncodeError,
-	image: &imageCodec{decodeRequest: images.DecodeRequest, encodeResponse: images.EncodeResponse},
+	image: &imageCodec{prepare: prepareGeneration, encodeResponse: images.EncodeResponse},
 }
 
 var codexImagesCodec = codec{
 	id: "oai-codex-images", protocol: domain.ProtocolOpenAICodex,
 	upstreamPath: "/images/generations", encodeError: openai.EncodeError,
-	image: &imageCodec{encodeRequest: images.EncodeCodexRequest, decodeResponse: images.DecodeCodexResponse},
+	image: &imageCodec{decodeResponse: images.DecodeCodexResponse},
+}
+
+var imagesEditsCodec = codec{
+	id: "oai-images-edits", encodeError: openai.EncodeError,
+	image: &imageCodec{prepare: prepareEdit, encodeResponse: images.EncodeResponse},
+}
+
+var codexImagesEditsCodec = codec{
+	id: "oai-codex-images-edits", protocol: domain.ProtocolOpenAICodex,
+	upstreamPath: "/images/edits", encodeError: openai.EncodeError,
+	image: &imageCodec{decodeResponse: images.DecodeCodexResponse},
+}
+
+func init() {
+	imagesCodec.image.backend = &codexImagesCodec
+	imagesEditsCodec.image.backend = &codexImagesEditsCodec
 }
 
 func (p *Proxy) imageTargets(ctx context.Context, combo *domain.Combo) []domain.ComboTarget {
@@ -46,15 +107,24 @@ func (p *Proxy) imageTargets(ctx context.Context, combo *domain.Combo) []domain.
 }
 
 func (p *Proxy) serveImages(w http.ResponseWriter, r *http.Request, res *reqResult, rec *domain.RequestLog, ingress codec, combo *domain.Combo, body []byte) {
-	req, err := ingress.image.decodeRequest(body)
+	if ingress.image == nil || ingress.image.prepare == nil || ingress.image.backend == nil {
+		res.fail(w, ingress, http.StatusInternalServerError, "images: no image backend", "api_error")
+		return
+	}
+	prepared, err := ingress.image.prepare(body)
 	if err != nil {
-		res.fail(w, ingress, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		status := http.StatusBadRequest
+		if images.IsBudgetExceeded(err) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		res.fail(w, ingress, status, err.Error(), "invalid_request_error")
 		return
 	}
 	if contentType := r.Header.Get("Content-Type"); contentType != "" && !strings.EqualFold(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]), "application/json") {
 		res.fail(w, ingress, http.StatusBadRequest, "images: only application/json is supported", "invalid_request_error")
 		return
 	}
+	backend := ingress.image.backend
 	targets := p.imageTargets(r.Context(), combo)
 	if len(targets) == 0 {
 		if len(activeComboTargets(combo)) == 0 {
@@ -79,9 +149,7 @@ func (p *Proxy) serveImages(w http.ResponseWriter, r *http.Request, res *reqResu
 		rec.Provider = target.Provider.Name
 		rec.UpstreamModel = target.UpstreamModel
 		started := time.Now()
-		attemptReq := *req
-		attemptReq.Model = target.UpstreamModel
-		last = p.attemptImage(w, r.Context(), res, ingress, target.Provider, &attemptReq, headers)
+		last = p.attemptImage(w, r.Context(), res, ingress, backend, target.Provider, prepared, target.UpstreamModel, headers)
 		if ctxErr(r.Context()) && !last.written {
 			last = callerCanceledResult()
 			break
@@ -96,7 +164,7 @@ func (p *Proxy) serveImages(w http.ResponseWriter, r *http.Request, res *reqResu
 		}
 		p.penalizeProvider(target.ProviderID)
 		willRetry := i < len(targets)-1
-		p.logUpstreamAttemptFailed(r.Context(), combo.Name, target.Provider, target.UpstreamModel, codexImagesCodec, i+1, last, willRetry)
+		p.logUpstreamAttemptFailed(r.Context(), combo.Name, target.Provider, target.UpstreamModel, *backend, i+1, last, willRetry)
 		if willRetry {
 			p.recordLog(r.Context(), &domain.RequestLog{
 				AccessKeyName: rec.AccessKeyName, Combo: combo.Name, Provider: target.Provider.Name,
@@ -115,10 +183,15 @@ func (p *Proxy) serveImages(w http.ResponseWriter, r *http.Request, res *reqResu
 	res.inTok, res.outTok = last.inTok, last.outTok
 }
 
-func (p *Proxy) attemptImage(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, provider *domain.Provider, req *ir.ImageGenerationRequest, headers http.Header) attemptResult {
-	backend := codexImagesCodec
-	body, err := backend.image.encodeRequest(req)
+func (p *Proxy) attemptImage(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress codec, backend *codec, provider *domain.Provider, prepared preparedImage, model string, headers http.Header) attemptResult {
+	if backend == nil || backend.image == nil || backend.image.decodeResponse == nil || backend.upstreamPath == "" {
+		return terminal(http.StatusInternalServerError, "failed to encode upstream request", "api_error")
+	}
+	body, err := prepared.encode(model)
 	if err != nil {
+		if images.IsBudgetExceeded(err) {
+			return terminal(http.StatusRequestEntityTooLarge, err.Error(), "invalid_request_error")
+		}
 		return terminalEncodeError(err)
 	}
 	status, raw, err := p.forward(ctx, provider, backend.upstreamPath, body, headers)
