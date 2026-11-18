@@ -69,9 +69,11 @@ rows. Console credentials are sent only to official Go endpoints.
 
 A successful dashboard Check for an API key confirms model discovery, not
 inference access. A Console Check calls the Go usage endpoint and does not
-treat public model discovery as authorization. Free-model access depends on
-OpenCode's upstream restrictions and is not guaranteed. Paid Zen models and
-OpenCode Go are the supported paths for third-party clients.
+treat public model discovery as authorization. The Usage tab shows the same
+Go allowance for a Console connection. It does not show Zen, a Go API key, or
+a custom URL. Free-model access depends on OpenCode's upstream restrictions
+and is not guaranteed. Paid Zen models and OpenCode Go are the supported
+paths for third-party clients.
 
 ## Client API
 

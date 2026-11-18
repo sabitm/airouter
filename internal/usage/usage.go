@@ -95,6 +95,13 @@ type tokenResolver interface {
 	Resolve(ctx context.Context, provider *domain.Provider, force bool) (string, error)
 }
 
+// credsResolver is the oauth.Service.ResolveCreds seam. OpenCode Console usage
+// needs the snapshot that produced the token. resolveToken is not a substitute:
+// it can return a saved token after a mismatch.
+type credsResolver interface {
+	ResolveCreds(ctx context.Context, provider *domain.Provider, force bool) (*domain.OAuthCreds, error)
+}
+
 type cacheEntry struct {
 	report    *Report
 	expiresAt time.Time
@@ -121,6 +128,14 @@ type Service struct {
 	// rate-limits polling; chat on the same token still works, so we cool down
 	// per provider instead of hammering it.
 	cooldownUntil map[int64]time.Time
+
+	// Console cache and in-flight state are separate from the provider-ID maps.
+	// A reconnect must not read or join another account or workspace.
+	consoleCache    map[consoleIdentity]consoleCacheEntry
+	consoleInflight map[consoleInflightKey]*inflight
+	consoleLatest   map[consoleIdentity][32]byte
+	consoleOwner    map[int64]consoleIdentity
+	consoleEpoch    map[int64]uint64
 }
 
 // NewService builds a Service. client may be nil (15s timeout). logger may be nil.
@@ -140,15 +155,33 @@ func newService(o tokenResolver, logger *slog.Logger, client *http.Client) *Serv
 		client = &http.Client{Timeout: httpTimeout}
 	}
 	return &Service{
-		oauth:         o,
-		logger:        logger.With("component", "usage"),
-		client:        client,
-		now:           time.Now,
-		cache:         map[int64]cacheEntry{},
-		inflight:      map[int64]*inflight{},
-		cacheGen:      map[int64]uint64{},
-		cooldownUntil: map[int64]time.Time{},
+		oauth:           o,
+		logger:          logger.With("component", "usage"),
+		client:          client,
+		now:             time.Now,
+		cache:           map[int64]cacheEntry{},
+		inflight:        map[int64]*inflight{},
+		cacheGen:        map[int64]uint64{},
+		cooldownUntil:   map[int64]time.Time{},
+		consoleCache:    map[consoleIdentity]consoleCacheEntry{},
+		consoleInflight: map[consoleInflightKey]*inflight{},
+		consoleLatest:   map[consoleIdentity][32]byte{},
+		consoleOwner:    map[int64]consoleIdentity{},
+		consoleEpoch:    map[int64]uint64{},
 	}
+}
+
+// SetClientForTest replaces the HTTP client used for usage requests.
+// Official OpenCode usage stays on a fixed URL, so tests intercept that URL
+// here instead of pointing the URL at a local server.
+func (s *Service) SetClientForTest(c *http.Client) {
+	if s == nil {
+		return
+	}
+	if c == nil {
+		c = &http.Client{Timeout: httpTimeout}
+	}
+	s.client = c
 }
 
 // Supported reports whether the provider protocol has a quota endpoint.
@@ -157,7 +190,7 @@ func Supported(p *domain.Provider) bool {
 	if p == nil {
 		return false
 	}
-	if isGrok(p) {
+	if isGrok(p) || isOpenCodeGoConsole(p) {
 		return true
 	}
 	switch p.Protocol {
@@ -189,6 +222,11 @@ func (s *Service) Fetch(ctx context.Context, p *domain.Provider) (*Report, error
 func (s *Service) FetchWith(ctx context.Context, p *domain.Provider, opts FetchOpts) (*Report, error) {
 	if p == nil || !Supported(p) {
 		return nil, ErrUnsupported
+	}
+	// Console identity is not the provider ID. Keep this branch ahead of the
+	// generic cache so a reconnect cannot read or join another account.
+	if isOpenCodeGoConsole(p) {
+		return s.fetchOpenCodeGoWith(ctx, p, opts)
 	}
 	if p.ID == 0 {
 		return s.fetchLive(ctx, p)
