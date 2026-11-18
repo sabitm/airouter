@@ -123,6 +123,8 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/providers/kiro/device/begin", h.kiroDeviceBegin)
 	mux.HandleFunc("POST /dashboard/providers/qoder/device/begin", h.qoderDeviceBegin)
 	mux.HandleFunc("POST /dashboard/providers/cursor/begin", h.cursorConnectBegin)
+	mux.HandleFunc("POST /dashboard/providers/opencode/console/begin", h.opencodeConsoleBegin)
+	mux.HandleFunc("POST /dashboard/providers/opencode/console/org", h.opencodeConsoleChoose)
 
 	// Combos
 	mux.HandleFunc("GET /dashboard/combos", h.combosPage)
@@ -300,6 +302,10 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid protocol")
 		return
 	}
+	if proto == domain.ProtocolOpencode {
+		h.createOpencodeProvider(w, r)
+		return
+	}
 	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
 		h.createOAuthProvider(w, r, proto)
 		return
@@ -313,14 +319,6 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	// Generic apikey providers need a credential at create time. Kiro may still
 	// rely on profile/oauth paths and is validated separately there.
 	baseURL := providerBaseURLOrDefault(proto, r.FormValue("base_url"))
-	if proto == domain.ProtocolOpencode {
-		var err error
-		baseURL, apiKey, err = resolveOpencodeCredential(opencodeTierFromForm(r, baseURL), apiKey, nil)
-		if err != nil {
-			htmxBadRequest(w, r, "provider-flash", err.Error())
-			return
-		}
-	}
 	if proto != domain.ProtocolKiro && apiKey == "" {
 		htmxBadRequest(w, r, "provider-flash", "API key is required")
 		return
@@ -455,7 +453,7 @@ func (h *Handler) connectedCreds(state string) (*domain.OAuthCreds, bool) {
 		return nil, false
 	}
 	creds, err, done := sess.conn.Result()
-	if !done || err != nil || creds == nil || creds.AccessToken == "" {
+	if !done || err != nil || creds == nil || creds.AccessToken == "" || creds.OpencodeConsoleAuth {
 		return nil, false
 	}
 	return creds, true
@@ -514,6 +512,14 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 		htmxBadRequest(w, r, "provider-flash", "invalid protocol")
 		return
 	}
+	if proto == domain.ProtocolOpencode || cur.Protocol == domain.ProtocolOpencode {
+		if proto != cur.Protocol {
+			htmxBadRequest(w, r, "provider-flash", "OpenCode providers cannot change protocol")
+			return
+		}
+		h.saveOpencodeProvider(w, r, cur, stored.OAuthBlob)
+		return
+	}
 	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
 		h.updateOAuthProvider(w, r, cur, proto, stored.OAuthBlob)
 		return
@@ -537,14 +543,6 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	apiKey := cur.APIKey
 	if submitted := strings.TrimSpace(r.FormValue("api_key")); submitted != "" {
 		apiKey = submitted
-	}
-	if proto == domain.ProtocolOpencode {
-		var err error
-		baseURL, apiKey, err = resolveOpencodeCredential(opencodeTierFromForm(r, cur.BaseURL), r.FormValue("api_key"), cur)
-		if err != nil {
-			htmxBadRequest(w, r, "provider-flash", err.Error())
-			return
-		}
 	}
 	cur.Name = r.FormValue("name")
 	cur.BaseURL = baseURL

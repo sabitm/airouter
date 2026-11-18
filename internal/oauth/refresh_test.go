@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/store"
 )
 
@@ -69,7 +70,11 @@ func (f *fakeStore) GetProvider(_ context.Context, id int64) (*domain.Provider, 
 	}
 	cp := *c
 	conn := f.connection(id)
-	return &domain.Provider{ID: id, Protocol: conn.proto, AuthMethod: conn.method, OAuthCreds: &cp}, nil
+	p := &domain.Provider{ID: id, Protocol: conn.proto, AuthMethod: conn.method, OAuthCreds: &cp}
+	if conn.proto == domain.ProtocolOpencode {
+		p.BaseURL = opencode.GoBaseURL
+	}
+	return p, nil
 }
 
 // UpdateProviderConnectionCAS mirrors the real store's provider-aware

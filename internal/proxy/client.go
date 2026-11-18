@@ -642,9 +642,14 @@ func applyKiroHeaders(req *http.Request, provider *domain.Provider) {
 // session; fingerprinting fills whatever is still missing. Free Zen uses the
 // CLI fallback and mirrors the resolved session. Paid Zen, Go, and probes keep
 // the desktop defaults and do not synthesize the session-id mirror.
-// Authorization stays on the provider credential set by the auth-scheme switch.
+// Authorization stays on the provider credential set by the auth-scheme switch,
+// except Console mode, which rewrites Bearer and x-opencode-org-id from the
+// resolved credential snapshot and drops a caller-supplied workspace id.
 func applyOpencodeHeaders(req *http.Request, provider *domain.Provider, ctx context.Context, body []byte) {
 	opencode.SanitizeIdentityHeaders(req.Header)
+	if provider != nil && provider.OAuthCreds != nil && provider.OAuthCreds.OpencodeConsoleAuth {
+		req.Header.Del("x-opencode-org-id")
+	}
 	st := opencodeStateFrom(ctx)
 	if st != nil {
 		opencode.ApplyIdentity(req.Header, st.identity)
@@ -672,15 +677,25 @@ func applyOpencodeHeaders(req *http.Request, provider *domain.Provider, ctx cont
 		}
 		if provider != nil && provider.Protocol == domain.ProtocolOpencode && opencode.UseV2Profile(req.URL.String(), reqModelFromBody(body)) {
 			opencode.FingerprintV2Headers(req.Header, req.Header.Get("x-opencode-session"))
+			applyOpencodeConsoleAuth(req, provider)
 			return
 		}
 		// Drop an unvalidated mirror before free fingerprinting. The helper then
 		// writes only the session resolved above, so a conflicting copy cannot drift.
 		req.Header.Del(opencode.SessionIDHeader)
 		opencode.FingerprintFreeHeaders(req.Header, sid)
+		applyOpencodeConsoleAuth(req, provider)
 		return
 	}
 	opencode.FingerprintHeaders(req.Header, sid)
+	applyOpencodeConsoleAuth(req, provider)
+}
+
+func applyOpencodeConsoleAuth(req *http.Request, provider *domain.Provider) {
+	if provider == nil || provider.OAuthCreds == nil || !provider.OAuthCreds.OpencodeConsoleAuth {
+		return
+	}
+	opencode.ApplyConsoleAuth(req.Header, provider.OAuthCreds)
 }
 
 // opencodeReqState is request-private OpenCode identity plus the session
@@ -1049,6 +1064,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		t.UpstreamURL = url
 	}
 	send := func() (int, []byte, error) {
+		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
+			return 0, nil, err
+		}
 		started := time.Now()
 		wire, err := claudeWireBody(ctx, provider, path, body)
 		if err != nil {
@@ -1093,6 +1111,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 	}
 
 	if err := p.resolveToken(ctx, provider, false); err != nil {
+		if abortOnOAuthResolveError(provider, err) {
+			return 0, nil, err
+		}
 		// Proactive refresh failed; proceed with the existing token (it may still
 		// work, or the reactive path below will catch the 401).
 		observability.Logger(ctx, p.logger).Debug("oauth_resolve_failed",
@@ -1178,6 +1199,9 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		accept = "text/event-stream"
 	}
 	send := func(ctx context.Context) (*http.Response, error) {
+		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
+			return nil, err
+		}
 		started := time.Now()
 		wire, err := claudeWireBody(ctx, provider, path, body)
 		if err != nil {
@@ -1221,6 +1245,9 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 	}
 
 	if err := p.resolveToken(ctx, provider, false); err != nil {
+		if abortOnOAuthResolveError(provider, err) {
+			return nil, err
+		}
 		observability.Logger(ctx, p.logger).Debug("oauth_resolve_failed",
 			"event", "oauth_resolve_failed",
 			"provider", provider.Name,
@@ -1313,6 +1340,9 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 	}()
 
 	send := func() (*http.Response, error) {
+		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
+			return nil, err
+		}
 		closeWrite() // release the previous attempt's pipe, if any
 		pr, npw := io.Pipe()
 		mu.Lock()
@@ -1373,6 +1403,9 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 	}
 
 	if err := p.resolveToken(ctx, provider, false); err != nil {
+		if abortOnOAuthResolveError(provider, err) {
+			return nil, nil, nil, err
+		}
 		observability.Logger(ctx, p.logger).Debug("oauth_resolve_failed",
 			"event", "oauth_resolve_failed",
 			"provider", provider.Name,
@@ -1552,6 +1585,11 @@ func (p *Proxy) resolveToken(ctx context.Context, provider *domain.Provider, for
 		provider.APIKey = cp.AccessToken
 	}
 	return err
+}
+
+func abortOnOAuthResolveError(provider *domain.Provider, err error) bool {
+	return oauth.IsCredentialConflict(err) ||
+		provider.Protocol == domain.ProtocolOpencode && provider.Method() == domain.AuthOAuth
 }
 
 // isAuthFailure reports whether an upstream status indicates a rejected

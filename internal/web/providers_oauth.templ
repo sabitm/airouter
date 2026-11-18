@@ -60,6 +60,64 @@ templ QoderDeviceView(state, verificationURI string) {
 	</div>
 }
 
+templ OpencodeConsolePending(state, verificationURI, userCode string) {
+	<div class="oauth-connect">
+		<p class="muted">Open the OpenCode Console page and approve the request. This page detects completion automatically.</p>
+		if verificationURI != "" {
+			<a class="button" href={ templ.SafeURL(verificationURI) } target="_blank" rel="noopener">Open verification page</a>
+		}
+		if userCode != "" {
+			<p class="muted">Verification code: <span class="mono">{ userCode }</span></p>
+		}
+		<button
+			type="button"
+			class="link danger"
+			hx-post="/dashboard/providers/oauth/cancel"
+			hx-vals={ `{"state":"` + state + `"}` }
+			hx-target="closest .oauth-region"
+			hx-swap="innerHTML"
+		>Cancel</button>
+		@OAuthStatusLine(state, true, "pending", "", "")
+	</div>
+}
+
+templ OpencodeConsoleChoice(state, errMsg string, orgs []opencodeWorkspaceView) {
+	<div id={ "oauth-status-" + state } class="oauth-connect">
+		<p class="muted">Choose the OpenCode Console workspace for this connection.</p>
+		if errMsg != "" {
+			<p class="check err">{ errMsg }</p>
+		}
+		<label class="field">
+			<span class="field-name">Workspace</span>
+			<select name="opencode_org_choice" aria-label="OpenCode workspace">
+				for _, org := range orgs {
+					<option value={ org.ID }>{ org.Name }</option>
+				}
+			</select>
+		</label>
+		<button
+			type="button"
+			class="link"
+			hx-post="/dashboard/providers/opencode/console/org"
+			hx-include="closest .oauth-connect"
+			hx-vals={ `{"state":"` + state + `"}` }
+			hx-target={ "#oauth-status-" + state }
+			hx-swap="outerHTML"
+		>Use workspace</button>
+	</div>
+}
+
+templ OpencodeConsoleConnected(state, workspace string) {
+	<span id={ "oauth-status-" + state } class="check ok">
+		if workspace != "" {
+			connected to { workspace }
+		} else {
+			connected
+		}
+		<input type="hidden" name="oauth_session" value={ state }/>
+	</span>
+}
+
 templ CursorConnectView(state, loginURL string) {
 	<div class="oauth-connect">
 		<p class="muted">Open the Cursor authorization page and approve the request. This page detects completion automatically.</p>

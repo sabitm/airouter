@@ -558,6 +558,10 @@ func (h *Handler) oauthConnectStatus(w http.ResponseWriter, r *http.Request) {
 		render(w, r, OAuthStatusLine(state, false, "error", "", "connect session expired - start over"))
 		return
 	}
+	if conn, ok := sess.conn.(*oauth.OpencodeConsoleConnect); ok {
+		h.renderOpencodeConsoleStatus(w, r, conn)
+		return
+	}
 	phase, email, errMsg := connectPhase(sess)
 	render(w, r, OAuthStatusLine(state, connectPolls(sess), phase, email, errMsg))
 }
@@ -671,6 +675,10 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 			saved = p
 			id = parsed
 		}
+	}
+	if saved != nil && saved.OAuthCreds != nil && saved.OAuthCreds.OpencodeConsoleAuth {
+		h.refreshSavedOpencodeConsole(w, r, saved, statusView)
+		return
 	}
 	if saved != nil && saved.Protocol == domain.ProtocolClaudeCode {
 		// A config-only row is effective APIKey even when a credential blob is
@@ -905,6 +913,12 @@ func emailSuffix(email string) string {
 // oauthLabel is the credential-column text for a connected oauth provider: the
 // account email when known, then provider account id, otherwise "connected".
 func oauthLabel(c *domain.OAuthCreds) string {
+	if c != nil && c.OpencodeConsoleAuth {
+		if c.OpencodeOrgName != "" {
+			return c.OpencodeOrgName
+		}
+		return "OpenCode Console"
+	}
 	if c != nil && c.Email != "" {
 		return c.Email
 	}

@@ -21,6 +21,30 @@ function airouterToggleOAuthMode(sel) {
   }
 }
 
+function airouterSyncOpencodeForm(form) {
+  if (!form) {
+    return;
+  }
+  const tier = form.querySelector("[name=opencode_tier]");
+  const auth = form.querySelector("[name=opencode_auth]");
+  if (!tier) {
+    return;
+  }
+  form.setAttribute("data-opencode-tier", tier.value);
+  if (tier.value !== "go" && auth) {
+    auth.value = "apikey";
+  }
+  form.setAttribute("data-opencode-auth", auth ? auth.value : "apikey");
+}
+
+function airouterToggleOpencodeTier(sel) {
+  airouterSyncOpencodeForm(sel.closest(".provider-form"));
+}
+
+function airouterToggleOpencodeAuth(sel) {
+  airouterSyncOpencodeForm(sel.closest(".provider-form"));
+}
+
 // airouterSelectProviderCard marks the clicked card as the active one so the
 // grid shows which recipe's add-form is open. Selection is purely visual and
 // non-persistent; a page reload clears it, which matches the empty form slot on
@@ -151,6 +175,7 @@ function airouterApplyProviderTagFilter() {
 function airouterResetProviderForm(form) {
   form.reset();
   airouterToggleAuthMethod(form.querySelector(".auth-method"));
+  airouterSyncOpencodeForm(form);
   form.querySelectorAll(".oauth-tokens input").forEach(function (i) {
     i.value = "";
   });

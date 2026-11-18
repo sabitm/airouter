@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"net/http"
 	"reflect"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/opencode"
 	"airouter/internal/store"
 )
 
@@ -50,10 +52,8 @@ type OAuthProviderCASStore interface {
 	UpdateProviderConnectionCAS(ctx context.Context, id int64, update func(current *domain.OAuthCreds, method domain.AuthMethod, proto domain.Protocol) (*domain.OAuthCreds, bool, error)) (*domain.OAuthCreds, error)
 }
 
-// ErrCredentialConflict reports that a dashboard Claude refresh observed a
-// newer credential row and discarded its token-endpoint result. It is not an
-// upstream rejection and must not be rendered as a successful refresh or as a
-// fresh reconnect requirement.
+// ErrCredentialConflict reports that a connection changed during credential
+// resolution or refresh. It is not an upstream rejection.
 var ErrCredentialConflict = errors.New("oauth: credentials changed during refresh")
 
 // IsCredentialConflict reports whether err is ErrCredentialConflict.
@@ -97,10 +97,8 @@ type Service struct {
 	now func() time.Time
 
 	mu sync.Mutex
-	// inflight deduplicates concurrent refreshes by provider id and mode:
-	// forced (reactive 401/403) refreshes coalesce among themselves but are
-	// never shared with proactive callers, whose cached result may reflect a
-	// different outcome. Keyed on (provider id, force).
+	// Generic refreshes are keyed by (id, force). Console refreshes use a
+	// separate key shared by all callers holding the same rotating grant.
 	inflight map[refreshKey]*call
 	// testOnJoin, if set, is called after this caller has obtained the
 	// inflight slot (leader or waiter) and before it waits. Tests use it as
@@ -109,8 +107,10 @@ type Service struct {
 }
 
 type refreshKey struct {
-	id    int64
-	force bool
+	id           int64
+	force        bool
+	console      bool
+	refreshGrant [sha256.Size]byte
 }
 
 type call struct {
@@ -173,6 +173,10 @@ func (s *Service) Resolve(ctx context.Context, provider *domain.Provider, force 
 // provider. ResolveCreds does not mutate the passed provider or a shared row
 // except for the existing refresh and Claude device initialization writes.
 func (s *Service) ResolveCreds(ctx context.Context, provider *domain.Provider, force bool) (*domain.OAuthCreds, error) {
+	if provider != nil && (hasOpencodeConsoleCreds(provider.OAuthCreds) ||
+		provider.Protocol == domain.ProtocolOpencode && provider.Method() == domain.AuthOAuth) {
+		return s.resolveOpencodeConsole(ctx, provider, force)
+	}
 	if provider == nil || provider.Method() != domain.AuthOAuth || provider.OAuthCreds == nil {
 		if provider == nil || provider.OAuthCreds == nil {
 			return nil, nil
@@ -191,6 +195,9 @@ func (s *Service) ResolveCreds(ctx context.Context, provider *domain.Provider, f
 	// snapshot, matching the best-available-token philosophy of the failure
 	// paths below.
 	if live, err := s.store.GetProvider(ctx, provider.ID); err == nil && live != nil && live.OAuthCreds != nil {
+		if hasOpencodeConsoleCreds(live.OAuthCreds) {
+			return nil, ErrCredentialConflict
+		}
 		creds = live.OAuthCreds
 	}
 	// Every non-force Resolve consults shouldRefresh on the selected basis.
@@ -337,6 +344,9 @@ func (s *Service) startOrJoin(ctx context.Context, key refreshKey, creds *domain
 // method keeps the historical authoritative write for other rows whose creds
 // still carry the Claude Code marker, for example after a protocol transition.
 func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCreds, authoritative bool) (*domain.OAuthCreds, error) {
+	if hasOpencodeConsoleCreds(creds) {
+		return s.doRefreshOpencodeConsole(ctx, id, creds)
+	}
 	if !authoritative && creds != nil && creds.ClaudeCodeAuth {
 		return s.doRefreshClaude(ctx, id, creds)
 	}
@@ -650,6 +660,9 @@ func (s *Service) RefreshTokens(ctx context.Context, creds *domain.OAuthCreds) (
 // dashboard refresh uses RefreshSavedClaude so the starting stored snapshot
 // stays distinct from the effective grant.
 func (s *Service) RefreshAndPersist(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	if hasOpencodeConsoleCreds(creds) {
+		return s.refreshOpencodeConsoleGrant(ctx, id, creds)
+	}
 	return s.doRefresh(ctx, id, creds, true)
 }
 
@@ -724,3 +737,102 @@ func IsInvalidGrant(err error) bool { return errors.Is(err, ErrInvalidGrant) }
 // IsCursorNotRotatable reports a Cursor session that cannot exchange but still
 // has a usable access token. Callers must not treat this as reconnect.
 func IsCursorNotRotatable(err error) bool { return errors.Is(err, ErrCursorNotRotatable) }
+
+func (s *Service) resolveOpencodeConsole(ctx context.Context, provider *domain.Provider, force bool) (*domain.OAuthCreds, error) {
+	if !opencodeConsoleConnection(provider) {
+		return nil, ErrCredentialConflict
+	}
+	live, err := s.loadOpencodeConsole(ctx, provider.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !sameOpencodeConsoleWorkspace(live.OAuthCreds, provider.OAuthCreds) {
+		return nil, ErrCredentialConflict
+	}
+	// A request retrying rejected credentials uses a rotation another caller
+	// already completed rather than immediately rotating the replacement.
+	if (!force && !shouldRefresh(live.OAuthCreds, s.now())) ||
+		(force && opencodeConsoleGenerationChanged(live.OAuthCreds, provider.OAuthCreds)) {
+		return live.OAuthCreds, nil
+	}
+	basis := live.OAuthCreds
+	updated, err := s.refreshOpencodeConsoleGrant(ctx, provider.ID, basis)
+	if IsCredentialConflict(err) {
+		if newer, loadErr := s.loadOpencodeConsole(ctx, provider.ID); loadErr == nil &&
+			sameOpencodeConsoleWorkspace(newer.OAuthCreds, basis) && opencodeConsoleGenerationChanged(newer.OAuthCreds, basis) {
+			return newer.OAuthCreds, nil
+		}
+	}
+	return updated, err
+}
+
+func (s *Service) refreshOpencodeConsoleGrant(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	key := refreshKey{id: id, console: true, refreshGrant: sha256.Sum256([]byte(creds.RefreshToken))}
+	return s.dedupRefresh(ctx, key, creds)
+}
+
+func (s *Service) loadOpencodeConsole(ctx context.Context, id int64) (*domain.Provider, error) {
+	live, err := s.store.GetProvider(ctx, id)
+	if errors.Is(err, store.ErrNotFound) || err == nil && !opencodeConsoleConnection(live) {
+		return nil, ErrCredentialConflict
+	}
+	return live, err
+}
+
+func hasOpencodeConsoleCreds(c *domain.OAuthCreds) bool { return c != nil && c.OpencodeConsoleAuth }
+
+func opencodeConsoleConnection(p *domain.Provider) bool {
+	return p != nil && hasOpencodeConsoleCreds(p.OAuthCreds) &&
+		opencode.RejectUnsafeSend(p, opencode.GoBaseURL+"/models") == nil
+}
+
+func (s *Service) doRefreshOpencodeConsole(ctx context.Context, id int64, basis *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	cas, ok := s.store.(OAuthProviderCASStore)
+	if !ok {
+		return nil, errors.New("oauth: store does not support atomic OpenCode Console refresh")
+	}
+	live, err := s.loadOpencodeConsole(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// A caller can join after the preceding worker removed its completed
+	// entry. Re-read before submitting the grant, not just before committing.
+	if opencodeConsoleGenerationChanged(live.OAuthCreds, basis) {
+		return nil, ErrCredentialConflict
+	}
+	rotated := *live.OAuthCreds
+	if err := refresh(ctx, &rotated, s.now()); err != nil {
+		newer, loadErr := s.loadOpencodeConsole(ctx, id)
+		if IsCredentialConflict(loadErr) || loadErr == nil && opencodeConsoleGenerationChanged(newer.OAuthCreds, basis) {
+			return nil, ErrCredentialConflict
+		}
+		return nil, err
+	}
+	out, err := cas.UpdateProviderConnectionCAS(ctx, id, func(current *domain.OAuthCreds, method domain.AuthMethod, proto domain.Protocol) (*domain.OAuthCreds, bool, error) {
+		if method != domain.AuthOAuth || proto != domain.ProtocolOpencode || opencodeConsoleGenerationChanged(current, basis) {
+			return nil, false, ErrCredentialConflict
+		}
+		next := *current
+		next.AccessToken = rotated.AccessToken
+		next.RefreshToken = rotated.RefreshToken
+		next.ExpiresAt = rotated.ExpiresAt
+		next.ClientID = rotated.ClientID
+		next.TokenURL = rotated.TokenURL
+		next.RefreshJSON = rotated.RefreshJSON
+		return &next, true, nil
+	})
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) {
+		return nil, ErrCredentialConflict
+	}
+	return out, err
+}
+
+func sameOpencodeConsoleWorkspace(a, b *domain.OAuthCreds) bool {
+	return a.OpencodeOrgID == b.OpencodeOrgID && a.AccountID == b.AccountID
+}
+
+func opencodeConsoleGenerationChanged(current, basis *domain.OAuthCreds) bool {
+	return !hasOpencodeConsoleCreds(current) || !hasOpencodeConsoleCreds(basis) ||
+		!sameOpencodeConsoleWorkspace(current, basis) || current.AccessToken != basis.AccessToken ||
+		current.RefreshToken != basis.RefreshToken || current.ExpiresAt != basis.ExpiresAt
+}

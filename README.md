@@ -53,22 +53,25 @@ Anthropic-compatible APIs. The dashboard also includes guided connections for:
 | Antigravity (Google Cloud Code) | OAuth; unofficial |
 | Cursor | OAuth or imported CLI/IDE token; unofficial |
 | Claude Code | OAuth; unofficial CLI profile, not a supported proxy |
-| OpenCode | zen tier: key `public`; go tier: opencode.ai API key |
+| OpenCode | zen tier: key `public`; go tier: API key or OpenCode Console sign-in |
 
 Provider credentials and OAuth tokens are encrypted in SQLite using
 `AIROUTER_SECRET`. OAuth tokens are refreshed automatically when supported.
 
 ### OpenCode notes
 
-Select the Zen or Go tier in the dashboard. Zen uses the key `public`; Go
-requires an opencode.ai API key. airouter selects the upstream API format and
-endpoint for each model automatically. Custom and self-hosted URLs are used
-unchanged.
+Select the Zen or Go tier in the dashboard. Zen uses the key `public`. Go
+accepts an opencode.ai API key, or Sign in with OpenCode Console. Console
+sign-in is Go only. It stores the connected workspace and does not accept a
+pasted token. airouter selects the upstream API format and endpoint for each
+model automatically. Custom and self-hosted URLs are used unchanged for API-key
+rows. Console credentials are sent only to official Go endpoints.
 
-A successful dashboard Check confirms model discovery, not inference access.
-Free-model access depends on OpenCode's upstream restrictions and is not
-guaranteed. Paid Zen models and OpenCode Go are the supported paths for
-third-party clients.
+A successful dashboard Check for an API key confirms model discovery, not
+inference access. A Console Check calls the Go usage endpoint and does not
+treat public model discovery as authorization. Free-model access depends on
+OpenCode's upstream restrictions and is not guaranteed. Paid Zen models and
+OpenCode Go are the supported paths for third-party clients.
 
 ## Client API
 

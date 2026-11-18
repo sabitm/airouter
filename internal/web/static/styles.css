@@ -527,6 +527,14 @@ td.mono { overflow-wrap: anywhere; }
 .provider-form[data-method="oauth"] .oauth-edit { display: contents; }
 .provider-form[data-method="oauth"] .oauth-fields { display: contents; }
 .provider-form[data-protocol="kiro"] .kiro-fields { display: contents; }
+.provider-form[data-protocol="opencode"] .opencode-go-auth,
+.provider-form[data-protocol="opencode"] .opencode-console { display: none; }
+.provider-form[data-protocol="opencode"][data-opencode-tier="go"] .opencode-go-auth { display: contents; }
+.provider-form[data-protocol="opencode"][data-opencode-tier="go"][data-opencode-auth="console"] .opencode-console {
+	display: block;
+	grid-column: 1 / -1;
+}
+.provider-form[data-protocol="opencode"][data-opencode-tier="go"][data-opencode-auth="console"] .opencode-apikey { display: none; }
 
 /* Interactive-oauth mode toggle: show either the web-auth (Connect) group or
    the manual token-import group, never both. */

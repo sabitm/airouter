@@ -114,6 +114,11 @@ func shouldRefresh(c *domain.OAuthCreds, now time.Time) bool {
 // (some providers always issue a new one; others reuse). Returns ErrInvalidGrant
 // when the authorization server rejects the refresh token.
 func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
+	// OpenCode Console refresh is a fixed JSON grant. A stored TokenURL must
+	// not redirect the refresh token to another host.
+	if c != nil && c.OpencodeConsoleAuth {
+		return refreshOpencodeConsole(ctx, c, now)
+	}
 	// Qoder device tokens cannot refresh (center.qoder.sh returns 403).
 	if c.QoderAuth {
 		return refreshQoder(ctx, c, now)

@@ -49,7 +49,9 @@ const (
 	// OpenAI Chat Completions on /chat/completions while muse-spark models are
 	// Responses-only on /responses (each endpoint 500s for the other's models).
 	// The free (zen) tier authenticates with the literal key "public" and gates
-	// on a client fingerprint; the go (paid) tier uses a real API key.
+	// on a client fingerprint. The go (paid) tier uses a real API key or an
+	// OpenCode Console device login (OAuthCreds.OpencodeConsoleAuth). Console
+	// login is not a separate protocol.
 	ProtocolOpencode Protocol = "opencode"
 )
 
@@ -324,6 +326,18 @@ type OAuthCreds struct {
 	// ClaudeRefreshExpiresAt is refresh_token_expires_in applied as Unix seconds.
 	// Zero means the token response did not supply it.
 	ClaudeRefreshExpiresAt int64 `json:"claude_refresh_expires_at,omitempty"`
+
+	// OpencodeConsoleAuth marks an OpenCode Go Console device-login connection.
+	// It is not inferred from ProtocolOpencode. When true, refresh uses the
+	// fixed Console device-token grant, and inference sends the access token as
+	// Bearer plus OpencodeOrgID as x-opencode-org-id from this same snapshot.
+	OpencodeConsoleAuth bool `json:"opencode_console_auth,omitempty"`
+	// OpencodeOrgID is the Console workspace bound at sign-in. Refresh must not
+	// replace it with a different org_id.
+	OpencodeOrgID string `json:"opencode_org_id,omitempty"`
+	// OpencodeOrgName is the workspace label shown in the dashboard. It is not
+	// a token.
+	OpencodeOrgName string `json:"opencode_org_name,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

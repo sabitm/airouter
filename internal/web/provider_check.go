@@ -52,8 +52,12 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	method := domain.AuthMethod(r.FormValue("auth_method"))
-	if method == domain.AuthOAuth {
+	if proto == domain.ProtocolOpencode {
+		if opencodeAuthFromForm(r) == "console" {
+			h.checkOpencodeConsole(w, r)
+			return
+		}
+	} else if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
 		h.checkOAuthProvider(w, r, baseURL, proto)
 		return
 	}
@@ -204,7 +208,7 @@ func (h *Handler) oauthCheckCreds(r *http.Request) (creds *domain.OAuthCreds, fr
 	}
 	if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
 		if p, err := h.store.GetProvider(r.Context(), id); err == nil &&
-			p.OAuthCreds != nil && p.OAuthCreds.AccessToken != "" {
+			p.OAuthCreds != nil && p.OAuthCreds.AccessToken != "" && !p.OAuthCreds.OpencodeConsoleAuth {
 			return p.OAuthCreds, true
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/opencode"
 )
 
 // Portable config formats. API keys are exported in PLAINTEXT so the config can
@@ -252,6 +253,9 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 		cur.Tags = tags
 		cur.AuthScheme = cur.Auth()   // expand the default alias to a concrete scheme
 		cur.AuthMethod = cur.Method() // expand the default alias to a concrete method
+		if err := opencode.ValidateConsoleImport(cur); err != nil {
+			return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
+		}
 		if err := s.updateProvider(ctx, ex, cur); err != nil {
 			return fmt.Sprintf("provider %q: %v", pp.Name, err)
 		}
@@ -265,6 +269,9 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 	}
 	np.AuthScheme = np.Auth()   // expand the default alias to a concrete scheme
 	np.AuthMethod = np.Method() // expand the default alias to a concrete method
+	if err := opencode.ValidateConsoleImport(np); err != nil {
+		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
+	}
 	if err := s.createProvider(ctx, ex, np); err != nil {
 		return fmt.Sprintf("provider %q: %v", pp.Name, err)
 	}

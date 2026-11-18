@@ -406,7 +406,7 @@ templ ProviderRecipeForm(r recipe) {
 				</div>
 			</form>
 		case kindOpencode:
-			<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+			<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(r.Protocol) } data-opencode-tier="zen" data-opencode-auth="apikey" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
 				<input type="hidden" name="auth_method" value="apikey"/>
 				<input type="hidden" name="auth_scheme" value="bearer"/>
@@ -416,15 +416,29 @@ templ ProviderRecipeForm(r recipe) {
 				</label>
 				<label class="field">
 					<span class="field-name">Tier</span>
-					<select name="opencode_tier" title="opencode.ai tier" aria-label="opencode tier">
+					<select name="opencode_tier" title="opencode.ai tier" aria-label="opencode tier" onchange="airouterToggleOpencodeTier(this)">
 						<option value="zen">zen (free, key "public")</option>
-						<option value="go">go (paid, API key)</option>
+						<option value="go">go (paid)</option>
 					</select>
 				</label>
-				<label class="field">
+				<label class="field opencode-go-auth">
+					<span class="field-name">Go authentication</span>
+					<select name="opencode_auth" class="opencode-auth" title="Go authentication" aria-label="Go authentication" onchange="airouterToggleOpencodeAuth(this)">
+						<option value="apikey">API key</option>
+						<option value="console">Sign in with OpenCode Console</option>
+					</select>
+				</label>
+				<label class="field opencode-apikey">
 					<span class="field-name">API key</span>
 					<input name="api_key" type="password" placeholder="blank for zen (uses public)"/>
 				</label>
+				<div class="opencode-console">
+					<p class="muted">Sign in with OpenCode Console for Go. This does not accept a pasted token. Zen keeps the public key.</p>
+					<button type="button" class="link" hx-post="/dashboard/providers/opencode/console/begin" hx-include="closest form" hx-target="#oauth-region-new-opencode" hx-swap="innerHTML">Sign in with OpenCode Console</button>
+					<div id="oauth-region-new-opencode" class="oauth-region" aria-live="polite">
+						@OAuthConnectIdle()
+					</div>
+				</div>
 				@providerTagsField("")
 				<div class="form-actions">
 					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
@@ -630,10 +644,10 @@ templ ProviderEditRow(p *domain.Provider) {
 }
 
 templ providerEditRowOpencode(p *domain.Provider) {
-	<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(p.Protocol) } hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
+	<form class="provider-form provider-form-grid" data-method={ opencodeFormMethod(p) } data-protocol={ string(p.Protocol) } data-opencode-tier={ opencodeFormTier(p) } data-opencode-auth={ opencodeFormAuth(p) } hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) } hx-target="#provider-list" hx-swap="outerHTML">
 		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
 		<input type="hidden" name="protocol" value={ string(p.Protocol) }/>
-		<input type="hidden" name="auth_method" value="apikey"/>
+		<input type="hidden" name="auth_method" value={ opencodeFormMethod(p) }/>
 		<input type="hidden" name="auth_scheme" value="bearer"/>
 		<input type="hidden" name="reasoning_dialect" value={ string(lockedReasoningDialect(p.Protocol)) }/>
 		<label class="field">
@@ -642,15 +656,43 @@ templ providerEditRowOpencode(p *domain.Provider) {
 		</label>
 		<label class="field">
 			<span class="field-name">Tier</span>
-			<select name="opencode_tier" title="opencode.ai tier" aria-label="opencode tier">
+			<select name="opencode_tier" title="opencode.ai tier" aria-label="opencode tier" onchange="airouterToggleOpencodeTier(this)">
 				<option value="zen" selected?={ opencode.Tier(p.BaseURL) != "go" }>zen (free, key "public")</option>
-				<option value="go" selected?={ opencode.Tier(p.BaseURL) == "go" }>go (paid, API key)</option>
+				<option value="go" selected?={ opencode.Tier(p.BaseURL) == "go" }>go (paid)</option>
 			</select>
 		</label>
-		<label class="field">
+		<label class="field opencode-go-auth">
+			<span class="field-name">Go authentication</span>
+			<select name="opencode_auth" class="opencode-auth" title="Go authentication" aria-label="Go authentication" onchange="airouterToggleOpencodeAuth(this)">
+				<option value="apikey" selected?={ opencodeFormAuth(p) != "console" }>API key</option>
+				<option value="console" selected?={ opencodeFormAuth(p) == "console" }>Sign in with OpenCode Console</option>
+			</select>
+		</label>
+		<label class="field opencode-apikey">
 			<span class="field-name">API key</span>
 			<input name="api_key" type="password" placeholder="leave blank to keep current"/>
 		</label>
+		<div class="opencode-console">
+			if opencodeFormAuth(p) == "console" {
+				<p class="muted">Connected workspace: { opencodeWorkspaceLabel(p) }. Sign in again only to reconnect.</p>
+				<button
+					type="button"
+					class="link"
+					hx-post="/dashboard/providers/oauth/refresh"
+					hx-include="closest form"
+					hx-vals='{"refresh_view":"status"}'
+					hx-target={ "#oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) }
+					hx-swap="innerHTML"
+				>Refresh token</button>
+				<span id={ "oauth-refresh-result-" + strconv.FormatInt(p.ID, 10) } class="oauth-refresh-result" aria-live="polite"></span>
+			} else {
+				<p class="muted">Sign in with OpenCode Console for Go. Saving replaces an API key. This does not accept a pasted token.</p>
+			}
+			<button type="button" class="link" hx-post="/dashboard/providers/opencode/console/begin" hx-include="closest form" hx-target={ "#oauth-region-edit-opencode-" + strconv.FormatInt(p.ID, 10) } hx-swap="innerHTML">Sign in with OpenCode Console</button>
+			<div id={ "oauth-region-edit-opencode-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
+				@OAuthConnectIdle()
+			</div>
+		</div>
 		@providerTagsField(domain.FormatTags(p.Tags))
 		<div class="form-actions">
 			@providerEditCheck()

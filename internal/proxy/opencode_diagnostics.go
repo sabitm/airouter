@@ -19,6 +19,9 @@ import (
 
 func (p *Proxy) doUpstreamRequest(req *http.Request, provider *domain.Provider, body []byte, stream bool) (*http.Response, error) {
 	client := p.upstreamClient(provider, req.URL.String(), body, stream)
+	if provider != nil && provider.OAuthCreds != nil && provider.OAuthCreds.OpencodeConsoleAuth {
+		client = opencode.ClientNoRedirect(client)
+	}
 	if p.logger == nil || !p.logger.Enabled(req.Context(), observability.LevelTrace) ||
 		provider == nil || provider.Protocol != domain.ProtocolOpencode ||
 		!opencode.IsOfficialFreeTierURL(req.URL.String()) ||

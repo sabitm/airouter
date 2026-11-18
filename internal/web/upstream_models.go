@@ -54,7 +54,15 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 	if provider.Method() == domain.AuthOAuth {
 		var tok string
 		var err error
-		if provider.Protocol == domain.ProtocolKiro {
+		if provider.Protocol == domain.ProtocolOpencode {
+			var creds *domain.OAuthCreds
+			creds, err = h.oauth.ResolveCreds(r.Context(), provider, false)
+			if creds != nil {
+				cp := *creds
+				provider.OAuthCreds = &cp
+				tok = cp.AccessToken
+			}
+		} else if provider.Protocol == domain.ProtocolKiro {
 			tok, err = kirocatalog.ResolveToken(r.Context(), h.oauth, h.store, provider, false)
 		} else {
 			tok, err = h.oauth.Resolve(r.Context(), provider, false)
@@ -175,6 +183,9 @@ func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 // /models has no family segment.
 func queryOpencodeModels(ctx context.Context, logger *slog.Logger, p *domain.Provider, operation string) ([]string, probeResult, error) {
 	url := strings.TrimRight(opencode.EffectiveBaseURL(p.BaseURL), "/") + "/models"
+	if err := opencode.RejectUnsafeSend(p, url); err != nil {
+		return nil, probeResult{}, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, probeResult{}, errOpencodeInvalidBaseURL
@@ -182,8 +193,13 @@ func queryOpencodeModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 	req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	req.Header.Set("Accept", "application/json")
 	opencode.FingerprintHeaders(req.Header, "")
+	client := upstreamClient
+	if p.OAuthCreds != nil && p.OAuthCreds.OpencodeConsoleAuth {
+		opencode.ApplyConsoleAuth(req.Header, p.OAuthCreds)
+		client = opencode.ClientNoRedirect(upstreamClient)
+	}
 
-	pr, err := executeProbe(ctx, logger, upstreamClient, req, operation)
+	pr, err := executeProbe(ctx, logger, client, req, operation)
 	if err != nil {
 		return nil, pr, err
 	}
