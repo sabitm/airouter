@@ -218,8 +218,8 @@ func TestApplyAntigravityHeadersAndProject(t *testing.T) {
 	}
 	req.Header.Set("User-Agent", "client/1")
 	applyUpstreamHeaders(req, provider, http.Header{"User-Agent": {"client/1"}}, context.Background(), body)
-	if got := req.Header.Get("User-Agent"); got != antigravity.UserAgent {
-		t.Fatalf("user-agent = %q", got)
+	if got, want := req.Header.Get("User-Agent"), "antigravity/hub/2.34.0 darwin/arm64"; got != want {
+		t.Fatalf("User-Agent = %q, want %q", got, want)
 	}
 	if got := req.Header.Get("Authorization"); got != "Bearer tok" {
 		t.Fatalf("auth = %q", got)

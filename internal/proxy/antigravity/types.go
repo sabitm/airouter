@@ -3,12 +3,11 @@ package antigravity
 // Cloud Code envelope and Gemini-shaped wire types for Antigravity chat.
 
 type envelope struct {
-	Project     string        `json:"project"`
-	Model       string        `json:"model"`
-	UserAgent   string        `json:"userAgent"`
-	RequestType string        `json:"requestType"`
-	RequestID   string        `json:"requestId,omitempty"`
-	Request     geminiRequest `json:"request"`
+	Project   string        `json:"project"`
+	Model     string        `json:"model"`
+	UserAgent string        `json:"userAgent"`
+	RequestID string        `json:"requestId,omitempty"`
+	Request   geminiRequest `json:"request"`
 }
 
 type geminiRequest struct {

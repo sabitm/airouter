@@ -10,10 +10,9 @@ const (
 	// (loadCodeAssist/onboardUser/fetchAvailableModels) stays on prod.
 	DefaultBaseURL = "https://daily-cloudcode-pa.googleapis.com"
 
-	IDEVersion = "2.1.1"
-	// UserAgent is the official Antigravity IDE Desktop fingerprint (macOS arm64).
-	// Kept static even when airouter runs on Linux so the chat profile matches the IDE.
-	UserAgent = "antigravity/ide/" + IDEVersion + " darwin/arm64"
+	IDEVersion = "2.34.0"
+	// Keep the Antigravity Hub profile fixed to macOS arm64 regardless of the server platform.
+	UserAgent = "antigravity/hub/" + IDEVersion + " darwin/arm64"
 
 	UpstreamPathStream = "/v1internal:streamGenerateContent?alt=sse"
 
@@ -22,7 +21,6 @@ const (
 
 	ToolSuffix        = "_ide"
 	UserAgentEnvelope = "antigravity"
-	RequestTypeAgent  = "agent"
 )
 
 // DefaultThoughtSignature is backfilled on functionCall parts that lack one.

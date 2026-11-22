@@ -429,9 +429,15 @@ func TestFetchAntigravityMissingProject(t *testing.T) {
 
 func TestFetchAntigravityFiltersInternal(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("User-Agent"), "antigravity/hub/2.34.0 darwin/arm64"; got != want {
+			t.Errorf("%s: User-Agent = %q, want %q", r.URL.Path, got, want)
+		}
 		if strings.Contains(r.URL.Path, "loadCodeAssist") {
 			_ = json.NewEncoder(w).Encode(map[string]any{"currentTier": map[string]any{"name": "Pro"}})
 			return
+		}
+		if got, want := r.Header.Get("X-Client-Version"), "2.34.0"; got != want {
+			t.Errorf("X-Client-Version = %q, want %q", got, want)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"models": map[string]any{

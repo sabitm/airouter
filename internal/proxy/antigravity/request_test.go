@@ -34,8 +34,15 @@ func TestEncodeRequestBasic(t *testing.T) {
 	if env.Project != "" {
 		t.Fatalf("project should be empty before inject: %q", env.Project)
 	}
-	if env.UserAgent != "antigravity" || env.RequestType != "agent" {
+	if env.UserAgent != "antigravity" || !strings.HasPrefix(env.RequestID, "agent/") {
 		t.Fatalf("envelope meta: %+v", env)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok := wire["requestType"]; ok {
+		t.Fatalf("chat envelope must omit requestType, got %s", raw)
 	}
 	if env.Model != "gemini-3-flash" {
 		t.Fatalf("model %q", env.Model)
@@ -63,6 +70,49 @@ func TestEncodeRequestBasic(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("missing decoy")
+	}
+}
+
+func TestEncodeRequestRewritesOnlyPiSystemPassages(t *testing.T) {
+	const opener = "You are a coding assistant running inside pi, a coding agent harness."
+	const unrelated = "- When asked about: extensions (docs/local.md)"
+	for _, tc := range []struct {
+		name, system, want string
+	}{
+		{"embedded lines", "Keep this.\n" + opener + " Help users inspect files.\n<docs>\n" + piDocsLookupLine + "\n" + unrelated + "\n</docs>", "Keep this.\nYou are a coding assistant. Help users inspect files.\n<docs>\n" + unrelated + "\n</docs>"},
+		{"CRLF", "First\r\n" + piDocsLookupLine + "\r\nLast", "First\r\nLast"},
+		{"not an exact line", piDocsLookupLine + " (local note)", piDocsLookupLine + " (local note)"},
+		{"whole prompt removed", piDocsLookupLine, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := opener + "\n" + piDocsLookupLine
+			req := &ir.Request{
+				Model:  "gemini-3.8-flash-high",
+				System: tc.system,
+				Messages: []ir.Message{{
+					Role: ir.RoleUser, Content: []ir.ContentBlock{{Type: ir.BlockText, Text: original}},
+				}},
+				Tools: []ir.Tool{{Name: "lookup", Description: original}},
+			}
+			body, err := EncodeRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var env envelope
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatal(err)
+			}
+			if sys := env.Request.SystemInstruction; tc.want == "" {
+				if sys != nil {
+					t.Fatalf("expected no system instruction, got %+v", sys)
+				}
+			} else if sys == nil || len(sys.Parts) != 1 || sys.Parts[0].Text != tc.want {
+				t.Fatalf("system instruction = %+v, want %q", sys, tc.want)
+			}
+			if req.System != tc.system || env.Request.Contents[0].Parts[0].Text != original || env.Request.Tools[0].FunctionDeclarations[0].Description != original {
+				t.Fatal("rewriting altered the IR or non-system content")
+			}
+		})
 	}
 }
 

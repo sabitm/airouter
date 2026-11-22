@@ -14,6 +14,8 @@ import (
 
 var nonFuncNameChars = regexp.MustCompile(`[^a-zA-Z0-9_.:\-]`)
 
+const piDocsLookupLine = "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)"
+
 // EncodeRequest renders the IR as a Cloud Code Antigravity envelope with an
 // empty project field. The proxy injects OAuthCreds.ProjectID via InjectProjectID.
 func EncodeRequest(req *ir.Request) ([]byte, error) {
@@ -24,7 +26,7 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 		SessionID: newSessionID(),
 		Contents:  buildContents(req.Messages),
 	}
-	if sys := strings.TrimSpace(req.System); sys != "" {
+	if sys := rewritePiSystemPrompt(req.System); sys != "" {
 		inner.SystemInstruction = &geminiContent{Parts: []geminiPart{{Text: sys}}}
 	}
 	inner.GenerationConfig = &generationConfig{
@@ -61,15 +63,30 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	// Cloak after schema clean / name sanitize so _ide applies to wire names.
 	_ = CloakTools(&inner)
 
+	// Omit requestType for chat. Google can return a false quota 429 when it is set to "agent".
 	env := envelope{
-		Project:     "",
-		Model:       req.Model,
-		UserAgent:   UserAgentEnvelope,
-		RequestType: RequestTypeAgent,
-		RequestID:   buildRequestID(inner.SessionID, req.Model, len(inner.Contents)),
-		Request:     inner,
+		Project:   "",
+		Model:     req.Model,
+		UserAgent: UserAgentEnvelope,
+		RequestID: buildRequestID(inner.SessionID, req.Model, len(inner.Contents)),
+		Request:   inner,
 	}
 	return json.Marshal(env)
+}
+
+// Both stock Pi 1.6.0 passages independently caused the same generic upstream 429.
+func rewritePiSystemPrompt(system string) string {
+	system = strings.ReplaceAll(system, "You are a coding assistant running inside pi, a coding agent harness.", "You are a coding assistant.")
+	if !strings.Contains(system, piDocsLookupLine) {
+		return strings.TrimSpace(system)
+	}
+	var out strings.Builder
+	for line := range strings.Lines(system) {
+		if strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r") != piDocsLookupLine {
+			out.WriteString(line)
+		}
+	}
+	return strings.TrimSpace(out.String())
 }
 
 func clampMaxTokens(n int) int {
