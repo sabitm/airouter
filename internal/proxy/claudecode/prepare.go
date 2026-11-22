@@ -11,13 +11,9 @@ import (
 
 // PrepareInput is the per-send Claude Code preparation. SessionID must match
 // the session header. AccountUUID and DeviceID come from the resolved
-// credential snapshot, never from the client body. Token is recorded so a
-// caller can see which credential the body was prepared for. The body itself
-// does not contain the token. OAuth-specific billing and beta fields are
-// selected by the header seam from the same snapshot, not by rewriting this body
-// into an OAuth envelope.
+// credential snapshot, never from the client body. The auth token stays at
+// the header seam.
 type PrepareInput struct {
-	Token       string
 	SessionID   string
 	AccountUUID string
 	DeviceID    string
@@ -35,12 +31,11 @@ type PrepareInput struct {
 	Attribution BillingInput
 }
 
-// Prepare applies official CLI preparation to an encoded Anthropic Messages
-// body. It replaces only the system array and metadata.user_id. Other
-// top-level fields, including context_management, output_config, thinking,
-// tool_choice, and tool declarations, stay as the Anthropic encoder wrote them.
-// Unknown top-level ingress fields are not forwarded: this function edits the
-// already-validated Anthropic body, it does not accept a raw client envelope.
+// Prepare edits the encoded Anthropic Messages body as JSON, not through a
+// narrower request struct that could drop fields such as thinking.display or
+// output_config.format. It updates system and metadata.user_id and strips model
+// context selectors. Caller tool names stay unchanged and no decoys are added.
+// This function takes the Anthropic encoder's output, not a raw client envelope.
 func Prepare(body []byte, in PrepareInput) ([]byte, error) {
 	var doc map[string]json.RawMessage
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -52,9 +47,6 @@ func Prepare(body []byte, in PrepareInput) ([]byte, error) {
 		return nil, err
 	}
 	profile := in.Profile
-	if profile.Version == "" {
-		profile.Version = CLIVersion
-	}
 	if profile.Entrypoint == "" {
 		profile.Entrypoint = DefaultEntrypoint
 	}
@@ -536,7 +528,8 @@ func stripBillingHeader(s string) string {
 func looksLikeBillingField(s string) bool {
 	fields := []string{
 		"cc_version=", "cc_entrypoint=", "cch=", "cc_workload=", "cc_is_subagent=",
-		"cc_prev_req=", "cc_prompt_id=", "cc_turn_origin=", "cc_prompt_index=",
+		"cc_prev_req=", "cc_prev_msg=", "cc_prev_prompt_index=", "cc_prev_turn_index=",
+		"cc_prompt_id=", "cc_turn_origin=", "cc_prompt_index=",
 		"cc_turn_index=", "cc_gateway=", "cc_project=", "cc_project_src=",
 	}
 	for _, f := range fields {

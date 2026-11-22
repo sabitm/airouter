@@ -1,0 +1,122 @@
+{
+  "cli_version": "2.1.318",
+  "scope": "Source-derived field expectations for first-party interactive Messages inference with a paired OAuth inference grant. These are synthetic inputs, not captured CLI requests. The comparison does not specify the CLI's full prompt, cache layout, runtime headers, complete beta set, or HTTP transport.",
+  "sources": [
+    {
+      "file": "chunk-5xgkngpb.js",
+      "sha256": "8b48a8c0f65827cc4e6a4c5493b98b26df81946b855ca19c45e15ed3eb884dff",
+      "evidence": "Byte 2825443 sets stream=true on the main inference send. Bytes 2778633, 2780280, and 2782449 select the output cap, demote a named tool under thinking, and omit temperature under thinking. Byte 2784834 builds the request from the equivalent message and tool inputs."
+    },
+    {
+      "file": "chunk-5m8x0kb6.js",
+      "sha256": "aa9a02b9c1887710c776983c745363a41801e1a21060d77050ae804da8ce4208",
+      "evidence": "Byte 7081 starts the Sonnet 4.6 catalog row with baked default 32000 and upper limit 128000."
+    },
+    {
+      "file": "chunk-exfmq47h.js",
+      "sha256": "cd6e91b444dca42fe18f1e806dee19d53f60cc862d7d2e88c4329795768fd5e2",
+      "evidence": "Bytes 487395 and 487828 resolve the effective output limit. The default-cap fixture assumes no served, environment, or per-call override. Bytes 489567 and 495224 admit temperature on Sonnet 4.6 when thinking is disabled and capabilities are not overridden. Byte 606583 builds the interactive User-Agent."
+    },
+    {
+      "file": "chunk-vn3g7zt8.js",
+      "sha256": "3cc492cb8de9608485be78039b04fd81e49feb9b0ee70957b294e522e3e9595f",
+      "evidence": "Byte 119077 is the raw beta Messages POST, not the SDK stream helper. Bytes 20196, 176878, 272811, and 280183 cover JSON, API version/browser-access headers, interactive x-app, and API client options."
+    },
+    {
+      "file": "chunk-gjbr82c9.js",
+      "sha256": "d211aa747e0dbffef856e85d50ee19b17109bf9c9bdb7b49639b13696ad23348",
+      "evidence": "Byte 934 pins SDK package version 0.128.0. Byte 1307 starts the SDK runtime header function."
+    },
+    {
+      "file": "chunk-tzbg5px3.js",
+      "sha256": "22a772a74f3ac6378e7d7d7ccb803f57e1954fd1d74294401a72efece3a22a37",
+      "evidence": "Byte 839 pins the OAuth beta value."
+    }
+  ],
+  "method": "POST",
+  "url": "https://api.anthropic.com/v1/messages?beta=true",
+  "headers": {
+    "Content-Type": "application/json",
+    "Anthropic-Version": "2023-06-01",
+    "Anthropic-Dangerous-Direct-Browser-Access": "true",
+    "User-Agent": "claude-cli/2.1.318 (external, cli)",
+    "X-App": "cli",
+    "X-Stainless-Lang": "js",
+    "X-Stainless-Package-Version": "0.128.0"
+  },
+  "absent_headers": ["X-Api-Key", "X-Stainless-Helper-Method"],
+  "required_betas": ["oauth-2025-04-20"],
+  "match_body": {
+    "model": "claude-sonnet-4-6",
+    "messages.0.role": "user",
+    "messages.0.content.0.type": "text",
+    "messages.0.content.0.text": "hello"
+  },
+  "cases": [
+    {
+      "name": "plain-stream",
+      "input": {
+        "model": "default",
+        "stream": true,
+        "max_tokens": 4096,
+        "thinking": {"type": "disabled"},
+        "temperature": 1,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+      },
+      "match_body": {"stream": true, "max_tokens": 4096, "temperature": 1}
+    },
+    {
+      "name": "plain-unary",
+      "input": {
+        "model": "default",
+        "max_tokens": 4096,
+        "thinking": {"type": "disabled"},
+        "temperature": 1,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+      },
+      "match_body": {"max_tokens": 4096, "temperature": 1},
+      "differences": {
+        "stream": {"cli": true}
+      }
+    },
+    {
+      "name": "omitted-output-cap",
+      "input": {
+        "model": "default",
+        "stream": true,
+        "thinking": {"type": "disabled"},
+        "temperature": 1,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+      },
+      "match_body": {"stream": true, "temperature": 1},
+      "differences": {
+        "max_tokens": {"cli": 32000, "airouter": 4096}
+      }
+    },
+    {
+      "name": "active-thinking-with-named-tool-and-temperature",
+      "input": {
+        "model": "default",
+        "stream": true,
+        "max_tokens": 4096,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+        "temperature": 0.4,
+        "tool_choice": {"type": "tool", "name": "lookup"},
+        "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+      },
+      "match_body": {
+        "stream": true,
+        "max_tokens": 4096,
+        "thinking.type": "adaptive",
+        "tools.0.name": "lookup",
+        "tools.0.input_schema": {"type": "object"}
+      },
+      "differences": {
+        "temperature": {"airouter": 0.4},
+        "tool_choice": {"cli": {"type": "auto"}, "airouter": {"type": "tool", "name": "lookup"}}
+      }
+    }
+  ]
+}

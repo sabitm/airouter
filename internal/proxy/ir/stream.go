@@ -152,9 +152,14 @@ type StreamEvent struct {
 	ContextManagement    json.RawMessage
 	StopDetails          json.RawMessage
 	InputTransformations json.RawMessage
-	// UsageReported is set only by the Cursor agent decoder on a normal
-	// Connect completion whose turn_ended supplied both input and output
-	// counters, including explicit zero. It is not encoded. Other codecs
-	// leave it false, which must not be read as missing usage.
+	// UsageReported is an internal marker, not a wire field, and it is not
+	// encoded. False is the default and must not be read as missing usage.
+	// Cursor sets it only on a normal Connect completion whose turn_ended
+	// supplied both input and output counters, including explicit zero. A
+	// missing counter, a partial pair, or an immediate MCP handoff leaves it
+	// false. Claude Code sets it on a successful finish when any supported
+	// non-null numeric counter was present on message_start or message_delta,
+	// including explicit zero, a partial report, and a recognized cache TTL
+	// counter. Other codecs leave it false.
 	UsageReported bool
 }

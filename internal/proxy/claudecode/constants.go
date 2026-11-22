@@ -6,10 +6,9 @@
 // distinct from anth-msg so every ingress translates through this prepare step
 // rather than passing through.
 //
-// The profile is pinned to Claude Code 2.1.303 (SDK 0.128.0). Official wire
-// fidelity does not mean Anthropic supports this proxy. Agent runtime, cloud
-// gateway, remote workers, telemetry, and experimental feature flags are out
-// of scope.
+// The profile targets Claude Code 2.1.318 (SDK 0.128.0), not full wire parity.
+// This is not a supported Anthropic proxy. Agent runtime, cloud gateway,
+// remote workers, telemetry, and experimental feature flags are out of scope.
 package claudecode
 
 import "runtime"
@@ -23,7 +22,7 @@ const UpstreamPath = "/messages?beta=true"
 
 const (
 	// CLIVersion is the pinned Claude Code client version.
-	CLIVersion = "2.1.303"
+	CLIVersion = "2.1.318"
 	// SDKPackageVersion is the Anthropic SDK package version embedded in that CLI.
 	SDKPackageVersion = "0.128.0"
 	// DefaultEntrypoint is the V0 fallback when CLAUDE_CODE_ENTRYPOINT is unset.
@@ -41,8 +40,8 @@ const (
 
 	// BillingHeaderPrefix is the system-text marker the CLI prepends.
 	BillingHeaderPrefix = "x-anthropic-billing-header:"
-	// BillingFingerprintSalt is the CLI salt (var oj in 2.1.303). Qm uses it
-	// only for the cc_version suffix. cch stays the literal 00000.
+	// BillingFingerprintSalt is used only for the three-hex cc_version suffix.
+	// The separate cch builder placeholder is not this fingerprint.
 	BillingFingerprintSalt = "59cf53e54c78"
 
 	// IdentityCLI is the interactive CLI system line (nl).
@@ -53,12 +52,11 @@ const (
 	// IdentityAgent is the non-interactive line without an append (qd).
 	IdentityAgent = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
-	// Official OAuth endpoints and the public CLI client id (2.1.303).
-	AuthorizeURL        = "https://claude.com/cai/oauth/authorize"
-	ConsoleAuthorizeURL = "https://platform.claude.com/oauth/authorize"
-	TokenURL            = "https://platform.claude.com/v1/oauth/token"
-	ManualRedirectURL   = "https://platform.claude.com/oauth/code/callback"
-	ClientID            = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	// Official OAuth endpoints and the public CLI client id (2.1.318).
+	AuthorizeURL      = "https://claude.com/cai/oauth/authorize"
+	TokenURL          = "https://platform.claude.com/v1/oauth/token"
+	ManualRedirectURL = "https://platform.claude.com/oauth/code/callback"
+	ClientID          = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 	// DefaultScopes is iWo(): org:create_api_key and user:profile, unioned with
 	// Dbt (profile, inference, sessions, mcp_servers, file_upload, and plugins
@@ -76,7 +74,7 @@ const (
 	StainlessTimeoutSeconds = "600"
 )
 
-// Beta flag names from the 2.1.303 registry. Registry presence is not evidence
+// Beta flag names verified in the 2.1.318 registry. Registry presence is not evidence
 // that a flag is always sent. Selection is feature- and model-gated.
 const (
 	BetaClaudeCode      = "claude-code-20250219"
@@ -102,16 +100,6 @@ const (
 // not Node, so the runtime is "unknown" and OS/arch come from the real process.
 // Callers overwrite forwarded client values after copying client headers.
 func StainlessRuntimeHeaders() map[string]string {
-	h := StainlessRuntimeHeadersFor("stream")
-	return h
-}
-
-// StainlessRuntimeHeadersFor returns the process fingerprint with the helper
-// method for that endpoint. A model list is not a stream.
-func StainlessRuntimeHeadersFor(method string) map[string]string {
-	if method == "" {
-		method = "stream"
-	}
 	return map[string]string{
 		"X-Stainless-Lang":            "js",
 		"X-Stainless-Package-Version": SDKPackageVersion,
@@ -121,7 +109,6 @@ func StainlessRuntimeHeadersFor(method string) map[string]string {
 		"X-Stainless-Runtime-Version": "unknown",
 		"X-Stainless-Retry-Count":     "0",
 		"X-Stainless-Timeout":         StainlessTimeoutSeconds,
-		"X-Stainless-Helper-Method":   method,
 	}
 }
 
@@ -161,8 +148,9 @@ func stainlessArch(goarch string) string {
 }
 
 // StaticModels is the fallback catalog for dashboard autocomplete when the
-// live /models probe fails. Names match the 2.1.303 first-party catalog.
+// live /models probe fails. This subset is not an entitlement list.
 var StaticModels = []string{
+	"claude-haiku-5-5",
 	"claude-fable-5",
 	"claude-fable-5-1",
 	"claude-sonnet-5",

@@ -386,8 +386,11 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	}
 	cursorBackend := backend.protocol == domain.ProtocolCursor
 	cursorReported := false
+	claudeBackend := backend.protocol == domain.ProtocolClaudeCode
+	claudeReported := false
 	emit := func(ev ir.StreamEvent) error {
-		if cursorBackend && ev.Kind == ir.EventFinish {
+		switch {
+		case cursorBackend && ev.Kind == ir.EventFinish:
 			if ev.UsageReported {
 				// Inclusive totals can exceed the request body. Cursor adds
 				// context the proxy did not send, so do not apply the byte heuristic.
@@ -413,7 +416,16 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 				cursorReported = false
 				res.usageEstimated = true
 			}
-		} else {
+		case claudeBackend && ev.Kind == ir.EventFinish && ev.UsageReported:
+			// A marked Claude Code finish is the log snapshot, including explicit
+			// zero and a partial report. Do not replace a zero partition with an
+			// estimate. The request-size heuristic runs only for an unmarked finish.
+			// Failure and cancel paths do not use this branch.
+			inTok = ev.InputTokens
+			outTok = ev.OutputTokens
+			claudeReported = true
+			res.usageEstimated = false
+		default:
 			switch ev.Kind {
 			case ir.EventMessageStart:
 				if ev.InputTokens != 0 {
@@ -504,6 +516,11 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			return committed().withTokens(inTok, outTok)
 		}
 		return committed().withEstimatedTokens(inTok, outTok)
+	}
+	if claudeReported {
+		// Successful marked finish only. Unmarked Claude usage keeps the
+		// heuristic and the both-zero estimate below.
+		return committed().withTokens(inTok, outTok)
 	}
 	if !usageInputPlausible(len(upstreamBody), inTok) {
 		// A decoded input count that cannot fit the sent request is not usage.

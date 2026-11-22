@@ -8,30 +8,37 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"airouter/internal/domain"
 )
 
 var modelsClient = &http.Client{Timeout: 15 * time.Second}
 
 // ListModelIDs fetches the provider's live model list using the Claude Code CLI
 // identity headers, since the /models endpoint keys acceptance on the client
-// fingerprint. accessToken is the resolved bearer token. The caller falls back
-// to StaticModels on error or an empty list so dashboard autocomplete still works.
-func ListModelIDs(ctx context.Context, baseURL, accessToken string) ([]string, error) {
-	url := strings.TrimRight(baseURL, "/") + "/models"
+// fingerprint. The provider carries the resolved bearer token and the grant
+// snapshot used to classify the oauth beta. The caller falls back to
+// StaticModels on error or an empty list so dashboard autocomplete still works.
+func ListModelIDs(ctx context.Context, provider *domain.Provider) ([]string, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("claude-code: provider is nil")
+	}
+	url := strings.TrimRight(provider.BaseURL, "/") + "/models?limit=1000"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	for k, v := range StainlessRuntimeHeadersFor("list") {
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	for k, v := range StainlessRuntimeHeaders() {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("anthropic-version", AnthropicVersion)
 	req.Header.Set("User-Agent", DefaultProfile().UserAgent())
 	req.Header.Set("X-App", "cli")
 	// A model-list probe has no thinking, tools, or cache policy. The oauth
-	// beta is sent only for an OAuth token. Acceptance here is not Messages proof.
-	req.Header.Set("anthropic-beta", BetaHeaders(BetaRequest{OAuth: IsOAuthToken(accessToken)}))
+	// beta follows the paired grant on this provider. Acceptance here is not
+	// Messages proof.
+	req.Header.Set("anthropic-beta", BetaHeaders(BetaRequest{OAuth: OAuthBeta(provider)}))
 	resp, err := modelsClient.Do(req)
 	if err != nil {
 		return nil, err

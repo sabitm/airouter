@@ -97,7 +97,7 @@ func TestClaudeCodeFinding4Mythos5HTTP(t *testing.T) {
 			assertBetaFlagCount(t, wire.beta, claudecode.BetaEffort, 1)
 			assertBetaFlagCount(t, wire.beta, claudecode.BetaInterleaved, 1)
 			assertBetaFlagCount(t, wire.beta, claudecode.BetaRedactThinking, 1)
-			assertBetaFlagCount(t, wire.beta, claudecode.BetaContextMgmt, boolCount(tc.path == "/v1/messages"))
+			assertBetaFlagCount(t, wire.beta, claudecode.BetaContextMgmt, 1)
 			if tc.path == "/v1/messages" && !strings.Contains(wire.body, `"context_management"`) {
 				t.Fatalf("context_management intent lost: %s", wire.body)
 			}
@@ -155,7 +155,7 @@ func TestClaudeCodeFinding4Mythos5IntentHTTP(t *testing.T) {
 					t.Fatalf("no-intent request gained thinking: %s", wire.body)
 				}
 				assertBetaFlagCount(t, wire.beta, claudecode.BetaEffort, 0)
-				assertBetaFlagCount(t, wire.beta, claudecode.BetaInterleaved, 0)
+				assertBetaFlagCount(t, wire.beta, claudecode.BetaInterleaved, 1)
 				assertBetaFlagCount(t, wire.beta, claudecode.BetaRedactThinking, 0)
 				return
 			}
@@ -254,7 +254,7 @@ func TestClaudeCodeFinding4Mythos5DisableHTTP(t *testing.T) {
 					}
 					assertMythos5DisableRequest(t, wire, in.sibling)
 					assertBetaFlagCount(t, wire.beta, claudecode.BetaEffort, 0)
-					assertBetaFlagCount(t, wire.beta, claudecode.BetaInterleaved, 0)
+					assertBetaFlagCount(t, wire.beta, claudecode.BetaInterleaved, 1)
 					assertBetaFlagCount(t, wire.beta, claudecode.BetaRedactThinking, 0)
 					assertSelectorUsage(t, in.path, stream, string(out))
 				})
@@ -356,7 +356,7 @@ func TestClaudeCodeFinding4Haiku45HTTP(t *testing.T) {
 			assertBetaFlagCount(t, wire.beta, claudecode.BetaInterleaved, 1)
 			assertBetaFlagCount(t, wire.beta, claudecode.BetaRedactThinking, 1)
 			assertBetaFlagCount(t, wire.beta, claudecode.BetaLongContext, boolCount(tc.longCtx))
-			assertBetaFlagCount(t, wire.beta, claudecode.BetaContextMgmt, boolCount(tc.context))
+			assertBetaFlagCount(t, wire.beta, claudecode.BetaContextMgmt, 1)
 			if tc.context && !strings.Contains(wire.body, `"context_management"`) {
 				t.Fatalf("context_management intent lost: %s", wire.body)
 			}

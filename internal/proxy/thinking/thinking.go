@@ -635,15 +635,20 @@ func writeClaudeBudget(m map[string]any, cfg *Config, caps Caps) {
 		m["thinking"] = map[string]any{"type": "disabled"}
 		return
 	}
+	fields := map[string]any{"type": "enabled"}
+	if cfg.Display != "" {
+		fields["display"] = cfg.Display
+	}
 	if cfg.Mode == ModeAuto {
-		m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "enabled"})
+		m["thinking"] = mergeObject(m["thinking"], fields)
 		return
 	}
 	budget := BudgetFor(cfg, caps.BudgetMin, caps.BudgetMax)
 	if budget <= 0 {
 		budget = 8192
 	}
-	m["thinking"] = mergeObject(m["thinking"], map[string]any{"type": "enabled", "budget_tokens": budget})
+	fields["budget_tokens"] = budget
+	m["thinking"] = mergeObject(m["thinking"], fields)
 	// Reconcile max_tokens: thinking tokens count against it.
 	ReconcileMaxTokens(m, budget, caps.MaxOutput)
 }

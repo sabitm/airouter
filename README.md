@@ -274,13 +274,83 @@ preserve that history. Other client formats receive only readable thinking text.
 The proxy does not copy Anthropic signatures into OpenAI encrypted content and
 does not return redacted data as text.
 
-Claude Code uses a pinned CLI profile (version 2.1.303). A dashboard Check
-calls `GET /models` only. A passing Check does not prove that Messages
+Claude Code uses a pinned CLI profile (version 2.1.318, SDK 0.128.0), not full
+CLI wire parity. The billing builder writes the placeholder `cch=00000` only
+for an official host. A custom host does not receive that field. Each Messages
+send then replaces one placeholder in the final body when the resolved upstream
+URL contains `/v1/messages` and the compact system marker has that placeholder
+in its 300-byte window. The patch does not add its own host check. The
+replacement is five lowercase hex digits. It is not the three-hex `cc_version`
+fingerprint. Discovery requests are not patched. This covers plaintext
+activation, raw byte exclusions, and the five-digit overwrite only. It does not
+prove gzip ordering, random padding, HTTP/2 framing, CLI runtime behavior, or
+provider acceptance. Caller tool names stay unchanged, unlike the CLI's
+conditional MCP name mapping. A dashboard Check
+calls `GET /models?limit=1000` only. A passing Check does not prove that Messages
 requests will be accepted, and it does not send an inference request. The
 profile does not include the Claude Agent SDK runtime, cloud gateway, remote
 workers, or telemetry. A browser connect uses the official authorize and token
 endpoints, but that login path is not a verified first-party login. Existing
 connections keep their stored endpoints and are not expanded to newer scopes.
+The oauth beta uses a stored grant only when that grant is paired with the
+effective token and contains the exact scope `user:inference`. A known grant
+without that scope does not receive the oauth beta. An unknown grant, a
+whitespace-only scope list, or a token that does not match its stored
+credential uses the legacy `sk-ant-oat` check. That fallback includes imported
+static bearer tokens. An API-key provider ignores OAuth credential scopes.
+This rule classifies only the oauth beta. It does not authorize inference,
+change the authentication scheme, or claim full CLI or provider conformance.
+
+Inference advertises interleaved-thinking and context-management betas for
+supported, known models even when the body does not use those features.
+Redact-thinking still requires active, nonsummarized thinking. The cache-scope
+beta is automatic on the official API host; custom endpoints retain explicit
+cache-scope requests. These headers do not add cache markers or change TTLs.
+A target's `[1m]` selector does not add the long-context beta on pinned
+native-1M models. Explicit beta requests retain the existing capability gate.
+Structured-output beta requests exclude Opus 4.0 and Sonnet 4.0, but allow
+Opus 4.1. Other beta flags keep their existing feature gates. This is a bounded
+proxy policy, not the CLI's organization flags, served model overrides, or
+beta-rejection retry policy. Discovery does not advertise inference features.
+
+Claude Code stream completion is stricter than generic Anthropic decoding. A
+successful stream needs a valid `message_start`, no open text, tool, thinking,
+or server block, and either `message_stop` or a `message_delta` whose
+`stop_reason` is a JSON string. A clean end after that terminal delta is
+complete. `message_stop` is not required in that case. A stream that only
+starts, a content event before `message_start`, or an open block at the end is
+an error. The proxy does not report that truncated output as a successful
+finish. An explicit `message_stop` with no stop reason still ends as
+`end_turn`. This is a bounded proxy rule. It does not reproduce CLI retries,
+partial salvage, or server-side model fallback, and it is not full CLI or
+provider conformance.
+
+Claude Code stream usage merges `message_start` and each `message_delta` for
+ordinary input, cache read, cache write, and output only. A positive ordinary
+input, cache read, or aggregate cache write replaces the prior value. An
+omitted, null, or zero value keeps that prior value. A positive
+`cache_creation_input_tokens` wins over the current frame's
+`ephemeral_1h_input_tokens` plus `ephemeral_5m_input_tokens`. Otherwise a
+positive sum of those two current-frame fields becomes cache write. The proxy
+does not add TTL values from earlier frames. Output uses nullish coalescing:
+omitted and null keep the prior output, and an explicit zero replaces it. A
+successful finish is marked when any supported non-null numeric counter was
+present, including explicit zero, a partial report, or a recognized TTL
+counter. Missing, null, and unknown-only usage are not marked. Inclusive input
+is ordinary plus cache read plus cache write. Cache buckets are not added
+again. Negative counters and sums that overflow are rejected without copying
+upstream usage JSON or counter values into the error. A usage-only delta does
+not complete a stream. The proxy does not store TTL breakdowns, thinking
+tokens, server-tool counts, service tier, speed, iterations, inference
+geography, or fallback credit, and it does not apply fallback-credit
+adjustment. It does not change pricing, quota, or unary response decoding.
+Generic Anthropic and OpenCode streams keep their existing usage replacement.
+A marked Claude Code finish is the log snapshot, including zero and partial
+reports, and it bypasses the request-size estimate. Unmarked usage keeps zero
+wire counts and the existing log-only estimate. The Logs page caps aggregate
+input and output totals to the signed 64-bit range without changing the
+stored count for any request. This is not full CLI usage accounting or
+provider conformance.
 
 ## Configuration
 

@@ -6,11 +6,10 @@ import (
 	"airouter/internal/proxy/thinking"
 )
 
-// Profile is the pinned Claude Code 2.1.303 request profile.
+// Profile is the pinned Claude Code 2.1.318 request profile.
 // Runtime fingerprints are not invented. The process reports its own OS and
 // architecture, and the runtime name stays unknown because this process is not Node.
 type Profile struct {
-	Version    string
 	Entrypoint string
 	// SDK is true only when the caller is a validated Agent SDK entrypoint
 	// (sdk-cli, sdk-ts, sdk-py) and an Agent SDK version was supplied.
@@ -34,7 +33,7 @@ type Profile struct {
 // DefaultProfile is the interactive CLI profile used when the caller does not
 // supply a validated entrypoint.
 func DefaultProfile() Profile {
-	return Profile{Version: CLIVersion, Entrypoint: DefaultEntrypoint}
+	return Profile{Entrypoint: DefaultEntrypoint}
 }
 
 // ProfileUserAgent is the short profile User-Agent used by the profile fetch.
@@ -119,6 +118,12 @@ type BetaRequest struct {
 	ThinkingSummarized bool
 	FastMode           bool
 	OneMillion         bool
+	// OfficialHost enables inference cache-scope advertisement without changing
+	// caller cache markers. Discovery does not set this inference-only flag.
+	OfficialHost bool
+	// ExplicitOneMillion distinguishes a structured beta request from a model
+	// selector, since native-1M suppression applies only to selector intent.
+	ExplicitOneMillion bool
 	// ContextOneMillion carries the request-local target [1m] selector. The
 	// prepared wire model no longer contains that selector.
 	ContextOneMillion bool
@@ -128,8 +133,8 @@ type BetaRequest struct {
 }
 
 // BetaHeaders returns the feature- and model-gated flags for one request.
-// The 2.1.303 registry is not sent wholesale. token-efficient-tools and
-// between_tools are absent from that CLI and are never added.
+// Known 2.1.318 registry strings are not sent wholesale. Selection is proxy
+// policy, not a reproduction of CLI runtime feature flags or retry filters.
 // A summarized thinking display does not receive the redact-thinking beta.
 func BetaHeaders(req BetaRequest) string {
 	var out []string
@@ -148,16 +153,16 @@ func BetaHeaders(req BetaRequest) string {
 	if req.OAuth {
 		add(BetaOAuth)
 	}
-	if req.OneMillion && (req.ContextOneMillion || thinking.HasOneMillionContextSelector(req.Model) || modelSupportsOneMillion(model)) {
+	if requestNeedsLongContextBeta(req, model) {
 		add(BetaLongContext)
 	}
-	if req.ThinkingActive && modelSupportsInterleavedThinking(model) {
+	if (req.ThinkingActive || modelHasBaselineBetas(model)) && modelSupportsInterleavedThinking(model) {
 		add(BetaInterleaved)
-		if !req.ThinkingSummarized {
+		if req.ThinkingActive && !req.ThinkingSummarized {
 			add(BetaRedactThinking)
 		}
 	}
-	if req.ContextManagement && modelSupportsContextManagement(model) {
+	if (req.ContextManagement || modelHasBaselineBetas(model)) && modelSupportsContextManagement(model) {
 		add(BetaContextMgmt)
 	}
 	if req.StructuredOutput && modelSupportsStructuredOutput(model) {
@@ -166,7 +171,7 @@ func BetaHeaders(req BetaRequest) string {
 	if req.Effort && modelSupportsEffort(model) {
 		add(BetaEffort)
 	}
-	if req.CacheScope {
+	if req.CacheScope || req.OfficialHost {
 		add(BetaPromptCache)
 	}
 	if req.ExtendedTTL {
@@ -194,15 +199,6 @@ func BetaHeaders(req BetaRequest) string {
 	return strings.Join(out, ",")
 }
 
-func callerBeta(req BetaRequest, flag string) bool {
-	for _, got := range req.CallerBetas {
-		if got == flag {
-			return true
-		}
-	}
-	return false
-}
-
 // callerBetaSupported admits a caller flag only when this model can use it.
 // The check reuses the same feature gates as a body-derived flag. It does not
 // accept an unknown name or a flag the catalog does not support.
@@ -217,7 +213,7 @@ func callerBetaSupported(flag, model string, req BetaRequest) bool {
 		// Do not also require the body to repeat the same flag.
 		return modelSupportsOneMillion(model)
 	case BetaInterleaved:
-		return req.ThinkingActive && modelSupportsInterleavedThinking(model)
+		return (req.ThinkingActive || modelHasBaselineBetas(model)) && modelSupportsInterleavedThinking(model)
 	case BetaRedactThinking:
 		return req.ThinkingActive && !req.ThinkingSummarized && modelSupportsInterleavedThinking(model)
 	case BetaContextMgmt:
@@ -302,7 +298,7 @@ func modelSupportsContextManagement(model string) bool {
 
 func modelSupportsStructuredOutput(model string) bool {
 	m := canonicalModel(model)
-	if m == "" || strings.Contains(m, "claude-3") || m == "claude-opus-4-1" {
+	if m == "" || strings.Contains(m, "claude-3") || m == "claude-opus-4-0" || m == "claude-sonnet-4-0" {
 		return false
 	}
 	return strings.HasPrefix(m, "claude-")

@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -266,6 +268,45 @@ func TestRequestLogStatsAggregates(t *testing.T) {
 	}
 	if totalOut != 31 {
 		t.Errorf("totalOut = %d, want 31", totalOut)
+	}
+}
+
+func TestRequestLogStatsOverflow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows [][2]int64
+		in   int64
+		out  int64
+	}{
+		{"input overflow", [][2]int64{{math.MaxInt64, math.MaxInt64 - 2}, {1, 1}}, math.MaxInt64, math.MaxInt64 - 1},
+		{"output overflow", [][2]int64{{math.MinInt64 + 2, math.MaxInt64}, {-1, 1}}, math.MinInt64 + 1, math.MaxInt64},
+		{"underflow", [][2]int64{{math.MinInt64, 2}, {-1, 3}}, math.MinInt64, 5},
+		{"both overflow", [][2]int64{{math.MaxInt64, math.MinInt64}, {math.MaxInt64, math.MinInt64}}, math.MaxInt64, math.MinInt64},
+		{"intermediate overflow", [][2]int64{{math.MaxInt64, math.MinInt64}, {10, -10}, {-11, 11}}, math.MaxInt64 - 1, math.MinInt64 + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			ctx := t.Context()
+			// Use SQL's int64 column range independently of Go's host int size.
+			for _, row := range tc.rows {
+				if _, err := st.db.ExecContext(ctx, `INSERT INTO request_logs (input_tokens, output_tokens) VALUES (?, ?)`, row[0], row[1]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			count, in, out, err := st.RequestLogStats(ctx)
+			if err != nil || count != int64(len(tc.rows)) || in != tc.in || out != tc.out {
+				t.Fatalf("stats = (%d,%d,%d), err=%v; want (%d,%d,%d)", count, in, out, err, len(tc.rows), tc.in, tc.out)
+			}
+		})
+	}
+}
+
+func TestRequestLogStatsReturnsContextError(t *testing.T) {
+	st := testStore(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, _, _, err := st.RequestLogStats(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stats error = %v, want context.Canceled", err)
 	}
 }
 

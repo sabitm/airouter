@@ -1744,6 +1744,64 @@ func TestApplyWireGrokNonEffortStripsIncomingEffort(t *testing.T) {
 	}
 }
 
+func TestClaudeBudgetDisplayPreservation(t *testing.T) {
+	for _, protocol := range []domain.Protocol{domain.ProtocolAnthropic, domain.ProtocolClaudeCode} {
+		for _, tc := range []struct {
+			mode   Mode
+			budget int
+		}{
+			{ModeBudget, 2048},
+			{ModeLevel, 1024},
+			{ModeAuto, 0},
+			{ModeNone, 0},
+		} {
+			for _, display := range []string{"", "summarized"} {
+				t.Run(string(protocol)+"/"+string(tc.mode)+"/display="+display, func(t *testing.T) {
+					raw := []byte(`{"model":"combo","max_tokens":16,"thinking":{"type":"enabled","display":"stale","budget_tokens":8192},"messages":[{"role":"user","content":"hi"}],"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}`)
+					cfg := &Config{Mode: tc.mode, Budget: 2048, Level: "low", Display: display}
+					out, err := ApplyWire("anth-msg", raw, "claude-sonnet-4-5", cfg, protocol, domain.ReasoningClaude)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var doc struct {
+						Thinking     map[string]any `json:"thinking"`
+						MaxTokens    int            `json:"max_tokens"`
+						OutputConfig struct {
+							Format json.RawMessage `json:"format"`
+						} `json:"output_config"`
+					}
+					if err := json.Unmarshal(out, &doc); err != nil {
+						t.Fatal(err)
+					}
+					wantType := "enabled"
+					wantDisplay := display
+					if tc.mode == ModeNone {
+						wantType, wantDisplay = "disabled", ""
+					}
+					if doc.Thinking["type"] != wantType {
+						t.Fatalf("thinking type = %v, want %s", doc.Thinking["type"], wantType)
+					}
+					gotDisplay, hasDisplay := doc.Thinking["display"]
+					if hasDisplay != (wantDisplay != "") || hasDisplay && gotDisplay != wantDisplay {
+						t.Fatalf("thinking display = %v, want %q; body=%s", gotDisplay, wantDisplay, out)
+					}
+					budget, hasBudget := doc.Thinking["budget_tokens"]
+					if hasBudget != (tc.budget > 0) || hasBudget && budget != float64(tc.budget) {
+						t.Fatalf("thinking budget = %v, want %d; body=%s", budget, tc.budget, out)
+					}
+					wantMax := 16
+					if tc.budget > 0 {
+						wantMax = tc.budget + 1024
+					}
+					if doc.MaxTokens != wantMax || len(doc.OutputConfig.Format) == 0 {
+						t.Fatalf("display handling changed token reconciliation or format: %s", out)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestClaudeDisabledDropsDisplayAndBudget(t *testing.T) {
 	raw := []byte(`{"model":"combo","max_tokens":16,"thinking":{"type":"disabled","display":"summarized","budget_tokens":8192},"messages":[{"role":"user","content":"hi"}]}`)
 	out, err := ApplyWire("anth-msg", raw, "claude-sonnet-5", &Config{Mode: ModeNone, Display: "summarized", Budget: 8192}, domain.ProtocolAnthropic, domain.ReasoningClaude)

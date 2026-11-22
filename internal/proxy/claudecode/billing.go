@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 )
 
 // projectIDPattern is the CLI tagged project id check. A value that does not
 // match is omitted. The proxy does not synthesize one.
-var projectIDPattern = regexp.MustCompile(`^claude_proj_(?:staging_|local_)?01[1-9A-HJ-NP-Za-km-z]{22}$`)
+var projectIDPattern = regexp.MustCompile(`^(?:claude_proj|chan)_(?:staging_|local_)?01[1-9A-HJ-NP-Za-km-z]{22}$`)
 
 // BillingInput is the verified attribution set for one CLI request.
 // Optional fields are omitted unless they pass the CLI's own validators.
@@ -54,12 +55,12 @@ type BillingInput struct {
 	Gateway string
 }
 
-// cchLiteral is the value GPo writes. It is not a fingerprint and is not patched.
+// cchLiteral is the CLI builder placeholder. BillingHeader and Prepare keep
+// these five digits. The send path replaces them on the final body.
 const cchLiteral = "00000"
 
 // BillingHeader builds the x-anthropic-billing-header system text.
-// cch is the literal 00000 on a verified official host. Qm's 3-hex digest is
-// appended only to cc_version.
+// The three-hex fingerprint belongs only to cc_version, not cch.
 func BillingHeader(in BillingInput) string {
 	fp := in.Fingerprint
 	if fp == "" {
@@ -110,7 +111,7 @@ func BillingHeader(in BillingInput) string {
 	return b.String()
 }
 
-// Fingerprint matches Qm in Claude Code 2.1.303: take UTF-16 units at indexes
+// Fingerprint matches Du in Claude Code 2.1.318: take UTF-16 units at indexes
 // 4, 7, and 20, replace a missing unit with "0", join those units into one
 // UTF-16 string, then UTF-8 encode that string once. sha256(salt + chars +
 // version) hex[:3] is the result. Joining before decoding is required: a
@@ -193,16 +194,16 @@ func validProject(id, source string) bool {
 		return false
 	}
 	switch source {
-	case "flag", "managed", "admin_default":
+	case "harness", "user", "project", "local", "flag", "managed", "admin_default":
 		return true
 	default:
 		return false
 	}
 }
 
-// IsOfficialHost reports whether the base URL host is exactly api.anthropic.com.
-// A substring, path, or userinfo trick does not match. An unparseable value is
-// not official. Vertex is not inferred from the hostname; the caller sets
+// IsOfficialHost reports whether the normalized URL host is api.anthropic.com.
+// Default ports are omitted as in URL.host; nondefault ports do not match.
+// Vertex is not inferred from the hostname; the caller sets
 // BillingInput.VertexTransport only for an actual Vertex backend.
 func IsOfficialHost(baseURL string) bool {
 	host, ok := requestHost(baseURL)
@@ -215,11 +216,21 @@ func requestHost(raw string) (string, bool) {
 		return "", false
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || u.Hostname() == "" {
+	if err != nil || u.Host == "" || u.Hostname() == "" || strings.HasPrefix(u.Host, "[") {
 		return "", false
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return "", false
 	}
-	return strings.ToLower(u.Hostname()), true
+	host := strings.ToLower(u.Hostname())
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 0 || n > 65535 {
+			return "", false
+		}
+		if !((u.Scheme == "https" && n == 443) || (u.Scheme == "http" && n == 80)) {
+			host += ":" + strconv.Itoa(n)
+		}
+	}
+	return host, true
 }

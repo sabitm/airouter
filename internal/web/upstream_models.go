@@ -51,7 +51,17 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 	// oauth providers carry no static key; resolve (and refresh) the access token
 	// onto provider.APIKey so fetchUpstreamModels can send it as a bearer. Resolve
 	// does not mutate the provider, so the returned token must be assigned back.
-	if provider.Method() == domain.AuthOAuth {
+	// Saved Claude Code installs the ResolveCreds snapshot with that token so the
+	// oauth beta sees the grant that produced it. Other protocols keep their
+	// existing resolve path. A models failure does not force another refresh.
+	if provider.Method() == domain.AuthOAuth && provider.Protocol == domain.ProtocolClaudeCode {
+		resolved, err := h.oauth.ResolveCreds(r.Context(), provider, false)
+		if err != nil {
+			render(w, r, ModelOptions(nil, listID, true))
+			return
+		}
+		installResolvedClaudeCreds(provider, resolved)
+	} else if provider.Method() == domain.AuthOAuth {
 		var tok string
 		var err error
 		if provider.Protocol == domain.ProtocolOpencode {
@@ -130,7 +140,7 @@ func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 		return ids, nil
 	}
 	if p.Protocol == domain.ProtocolClaudeCode {
-		ids, err := claudecode.ListModelIDs(ctx, p.BaseURL, p.APIKey)
+		ids, err := claudecode.ListModelIDs(ctx, p)
 		if err != nil || len(ids) == 0 {
 			return append([]string(nil), claudecode.StaticModels...), nil
 		}

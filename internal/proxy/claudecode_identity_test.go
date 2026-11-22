@@ -12,39 +12,139 @@ import (
 	"airouter/internal/proxy/claudecode"
 )
 
+func TestClaudeOptionalHeadersAreValidatedAndControlled(t *testing.T) {
+	const prompt = "22222222-2222-4222-8222-222222222222"
+	const agent = "33333333-3333-4333-8333-333333333333"
+	for _, tc := range []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{"valid", []string{"valid"}, true},
+		{"invalid", []string{"bad; value"}, false},
+		{"duplicates", []string{"valid", "valid"}, false},
+		{"comma-joined", []string{"valid,valid"}, false},
+		{"absent", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := make(http.Header)
+			for _, value := range tc.values {
+				appValue, promptValue, agentValue := value, value, value
+				if value == "valid" {
+					appValue, promptValue, agentValue = "my-app", prompt, agent
+				}
+				h.Add("X-Client-App", appValue)
+				h.Add(claudePromptHeader, promptValue)
+				h.Add(claudeAgentHeader, agentValue)
+			}
+			h.Set("X-Stainless-Helper-Method", "stream")
+			ctx := withClaudeRequest(withClaudeTenant(t.Context(), "tenant"), h, nil)
+			provider := &domain.Provider{ID: 7, Protocol: domain.ProtocolClaudeCode, APIKey: "synthetic-key", AuthScheme: domain.AuthXAPIKey}
+			for _, forwarded := range []http.Header{nil, h} {
+				req, err := http.NewRequest(http.MethodPost, "http://local.invalid/messages", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				applyUpstreamHeaders(req, provider, forwarded, ctx, []byte(`{"model":"claude-sonnet-5"}`))
+				if req.Header.Get("x-api-key") != "synthetic-key" || req.Header.Get("Authorization") != "" {
+					t.Fatal("optional identity changed the configured auth scheme")
+				}
+				if _, ok := req.Header["X-Stainless-Helper-Method"]; ok {
+					t.Fatal("forwarded helper method survived")
+				}
+				for _, key := range []string{"X-Client-App", claudePromptHeader, claudeAgentHeader} {
+					got := req.Header.Get(key)
+					if (got != "") != tc.want {
+						t.Fatalf("header %s = %q, want present %v", key, got, tc.want)
+					}
+				}
+				if tc.want {
+					got := req.Header.Get(claudeAgentHeader)
+					if got == agent || !validClaudeUUID(got) {
+						t.Fatalf("unscoped/invalid agent = %q", got)
+					}
+					if req.Header.Get("X-Client-App") != "my-app" || req.Header.Get(claudePromptHeader) != prompt {
+						t.Fatal("validated optional headers changed")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeAgentScopeUsesCurrentCredentialSnapshot(t *testing.T) {
+	const agent = "abcdefab-cdef-4abc-8abc-abcdefabcdef"
+	h := make(http.Header)
+	h.Set(claudeAgentHeader, agent)
+	ctx := withClaudeRequest(withClaudeTenant(t.Context(), "tenant"), h, nil)
+	provider := &domain.Provider{ID: 7, Name: "old", BaseURL: "https://api.anthropic.com/v1", AuthMethod: domain.AuthOAuth, OAuthCreds: &domain.OAuthCreds{ClaudeAccountUUID: "old-account"}}
+	get := func(ctx context.Context, p *domain.Provider) string {
+		headers := make(http.Header)
+		applyClaudeOptionalHeaders(headers, ctx, p)
+		return headers.Get(claudeAgentHeader)
+	}
+	first := get(ctx, provider)
+	if first == "" || first == agent || first == claudeScopedSession("tenant", provider, agent) {
+		t.Fatal("agent not isolated from caller/session identity")
+	}
+	copyProvider := *provider
+	copyProvider.Name = "renamed"
+	copyProvider.APIKey = "rotated-token"
+	if get(ctx, &copyProvider) != first || get(ctx, provider) != first {
+		t.Fatal("retry, rename, or token rotation changed agent scope")
+	}
+	copyProvider.OAuthCreds = &domain.OAuthCreds{ClaudeAccountUUID: "new-account"}
+	if get(ctx, &copyProvider) == first {
+		t.Fatal("new account reused old agent scope")
+	}
+	copyProvider = *provider
+	copyProvider.ID++
+	if get(ctx, &copyProvider) == first {
+		t.Fatal("providers shared an agent")
+	}
+	copyProvider = *provider
+	copyProvider.BaseURL = "https://other.invalid/v1"
+	if get(ctx, &copyProvider) == first || get(withClaudeTenant(ctx, "other-tenant"), provider) == first {
+		t.Fatal("base URLs or tenants shared an agent")
+	}
+	upper := make(http.Header)
+	upper.Set(claudeAgentHeader, strings.ToUpper(agent))
+	if get(withClaudeRequest(withClaudeTenant(t.Context(), "tenant"), upper, nil), provider) != first {
+		t.Fatal("UUID case changed agent scope")
+	}
+}
+
 func TestClaudeSessionStableAcrossRetries(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Claude-Code-Session-Id", "11111111-1111-4111-8111-111111111111")
 	ctx := withClaudeRequest(context.Background(), h, nil)
 	p := &domain.Provider{Name: "cc", Protocol: domain.ProtocolClaudeCode}
-	px := &Proxy{}
-	a := px.resolveClaudeSession(ctx, p, "tenant")
-	b := px.resolveClaudeSession(ctx, p, "tenant")
+	a := claudeSessionID(ctx, p, "tenant")
+	b := claudeSessionID(ctx, p, "tenant")
 	if a != b {
 		t.Fatalf("session changed across retries: %s / %s", a, b)
 	}
 	if a == "11111111-1111-4111-8111-111111111111" {
 		t.Fatal("client session was returned without tenant scope")
 	}
-	other := px.resolveClaudeSession(ctx, p, "other-tenant")
+	other := claudeSessionID(ctx, p, "other-tenant")
 	if other == a {
 		t.Fatal("same client session joined another tenant")
 	}
 }
 
 func TestClaudeAnonymousRequestsStayIndependent(t *testing.T) {
-	px := &Proxy{}
 	p := &domain.Provider{ID: 7, Name: "cc", BaseURL: "https://api.anthropic.com", Protocol: domain.ProtocolClaudeCode, OAuthCreds: &domain.OAuthCreds{ClaudeAccountUUID: "acct"}}
 	ctx := withClaudeRequest(context.Background(), nil, nil)
-	a := px.resolveClaudeSession(ctx, p, "tenant-a")
-	if again := px.resolveClaudeSession(ctx, p, "tenant-a"); again != a {
+	a := claudeSessionID(ctx, p, "tenant-a")
+	if again := claudeSessionID(ctx, p, "tenant-a"); again != a {
 		t.Fatalf("anonymous retry changed session: %s / %s", a, again)
 	}
-	if b := px.resolveClaudeSession(ctx, p, "tenant-b"); a == b {
+	if b := claudeSessionID(ctx, p, "tenant-b"); a == b {
 		t.Fatal("tenants shared an anonymous session")
 	}
 	other := withClaudeRequest(context.Background(), nil, nil)
-	if px.resolveClaudeSession(other, p, "tenant-a") == a {
+	if claudeSessionID(other, p, "tenant-a") == a {
 		t.Fatal("unidentified requests were joined")
 	}
 }
@@ -90,8 +190,7 @@ func TestClaudeSessionScopeUsesStableProviderIdentity(t *testing.T) {
 	h.Set("X-Claude-Code-Session-Id", session)
 	h.Set("X-Claude-Code-Parent-Session-Id", parent)
 	ctx := withClaudeRequest(context.Background(), h, nil)
-	px := &Proxy{}
-	if px.resolveClaudeSession(ctx, a, "tenant") != px.resolveClaudeSession(ctx, &renamed, "tenant") {
+	if claudeSessionID(ctx, a, "tenant") != claudeSessionID(ctx, &renamed, "tenant") {
 		t.Fatal("retry after rename changed the main session")
 	}
 	if claudeParentID(ctx, a) != claudeParentID(ctx, &renamed) || claudeParentID(ctx, a) == parent {
@@ -103,7 +202,6 @@ func TestClaudeSessionScopeUsesStableProviderIdentity(t *testing.T) {
 }
 
 func TestClaudeAnonymousConcurrencyDoesNotJoin(t *testing.T) {
-	px := &Proxy{}
 	p := &domain.Provider{ID: 4, BaseURL: "https://api.anthropic.com", Protocol: domain.ProtocolClaudeCode}
 	var wg sync.WaitGroup
 	got := make([]string, 8)
@@ -112,7 +210,7 @@ func TestClaudeAnonymousConcurrencyDoesNotJoin(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			ctx := withClaudeRequest(context.Background(), nil, nil)
-			got[i] = px.resolveClaudeSession(ctx, p, "tenant")
+			got[i] = claudeSessionID(ctx, p, "tenant")
 		}(i)
 	}
 	wg.Wait()

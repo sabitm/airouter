@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"sort"
+	"strconv"
 
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/sse"
@@ -76,10 +78,6 @@ type streamDeltaUsage struct {
 	OutputTokens             int  `json:"output_tokens"`
 }
 
-// DecodeStream reads an Anthropic Messages SSE stream and emits IR stream
-// events. Used when Anthropic is the backend format. The block index from the
-// wire is carried through as StreamEvent.Index so the ingress encoder can
-// attribute tool argument fragments correctly.
 func quoteJSON(s string) string {
 	raw, err := json.Marshal(s)
 	if err != nil {
@@ -98,21 +96,61 @@ func rawContentBlock(data []byte) json.RawMessage {
 	return wrap.ContentBlock
 }
 
+// DecodeStreamOptions selects optional Anthropic stream completion rules.
+// The zero value preserves generic Anthropic and OpenCode Messages behavior.
+type DecodeStreamOptions struct {
+	// StrictCompletion requires a valid message_start and a terminal condition
+	// before a successful finish. Claude Code opts in. It is a bounded proxy
+	// rule, not full CLI or provider conformance.
+	StrictCompletion bool
+	// ReportedUsage merges message_start and message_delta usage with the
+	// pinned Claude Code aggregate rules and marks a successful finish when a
+	// supported counter was present. It is independent of StrictCompletion.
+	// Generic Anthropic and OpenCode leave it false.
+	ReportedUsage bool
+}
+
+// DecodeStream reads an Anthropic Messages SSE stream and emits IR stream
+// events. Used when Anthropic is the backend format. The block index from the
+// wire is carried through as StreamEvent.Index so the ingress encoder can
+// attribute tool argument fragments correctly. A clean EOF after any started
+// content still synthesizes EventFinish.
 func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
+	return DecodeStreamWithOptions(r, emit, DecodeStreamOptions{})
+}
+
+// DecodeStreamWithOptions is DecodeStream with optional completion rules.
+func DecodeStreamWithOptions(r io.Reader, emit func(ir.StreamEvent) error, opt DecodeStreamOptions) error {
 	reader := sse.NewReader(r)
 	var stopReason ir.StopReason = ir.StopEndTurn
 	ordinary, cacheRead, cacheWrite := 0, 0, 0
 	inputTokens, outputTokens := 0, 0
+	// usageSeen is attempt-local. A successful ReportedUsage finish sets
+	// UsageReported only when this attempt saw a supported counter.
+	var usageSeen bool
 	var stopSequence *string
 	var container, contextManagement, stopDetails, inputTransformations json.RawMessage
 	finished := false
 	started := false
+	strict := opt.StrictCompletion
+	mergeUsage := opt.ReportedUsage
+	// messageStarted is a valid message_start only. started is also set by
+	// content events and must not decide strict completion.
+	messageStarted := false
+	// terminal is set when message_delta carries a JSON string stop_reason.
+	// A later content start, delta, or stop clears it. Clean EOF can finish
+	// only while it remains set and every tracked block is closed. message_stop
+	// does not consult this flag. An empty string is still a string.
+	terminal := false
 	// thinkingOpen is the set of source indexes whose explicit thinking block
 	// has not stopped. Completed indexes are deleted so the map stays bounded
 	// by simultaneously open blocks, not stream history. A new explicit thinking
 	// block cannot start while one remains open. Text, tool, and redacted
 	// indexes may create gaps; those indexes are not required to be contiguous.
 	thinkingOpen := map[int]thinkingDecodeState{}
+	// Redacted data is complete on start, but strict completion still requires
+	// the source stop. Retain only open indexes under the thinking-block cap.
+	redactedOpen := map[int]bool{}
 	// textOpen tracks source text blocks so a delta and its citations bind to
 	// the source block rather than the latest merged text buffer. Completed
 	// indexes are deleted, so the map is bounded by simultaneous open blocks.
@@ -156,6 +194,56 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		}
 		return sb
 	}
+	applyReported := func(data []byte, fromMessage bool) error {
+		raw, present, err := reportedUsageRaw(data, fromMessage)
+		if err != nil {
+			return err
+		}
+		if err := mergeReportedUsage(&ordinary, &cacheRead, &cacheWrite, &outputTokens, &usageSeen, raw, present); err != nil {
+			return err
+		}
+		sum, err := reportedInclusive(ordinary, cacheRead, cacheWrite)
+		if err != nil {
+			return err
+		}
+		inputTokens = sum
+		return nil
+	}
+	emitFinish := func() error {
+		reported := false
+		if mergeUsage {
+			sum, err := reportedInclusive(ordinary, cacheRead, cacheWrite)
+			if err != nil {
+				return err
+			}
+			if err := reportedTotal(sum, outputTokens); err != nil {
+				return err
+			}
+			inputTokens = sum
+			reported = usageSeen
+		}
+		return emit(ir.StreamEvent{
+			Kind: ir.EventFinish, StopReason: stopReason, StopSequence: stopSequence,
+			InputTokens: inputTokens, OutputTokens: outputTokens,
+			CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
+			Container: container, ContextManagement: contextManagement,
+			StopDetails: stopDetails, InputTransformations: inputTransformations,
+			UsageReported: reported,
+		})
+	}
+	beforeStart := func() error {
+		if strict && !messageStarted {
+			return ir.ProtocolError("stream event before message_start")
+		}
+		return nil
+	}
+	// Content events invalidate a prior terminal delta. The received stop
+	// reason itself stays available for an explicit message_stop.
+	invalidateTerminal := func() {
+		if strict {
+			terminal = false
+		}
+	}
 
 	for {
 		ev, err := reader.Next()
@@ -182,8 +270,41 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			}
 			return sf
 		case "message_start":
+			if strict && messageStarted {
+				return ir.ProtocolError("message_start before message_stop")
+			}
+			if strict {
+				if err := strictMessageStartObject(ev.Data); err != nil {
+					return err
+				}
+			}
 			var m streamMessageStart
-			if json.Unmarshal(ev.Data, &m) != nil {
+			// Reported usage is parsed from raw JSON. The shared start struct uses
+			// plain integers, so an invalid counter would otherwise hide the usage
+			// error behind a generic decode failure.
+			if mergeUsage {
+				var ident struct {
+					Message struct {
+						ID                string          `json:"id"`
+						Model             string          `json:"model"`
+						Container         json.RawMessage `json:"container"`
+						ContextManagement json.RawMessage `json:"context_management"`
+					} `json:"message"`
+				}
+				if json.Unmarshal(ev.Data, &ident) != nil {
+					if strict {
+						return ir.ProtocolError("malformed stream event")
+					}
+					continue
+				}
+				m.Message.ID = ident.Message.ID
+				m.Message.Model = ident.Message.Model
+				m.Message.Container = ident.Message.Container
+				m.Message.ContextManagement = ident.Message.ContextManagement
+			} else if json.Unmarshal(ev.Data, &m) != nil {
+				if strict {
+					return ir.ProtocolError("malformed stream event")
+				}
 				continue
 			}
 			if m.Message.Container != nil {
@@ -200,10 +321,16 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				}
 				contextManagement = v
 			}
-			ordinary = m.Message.Usage.InputTokens
-			cacheRead = m.Message.Usage.CacheReadInputTokens
-			cacheWrite = m.Message.Usage.CacheCreationInputTokens
-			inputTokens = inclusiveInput()
+			if mergeUsage {
+				if err := applyReported(ev.Data, true); err != nil {
+					return err
+				}
+			} else {
+				ordinary = m.Message.Usage.InputTokens
+				cacheRead = m.Message.Usage.CacheReadInputTokens
+				cacheWrite = m.Message.Usage.CacheCreationInputTokens
+				inputTokens = inclusiveInput()
+			}
 			if err := emit(ir.StreamEvent{
 				Kind: ir.EventMessageStart, ID: m.Message.ID, Model: m.Message.Model,
 				InputTokens:     inputTokens,
@@ -213,13 +340,29 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				return err
 			}
 			started = true
+			messageStarted = true
 		case "content_block_start":
+			if err := beforeStart(); err != nil {
+				return err
+			}
+			if strict {
+				if err := strictContentStartObject(ev.Data); err != nil {
+					return err
+				}
+			}
 			var s streamContentBlockStart
 			if json.Unmarshal(ev.Data, &s) != nil {
+				if strict {
+					return ir.ProtocolError("malformed stream event")
+				}
 				continue
 			}
+			invalidateTerminal()
 			if s.Index < 0 {
 				return ir.ProtocolError("negative content block index")
+			}
+			if redactedOpen[s.Index] {
+				return ir.ProtocolError("content block started on an open redacted thinking block")
 			}
 			switch s.ContentBlock.Type {
 			case "tool_use":
@@ -271,6 +414,18 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			case "redacted_thinking":
 				if len(thinkingOpen) != 0 {
 					return ir.ProtocolError("content block started while thinking block is open")
+				}
+				if strict {
+					if s.Index <= stoppedThrough {
+						return ir.ProtocolError("redacted thinking block restarted after stop")
+					}
+					if textOpen[s.Index] || toolOpen[s.Index] || serverOpen[s.Index] != nil {
+						return ir.ProtocolError("redacted thinking block started on an open content block")
+					}
+					if len(redactedOpen) >= maxOpenThinkingBlocks {
+						return ir.ProtocolError("too many open redacted thinking blocks")
+					}
+					redactedOpen[s.Index] = true
 				}
 				// The data arrives complete on start. Do not invent readable text.
 				if err := emit(ir.StreamEvent{Kind: ir.EventRedactedReasoning, Index: s.Index, Data: s.ContentBlock.Data}); err != nil {
@@ -348,12 +503,27 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				started = true
 			}
 		case "content_block_delta":
+			if err := beforeStart(); err != nil {
+				return err
+			}
+			if strict {
+				if err := strictContentDeltaObject(ev.Data); err != nil {
+					return err
+				}
+			}
 			var d streamContentBlockDelta
 			if json.Unmarshal(ev.Data, &d) != nil {
+				if strict {
+					return ir.ProtocolError("malformed stream event")
+				}
 				continue
 			}
+			invalidateTerminal()
 			if d.Index < 0 {
 				return ir.ProtocolError("negative content block index")
+			}
+			if redactedOpen[d.Index] {
+				return ir.ProtocolError("delta on a redacted thinking block")
 			}
 			switch d.Delta.Type {
 			case "thinking_delta":
@@ -401,7 +571,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if d.Index <= stoppedThrough {
 					return ir.ProtocolError("text delta after block stop")
 				}
-				if explicitText {
+				if explicitText || strict {
 					return ir.ProtocolError("text delta without an open text block")
 				}
 				if err := emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: d.Delta.Text}); err != nil {
@@ -452,6 +622,9 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				if d.Index <= stoppedThrough {
 					return ir.ProtocolError("input delta after block stop")
 				}
+				if strict {
+					return ir.ProtocolError("input delta without an open tool block")
+				}
 				if err := emit(ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: d.Index, ArgsFrag: d.Delta.PartialJSON}); err != nil {
 					return err
 				}
@@ -480,12 +653,32 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				}
 			}
 		case "content_block_stop":
+			if err := beforeStart(); err != nil {
+				return err
+			}
+			if strict {
+				if _, err := strictContentObject(ev.Data); err != nil {
+					return err
+				}
+			}
 			var s streamContentBlockStop
 			if json.Unmarshal(ev.Data, &s) != nil {
+				if strict {
+					return ir.ProtocolError("malformed stream event")
+				}
 				continue
 			}
+			invalidateTerminal()
 			if s.Index < 0 {
 				return ir.ProtocolError("negative content block index")
+			}
+			if redactedOpen[s.Index] {
+				delete(redactedOpen, s.Index)
+				if s.Index > stoppedThrough {
+					stoppedThrough = s.Index
+				}
+				// EventRedactedReasoning already contains the complete IR block.
+				break
 			}
 			if _, open := thinkingOpen[s.Index]; open {
 				delete(thinkingOpen, s.Index)
@@ -525,11 +718,41 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				started = true
 			}
 		case "message_delta":
+			if err := beforeStart(); err != nil {
+				return err
+			}
+			var received string
+			var gotReason bool
+			if strict {
+				reason, ok, err := strictReceivedStopReason(ev.Data)
+				if err != nil {
+					return err
+				}
+				received, gotReason = reason, ok
+			}
+			if mergeUsage {
+				// Validate usage before the shared integer decode. A bad counter must
+				// not be reported as a generic malformed event, and it must not update
+				// a later field after an earlier field already failed.
+				if err := applyReported(ev.Data, false); err != nil {
+					return err
+				}
+			}
 			var m streamMessageDelta
 			if json.Unmarshal(ev.Data, &m) != nil {
+				if strict {
+					return ir.ProtocolError("malformed stream event")
+				}
 				continue
 			}
-			stopReason = stopReason2(m.Delta.StopReason)
+			if strict {
+				if gotReason {
+					stopReason = stopReason2(received)
+					terminal = true
+				}
+			} else {
+				stopReason = stopReason2(m.Delta.StopReason)
+			}
 			stopSequence = m.Delta.StopSequence
 			if m.Delta.Container != nil {
 				v, err := validateOptionalObject(m.Delta.Container, "container")
@@ -559,37 +782,65 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 				}
 				inputTransformations = v
 			}
-			if m.Usage.InputTokens != nil {
-				ordinary = *m.Usage.InputTokens
+			// A usage-only delta updates counters but does not set terminal.
+			// Completion still requires a string stop_reason or message_stop.
+			if !mergeUsage {
+				if m.Usage.InputTokens != nil {
+					ordinary = *m.Usage.InputTokens
+				}
+				if m.Usage.CacheReadInputTokens != nil {
+					cacheRead = *m.Usage.CacheReadInputTokens
+				}
+				if m.Usage.CacheCreationInputTokens != nil {
+					cacheWrite = *m.Usage.CacheCreationInputTokens
+				}
+				inputTokens = inclusiveInput()
+				outputTokens = m.Usage.OutputTokens
 			}
-			if m.Usage.CacheReadInputTokens != nil {
-				cacheRead = *m.Usage.CacheReadInputTokens
-			}
-			if m.Usage.CacheCreationInputTokens != nil {
-				cacheWrite = *m.Usage.CacheCreationInputTokens
-			}
-			inputTokens = inclusiveInput()
-			outputTokens = m.Usage.OutputTokens
 		case "message_stop":
-			if len(thinkingOpen) != 0 {
-				return ir.ProtocolError("thinking block closed by stream end")
+			if err := beforeStart(); err != nil {
+				return err
 			}
-			if len(serverOpen) != 0 {
-				return ir.ProtocolError("server block closed by stream end")
+			if strict {
+				if err := strictEventObject(ev.Data); err != nil {
+					return err
+				}
+				if err := strictOpenBlocks(len(thinkingOpen), len(textOpen), len(toolOpen), len(serverOpen), len(redactedOpen)); err != nil {
+					return err
+				}
+			} else {
+				if len(thinkingOpen) != 0 {
+					return ir.ProtocolError("thinking block closed by stream end")
+				}
+				if len(serverOpen) != 0 {
+					return ir.ProtocolError("server block closed by stream end")
+				}
 			}
-			if err := emit(ir.StreamEvent{
-				Kind: ir.EventFinish, StopReason: stopReason, StopSequence: stopSequence,
-				InputTokens: inputTokens, OutputTokens: outputTokens,
-				CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
-				Container: container, ContextManagement: contextManagement,
-				StopDetails: stopDetails, InputTransformations: inputTransformations,
-			}); err != nil {
+			if err := emitFinish(); err != nil {
 				return err
 			}
 			finished = true
+			// A valid explicit message_stop ends strict decoding. Later events,
+			// including a provider error, must not replace that completion.
+			if strict {
+				return nil
+			}
 		}
 	}
 	if !finished {
+		if strict {
+			if !messageStarted {
+				// Empty, comment, ping, and unknown events do not fabricate success.
+				return nil
+			}
+			if err := strictOpenBlocks(len(thinkingOpen), len(textOpen), len(toolOpen), len(serverOpen), len(redactedOpen)); err != nil {
+				return err
+			}
+			if !terminal {
+				return ir.ProtocolError("stream ended before completion")
+			}
+			return emitFinish()
+		}
 		if !started {
 			// Empty / comment-only stream: do not fabricate a successful completion.
 			return nil
@@ -602,18 +853,395 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 		if len(serverOpen) != 0 {
 			return ir.ProtocolError("server block closed by stream end")
 		}
-		return emit(ir.StreamEvent{
-			Kind: ir.EventFinish, StopReason: stopReason, StopSequence: stopSequence,
-			InputTokens: inputTokens, OutputTokens: outputTokens,
-			CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite,
-			Container: container, ContextManagement: contextManagement,
-			StopDetails: stopDetails, InputTransformations: inputTransformations,
-		})
+		return emitFinish()
 	}
 	if len(thinkingOpen) != 0 {
 		return ir.ProtocolError("thinking block closed by stream end")
 	}
 	return nil
+}
+
+// mergeReportedUsage applies one Claude Code usage snapshot. Positive ordinary
+// input, cache read, and aggregate cache write replace. Omitted, null, and zero
+// values keep those partitions. A positive aggregate cache write wins over the
+// current frame's TTL split. Otherwise a positive sum of this frame's
+// ephemeral_1h_input_tokens and ephemeral_5m_input_tokens replaces cache write.
+// Stale TTL members from earlier frames are not added. Output uses nullish
+// coalescing, so an explicit zero replaces and an omission does not. Rich usage
+// fields are ignored. This is not fallback-credit accounting.
+//
+// The four input/output sums are checked before the state is stored. Chat and
+// Responses encode total as input plus output, so an overflowing snapshot is
+// rejected before it can be emitted.
+func mergeReportedUsage(ordinary, cacheRead, cacheWrite, output *int, seen *bool, raw json.RawMessage, present bool) error {
+	if !present || jsonNull(raw) {
+		return nil
+	}
+	obj, err := reportedUsageObject(raw)
+	if err != nil {
+		return err
+	}
+	nextOrdinary, nextRead, nextWrite, nextOutput := *ordinary, *cacheRead, *cacheWrite, *output
+	nextSeen := *seen
+	if err := applyPositiveUsage(&nextOrdinary, &nextSeen, obj, "input_tokens"); err != nil {
+		return err
+	}
+	if err := applyPositiveUsage(&nextRead, &nextSeen, obj, "cache_read_input_tokens"); err != nil {
+		return err
+	}
+	if err := applyOutputUsage(&nextOutput, &nextSeen, obj, "output_tokens"); err != nil {
+		return err
+	}
+	if err := applyCacheWriteUsage(&nextWrite, &nextSeen, obj); err != nil {
+		return err
+	}
+	sum, err := reportedInclusive(nextOrdinary, nextRead, nextWrite)
+	if err != nil {
+		return err
+	}
+	if err := reportedTotal(sum, nextOutput); err != nil {
+		return err
+	}
+	*ordinary, *cacheRead, *cacheWrite, *output, *seen = nextOrdinary, nextRead, nextWrite, nextOutput, nextSeen
+	return nil
+}
+
+func applyPositiveUsage(dst *int, seen *bool, obj map[string]json.RawMessage, key string) error {
+	raw, ok := obj[key]
+	if !ok {
+		return nil
+	}
+	value, present, err := parseReportedCounter(raw)
+	if err != nil || !present {
+		return err
+	}
+	*seen = true
+	// Zero is a supported counter, but it is not a positive replacement.
+	if value > 0 {
+		*dst = value
+	}
+	return nil
+}
+
+func applyOutputUsage(dst *int, seen *bool, obj map[string]json.RawMessage, key string) error {
+	raw, ok := obj[key]
+	if !ok {
+		return nil
+	}
+	value, present, err := parseReportedCounter(raw)
+	if err != nil || !present {
+		return err
+	}
+	*seen = true
+	*dst = value
+	return nil
+}
+
+func applyCacheWriteUsage(dst *int, seen *bool, obj map[string]json.RawMessage) error {
+	aggValue, aggPresent := 0, false
+	if raw, ok := obj["cache_creation_input_tokens"]; ok {
+		value, present, err := parseReportedCounter(raw)
+		if err != nil {
+			return err
+		}
+		if present {
+			aggPresent = true
+			aggValue = value
+			*seen = true
+		}
+	}
+	ttlSum, ttlSeen := 0, false
+	if raw, ok := obj["cache_creation"]; ok {
+		sum, seenTTL, err := reportedTTLSum(raw)
+		if err != nil {
+			return err
+		}
+		ttlSum, ttlSeen = sum, seenTTL
+		if ttlSeen {
+			*seen = true
+		}
+	}
+	switch {
+	case aggPresent && aggValue > 0:
+		*dst = aggValue
+	case ttlSum > 0:
+		*dst = ttlSum
+	}
+	return nil
+}
+
+func reportedTTLSum(raw json.RawMessage) (int, bool, error) {
+	if jsonNull(raw) {
+		return 0, false, nil
+	}
+	obj, err := reportedUsageObject(raw)
+	if err != nil {
+		return 0, false, err
+	}
+	hour, hourSeen, err := optionalReportedCounter(obj, "ephemeral_1h_input_tokens")
+	if err != nil {
+		return 0, false, err
+	}
+	minute, minuteSeen, err := optionalReportedCounter(obj, "ephemeral_5m_input_tokens")
+	if err != nil {
+		return 0, false, err
+	}
+	if !hourSeen && !minuteSeen {
+		return 0, false, nil
+	}
+	h, m := 0, 0
+	if hourSeen {
+		h = hour
+	}
+	if minuteSeen {
+		m = minute
+	}
+	// Sum only this frame. Absent and null members contribute zero, not a
+	// previous frame's TTL value.
+	sum, err := addReportedUsage(h, m)
+	if err != nil {
+		return 0, false, err
+	}
+	return sum, true, nil
+}
+
+func optionalReportedCounter(obj map[string]json.RawMessage, key string) (int, bool, error) {
+	raw, ok := obj[key]
+	if !ok {
+		return 0, false, nil
+	}
+	return parseReportedCounter(raw)
+}
+
+func reportedUsageRaw(data []byte, fromMessage bool) (json.RawMessage, bool, error) {
+	obj, err := reportedJSONObject(data)
+	if err != nil {
+		return nil, false, err
+	}
+	if fromMessage {
+		raw, ok := obj["message"]
+		if !ok {
+			return nil, false, nil
+		}
+		obj, err = reportedJSONObject(raw)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	raw, ok := obj["usage"]
+	if !ok {
+		return nil, false, nil
+	}
+	return raw, true, nil
+}
+
+func reportedJSONObject(data []byte) (map[string]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, ir.ProtocolError("malformed stream event")
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(trimmed, &obj) != nil || obj == nil {
+		return nil, ir.ProtocolError("malformed stream event")
+	}
+	return obj, nil
+}
+
+func reportedUsageObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, ir.ProtocolError("invalid usage object")
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(trimmed, &obj) != nil || obj == nil {
+		return nil, ir.ProtocolError("invalid usage object")
+	}
+	return obj, nil
+}
+
+func parseReportedCounter(raw json.RawMessage) (int, bool, error) {
+	if jsonNull(raw) {
+		return 0, false, nil
+	}
+	n, err := parseReportedInt(raw)
+	if err != nil {
+		return 0, false, err
+	}
+	return n, true, nil
+}
+
+func parseReportedInt(raw json.RawMessage) (int, error) {
+	token := bytes.TrimSpace(raw)
+	if len(token) == 0 {
+		return 0, ir.ProtocolError("invalid usage counter")
+	}
+	i := 0
+	if token[0] == '-' {
+		i = 1
+	}
+	if i == len(token) {
+		return 0, ir.ProtocolError("invalid usage counter")
+	}
+	for _, c := range token[i:] {
+		if c < '0' || c > '9' {
+			return 0, ir.ProtocolError("invalid usage counter")
+		}
+	}
+	n, err := strconv.ParseInt(string(token), 10, 64)
+	if err != nil {
+		return 0, ir.ProtocolError("usage total overflow")
+	}
+	if n < 0 {
+		return 0, ir.ProtocolError("invalid usage counter")
+	}
+	if n > int64(math.MaxInt) {
+		return 0, ir.ProtocolError("usage total overflow")
+	}
+	return int(n), nil
+}
+
+func jsonNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func addReportedUsage(a, b int) (int, error) {
+	if a < 0 || b < 0 {
+		return 0, ir.ProtocolError("invalid usage counter")
+	}
+	if b > 0 && a > math.MaxInt-b {
+		return 0, ir.ProtocolError("usage total overflow")
+	}
+	return a + b, nil
+}
+
+func reportedInclusive(ordinary, read, write int) (int, error) {
+	sum, err := addReportedUsage(ordinary, read)
+	if err != nil {
+		return 0, err
+	}
+	return addReportedUsage(sum, write)
+}
+
+func reportedTotal(input, output int) error {
+	_, err := addReportedUsage(input, output)
+	return err
+}
+
+func strictOpenBlocks(thinking, text, tool, server, redacted int) error {
+	if thinking != 0 {
+		return ir.ProtocolError("thinking block closed by stream end")
+	}
+	if server != 0 {
+		return ir.ProtocolError("server block closed by stream end")
+	}
+	if text != 0 || tool != 0 || redacted != 0 {
+		return ir.ProtocolError("stream ended with an open content block")
+	}
+	return nil
+}
+
+func strictEventObject(data []byte) error {
+	_, err := strictJSONObject(data)
+	return err
+}
+
+func strictJSONObject(data []byte) (map[string]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, ir.ProtocolError("malformed stream event")
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(trimmed, &obj) != nil || obj == nil {
+		return nil, ir.ProtocolError("malformed stream event")
+	}
+	return obj, nil
+}
+
+func strictMessageStartObject(data []byte) error {
+	obj, err := strictJSONObject(data)
+	if err != nil {
+		return err
+	}
+	raw, ok := obj["message"]
+	if !ok {
+		return ir.ProtocolError("malformed stream event")
+	}
+	_, err = strictJSONObject(raw)
+	return err
+}
+
+func strictContentObject(data []byte) (map[string]json.RawMessage, error) {
+	obj, err := strictJSONObject(data)
+	if err != nil {
+		return nil, err
+	}
+	// Missing and null indexes must not become Go's default block index zero.
+	var index *int
+	if json.Unmarshal(obj["index"], &index) != nil || index == nil || *index < 0 {
+		return nil, ir.ProtocolError("malformed content block index")
+	}
+	return obj, nil
+}
+
+func strictContentStartObject(data []byte) error {
+	obj, err := strictContentObject(data)
+	if err != nil {
+		return err
+	}
+	raw, ok := obj["content_block"]
+	if !ok {
+		return ir.ProtocolError("malformed stream event")
+	}
+	_, err = strictJSONObject(raw)
+	return err
+}
+
+func strictContentDeltaObject(data []byte) error {
+	obj, err := strictContentObject(data)
+	if err != nil {
+		return err
+	}
+	raw, ok := obj["delta"]
+	if !ok {
+		return ir.ProtocolError("malformed stream event")
+	}
+	_, err = strictJSONObject(raw)
+	return err
+}
+
+// strictReceivedStopReason reports a JSON string stop_reason. An empty string
+// is still a string, so it is terminal and later maps through stopReason2.
+// Null and omitted reasons are not terminal. Other JSON types are malformed
+// and must not be copied into the error.
+func strictReceivedStopReason(data []byte) (string, bool, error) {
+	obj, err := strictJSONObject(data)
+	if err != nil {
+		return "", false, err
+	}
+	raw, ok := obj["delta"]
+	if !ok {
+		return "", false, ir.ProtocolError("malformed stream event")
+	}
+	delta, err := strictJSONObject(raw)
+	if err != nil {
+		return "", false, err
+	}
+	reason, ok := delta["stop_reason"]
+	if !ok {
+		return "", false, nil
+	}
+	reason = bytes.TrimSpace(reason)
+	if len(reason) == 0 || bytes.Equal(reason, []byte("null")) {
+		return "", false, nil
+	}
+	if reason[0] != '"' {
+		return "", false, ir.ProtocolError("malformed stream event")
+	}
+	var value string
+	if json.Unmarshal(reason, &value) != nil {
+		return "", false, ir.ProtocolError("malformed stream event")
+	}
+	return value, true, nil
 }
 
 // compactionDeltaFields extracts the verified compaction update fields. Content

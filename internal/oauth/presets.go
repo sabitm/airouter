@@ -183,7 +183,7 @@ var Presets = []Preset{
 		Protocol:   domain.ProtocolCursor,
 		CursorAuth: true,
 	},
-	// Claude Code uses the public CLI client and the 2.1.303 authorize/token
+	// Claude Code uses the public CLI client and the 2.1.318 authorize/token
 	// endpoints. New connects request the registered first-party scopes. A
 	// browser authorize from this dashboard is not a verified login: the CLI
 	// may require additional session context that this flow does not establish.

@@ -154,9 +154,11 @@ func cacheControlMap(cc *CacheMark) map[string]any {
 	return out
 }
 
-// IsOAuthToken reports whether the effective resolved token is a Claude OAuth
-// access token. Static API keys do not get the oauth beta solely from a
-// stored credential flag.
+// IsOAuthToken is the legacy compatibility heuristic for an unknown grant.
+// It reports whether token contains the historical sk-ant-oat marker. It does
+// not read scopes, authorize inference, or select the oauth beta by itself.
+// OAuthBeta applies an explicit paired grant first and calls this only when
+// the grant is unknown or the credential snapshot does not match the token.
 func IsOAuthToken(token string) bool {
 	return strings.Contains(token, "sk-ant-oat")
 }

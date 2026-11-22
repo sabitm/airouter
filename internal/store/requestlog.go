@@ -2,12 +2,17 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"airouter/internal/domain"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const maxRequestLogErrorBytes = domain.MaxErrorMessageBytes
@@ -191,9 +196,49 @@ func (s *Store) ClearRequestLogs(ctx context.Context) error {
 }
 
 // RequestLogStats returns aggregate totals across all recorded requests.
+// Totals outside the int64 range are capped without changing stored counts.
 func (s *Store) RequestLogStats(ctx context.Context) (totalReqs, totalIn, totalOut int64, err error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) FROM request_logs`)
 	err = row.Scan(&totalReqs, &totalIn, &totalOut)
+	// SQLite SUM reports overflow as a generic SQLITE_ERROR, with no separate code.
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_ERROR && strings.Contains(sqliteErr.Error(), "integer overflow") {
+		return s.requestLogStatsWide(ctx)
+	}
 	return
+}
+
+func (s *Store) requestLogStatsWide(ctx context.Context) (int64, int64, int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT input_tokens, output_tokens FROM request_logs`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer rows.Close()
+	// Legacy counts can be signed. Accumulate exactly before capping so a
+	// later negative count can offset a sum that temporarily exceeds int64.
+	var input, output, value big.Int
+	var count, in, out int64
+	for rows.Next() {
+		if err := rows.Scan(&in, &out); err != nil {
+			return 0, 0, 0, err
+		}
+		count++
+		input.Add(&input, value.SetInt64(in))
+		output.Add(&output, value.SetInt64(out))
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	return count, capLogTotal(&input), capLogTotal(&output), nil
+}
+
+func capLogTotal(n *big.Int) int64 {
+	if n.IsInt64() {
+		return n.Int64()
+	}
+	if n.Sign() < 0 {
+		return math.MinInt64
+	}
+	return math.MaxInt64
 }

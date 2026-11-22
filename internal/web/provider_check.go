@@ -135,10 +135,28 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	}
 	// A saved provider can be refreshed and the rotated token persisted (it has a
 	// store id); a session's token is probed as-is - refreshing it would write
-	// nowhere and the just-connected token is fresh anyway.
+	// nowhere and the just-connected token is fresh anyway. Saved Claude Code
+	// installs the ResolveCreds snapshot with the token. The oauth beta is
+	// classified from that pair, not from the pre-refresh scopes. This probe
+	// does not retry an upstream auth rejection.
 	if fromStore {
 		if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
 			probe.ID = id
+		}
+		if proto == domain.ProtocolClaudeCode {
+			resolved, err := h.oauth.ResolveCreds(r.Context(), probe, false)
+			if err != nil {
+				if oauth.IsInvalidGrant(err) {
+					render(w, r, CheckResult(false, "token expired - reconnect required"))
+					return
+				}
+				render(w, r, CheckResult(false, "token refresh failed: "+err.Error()))
+				return
+			}
+			installResolvedClaudeCreds(probe, resolved)
+			ok, msg := h.checkUpstreamResolved(r.Context(), probe, fromStore)
+			render(w, r, CheckResult(ok, msg))
+			return
 		}
 		var tok string
 		var err error
@@ -168,6 +186,20 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	}
 	ok, msg := h.checkUpstreamResolved(r.Context(), probe, fromStore)
 	render(w, r, CheckResult(ok, msg))
+}
+
+// installResolvedClaudeCreds pairs a ResolveCreds snapshot with the effective
+// token on a request-local provider. The classifier must not apply a grant to
+// a different token. The copy is not written back and the source is not mutated.
+func installResolvedClaudeCreds(p *domain.Provider, creds *domain.OAuthCreds) {
+	if p == nil || creds == nil {
+		return
+	}
+	cp := *creds
+	p.OAuthCreds = &cp
+	if cp.AccessToken != "" {
+		p.APIKey = cp.AccessToken
+	}
 }
 
 // checkUpstreamResolved probes a fully resolved provider. A saved Kiro OAuth
@@ -293,7 +325,7 @@ func checkUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider)
 // endpoint accepted the credential. It does not prove that Messages requests
 // will be accepted, and it does not send an inference request.
 func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
-	url := strings.TrimRight(p.BaseURL, "/") + "/models"
+	url := strings.TrimRight(p.BaseURL, "/") + "/models?limit=1000"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, "invalid base URL"
@@ -305,7 +337,7 @@ func checkClaudeCodeUpstream(ctx context.Context, logger *slog.Logger, p *domain
 	req.Header.Set("anthropic-version", claudecode.AnthropicVersion)
 	req.Header.Set("User-Agent", claudecode.DefaultProfile().UserAgent())
 	req.Header.Set("X-App", "cli")
-	req.Header.Set("anthropic-beta", claudecode.BetaHeaders(claudecode.BetaRequest{OAuth: claudecode.IsOAuthToken(p.APIKey)}))
+	req.Header.Set("anthropic-beta", claudecode.BetaHeaders(claudecode.BetaRequest{OAuth: claudecode.OAuthBeta(p)}))
 
 	pr, err := executeProbe(ctx, logger, upstreamClient, req, "check_claude_code")
 	if err != nil {

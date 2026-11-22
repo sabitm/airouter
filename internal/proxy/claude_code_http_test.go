@@ -167,11 +167,11 @@ func TestClaudeCodeHTTPIngressesCarryIdentity(t *testing.T) {
 		}
 		sys := doc["system"].([]any)
 		bill := sys[0].(map[string]any)["text"].(string)
-		if !strings.Contains(bill, "cc_version="+claudecode.CLIVersion+".9a3") {
+		if !strings.Contains(bill, "cc_version="+claudecode.CLIVersion+".5ab") {
 			t.Fatalf("billing fingerprint missing: %s", bill)
 		}
-		if strings.Contains(bill, "cch=") && !strings.Contains(bill, "cch=00000;") {
-			t.Fatalf("cch is not the literal 00000: %s", bill)
+		if strings.Contains(bill, "cch=") {
+			t.Fatalf("custom host included cch: %s", bill)
 		}
 		if _, ok := sys[0].(map[string]any)["cache_control"]; ok {
 			t.Fatal("billing block gained cache_control")

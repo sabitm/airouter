@@ -5,9 +5,8 @@ import (
 	"airouter/internal/proxy/ir"
 )
 
-// DecodeResponse parses an Anthropic Messages response. Tool names are not
-// rewritten. The 2.1.303 CLI does not append _ide, and a name that already
-// ends in _ide is a caller name.
+// DecodeResponse parses an Anthropic Messages response. The proxy preserves
+// caller tool names and does not apply the CLI's conditional MCP name mapping.
 func DecodeResponse(body []byte) (*ir.Response, error) {
 	return anthropic.DecodeResponse(body)
 }

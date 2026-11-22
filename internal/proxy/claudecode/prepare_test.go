@@ -10,7 +10,6 @@ import (
 func TestPrepareKeepsToolNamesAndInjectsIdentity(t *testing.T) {
 	in := []byte(`{"model":"claude-sonnet-4-5","max_tokens":8,"system":"be brief","messages":[{"role":"user","content":"hello world, this is a test"}],"tools":[{"name":"search_ide","input_schema":{"type":"object"}}]}`)
 	out, err := Prepare(in, PrepareInput{
-		Token:        "sk-ant-oat-test",
 		SessionID:    "11111111-1111-4111-8111-111111111111",
 		AccountUUID:  "acct-real",
 		DeviceID:     strings.Repeat("ab", 32),
@@ -46,9 +45,6 @@ func TestPrepareKeepsToolNamesAndInjectsIdentity(t *testing.T) {
 	meta := m["metadata"].(map[string]any)["user_id"].(string)
 	if !strings.Contains(meta, "acct-real") || !strings.Contains(meta, "11111111-1111-4111-8111-111111111111") {
 		t.Fatalf("user_id = %s", meta)
-	}
-	if strings.Contains(meta, "sk-ant") {
-		t.Fatal("token leaked into user_id")
 	}
 }
 
@@ -334,6 +330,45 @@ func TestBetaHeadersAreFeatureGated(t *testing.T) {
 	}
 	if strings.Contains(full, "token-efficient-tools") || strings.Contains(full, "between_tools") {
 		t.Fatalf("removed flag present: %s", full)
+	}
+}
+
+func TestPrepareStripsPreviousBillingFieldsWithoutChangingSuffix(t *testing.T) {
+	prefix := BillingHeaderPrefix + " cc_version=2.1.303.abc; cc_entrypoint=cli; cch=00000;"
+	for _, field := range []string{
+		"cc_prev_msg=msg_previous;", "cc_prev_prompt_index=7;", "cc_prev_turn_index=8;",
+		"cc_prev_msg=msg_previous; cc_prev_prompt_index=7; cc_prev_turn_index=8;",
+	} {
+		for _, suffix := range []string{"", "  keep; literal text\t", " caller cc_prev_msg=ordinary; text"} {
+			text := prefix + " " + field + suffix
+			if got := stripBillingHeader(text); got != suffix {
+				t.Fatalf("strip %q = %q, want %q", text, got, suffix)
+			}
+			body, err := json.Marshal(map[string]any{
+				"model": "claude-sonnet-5", "max_tokens": 8,
+				"system": text, "messages": []any{map[string]any{"role": "user", "content": "hi"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := Prepare(body, prepareEvictionInput())
+			if err != nil {
+				t.Fatal(err)
+			}
+			system := systemBlocks(t, out)
+			if suffix == "" {
+				if len(system) != 2 {
+					t.Fatalf("old attribution retained: %s", out)
+				}
+			} else if len(system) != 3 || system[2]["text"] != suffix {
+				t.Fatalf("caller suffix changed: %s", out)
+			}
+			for _, unknown := range []string{" cc_prev_unknown=value; caller", " cc_prev_message=value; caller"} {
+				if got := stripBillingHeader(prefix + unknown); got != unknown {
+					t.Fatalf("unknown caller text removed: %q", got)
+				}
+			}
+		}
 	}
 }
 

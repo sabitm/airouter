@@ -45,7 +45,6 @@ type claudeReqState struct {
 	clientApp      string
 	workload       string
 	nonInteractive bool
-	appendSystem   bool
 	// callerBetas is the validated anthropic-beta list captured before
 	// translation. The header seam merges only flags the model still supports.
 	callerBetas []string
@@ -89,9 +88,9 @@ func claudeStateFrom(ctx context.Context) *claudeReqState {
 }
 
 // applyClaudeCodeTargetModel removes recognized context selectors from the
-// Claude Code wire model and records the selector intent for this attempt. The
-// pinned CLI strips the tag from the API model but still sends the long-context
-// beta for a [1m] tag. Other protocols keep their model spelling unchanged.
+// Claude Code wire model and records the selector intent for this attempt.
+// A [1m] selector adds the long-context beta only for non-native-1M models.
+// Other protocols keep their model spelling unchanged.
 func applyClaudeCodeTargetModel(ctx context.Context, provider *domain.Provider, model string) string {
 	if provider == nil || provider.Protocol != domain.ProtocolClaudeCode {
 		return model
@@ -312,15 +311,9 @@ func claudeCanonicalBase(raw string) string {
 	return strings.ToLower(u.Scheme) + "://" + u.Host + u.Path
 }
 
-// resolveClaudeSession returns a session id for this request. A supplied UUID
-// and the request-local anonymous seed are both scoped to the tenant and the
-// current provider snapshot. The seed is stable across retries, while a refresh
-// that changes the account changes the scope. Unidentified requests never join
-// each other because each incoming request has its own anonymous seed.
-func (p *Proxy) resolveClaudeSession(ctx context.Context, provider *domain.Provider, tenant string) string {
-	return claudeSessionID(ctx, provider, tenant)
-}
-
+// claudeSessionID scopes the supplied session ID or request-local anonymous seed
+// to the tenant and current provider snapshot. The seed is stable across retries,
+// but a refresh that changes the account changes the scope.
 func claudeSessionID(ctx context.Context, provider *domain.Provider, tenant string) string {
 	seed := ""
 	if st := claudeStateFrom(ctx); st != nil {
@@ -374,15 +367,34 @@ func claudeProfileFrom(ctx context.Context) claudecode.Profile {
 	case "sdk-cli", "sdk-ts", "sdk-py":
 		p.SDK = st.sdkVersion != ""
 		p.NonInteractive = true
-		p.HasAppendSystemPrompt = st.appendSystem
 	default:
 		p.NonInteractive = st.nonInteractive
-		p.HasAppendSystemPrompt = st.appendSystem
 	}
 	p.AgentSDKVersion = st.sdkVersion
 	p.ClientApp = st.clientApp
 	p.Workload = st.workload
 	return p
+}
+
+func applyClaudeOptionalHeaders(h http.Header, ctx context.Context, provider *domain.Provider) {
+	for _, name := range []string{"X-Client-App", claudePromptHeader, claudeAgentHeader} {
+		h.Del(name)
+	}
+	st := claudeStateFrom(ctx)
+	if st == nil {
+		return
+	}
+	if st.clientApp != "" {
+		h.Set("X-Client-App", st.clientApp)
+	}
+	if st.promptID != "" {
+		h.Set(claudePromptHeader, st.promptID)
+	}
+	if st.agentID != "" {
+		// Separate agent and session domains even when the caller reuses a UUID.
+		sum := sha256.Sum256([]byte("claude-agent\x00" + claudeTenantFrom(ctx) + "\x00" + claudeProviderScope(provider) + "\x00" + strings.ToLower(st.agentID)))
+		h.Set(claudeAgentHeader, formatUUID(sum[:16]))
+	}
 }
 
 func claudePromptID(ctx context.Context) string {

@@ -9,24 +9,24 @@ import (
 )
 
 func TestFingerprintMatchesPinnedJSUnits(t *testing.T) {
-	// Node Qm: [4,7,20].map(i => text[i] ?? "0").join(""), then hash.
+	// Pinned Du: [4,7,20].map(i => text[i] || "0").join(""), then hash.
 	// 'abcd😀fZ' selects the high surrogate, 'Z', and a missing unit. The
-	// neighboring low surrogate is not selected. Node vector: 9a3.
-	if got := Fingerprint("abcd😀fZ"); got != "9a3" {
-		t.Fatalf("fingerprint=%s want 9a3", got)
+	// neighboring low surrogate is not selected. CLI 2.1.318 vector: 5ab.
+	if got := Fingerprint("abcd😀fZ"); got != "5ab" {
+		t.Fatalf("fingerprint=%s want 5ab", got)
 	}
 	// A selected high surrogate followed by a selected low surrogate joins
 	// before UTF-8 encoding. Node vector String.fromCharCode(0xD83D, 0xDE00,
-	// "0") hashes to cb4.
+	// "0") hashes to 2f9.
 	pair := []uint16{'a', 'b', 'c', 'd', 0xD83D, 'x', 'y', 0xDE00}
 	if got := selectedUnits(pair, 4, 7, 20); got != "😀0" {
 		t.Fatalf("selected pair = %q, want joined scalar", got)
 	}
 	sum := sha256.Sum256([]byte(BillingFingerprintSalt + "😀0" + CLIVersion))
-	if got := hex.EncodeToString(sum[:])[:3]; got != "cb4" {
-		t.Fatalf("selected pair node vector = %s, want cb4", got)
+	if got := hex.EncodeToString(sum[:])[:3]; got != "2f9" {
+		t.Fatalf("selected pair node vector = %s, want 2f9", got)
 	}
-	// Lone low: Node vector 9a3 (replacement, 'Z', missing '0').
+	// Lone low: Node vector 5ab (replacement, 'Z', missing '0').
 	lowUnits := []uint16{'a', 'b', 'c', 'd', 0xDE00, 'x', 'y', 'Z'}
 	if selectedUnits(lowUnits, 4) != "\uFFFD" {
 		t.Fatal("lone low surrogate was decoded as a full scalar")
@@ -34,14 +34,14 @@ func TestFingerprintMatchesPinnedJSUnits(t *testing.T) {
 	if selectedUnits(lowUnits, 4, 7, 20) != "\uFFFDZ0" {
 		t.Fatalf("lone low selection = %q", selectedUnits(lowUnits, 4, 7, 20))
 	}
-	// NUL is a selected unit and stays U+0000. Node vector: 1df.
+	// NUL is a selected unit and stays U+0000. Node vector: bd2.
 	nulUnits := []uint16{1, 2, 3, 4, 0, 6, 7, 'A', 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 'B'}
 	if got := selectedUnits(nulUnits, 4, 7, 20); got != "\x00AB" {
 		t.Fatalf("NUL selection = %q", got)
 	}
 	sum = sha256.Sum256([]byte(BillingFingerprintSalt + "\x00AB" + CLIVersion))
-	if got := hex.EncodeToString(sum[:])[:3]; got != "1df" {
-		t.Fatalf("NUL node vector = %s, want 1df", got)
+	if got := hex.EncodeToString(sum[:])[:3]; got != "bd2" {
+		t.Fatalf("NUL node vector = %s, want bd2", got)
 	}
 }
 
@@ -83,7 +83,7 @@ func unitString(units []uint16, indexes ...int) string {
 	return selectedUnits(units, indexes...)
 }
 
-func TestBillingHeaderKeepsLiteralCCH(t *testing.T) {
+func TestBillingHeaderKeepsBuilderCCHPlaceholder(t *testing.T) {
 	h := BillingHeader(BillingInput{
 		Entrypoint:    "cli",
 		OfficialHost:  true,
@@ -125,6 +125,60 @@ func TestBillingOmitsInvalidOptionalFields(t *testing.T) {
 		if strings.Contains(h, banned) {
 			t.Fatalf("invalid field emitted %s in %s", banned, h)
 		}
+	}
+}
+
+func TestOfficialHostMatchesNormalizedURLHost(t *testing.T) {
+	for _, raw := range []string{
+		"https://api.anthropic.com/v1", "http://api.anthropic.com/v1",
+		"https://API.ANTHROPIC.COM:443/v1", "http://api.anthropic.com:80/v1",
+		"https://api.anthropic.com:00443/v1", "https://api.anthropic.com:/v1",
+	} {
+		if !IsOfficialHost(raw) {
+			t.Errorf("official host rejected: %q", raw)
+		}
+	}
+	for _, raw := range []string{
+		"", "api.anthropic.com", "ftp://api.anthropic.com",
+		"https://api.anthropic.com:8443/v1", "https://api.anthropic.com:80/v1",
+		"http://api.anthropic.com:443/v1", "https://api.anthropic.com:65536/v1",
+		"https://api.anthropic.com:bad/v1", "https://api.anthropic.com.evil/v1",
+		"https://evil.example/api.anthropic.com", "https://api.anthropic.com@evil.example/v1",
+		"https://api.anthropic.com./v1", "https://[::1]/v1", "https://[api.anthropic.com]/v1",
+	} {
+		if IsOfficialHost(raw) {
+			t.Errorf("nonofficial host accepted: %q", raw)
+		}
+	}
+}
+
+func TestBillingProjectValidatorsMatchPinnedForms(t *testing.T) {
+	suffix := "01" + strings.Repeat("A", 22)
+	for _, prefix := range []string{"claude_proj_", "chan_"} {
+		for _, env := range []string{"", "staging_", "local_"} {
+			for _, source := range []string{"harness", "user", "project", "local", "flag", "managed", "admin_default"} {
+				id := prefix + env + suffix
+				if !validProject(id, source) {
+					t.Fatalf("valid project rejected: %q / %q", id, source)
+				}
+				h := BillingHeader(BillingInput{AttributionProjectID: id, AttributionProjectSource: source})
+				if !strings.Contains(h, " cc_project="+id+"; cc_project_src="+source+";") {
+					t.Fatalf("project attribution missing: %s", h)
+				}
+			}
+		}
+	}
+	for _, pair := range [][2]string{
+		{"chan_" + suffix, "unknown"}, {"channel_" + suffix, "user"},
+		{"claude_proj_" + suffix + "0", "flag"}, {"chan_01" + strings.Repeat("0", 22), "harness"},
+		{"chan_" + suffix, "user; cc_gateway=1"}, {"", "project"},
+	} {
+		if validProject(pair[0], pair[1]) {
+			t.Fatalf("invalid project accepted: %q / %q", pair[0], pair[1])
+		}
+	}
+	if h := BillingHeader(BillingInput{}); strings.Contains(h, "cc_project=") {
+		t.Fatalf("project was synthesized: %s", h)
 	}
 }
 

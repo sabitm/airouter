@@ -14,7 +14,7 @@ import (
 func TestFinalReviewTaskBudgetBeta(t *testing.T) {
 	for _, model := range []string{"claude-sonnet-4-5", "claude-sonnet-5"} {
 		body := []byte(`{"model":"` + model + `","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"output_config":{"task_budget":{"type":"tokens","total":1000}}}`)
-		h := claudeBetaHeader(context.Background(), &domain.Provider{}, body)
+		h := claudecode.BetaHeaders(claudeBetaRequest(context.Background(), &domain.Provider{}, body))
 		if !strings.Contains(h, claudecode.BetaTaskBudget) {
 			t.Fatalf("%s task-budget beta missing: %s", model, h)
 		}

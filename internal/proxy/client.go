@@ -312,9 +312,8 @@ func antigravityProjectID(provider *domain.Provider) string {
 	return ""
 }
 
-// prepareClaudeCodeBody applies the pinned CLI profile using the effective
-// resolved token. Account and device ids come from persisted credentials.
-// A missing account stays empty; it is not derived from the token.
+// prepareClaudeCodeBody applies the pinned CLI profile using the resolved
+// credential snapshot. A missing account stays empty, not derived from the token.
 func prepareClaudeCodeBody(ctx context.Context, provider *domain.Provider, body []byte) ([]byte, error) {
 	// Resolve has already installed the credential snapshot on this request-local
 	// provider. Derive the scope from that snapshot every send, not from an
@@ -336,23 +335,16 @@ func prepareClaudeCodeBody(ctx context.Context, provider *domain.Provider, body 
 		device = syntheticAPIKeyDevice(provider)
 	}
 	return claudecode.Prepare(body, claudecode.PrepareInput{
-		Token:        providerToken(provider),
 		SessionID:    sid,
 		AccountUUID:  account,
 		DeviceID:     device,
 		ParentID:     claudeParentID(ctx, provider),
 		Profile:      claudeProfileFrom(ctx),
 		BaseURL:      providerBase(provider),
-		CacheDefault: !claudeCallerCache(body),
+		CacheDefault: true,
 		CacheTTL:     "5m",
 		Attribution:  claudeAttribution(ctx),
 	})
-}
-
-// pSessionOrNew keeps the request seed stable while applying the current
-// provider scope. It is the request-local seed helper used by older callers.
-func pSessionOrNew(ctx context.Context, provider *domain.Provider) string {
-	return claudeSessionID(ctx, provider, claudeTenantFrom(ctx))
 }
 
 // syntheticAPIKeyDevice derives an install id for an API-key row. The id is
@@ -392,8 +384,12 @@ func claudeAttribution(ctx context.Context) claudecode.BillingInput {
 }
 
 // claudeWireBody prepares a Claude Code body once per send, after the
-// effective token is on the request-local provider. Other protocols return
-// the body unchanged. A refresh builds a new body with the new token.
+// effective token is on the request-local provider. It then applies one CCH
+// pass to that prepared copy. The checksum uses the resolved upstream URL,
+// not the path alone and not a host guess. Other protocols, and Claude Code
+// paths that are not Messages, return the input unchanged. Refresh and
+// failover call this again, so each send gets a new placeholder and its own
+// checksum. There is no reused checksum state.
 func claudeWireBody(ctx context.Context, provider *domain.Provider, path string, body []byte) ([]byte, error) {
 	if provider == nil || provider.Protocol != domain.ProtocolClaudeCode {
 		return body, nil
@@ -401,14 +397,11 @@ func claudeWireBody(ctx context.Context, provider *domain.Provider, path string,
 	if !strings.Contains(path, "/messages") {
 		return body, nil
 	}
-	return prepareClaudeCodeBody(ctx, provider, body)
-}
-
-func providerToken(p *domain.Provider) string {
-	if p == nil {
-		return ""
+	prepared, err := prepareClaudeCodeBody(ctx, provider, body)
+	if err != nil {
+		return nil, err
 	}
-	return p.APIKey
+	return claudecode.ApplyCCH(upstreamURL(provider, path), prepared), nil
 }
 
 func providerBase(p *domain.Provider) string {
@@ -416,13 +409,6 @@ func providerBase(p *domain.Provider) string {
 		return ""
 	}
 	return p.BaseURL
-}
-
-func claudeCallerCache(body []byte) bool {
-	// Prepare recounts structured markers, including a top-level policy.
-	// A quoted field name in schema or text is not caller policy. This seam
-	// therefore does not suppress the default from a substring.
-	return false
 }
 
 // reqModelFromBody reads the model field of an encoded upstream body; empty
@@ -842,6 +828,8 @@ func opencodeToolMapFrom(ctx context.Context) opencode.ToolMap {
 // left to the auth-scheme switch. Beta flags are feature-gated from the body.
 func applyClaudeCodeHeaders(req *http.Request, ctx context.Context, provider *domain.Provider, body []byte) {
 	profile := claudeProfileFrom(ctx)
+	applyClaudeOptionalHeaders(req.Header, ctx, provider)
+	req.Header.Del("X-Stainless-Helper-Method")
 	for k, v := range claudecode.StainlessRuntimeHeaders() {
 		req.Header.Set(k, v)
 	}
@@ -855,10 +843,6 @@ func applyClaudeCodeHeaders(req *http.Request, ctx context.Context, provider *do
 	if sid := claudeWireSession(ctx); sid != "" {
 		req.Header.Set(claudecode.SessionIDHeader, sid)
 	}
-}
-
-func claudeBetaHeader(ctx context.Context, provider *domain.Provider, body []byte) string {
-	return claudecode.BetaHeaders(claudeBetaRequest(ctx, provider, body))
 }
 
 // mergeCallerBetas combines the validated context capture with values forwarded
@@ -907,14 +891,15 @@ func claudeBetaRequest(ctx context.Context, provider *domain.Provider, body []by
 			Type    string `json:"type"`
 			Display string `json:"display"`
 		} `json:"thinking"`
-		System   json.RawMessage `json:"system"`
-		Messages json.RawMessage `json:"messages"`
 	}
 	_ = json.Unmarshal(body, &probe)
 	req := claudecode.BetaRequest{
-		Model:       probe.Model,
-		OAuth:       claudecode.IsOAuthToken(providerToken(provider)),
-		CallerBetas: claudeCallerBetas(ctx),
+		Model: probe.Model,
+		// The oauth beta follows the grant paired with this request-local token.
+		// A token substring is only the unknown-grant fallback.
+		OAuth:        claudecode.OAuthBeta(provider),
+		OfficialHost: claudecode.IsOfficialHost(providerBase(provider)),
+		CallerBetas:  claudeCallerBetas(ctx),
 	}
 	if len(probe.ContextManagement) > 0 && probe.ContextManagement[0] == '{' {
 		req.ContextManagement = true
@@ -937,22 +922,18 @@ func claudeBetaRequest(ctx context.Context, provider *domain.Provider, body []by
 		}
 	}
 	req.CacheScope, req.ExtendedTTL, req.CacheEvict = claudecode.CacheFeatures(body)
-	req.OneMillion = bodyRequestsOneMillion(probe.Model, body)
+	req.ExplicitOneMillion = bodyRequestsLongContextBeta(body)
+	req.ContextOneMillion = thinking.HasOneMillionContextSelector(probe.Model)
 	if st := claudeStateFrom(ctx); st != nil && st.contextOneMillion {
-		req.OneMillion = true
 		req.ContextOneMillion = true
 	}
+	req.OneMillion = req.ExplicitOneMillion || req.ContextOneMillion
 	return req
 }
 
-// bodyRequestsOneMillion reports a structured long-context request. A model
-// id suffix [1m] is the CLI opt-in. A top-level betas array or metadata.betas
-// entry equal to the long-context flag is also structured. A quoted flag
-// inside schema text is not.
-func bodyRequestsOneMillion(model string, body []byte) bool {
-	if strings.Contains(strings.ToLower(model), "[1m]") {
-		return true
-	}
+// bodyRequestsLongContextBeta accepts only structured beta lists. Selector
+// intent is tracked separately so native-1M models can omit selector betas.
+func bodyRequestsLongContextBeta(body []byte) bool {
 	var doc map[string]json.RawMessage
 	if json.Unmarshal(body, &doc) != nil {
 		return false

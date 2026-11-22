@@ -2,7 +2,7 @@ package claudecode
 
 import "airouter/internal/proxy/thinking"
 
-// modelCaps is one row of the 2.1.303 first-party catalog. Empty capability
+// modelCaps is one row of the 2.1.318 first-party catalog. Empty capability
 // lists are empty. They are not inferred from the family name.
 type modelCaps struct {
 	Adaptive        bool
@@ -16,9 +16,9 @@ type modelCaps struct {
 	MaxOutput       int
 }
 
-// catalog is the pinned 2.1.303 capability table. Dated provider ids are
+// catalog is the pinned 2.1.318 capability table. Dated provider ids are
 // normalized to the catalog id before lookup. An unknown id has no row.
-// OneMillion follows context.supports_1m_beta in the pinned 2.1.303 catalog.
+// OneMillion follows context.supports_1m_beta in the pinned 2.1.318 catalog.
 // A suffix-only row is not enough. claude-haiku-4-5 has supports_1m_suffix and
 // does not have supports_1m_beta, so it is not a long-context beta model.
 var catalog = map[string]modelCaps{
