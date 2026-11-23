@@ -75,8 +75,12 @@ type StreamEvent struct {
 	Kind StreamEventKind
 
 	// EventMessageStart
-	ID          string
-	Model       string
+	ID    string
+	Model string
+	// CreatedAt is the upstream creation time in Unix seconds. It is meaningful
+	// on EventMessageStart. Zero means unspecified and must not replace a positive
+	// value already saved.
+	CreatedAt   int64
 	InputTokens int
 	// CacheReadTokens and CacheWriteTokens are subsets of InputTokens when
 	// present on MessageStart or Finish. InputTokens is inclusive; cache

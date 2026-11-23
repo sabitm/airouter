@@ -12,11 +12,34 @@ import (
 
 // --- chunk wire types (streaming) ---
 
+// chatUnixSeconds reads the optional Chat Completions "created" field.
+// This chunk previously ignored that field. A strict int64 would newly reject
+// an otherwise usable chunk when a Chat-compatible provider sends a string,
+// fraction, or object. A positive JSON integer is kept. Every other value,
+// including zero, a numeric string, and a fractional number, stays zero and
+// does not fail the parent chunk.
+type chatUnixSeconds int64
+
+func (n *chatUnixSeconds) UnmarshalJSON(data []byte) error {
+	*n = 0
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+	var v int64
+	if err := json.Unmarshal(data, &v); err != nil || v <= 0 {
+		return nil
+	}
+	*n = chatUnixSeconds(v)
+	return nil
+}
+
 type chatChunk struct {
-	ID      string        `json:"id"`
-	Model   string        `json:"model"`
-	Choices []chunkChoice `json:"choices"`
-	Usage   *chatUsage    `json:"usage,omitempty"`
+	ID      string          `json:"id"`
+	Model   string          `json:"model"`
+	Created chatUnixSeconds `json:"created"`
+	Choices []chunkChoice   `json:"choices"`
+	Usage   *chatUsage      `json:"usage,omitempty"`
 }
 
 type chunkChoice struct {
@@ -166,10 +189,12 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	var stopReason ir.StopReason = ir.StopEndTurn
 	inputTokens, outputTokens := 0, 0
 	cacheRead, cacheWrite := 0, 0
-	// Latest non-empty identity seen before the first response-bearing event.
-	// Role-only preambles often carry id/model that later chunks omit; empty
-	// fields must not clear a value already saved.
+	// Latest non-empty identity and the first positive created timestamp seen
+	// before the first response-bearing event. Role and usage preambles often
+	// carry id, model, and created that later chunks omit. Empty or zero fields
+	// must not clear a value already saved, and those preambles are not a turn.
 	var startID, startModel string
+	var startCreated int64
 
 	for {
 		ev, err := reader.Next()
@@ -222,6 +247,11 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			if chunk.Model != "" {
 				startModel = chunk.Model
 			}
+			// First positive value wins. A later chunk cannot replace it, and a
+			// zero from a missing or malformed created field cannot clear it.
+			if startCreated == 0 && chunk.Created > 0 {
+				startCreated = int64(chunk.Created)
+			}
 		}
 		// Role and usage are not a turn. Only text, reasoning, tool activity, or
 		// an explicit finish reason opens the stream. Whitespace is content.
@@ -247,7 +277,7 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 			continue
 		}
 		if !started {
-			if err := emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: startID, Model: startModel}); err != nil {
+			if err := emit(ir.StreamEvent{Kind: ir.EventMessageStart, ID: startID, Model: startModel, CreatedAt: startCreated}); err != nil {
 				return err
 			}
 			started = true

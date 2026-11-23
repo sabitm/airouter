@@ -576,8 +576,11 @@ func (u Usage) OrdinaryInputTokens() int {
 }
 
 type Response struct {
-	ID         string
-	Model      string
+	ID    string
+	Model string
+	// CreatedAt is the upstream creation time in Unix seconds. Zero means the
+	// source did not supply a positive timestamp.
+	CreatedAt  int64
 	Content    []ContentBlock // text, reasoning, and tool_use blocks
 	StopReason StopReason
 	// StopSequence preserves an explicit matched stop sequence. Nil means the

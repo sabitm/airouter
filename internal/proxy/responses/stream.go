@@ -5,6 +5,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/sse"
@@ -2614,6 +2615,10 @@ type StreamEncoder struct {
 	cacheRead   int
 	cacheWrite  int
 
+	// createdAt is the Unix seconds shared by every synthesized response
+	// object in this stream. Zero until the first positive upstream value or
+	// the fallback clock is locked with the first response object.
+	createdAt      int64
 	createdEmitted bool
 	finishEmitted  bool
 
@@ -2714,17 +2719,41 @@ func (e *StreamEncoder) emit(w *sse.Writer, name string, data map[string]any) er
 	return w.WriteEvent(name, raw)
 }
 
+// responsesCreatedAt returns one positive Unix-second timestamp. A positive
+// upstream value is kept. Zero and negative are unspecified, so the wall clock
+// is used. A caller that emits more than one object must store the result.
+func responsesCreatedAt(upstream int64) int64 {
+	if upstream > 0 {
+		return upstream
+	}
+	return time.Now().Unix()
+}
+
+// noteCreatedAt records a positive upstream timestamp before the first response
+// object is emitted. Zero does not clear a saved value. A value that arrives
+// after the first object is ignored so every envelope shares one time.
+func (e *StreamEncoder) noteCreatedAt(upstream int64) {
+	if e.createdEmitted || upstream <= 0 || e.createdAt > 0 {
+		return
+	}
+	e.createdAt = upstream
+}
+
 func (e *StreamEncoder) responseObj(status string, output []map[string]any, withUsage bool) map[string]any {
 	out := any([]any{})
 	if output != nil {
 		out = output
 	}
+	if e.createdAt <= 0 {
+		e.createdAt = responsesCreatedAt(0)
+	}
 	obj := map[string]any{
-		"id":     e.id,
-		"object": "response",
-		"status": status,
-		"model":  e.model,
-		"output": out,
+		"id":         e.id,
+		"object":     "response",
+		"created_at": e.createdAt,
+		"status":     status,
+		"model":      e.model,
+		"output":     out,
 	}
 	if withUsage {
 		obj["usage"] = usageToWire(ir.Usage{
@@ -2741,10 +2770,15 @@ func (e *StreamEncoder) ensureCreated(w *sse.Writer) error {
 	if e.createdEmitted {
 		return nil
 	}
-	e.createdEmitted = true
 	if e.id == "" {
 		e.id = ir.NewID("resp_")
 	}
+	// Lock the timestamp before the first object. Later envelopes, including
+	// completed, incomplete, and Close, must reuse this value.
+	if e.createdAt <= 0 {
+		e.createdAt = responsesCreatedAt(0)
+	}
+	e.createdEmitted = true
 	return e.emit(w, "response.created", map[string]any{"response": e.responseObj("in_progress", nil, false)})
 }
 
@@ -2895,7 +2929,9 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 	if len(e.pendingEvents) > 0 {
 		switch {
 		case ev.Kind == ir.EventMessageStart:
-			// Metadata only; never reorders output.
+			// Metadata only; never reorders output. Record the timestamp before
+			// queued events emit the first response object.
+			e.noteCreatedAt(ev.CreatedAt)
 		case ev.Kind == ir.EventFinish:
 			// Finish flushes the whole queue in arrival order before closing, so
 			// encoding it now cannot reorder output and must not risk the cap.
@@ -2955,6 +2991,7 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 			e.model = ev.Model
 		}
 		e.applyUsage(ev)
+		e.noteCreatedAt(ev.CreatedAt)
 		return e.ensureCreated(w)
 
 	case ir.EventTextEnd:

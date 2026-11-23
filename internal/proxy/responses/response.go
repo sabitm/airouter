@@ -328,6 +328,7 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 	out := map[string]any{
 		"id":                 id,
 		"object":             "response",
+		"created_at":         responsesCreatedAt(resp.CreatedAt),
 		"status":             status,
 		"model":              resp.Model,
 		"output":             output,

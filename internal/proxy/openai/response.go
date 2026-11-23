@@ -17,6 +17,11 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 		return nil, fmt.Errorf("openai: decode response: %w", err)
 	}
 	out := &ir.Response{ID: resp.ID, Model: resp.Model, StopReason: ir.StopEndTurn}
+	// Zero and negative values are unspecified. The existing int64 field already
+	// rejects a non-integer created value for the whole unary body.
+	if resp.Created > 0 {
+		out.CreatedAt = resp.Created
+	}
 	if len(resp.Choices) > 0 {
 		c := resp.Choices[0]
 		if reasoning := chatReasoningText(c.Message.ReasoningContent, c.Message.Reasoning, c.Message.ReasoningDetails); reasoning != "" {

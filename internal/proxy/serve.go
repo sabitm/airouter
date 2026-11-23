@@ -1628,6 +1628,10 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 					return err
 				}
 			}
+			// Zero is unspecified. A later start must not clear a positive timestamp.
+			if ev.CreatedAt > 0 && resp.CreatedAt == 0 {
+				resp.CreatedAt = ev.CreatedAt
+			}
 			if err := applyCollectedResponseState(resp, ev, reserve); err != nil {
 				return err
 			}
