@@ -24,6 +24,11 @@ type httpResult struct {
 }
 
 func (s *Service) resolveToken(ctx context.Context, p *domain.Provider, force bool) (string, error) {
+	// A subscription row must not fall through to a stored access token when
+	// OAuth resolution mismatches. Generic quota has no Grok Build endpoint.
+	if grokBuildUsageBlocked(p) {
+		return "", ErrUnsupported
+	}
 	if p.Method() == domain.AuthAPIKey {
 		tok := strings.TrimSpace(p.APIKey)
 		if tok == "" {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/store"
 )
@@ -97,8 +98,9 @@ type Service struct {
 	now func() time.Time
 
 	mu sync.Mutex
-	// Generic refreshes are keyed by (id, force). Console refreshes use a
-	// separate key shared by all callers holding the same rotating grant.
+	// Generic refreshes are keyed by (id, force). Console and Grok Build
+	// refreshes use a separate key shared by every caller holding the same
+	// rotating grant and connection generation, including forced retries.
 	inflight map[refreshKey]*call
 	// testOnJoin, if set, is called after this caller has obtained the
 	// inflight slot (leader or waiter) and before it waits. Tests use it as
@@ -110,7 +112,9 @@ type refreshKey struct {
 	id           int64
 	force        bool
 	console      bool
+	grok         bool
 	refreshGrant [sha256.Size]byte
+	generation   [sha256.Size]byte
 }
 
 type call struct {
@@ -177,6 +181,12 @@ func (s *Service) ResolveCreds(ctx context.Context, provider *domain.Provider, f
 		provider.Protocol == domain.ProtocolOpencode && provider.Method() == domain.AuthOAuth) {
 		return s.resolveOpencodeConsole(ctx, provider, force)
 	}
+	if grokBuildInvolved(provider) {
+		return s.resolveGrokBuild(ctx, provider, force)
+	}
+	if err := rejectGrokBuildMismatch(provider, grokBuildCredsOf(provider)); err != nil {
+		return nil, err
+	}
 	if provider == nil || provider.Method() != domain.AuthOAuth || provider.OAuthCreds == nil {
 		if provider == nil || provider.OAuthCreds == nil {
 			return nil, nil
@@ -197,6 +207,9 @@ func (s *Service) ResolveCreds(ctx context.Context, provider *domain.Provider, f
 	if live, err := s.store.GetProvider(ctx, provider.ID); err == nil && live != nil && live.OAuthCreds != nil {
 		if hasOpencodeConsoleCreds(live.OAuthCreds) {
 			return nil, ErrCredentialConflict
+		}
+		if err := rejectGrokBuildMismatch(provider, live.OAuthCreds); err != nil {
+			return nil, err
 		}
 		creds = live.OAuthCreds
 	}
@@ -344,6 +357,9 @@ func (s *Service) startOrJoin(ctx context.Context, key refreshKey, creds *domain
 // method keeps the historical authoritative write for other rows whose creds
 // still carry the Claude Code marker, for example after a protocol transition.
 func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCreds, authoritative bool) (*domain.OAuthCreds, error) {
+	if grokBuildCredsMarked(creds) {
+		return s.doRefreshGrokBuild(ctx, id, creds)
+	}
 	if hasOpencodeConsoleCreds(creds) {
 		return s.doRefreshOpencodeConsole(ctx, id, creds)
 	}
@@ -660,6 +676,9 @@ func (s *Service) RefreshTokens(ctx context.Context, creds *domain.OAuthCreds) (
 // dashboard refresh uses RefreshSavedClaude so the starting stored snapshot
 // stays distinct from the effective grant.
 func (s *Service) RefreshAndPersist(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	if grokBuildCredsMarked(creds) {
+		return s.refreshGrokBuildGrant(ctx, id, creds)
+	}
 	if hasOpencodeConsoleCreds(creds) {
 		return s.refreshOpencodeConsoleGrant(ctx, id, creds)
 	}
@@ -835,4 +854,179 @@ func opencodeConsoleGenerationChanged(current, basis *domain.OAuthCreds) bool {
 	return !hasOpencodeConsoleCreds(current) || !hasOpencodeConsoleCreds(basis) ||
 		!sameOpencodeConsoleWorkspace(current, basis) || current.AccessToken != basis.AccessToken ||
 		current.RefreshToken != basis.RefreshToken || current.ExpiresAt != basis.ExpiresAt
+}
+
+func grokBuildCredsMarked(c *domain.OAuthCreds) bool {
+	return c != nil && (c.GrokBuildAuth || c.Preset == grokbuild.Preset)
+}
+
+func grokBuildInvolved(p *domain.Provider) bool {
+	if p == nil {
+		return false
+	}
+	if p.Protocol == domain.ProtocolGrokBuild {
+		return true
+	}
+	return grokBuildCredsMarked(p.OAuthCreds)
+}
+
+func grokBuildRefreshable(p *domain.Provider) bool {
+	if p == nil || p.Protocol != domain.ProtocolGrokBuild || p.Method() != domain.AuthOAuth {
+		return false
+	}
+	if p.OAuthCreds == nil || !p.OAuthCreds.GrokBuildAuth {
+		return false
+	}
+	if p.OAuthCreds.Preset != "" && p.OAuthCreds.Preset != grokbuild.Preset {
+		return false
+	}
+	return grokbuild.ValidateCredentialUse(p) == nil
+}
+
+func (s *Service) resolveGrokBuild(ctx context.Context, provider *domain.Provider, force bool) (*domain.OAuthCreds, error) {
+	if err := rejectGrokBuildMismatch(provider, grokBuildCredsOf(provider)); err != nil {
+		return nil, err
+	}
+	if !grokBuildRefreshable(provider) {
+		return nil, ErrCredentialConflict
+	}
+	live, err := s.loadGrokBuild(ctx, provider.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !sameGrokBuildConnection(live.OAuthCreds, provider.OAuthCreds) || !sameGrokBuildAccount(live.OAuthCreds, provider.OAuthCreds) {
+		return nil, ErrCredentialConflict
+	}
+	// A forced retry of a token this connection already replaced reuses that
+	// rotation. It must not submit the new grant or adopt a reconnect.
+	if (!force && !shouldRefresh(live.OAuthCreds, s.now())) ||
+		(force && grokBuildGrantChanged(live.OAuthCreds, provider.OAuthCreds)) {
+		cp := *live.OAuthCreds
+		return &cp, nil
+	}
+	basis := live.OAuthCreds
+	updated, err := s.refreshGrokBuildGrant(ctx, provider.ID, basis)
+	if IsCredentialConflict(err) {
+		if newer, loadErr := s.loadGrokBuild(ctx, provider.ID); loadErr == nil &&
+			sameGrokBuildConnection(newer.OAuthCreds, basis) && sameGrokBuildAccount(newer.OAuthCreds, basis) &&
+			grokBuildGrantChanged(newer.OAuthCreds, basis) {
+			cp := *newer.OAuthCreds
+			return &cp, nil
+		}
+	}
+	return updated, err
+}
+
+func (s *Service) refreshGrokBuildGrant(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	if creds == nil || creds.RefreshToken == "" {
+		return nil, ErrInvalidGrant
+	}
+	key := refreshKey{
+		id: id, grok: true,
+		refreshGrant: sha256.Sum256([]byte(creds.RefreshToken)),
+		generation:   sha256.Sum256([]byte(creds.GrokBuildConnection)),
+	}
+	return s.dedupRefresh(ctx, key, creds)
+}
+
+func (s *Service) loadGrokBuild(ctx context.Context, id int64) (*domain.Provider, error) {
+	live, err := s.store.GetProvider(ctx, id)
+	if errors.Is(err, store.ErrNotFound) || err == nil && !grokBuildRefreshable(live) {
+		return nil, ErrCredentialConflict
+	}
+	return live, err
+}
+
+func (s *Service) doRefreshGrokBuild(ctx context.Context, id int64, basis *domain.OAuthCreds) (*domain.OAuthCreds, error) {
+	cas, ok := s.store.(OAuthProviderCASStore)
+	if !ok {
+		return nil, errors.New("oauth: store does not support atomic Grok Build refresh")
+	}
+	live, err := s.loadGrokBuild(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Re-read after any earlier inflight entry has finished. Do not submit a
+	// grant that this connection, or a reconnect, has already replaced.
+	if !sameGrokBuildConnection(live.OAuthCreds, basis) || !sameGrokBuildAccount(live.OAuthCreds, basis) || grokBuildGrantChanged(live.OAuthCreds, basis) {
+		return nil, ErrCredentialConflict
+	}
+	rotated := *live.OAuthCreds
+	if rotated.GrokBuildConnection == "" {
+		connection, mintErr := newGrokBuildConnection()
+		if mintErr != nil {
+			return nil, mintErr
+		}
+		rotated.GrokBuildConnection = connection
+	}
+	if err := refresh(ctx, &rotated, s.now()); err != nil {
+		newer, loadErr := s.loadGrokBuild(ctx, id)
+		if IsCredentialConflict(loadErr) || loadErr == nil && (!sameGrokBuildConnection(newer.OAuthCreds, basis) || !sameGrokBuildAccount(newer.OAuthCreds, basis) || grokBuildGrantChanged(newer.OAuthCreds, basis)) {
+			return nil, ErrCredentialConflict
+		}
+		return nil, err
+	}
+	if rotated.GrokBuildConnection == "" {
+		rotated.GrokBuildConnection = live.OAuthCreds.GrokBuildConnection
+	}
+	out, err := cas.UpdateProviderConnectionCAS(ctx, id, func(current *domain.OAuthCreds, method domain.AuthMethod, proto domain.Protocol) (*domain.OAuthCreds, bool, error) {
+		if method != domain.AuthOAuth || proto != domain.ProtocolGrokBuild ||
+			!sameGrokBuildConnection(current, basis) || !sameGrokBuildAccount(current, basis) || grokBuildGrantChanged(current, basis) {
+			return nil, false, ErrCredentialConflict
+		}
+		next := *current
+		next.AccessToken = rotated.AccessToken
+		next.RefreshToken = rotated.RefreshToken
+		next.ExpiresAt = rotated.ExpiresAt
+		if rotated.UserID != "" {
+			next.UserID = rotated.UserID
+		}
+		if rotated.Email != "" {
+			next.Email = rotated.Email
+		}
+		if next.GrokBuildConnection == "" {
+			next.GrokBuildConnection = rotated.GrokBuildConnection
+		}
+		next.GrokBuildAuth = true
+		next.Preset = grokbuild.Preset
+		next.ClientID = grokbuild.ClientID
+		next.TokenURL = grokbuild.TokenURL
+		next.AuthURL = grokbuild.Issuer
+		next.Scopes = grokbuild.Scopes
+		return &next, true, nil
+	})
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) {
+		return nil, ErrCredentialConflict
+	}
+	return out, err
+}
+
+func sameGrokBuildAccount(a, b *domain.OAuthCreds) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.UserID == "" || b.UserID == "" || a.UserID == b.UserID
+}
+
+func sameGrokBuildConnection(current, basis *domain.OAuthCreds) bool {
+	if current == nil || basis == nil || !current.GrokBuildAuth || !basis.GrokBuildAuth {
+		return false
+	}
+	if current.Preset != "" && current.Preset != grokbuild.Preset || basis.Preset != "" && basis.Preset != grokbuild.Preset {
+		return false
+	}
+	if current.Preset != "" && basis.Preset != "" && current.Preset != basis.Preset {
+		return false
+	}
+	if current.GrokBuildConnection != "" || basis.GrokBuildConnection != "" {
+		return current.GrokBuildConnection != "" && current.GrokBuildConnection == basis.GrokBuildConnection
+	}
+	return current.AccessToken == basis.AccessToken && current.RefreshToken == basis.RefreshToken && current.ExpiresAt == basis.ExpiresAt
+}
+
+func grokBuildGrantChanged(current, basis *domain.OAuthCreds) bool {
+	if current == nil || basis == nil {
+		return true
+	}
+	return current.AccessToken != basis.AccessToken || current.RefreshToken != basis.RefreshToken || current.ExpiresAt != basis.ExpiresAt
 }

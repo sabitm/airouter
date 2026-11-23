@@ -44,6 +44,11 @@ const (
 	// step rather than forwarding the raw body. Official wire fidelity does not
 	// mean this proxy use is supported by Anthropic.
 	ProtocolClaudeCode Protocol = "claude-code"
+	// ProtocolGrokBuild is the Grok Build CLI subscription backend. Backend
+	// only: Responses wire format on the fixed cli-chat-proxy host, stream-only,
+	// with a device-code OAuth session that is not an xAI API credential. Its
+	// codec id differs from public Responses so ingress never passes through.
+	ProtocolGrokBuild Protocol = "grok-build"
 	// ProtocolOpencode is the opencode.ai Zen backend. Backend only: two
 	// model-dependent wire variants share one provider row — most models speak
 	// OpenAI Chat Completions on /chat/completions while muse-spark models are
@@ -56,7 +61,7 @@ const (
 )
 
 func (p Protocol) Valid() bool {
-	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity || p == ProtocolCursor || p == ProtocolClaudeCode || p == ProtocolOpencode
+	return p == ProtocolOpenAI || p == ProtocolAnthropic || p == ProtocolOpenAIResponses || p == ProtocolOpenAICodex || p == ProtocolKiro || p == ProtocolQoder || p == ProtocolAntigravity || p == ProtocolCursor || p == ProtocolClaudeCode || p == ProtocolOpencode || p == ProtocolGrokBuild
 }
 
 // AuthScheme is the header an upstream uses to carry the provider credential. It
@@ -171,7 +176,7 @@ func DefaultReasoningDialect(p Protocol) ReasoningDialect {
 	case ProtocolOpencode:
 		return ReasoningOpencode
 	default:
-		// Kiro, Qoder, Antigravity, Cursor: protocol-managed, no generic writer.
+		// Kiro, Qoder, Antigravity, Cursor, and Grok Build are protocol-managed.
 		return ReasoningNone
 	}
 }
@@ -338,6 +343,17 @@ type OAuthCreds struct {
 	// OpencodeOrgName is the workspace label shown in the dashboard. It is not
 	// a token.
 	OpencodeOrgName string `json:"opencode_org_name,omitempty"`
+
+	// GrokBuildAuth marks a Grok Build device-code connection. It is not inferred
+	// from the shared xAI client id. When true, refresh posts only to the fixed
+	// auth.x.ai token endpoint and inference uses only the subscription host.
+	GrokBuildAuth bool `json:"grok_build_auth,omitempty"`
+	// GrokBuildConnection is a random id minted at device login and kept across
+	// refresh. Token rotation and a reconnect of the same account both replace
+	// the access and refresh tokens, so this id is what keeps them distinct.
+	// Empty means the row predates the id; a token change then fails closed
+	// instead of being treated as a rotation.
+	GrokBuildConnection string `json:"grok_build_connection,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

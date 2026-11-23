@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
 )
 
@@ -256,6 +257,9 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 		if err := opencode.ValidateConsoleImport(cur); err != nil {
 			return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
 		}
+		if err := grokbuild.ValidateProvider(cur); err != nil {
+			return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
+		}
 		if err := s.updateProvider(ctx, ex, cur); err != nil {
 			return fmt.Sprintf("provider %q: %v", pp.Name, err)
 		}
@@ -270,6 +274,9 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 	np.AuthScheme = np.Auth()   // expand the default alias to a concrete scheme
 	np.AuthMethod = np.Method() // expand the default alias to a concrete method
 	if err := opencode.ValidateConsoleImport(np); err != nil {
+		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
+	}
+	if err := grokbuild.ValidateProvider(np); err != nil {
 		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
 	}
 	if err := s.createProvider(ctx, ex, np); err != nil {

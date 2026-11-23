@@ -10,6 +10,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/observability"
+	"airouter/internal/proxy/grokbuild"
 )
 
 // credsFromConnectForm builds an OAuthCreds config (no tokens yet) from the
@@ -27,6 +28,9 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 		if p.AuthURL != "" {
 			_, creds := oauth.Apply(p)
 			return creds, nil
+		}
+		if p.GrokBuildAuth {
+			return nil, fieldError("Grok Build credentials come only from device login")
 		}
 		c := manualCredsFromForm(r)
 		c.Preset = name
@@ -379,6 +383,34 @@ func applyQoderConfig(c *domain.OAuthCreds, r *http.Request) {
 	}
 }
 
+func (h *Handler) grokBuildDeviceBegin(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		render(w, r, OAuthConnectError("invalid form"))
+		return
+	}
+	targetID := int64(0)
+	if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil && id > 0 {
+		targetID = id
+		p, err := h.store.GetProvider(r.Context(), id)
+		if err != nil || p.Protocol != domain.ProtocolGrokBuild || p.Method() != domain.AuthOAuth {
+			render(w, r, OAuthConnectError("Grok Build reconnect requires the existing subscription provider"))
+			return
+		}
+	}
+	conn, err := oauth.NewGrokBuildConnect(r.Context())
+	if err != nil {
+		render(w, r, OAuthConnectError(err.Error()))
+		return
+	}
+	if err := conn.Start(r.Context()); err != nil {
+		conn.Close()
+		render(w, r, OAuthConnectError(err.Error()))
+		return
+	}
+	h.sessions.putBound(conn.State(), conn, grokBuildFlow, targetID, time.Now())
+	render(w, r, GrokBuildDeviceView(conn.State(), conn.VerificationURI(), conn.UserCode()))
+}
+
 func (h *Handler) qoderDeviceBegin(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		render(w, r, OAuthConnectError("invalid form"))
@@ -678,6 +710,14 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	if saved != nil && saved.OAuthCreds != nil && saved.OAuthCreds.OpencodeConsoleAuth {
 		h.refreshSavedOpencodeConsole(w, r, saved, statusView)
+		return
+	}
+	if saved != nil && (saved.Protocol == domain.ProtocolGrokBuild || grokBuildCredential(saved.OAuthCreds)) {
+		h.refreshSavedGrokBuild(w, r, saved)
+		return
+	}
+	if r.FormValue("preset") == grokbuild.Preset || r.FormValue("protocol") == string(domain.ProtocolGrokBuild) {
+		renderErr(nil, "Grok Build credentials come only from device login")
 		return
 	}
 	if saved != nil && saved.Protocol == domain.ProtocolClaudeCode {

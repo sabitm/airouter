@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/observability"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
 )
 
@@ -21,6 +22,10 @@ func (p *Proxy) doUpstreamRequest(req *http.Request, provider *domain.Provider, 
 	client := p.upstreamClient(provider, req.URL.String(), body, stream)
 	if provider != nil && provider.OAuthCreds != nil && provider.OAuthCreds.OpencodeConsoleAuth {
 		client = opencode.ClientNoRedirect(client)
+	}
+	if provider != nil && (provider.Protocol == domain.ProtocolGrokBuild ||
+		provider.OAuthCreds != nil && provider.OAuthCreds.GrokBuildAuth) {
+		client = grokbuild.ClientNoRedirect(client)
 	}
 	if p.logger == nil || !p.logger.Enabled(req.Context(), observability.LevelTrace) ||
 		provider == nil || provider.Protocol != domain.ProtocolOpencode ||

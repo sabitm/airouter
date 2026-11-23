@@ -92,6 +92,11 @@ type responsesReasoningDecoder struct {
 	// msgCount reports the number of message items registered so far, so a new
 	// item can record its position relative to an open message.
 	msgCount func() int
+	// bindSeq reserves a stream position after a successful bind. It is nil
+	// unless the Grok Build policy is active. The callback sees only the
+	// identity assign stored: nested item id for added and done, envelope
+	// item_id then nested id for summary frames.
+	bindSeq func(item *responsesReasoningItem)
 }
 
 func newResponsesReasoningDecoder(emit func(ir.StreamEvent) error, ensureStarted func() error, maxBytes, maxItems, maxParts int) *responsesReasoningDecoder {
@@ -398,6 +403,11 @@ func (r *responsesReasoningDecoder) bind(id reasoningIdentity, create, fromFinal
 	}
 	if err := r.assign(found, id); err != nil {
 		return nil, err
+	}
+	// A rejected identity returns above, so a sequence key cannot outlive
+	// the item the decoder accepted.
+	if r.bindSeq != nil {
+		r.bindSeq(found)
 	}
 	return found, nil
 }

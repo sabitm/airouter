@@ -17,6 +17,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 )
@@ -47,6 +48,8 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 	// protocol requires an explicit URL and must fail before credentials or I/O.
 	if proto == domain.ProtocolOpencode && baseURL == "" {
 		baseURL = opencode.ZenBaseURL
+	} else if proto == domain.ProtocolGrokBuild {
+		baseURL = grokbuild.BaseURL
 	} else if baseURL == "" {
 		render(w, r, CheckResult(false, "enter a base URL"))
 		return
@@ -57,6 +60,9 @@ func (h *Handler) checkProvider(w http.ResponseWriter, r *http.Request) {
 			h.checkOpencodeConsole(w, r)
 			return
 		}
+	} else if proto == domain.ProtocolGrokBuild {
+		h.checkGrokBuild(w, r)
+		return
 	} else if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
 		h.checkOAuthProvider(w, r, baseURL, proto)
 		return
@@ -107,6 +113,12 @@ func (h *Handler) checkOAuthProvider(w http.ResponseWriter, r *http.Request, bas
 	creds, fromStore := h.oauthCheckCreds(r)
 	if creds == nil {
 		render(w, r, CheckResult(false, "not connected yet - run Connect first"))
+		return
+	}
+	// Reject before Kiro, Claude, or any other protocol bootstrap. A subscription
+	// session or saved row must not be probed at the form URL.
+	if grokBuildCredential(creds) || proto == domain.ProtocolGrokBuild {
+		render(w, r, CheckResult(false, "grok-build: use the subscription check"))
 		return
 	}
 	if proto == domain.ProtocolKiro {
@@ -240,7 +252,8 @@ func (h *Handler) oauthCheckCreds(r *http.Request) (creds *domain.OAuthCreds, fr
 	}
 	if id, err := strconv.ParseInt(r.FormValue("id"), 10, 64); err == nil {
 		if p, err := h.store.GetProvider(r.Context(), id); err == nil &&
-			p.OAuthCreds != nil && p.OAuthCreds.AccessToken != "" && !p.OAuthCreds.OpencodeConsoleAuth {
+			p.OAuthCreds != nil && p.OAuthCreds.AccessToken != "" && !p.OAuthCreds.OpencodeConsoleAuth &&
+			!grokBuildGenericProbeBlocked(p) {
 			return p.OAuthCreds, true
 		}
 	}
@@ -253,6 +266,9 @@ func (h *Handler) oauthCheckCreds(r *http.Request) (creds *domain.OAuthCreds, fr
 // unexpected body, not definitively. Probe request/response tracing is handled
 // by executeProbe; auth headers are never logged.
 func checkUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider) (bool, string) {
+	if grokBuildGenericProbeBlocked(p) {
+		return false, "grok-build: use the subscription check"
+	}
 	if p.Protocol == domain.ProtocolOpenAICodex {
 		return checkCodexUpstream(ctx, logger, p)
 	}
@@ -273,6 +289,9 @@ func checkUpstream(ctx context.Context, logger *slog.Logger, p *domain.Provider)
 	}
 	if p.Protocol == domain.ProtocolOpencode {
 		return checkOpencodeUpstream(ctx, logger, p)
+	}
+	if p.Protocol == domain.ProtocolGrokBuild {
+		return false, "grok-build: use the subscription check"
 	}
 	if p.OAuthCreds != nil && p.OAuthCreds.ClineAuth {
 		return checkClineUpstream(ctx, logger, p)

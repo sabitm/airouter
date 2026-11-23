@@ -321,7 +321,7 @@ func anthropicServerInMessages(msgs []ir.Message) bool {
 // them. The provider/model is still fixed by the route guard.
 func preservesResponsesReasoning(codecID string) bool {
 	switch codecID {
-	case codecResponsesCodec, codecCodex, codecOpencodeResponse:
+	case codecResponsesCodec, codecCodex, codecOpencodeResponse, "grok-build":
 		return true
 	default:
 		return false

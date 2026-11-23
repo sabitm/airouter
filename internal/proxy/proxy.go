@@ -20,6 +20,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/openai"
@@ -269,6 +270,27 @@ var opencodeResponsesCodec = codec{
 	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
 }
 
+// grokBuildCodec is the Grok Build subscription backend. The wire is Responses,
+// but the id is distinct so an oai-responses ingress never passes through.
+// store=false and stream=true are applied in encode. The official sampler also
+// sets reasoning.summary from model config. This pass does not, because that
+// config is not in the account catalog payload used here.
+var grokBuildCodec = codec{
+	id:             "grok-build",
+	protocol:       domain.ProtocolGrokBuild,
+	decodeRequest:  responses.DecodeRequest,
+	encodeRequest:  grokbuild.EncodeRequest,
+	decodeResponse: responses.DecodeResponse,
+	encodeResponse: responses.EncodeResponse,
+	encodeError:    responses.EncodeError,
+	upstreamPath:   grokbuild.ResponsesPath,
+	streamOnly:     true,
+	// Withhold a function item until its native id arrives, or a terminal
+	// snapshot or EOF proves the id is absent. Standard Responses does not.
+	decodeStream:     responses.DecodeStreamAwaitingItemID,
+	newStreamEncoder: func(model string) streamEncoder { return responses.NewStreamEncoder(model) },
+}
+
 // opencodeMessagesCodec is the opencode.ai backend for @ai-sdk/anthropic models.
 // Its id differs from anth-msg so an Anthropic ingress request still translates.
 var opencodeMessagesCodec = codec{
@@ -325,6 +347,8 @@ func backendCodecForProvider(p domain.Protocol, provider *domain.Provider, model
 		return cursorCodec
 	case domain.ProtocolClaudeCode:
 		return claudeCodeCodec
+	case domain.ProtocolGrokBuild:
+		return grokBuildCodec
 	case domain.ProtocolOpencode:
 		c := opencodeCodecFor(baseURL, model)
 		// Free Zen models are stream-only. The shared codec values stay false so

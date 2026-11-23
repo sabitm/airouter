@@ -256,6 +256,16 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 	return decodeStreamLimited(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls)
 }
 
+// DecodeStreamAwaitingItemID is the Grok Build Responses policy. Tool start and
+// argument events stay withheld until a native item id arrives, or a terminal
+// snapshot or EOF proves that no id will arrive. A missing id still uses the
+// caller's synthetic fallback. Withheld tools occupy a position in the shared
+// ordering queue, so a later item cannot pass an earlier one. DecodeStream is
+// unchanged.
+func DecodeStreamAwaitingItemID(r io.Reader, emit func(ir.StreamEvent) error) error {
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, true)
+}
+
 func decodeStreamLimited(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls int) error {
 	return decodeStreamLimitedAll(r, emit, maxArgBytes, maxCalls, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts)
 }
@@ -268,12 +278,16 @@ func decodeStreamLimitedAll(r io.Reader, emit func(ir.StreamEvent) error, maxArg
 // keep their package constants; tests inject small budgets. The content-part
 // budget uses the production cap.
 func decodeStreamBounded(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int) error {
-	return decodeStreamBoundedParts(r, emit, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTrackedTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts)
+	return decodeStreamBoundedParts(r, emit, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTrackedTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts, false)
 }
+
+// testCaptureDecoder, when set, receives the decoder for an in-flight decode.
+// Tests inspect reasoning registration through it. Production leaves it nil.
+var testCaptureDecoder func(*responsesToolDecoder)
 
 // decodeStreamBoundedParts adds the content-part budget so tests can inject a
 // small part cap independently of the item cap and byte budgets.
-func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int) error {
+func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int, awaitItemID bool) error {
 	reader := sse.NewReader(r)
 	started := false
 	startID, startModel := "", ""
@@ -299,11 +313,18 @@ func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxA
 		emit: emit, maxArgBytes: maxArgBytes, maxCalls: maxCalls,
 		maxTextBytes: maxTextBytes, maxTextItems: maxTextItems, maxTextParts: maxTextParts,
 		maxPendingBytes: maxPendingBytes, maxPendingEvents: maxPendingEvents,
-		ensureStarted: func() error { return ensureStarted("", "") },
+		ensureStarted:     func() error { return ensureStarted("", "") },
+		awaitNativeItemID: awaitItemID,
 	}
 	dec.reasoning = newResponsesReasoningDecoder(emit, dec.ensureStarted, maxReasoningBytes, maxReasoningItems, maxReasoningParts)
 	dec.reasoning.orderEmit = dec.orderEmitReasoning
 	dec.reasoning.msgCount = func() int { return len(dec.texts) }
+	if awaitItemID {
+		dec.reasoning.bindSeq = dec.noteReasonBound
+	}
+	if testCaptureDecoder != nil {
+		testCaptureDecoder(dec)
+	}
 
 	for {
 		ev, err := reader.Next()
@@ -542,6 +563,15 @@ type responsesToolCall struct {
 	args        strings.Builder
 	emitted     int
 	terminal    bool
+	// awaitingItemID is set by the Grok Build policy while a native item id is
+	// still possible. itemIDAbsent is set when a terminal snapshot proved that
+	// the id will not arrive. EOF uses force instead of this flag.
+	awaitingItemID bool
+	itemIDAbsent   bool
+	// seq is the stream registration order shared with text and reasoning.
+	// A tool that still lacks a native item id is a barrier at this seq: no
+	// item registered at or after it may be delivered first.
+	seq int
 	// orderMsgs is len(texts) when the call was created. A call registered
 	// before an open message is not deferred by that message.
 	orderMsgs int
@@ -604,6 +634,26 @@ type responsesToolDecoder struct {
 	// responseDone is set after the first completed or incomplete snapshot is
 	// accepted. It blocks new calls and new content even when output is empty.
 	responseDone bool
+	// awaitNativeItemID withholds tool start and arguments until a native item
+	// id arrives or a terminal snapshot or EOF proves it absent. The withheld
+	// tool is a barrier in textQueue, at its registration seq, so later items
+	// cannot pass it. The barrier shares the pending text budget. drainingOrder
+	// is set while that queue is being delivered, so a release does not queue
+	// the same event again.
+	awaitNativeItemID bool
+	drainingOrder     bool
+	nextSeq           int
+	// seqByOutput and seqByID record a bound reasoning item's output index and
+	// id. Keys are copied from the item after the reasoning decoder accepts it.
+	// An envelope item_id that the decoder ignored is not a key.
+	seqByOutput map[int]int
+	seqByID     map[string]int
+	reasonSeq   map[*responsesReasoningItem]int
+	// itemWire records the order in which an item first reached the consumer.
+	// A completed array whose ordinals disagree with this order is a protocol
+	// error rather than a silent reorder of bytes already sent.
+	itemWire  map[any]int
+	wireClock int
 }
 
 // pendingOrderKind discriminates one deferred ordering work item. Text work
@@ -615,6 +665,9 @@ const (
 	pendingOrderText pendingOrderKind = iota
 	pendingOrderTool
 	pendingOrderReasoning
+	// pendingOrderItemBarrier reserves a tool's stream position until its
+	// native item id arrives or is proved absent. It is not an IR event.
+	pendingOrderItemBarrier
 )
 
 // pendingOrderWork is one ordering-sensitive emission retained behind an
@@ -628,6 +681,12 @@ type pendingOrderWork struct {
 	reason    *responsesReasoningItem
 	event     ir.StreamEvent
 	cost      int
+	// heldForItem marks work queued behind an item-id barrier. While any such
+	// entry or barrier remains, the queue drains as a strict prefix.
+	heldForItem bool
+	// raw is a stored text event with no text owner, used for unkeyed text that
+	// arrived while a barrier was active.
+	raw bool
 }
 
 // responsesTextPart is one content part of a message, keyed by content_index.
@@ -673,6 +732,9 @@ type responsesTextItem struct {
 	// delta is then an unsupported mixture. A done snapshot does not set this.
 	indexedDelta bool
 	terminal     bool
+	// seq is the stream registration order. Text registered before a blocked
+	// tool keeps this seq and is not moved behind that tool.
+	seq int
 }
 
 type textIdentity struct {
@@ -743,7 +805,11 @@ func (d *responsesToolDecoder) observeTextDelta(env *streamEnvelope, refusal boo
 		if err := d.ensureMessageStart(); err != nil {
 			return err
 		}
-		return d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: env.Delta})
+		ev := ir.StreamEvent{Kind: ir.EventTextDelta, Text: env.Delta}
+		if d.deferItemID(d.nextSeq) {
+			return d.enqueueRaw(ev)
+		}
+		return d.emit(ev)
 	}
 	item, err := d.bindText(textIdentity{outputIndex: env.OutputIndex, hasIndex: env.OutputIndexSet, itemID: env.ItemID}, true, false)
 	if err != nil {
@@ -753,9 +819,11 @@ func (d *responsesToolDecoder) observeTextDelta(env *streamEnvelope, refusal boo
 		return ir.ProtocolError("conflicting message text")
 	}
 	// Decide before retention whether this delta queues, so an over-budget
-	// queued event is rejected without retaining or emitting it.
+	// queued event is rejected without retaining or emitting it. A tool barrier
+	// at or before this message also queues the delta; an earlier message keeps
+	// emitting so it cannot move behind that tool.
 	open := d.firstOpenText()
-	if item == open {
+	if item == open && !d.shouldHoldText(item) {
 		if err := d.appendTextDelta(item, env, refusal); err != nil {
 			return err
 		}
@@ -768,8 +836,9 @@ func (d *responsesToolDecoder) observeTextDelta(env *streamEnvelope, refusal boo
 	if err := d.appendTextDelta(item, env, refusal); err != nil {
 		return err
 	}
-	d.appendPending(pendingOrderWork{
+	d.insertPending(pendingOrderWork{
 		kind: pendingOrderText, textOwner: item, cost: cost,
+		heldForItem: d.deferItemID(item.seq),
 	})
 	return nil
 }
@@ -847,13 +916,55 @@ func (d *responsesToolDecoder) appendPending(w pendingOrderWork) {
 	d.textQueueEvents++
 }
 
+// insertPending records one already-budget-checked entry at its owner's stream
+// position. A late event for an earlier item must not land behind a later tool
+// that is only waiting in the queue.
+func (d *responsesToolDecoder) insertPending(w pendingOrderWork) {
+	seq, ok := d.pendingSeq(w)
+	if !d.awaitNativeItemID || !ok {
+		d.appendPending(w)
+		return
+	}
+	idx := len(d.textQueue)
+	for i, existing := range d.textQueue {
+		es, eok := d.pendingSeq(existing)
+		if eok && es > seq {
+			idx = i
+			break
+		}
+	}
+	d.textQueue = append(d.textQueue, pendingOrderWork{})
+	copy(d.textQueue[idx+1:], d.textQueue[idx:])
+	d.textQueue[idx] = w
+	d.queueBytes += w.cost
+	d.textQueueEvents++
+}
+
+func (d *responsesToolDecoder) pendingSeq(w pendingOrderWork) (int, bool) {
+	switch w.kind {
+	case pendingOrderItemBarrier, pendingOrderTool:
+		if w.call != nil {
+			return w.call.seq, true
+		}
+	case pendingOrderText:
+		if w.textOwner != nil {
+			return w.textOwner.seq, true
+		}
+	case pendingOrderReasoning:
+		if w.reason != nil {
+			return d.reasonOrdinal(w.reason), true
+		}
+	}
+	return 0, false
+}
+
 // enqueueOrder validates and retains one ordering entry. A failure retains
 // nothing, so an offending event is never queued or emitted.
 func (d *responsesToolDecoder) enqueueOrder(w pendingOrderWork) error {
 	if err := d.checkPending(w.cost); err != nil {
 		return err
 	}
-	d.appendPending(w)
+	d.insertPending(w)
 	return nil
 }
 
@@ -884,7 +995,7 @@ func (d *responsesToolDecoder) textIndex(item *responsesTextItem) (int, bool) {
 // overhead, and one entry of bookkeeping.
 func pendingOrderEventBytes(ev ir.StreamEvent) int {
 	n := textQueueEntryOverhead
-	n += len(ev.Text) + len(ev.ArgsFrag) + len(ev.ToolID) + len(ev.ToolName) + len(ev.ReasoningID)
+	n += len(ev.Text) + len(ev.ArgsFrag) + len(ev.ToolID) + len(ev.ToolName) + len(ev.ResponsesItemID) + len(ev.ReasoningID)
 	if ev.Reasoning != nil {
 		n += len(ev.Reasoning.ID) + len(ev.Reasoning.Status)
 		if ev.Reasoning.EncryptedContent != nil {
@@ -910,6 +1021,9 @@ func (d *responsesToolDecoder) flushClosedText(item *responsesTextItem) error {
 			return nil
 		}
 	}
+	if d.shouldHoldText(item) {
+		return d.holdTextSuffix(item)
+	}
 	if err := d.emitTextSuffix(item); err != nil {
 		return err
 	}
@@ -923,6 +1037,8 @@ func (d *responsesToolDecoder) flushClosedText(item *responsesTextItem) error {
 // deferred by it.
 func (d *responsesToolDecoder) orderReleasable(w pendingOrderWork, barrier *responsesTextItem) bool {
 	switch w.kind {
+	case pendingOrderItemBarrier:
+		return false
 	case pendingOrderText:
 		if w.textOwner == nil || barrier == nil {
 			return true
@@ -956,14 +1072,22 @@ func (d *responsesToolDecoder) orderReleasable(w pendingOrderWork, barrier *resp
 // emitOrderWork emits one released entry: a message suffix for text work, or
 // the stored event verbatim for tool and reasoning work.
 func (d *responsesToolDecoder) emitOrderWork(w pendingOrderWork) error {
+	if w.kind == pendingOrderItemBarrier {
+		return nil
+	}
 	if w.kind == pendingOrderText {
+		if w.raw {
+			return d.emit(w.event)
+		}
 		return d.emitTextSuffix(w.textOwner)
 	}
 	if w.call != nil {
 		w.call.wired = true
+		d.noteItemWire(w.call)
 	}
 	if w.reason != nil {
 		w.reason.wired = true
+		d.noteItemWire(w.reason)
 	}
 	return d.emit(w.event)
 }
@@ -985,6 +1109,9 @@ func (d *responsesToolDecoder) drainOrdered() error {
 	if len(d.textQueue) == 0 {
 		return nil
 	}
+	if d.itemQueueStrict() {
+		return d.drainItemPrefix()
+	}
 	barrier := d.firstOpenText()
 	var kept []pendingOrderWork
 	for _, w := range d.textQueue {
@@ -998,11 +1125,33 @@ func (d *responsesToolDecoder) drainOrdered() error {
 		}
 	}
 	d.textQueue = kept
-	if len(d.textQueue) == 0 {
-		d.textQueue = nil
-		d.queueBytes = 0
-		d.textQueueEvents = 0
+	d.resetEmptyQueue()
+	return nil
+}
+
+// drainItemPrefix delivers a leading run of releasable work and stops at the
+// first item-id barrier or message-blocked entry. A later ready tool must not
+// pass either one.
+func (d *responsesToolDecoder) drainItemPrefix() error {
+	if d.drainingOrder {
+		return nil
 	}
+	d.drainingOrder = true
+	defer func() { d.drainingOrder = false }()
+	barrier := d.firstOpenText()
+	var kept []pendingOrderWork
+	for i, w := range d.textQueue {
+		if w.kind == pendingOrderItemBarrier || !d.orderReleasable(w, barrier) {
+			kept = append(kept, d.textQueue[i:]...)
+			break
+		}
+		d.releaseOrderCost(w)
+		if err := d.emitOrderWork(w); err != nil {
+			return err
+		}
+	}
+	d.textQueue = kept
+	d.resetEmptyQueue()
 	return nil
 }
 
@@ -1018,6 +1167,7 @@ func (d *responsesToolDecoder) flushOrderedForCall(call *responsesToolCall) erro
 			d.releaseOrderCost(w)
 			if w.call != nil {
 				w.call.wired = true
+				d.noteItemWire(w.call)
 			}
 			if err := d.emit(w.event); err != nil {
 				return err
@@ -1043,6 +1193,7 @@ func (d *responsesToolDecoder) flushOrderedForReason(reason *responsesReasoningI
 			d.releaseOrderCost(w)
 			if w.reason != nil {
 				w.reason.wired = true
+				d.noteItemWire(w.reason)
 			}
 			if err := d.emit(w.event); err != nil {
 				return err
@@ -1057,23 +1208,33 @@ func (d *responsesToolDecoder) flushOrderedForReason(reason *responsesReasoningI
 }
 
 func (d *responsesToolDecoder) resetEmptyQueue() {
-	if len(d.textQueue) == 0 {
-		d.textQueue = nil
-		d.queueBytes = 0
-		d.textQueueEvents = 0
+	if len(d.textQueue) != 0 {
+		return
 	}
+	d.textQueue = nil
+	d.queueBytes = 0
+	d.textQueueEvents = 0
 }
 
 // flushTextPending releases all retained ordering work at EOF when no terminal
 // snapshot arrived. Work drains in arrival order and each streamed message's
 // retained tail follows, so an incomplete stream drops no valid content.
 func (d *responsesToolDecoder) flushTextPending() error {
+	if err := d.releaseItemBarriers(); err != nil {
+		return err
+	}
+	d.drainingOrder = true
 	for _, w := range d.textQueue {
 		d.releaseOrderCost(w)
+		if w.kind == pendingOrderItemBarrier {
+			continue
+		}
 		if err := d.emitOrderWork(w); err != nil {
+			d.drainingOrder = false
 			return err
 		}
 	}
+	d.drainingOrder = false
 	d.textQueue = nil
 	d.queueBytes = 0
 	d.textQueueEvents = 0
@@ -1129,7 +1290,7 @@ func (d *responsesToolDecoder) bindText(id textIdentity, create, fromFinal bool)
 		if err := d.retainText(textItemOverhead); err != nil {
 			return nil, err
 		}
-		found = &responsesTextItem{fromFinal: fromFinal}
+		found = &responsesTextItem{fromFinal: fromFinal, seq: d.allocSeq()}
 		d.texts = append(d.texts, found)
 		if fromFinal {
 			if err := d.retainText(textKeyOverhead); err != nil {
@@ -1573,6 +1734,12 @@ func (d *responsesToolDecoder) applyMessageContent(item *responsesTextItem, cont
 // emitTextSuffix sends the retained bytes not yet streamed. Repeated terminal
 // snapshots emit nothing new.
 func (d *responsesToolDecoder) emitTextSuffix(item *responsesTextItem) error {
+	if item == nil {
+		return nil
+	}
+	if d.shouldHoldText(item) {
+		return d.holdTextSuffix(item)
+	}
 	if len(item.parts) == 0 {
 		return d.emitLooseTail(item, item.text.Len())
 	}
@@ -1602,6 +1769,7 @@ func (d *responsesToolDecoder) emitTextSuffix(item *responsesTextItem) error {
 			if err := d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Refusal: true}); err != nil {
 				return err
 			}
+			d.noteItemWire(item)
 			item.markEmptyRefusal(i)
 		}
 	}
@@ -1624,6 +1792,7 @@ func (d *responsesToolDecoder) emitClaimedSpan(item *responsesTextItem, from, to
 	if err := d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: item.text.String()[from:to], Refusal: refusal}); err != nil {
 		return err
 	}
+	d.noteItemWire(item)
 	item.emitted = to
 	return nil
 }
@@ -1660,6 +1829,7 @@ func (d *responsesToolDecoder) emitLooseTail(item *responsesTextItem, limit int)
 		if err := d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: text[item.emitted:end], Refusal: refusal}); err != nil {
 			return err
 		}
+		d.noteItemWire(item)
 		item.emitted = end
 	}
 	return nil
@@ -1854,7 +2024,7 @@ func (d *responsesToolDecoder) observeContentPartAdded(env *streamEnvelope) erro
 	// Budget and identity are decided before retention. A rejected added part
 	// leaves neither the bytes nor a queued emission.
 	open := d.firstOpenText()
-	queued := item != open
+	queued := item != open || d.shouldHoldText(item)
 	cost := 0
 	if queued {
 		cost = len(extra) + textQueueEntryOverhead
@@ -1869,8 +2039,9 @@ func (d *responsesToolDecoder) observeContentPartAdded(env *streamEnvelope) erro
 	part.end += len(extra)
 	d.sawRefusal = true
 	if queued {
-		d.appendPending(pendingOrderWork{
+		d.insertPending(pendingOrderWork{
 			kind: pendingOrderText, textOwner: item, cost: cost,
+			heldForItem: d.deferItemID(item.seq),
 		})
 		return nil
 	}
@@ -1927,6 +2098,10 @@ func (d *responsesToolDecoder) observeDelta(env *streamEnvelope) error {
 		return err
 	}
 	if env.Delta == "" {
+		// A late item id with no new argument bytes must still release a withheld start.
+		if d.awaitNativeItemID && call.itemID != "" && !call.started {
+			return d.emitReady(call)
+		}
 		return nil
 	}
 	if call.terminal {
@@ -2023,6 +2198,16 @@ func (d *responsesToolDecoder) observeFinal(items []respOutputItem) error {
 			slots[i].text = ti
 		}
 	}
+	// A final snapshot is the last chance for a native item id. Calls that
+	// still lack one are proven absent and may use the synthetic fallback.
+	if d.awaitNativeItemID {
+		for _, call := range d.calls {
+			if call.itemID == "" {
+				call.itemIDAbsent = true
+				call.awaitingItemID = false
+			}
+		}
+	}
 	// The terminal array pass emits in array order. bypassOrder stops a forced
 	// emission from deferring again, and each slot flushes its own queued
 	// streamed work first so a final-only item cannot overtake it.
@@ -2085,7 +2270,13 @@ func (d *responsesToolDecoder) observeFinal(items []respOutputItem) error {
 	}
 	// Drain entries whose item had no terminal slot, so an unmatched streamed
 	// item loses no content. Every message is closed, so nothing stays blocked.
-	return d.drainOrdered()
+	if err := d.releaseItemBarriers(); err != nil {
+		return err
+	}
+	if err := d.drainOrdered(); err != nil {
+		return err
+	}
+	return d.rejectEmittedFinalOrder()
 }
 
 // rejectReorderedEmission fails when a terminal slot at ordinal still has new
@@ -2119,6 +2310,48 @@ func (d *responsesToolDecoder) rejectReorderedEmission(ordinal int) error {
 			}
 			if item.finalOrdinal > ordinal {
 				return ir.ProtocolError("conflicting reasoning item order")
+			}
+		}
+	}
+	return nil
+}
+
+// rejectEmittedFinalOrder fails when items already delivered disagree with the
+// completed output array. The check runs even when those items have no new
+// bytes, so a consistent stream is not silently kept against the final order.
+func (d *responsesToolDecoder) rejectEmittedFinalOrder() error {
+	if !d.awaitNativeItemID {
+		return nil
+	}
+	type ranked struct {
+		wire, ordinal int
+		msg           string
+	}
+	var ranks []ranked
+	for _, call := range d.calls {
+		if !call.finalMatched || d.itemWire[call] == 0 {
+			continue
+		}
+		ranks = append(ranks, ranked{d.itemWire[call], call.finalOrdinal, "conflicting function call order"})
+	}
+	for _, item := range d.texts {
+		if !item.finalMatched || d.itemWire[item] == 0 {
+			continue
+		}
+		ranks = append(ranks, ranked{d.itemWire[item], item.finalOrdinal, "conflicting message text order"})
+	}
+	if d.reasoning != nil {
+		for _, item := range d.reasoning.items {
+			if !item.finalMatched || d.itemWire[item] == 0 {
+				continue
+			}
+			ranks = append(ranks, ranked{d.itemWire[item], item.finalOrdinal, "conflicting reasoning item order"})
+		}
+	}
+	for i := range ranks {
+		for j := range ranks {
+			if ranks[i].wire < ranks[j].wire && ranks[i].ordinal > ranks[j].ordinal {
+				return ir.ProtocolError(ranks[i].msg)
 			}
 		}
 	}
@@ -2285,6 +2518,9 @@ func (d *responsesToolDecoder) flushPending() error {
 		if call.started {
 			continue
 		}
+		if call.itemID == "" {
+			call.itemIDAbsent = true
+		}
 		if err := d.emitCall(call, true); err != nil {
 			return err
 		}
@@ -2347,7 +2583,7 @@ func (d *responsesToolDecoder) bind(id toolIdentity, create, fromFinal bool) (*r
 		if len(d.calls) >= d.maxCalls {
 			return nil, ir.ProtocolError("too many function calls")
 		}
-		found = &responsesToolCall{index: d.nextIndex, fromFinal: fromFinal, orderMsgs: len(d.texts)}
+		found = &responsesToolCall{index: d.nextIndex, fromFinal: fromFinal, orderMsgs: len(d.texts), seq: d.allocSeq()}
 		d.nextIndex++
 		d.calls = append(d.calls, found)
 		if fromFinal {
@@ -2438,8 +2674,8 @@ func (d *responsesToolDecoder) emitReady(call *responsesToolCall) error {
 }
 
 // orderEmitTool emits a tool event now, or queues it behind an earlier open
-// message. bypassOrder is set by the terminal array pass and by a drain, where
-// the caller already chose the position. A live emission marks the call wired.
+// message. bypassOrder is set by the terminal array pass, where the caller
+// already chose the position. A live emission marks the call wired.
 func (d *responsesToolDecoder) orderEmitTool(call *responsesToolCall, ev ir.StreamEvent) error {
 	if !d.bypassOrder && call != nil && d.messagePrecedes(call.orderMsgs) {
 		return d.enqueueOrder(pendingOrderWork{
@@ -2449,6 +2685,7 @@ func (d *responsesToolDecoder) orderEmitTool(call *responsesToolCall, ev ir.Stre
 	}
 	if call != nil {
 		call.wired = true
+		d.noteItemWire(call)
 	}
 	return d.emit(ev)
 }
@@ -2468,6 +2705,13 @@ func (d *responsesToolDecoder) messagePrecedes(orderMsgs int) bool {
 // item's event behind a message registered after the item, using the same
 // bounded queue and the same pending budget as tool and text work.
 func (d *responsesToolDecoder) orderEmitReasoning(item *responsesReasoningItem, ev ir.StreamEvent) error {
+	seq := d.reasonOrdinal(item)
+	if !d.bypassOrder && d.deferItemID(seq) {
+		return d.enqueueOrder(pendingOrderWork{
+			kind: pendingOrderReasoning, reason: item, event: ev,
+			cost: pendingOrderEventBytes(ev), heldForItem: true,
+		})
+	}
 	if !d.bypassOrder && item != nil && d.messagePrecedes(item.orderMsgs) {
 		return d.enqueueOrder(pendingOrderWork{
 			kind: pendingOrderReasoning, reason: item, event: ev,
@@ -2476,33 +2720,427 @@ func (d *responsesToolDecoder) orderEmitReasoning(item *responsesReasoningItem, 
 	}
 	if item != nil {
 		item.wired = true
+		d.noteItemWire(item)
 	}
 	return d.emit(ev)
 }
 
-func (d *responsesToolDecoder) emitCall(call *responsesToolCall, force bool) error {
-	if !force && (call.name == "" || call.callID == "") {
+func (d *responsesToolDecoder) allocSeq() int {
+	seq := d.nextSeq
+	d.nextSeq++
+	return seq
+}
+
+func (d *responsesToolDecoder) findSeq(hasIndex bool, index int, id string) (int, bool) {
+	if hasIndex && d.seqByOutput != nil {
+		if seq, ok := d.seqByOutput[index]; ok {
+			return seq, true
+		}
+	}
+	if id != "" && d.seqByID != nil {
+		if seq, ok := d.seqByID[id]; ok {
+			return seq, true
+		}
+	}
+	return 0, false
+}
+
+func (d *responsesToolDecoder) rememberSeq(seq int, hasIndex bool, index int, id string) {
+	if hasIndex {
+		if d.seqByOutput == nil {
+			d.seqByOutput = map[int]int{}
+		}
+		if _, ok := d.seqByOutput[index]; !ok {
+			d.seqByOutput[index] = seq
+		}
+	}
+	if id != "" {
+		if d.seqByID == nil {
+			d.seqByID = map[string]int{}
+		}
+		if _, ok := d.seqByID[id]; !ok {
+			d.seqByID[id] = seq
+		}
+	}
+}
+
+// noteReasonBound reserves the stream position of a reasoning item after that
+// decoder has accepted it. added and done frames bind only the nested item id.
+// Summary frames bind the envelope item_id, then the nested id. A repeated bind
+// reuses this item's sequence and does not store any other id. A final-only
+// item does not take a live sequence; the terminal pass emits it by array slot.
+func (d *responsesToolDecoder) noteReasonBound(item *responsesReasoningItem) {
+	if !d.awaitNativeItemID || item == nil || item.fromFinal {
+		return
+	}
+	var seq int
+	ok := false
+	if d.reasonSeq != nil {
+		seq, ok = d.reasonSeq[item]
+	}
+	if !ok {
+		seq = d.allocSeq()
+		if d.reasonSeq == nil {
+			d.reasonSeq = map[*responsesReasoningItem]int{}
+		}
+		d.reasonSeq[item] = seq
+	}
+	d.rememberSeq(seq, item.hasIndex, item.outputIndex, item.id)
+}
+
+func (d *responsesToolDecoder) reasonOrdinal(item *responsesReasoningItem) int {
+	if item == nil {
+		return d.nextSeq
+	}
+	if d.reasonSeq != nil {
+		if seq, ok := d.reasonSeq[item]; ok {
+			return seq
+		}
+	}
+	seq, ok := d.findSeq(item.hasIndex, item.outputIndex, item.id)
+	if !ok {
+		seq = d.allocSeq()
+	}
+	if d.reasonSeq == nil {
+		d.reasonSeq = map[*responsesReasoningItem]int{}
+	}
+	d.reasonSeq[item] = seq
+	d.rememberSeq(seq, item.hasIndex, item.outputIndex, item.id)
+	return seq
+}
+
+// deferItemID reports that an unresolved tool barrier occupies this seq or an
+// earlier one. An item registered before that barrier is not deferred.
+func (d *responsesToolDecoder) deferItemID(seq int) bool {
+	if !d.awaitNativeItemID || d.drainingOrder || d.bypassOrder {
+		return false
+	}
+	for _, w := range d.textQueue {
+		if w.kind == pendingOrderItemBarrier && w.call != nil && w.call.seq <= seq {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *responsesToolDecoder) shouldHoldText(item *responsesTextItem) bool {
+	if item == nil {
+		return false
+	}
+	return d.deferItemID(item.seq)
+}
+
+func (d *responsesToolDecoder) itemQueueStrict() bool {
+	if !d.awaitNativeItemID {
+		return false
+	}
+	for _, w := range d.textQueue {
+		if w.kind == pendingOrderItemBarrier || w.heldForItem {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *responsesToolDecoder) noteItemWire(key any) {
+	// Only the Grok Build final-order check reads these ranks.
+	if !d.awaitNativeItemID || key == nil {
+		return
+	}
+	if d.itemWire == nil {
+		d.itemWire = map[any]int{}
+	}
+	if d.itemWire[key] != 0 {
+		return
+	}
+	d.wireClock++
+	d.itemWire[key] = d.wireClock
+}
+
+func (d *responsesToolDecoder) noteAwaitingItem(call *responsesToolCall) error {
+	if call == nil || call.awaitingItemID {
 		return nil
 	}
-	if err := d.ensureMessageStart(); err != nil {
+	cost := textQueueEntryOverhead
+	if err := d.checkPending(cost); err != nil {
 		return err
 	}
+	call.awaitingItemID = true
+	d.insertPending(pendingOrderWork{
+		kind: pendingOrderItemBarrier, call: call, cost: cost, heldForItem: true,
+	})
+	return nil
+}
+
+func (d *responsesToolDecoder) enqueueRaw(ev ir.StreamEvent) error {
+	return d.enqueueOrder(pendingOrderWork{
+		kind: pendingOrderText, event: ev, cost: pendingOrderEventBytes(ev),
+		heldForItem: true, raw: true,
+	})
+}
+
+func (d *responsesToolDecoder) hasQueuedText(item *responsesTextItem) bool {
+	for _, w := range d.textQueue {
+		if w.kind == pendingOrderText && w.textOwner == item {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *responsesToolDecoder) holdTextSuffix(item *responsesTextItem) error {
+	if item == nil || !textItemWillEmit(item) || d.hasQueuedText(item) {
+		return nil
+	}
+	cost := item.text.Len() - item.emitted + textQueueEntryOverhead
+	if cost < textQueueEntryOverhead {
+		cost = textQueueEntryOverhead
+	}
+	if err := d.checkPending(cost); err != nil {
+		return err
+	}
+	d.insertPending(pendingOrderWork{
+		kind: pendingOrderText, textOwner: item, cost: cost, heldForItem: true,
+	})
+	return nil
+}
+
+func (d *responsesToolDecoder) barrierIndex(call *responsesToolCall) int {
+	for i, w := range d.textQueue {
+		if w.kind == pendingOrderItemBarrier && w.call == call {
+			return i
+		}
+	}
+	return -1
+}
+
+func (d *responsesToolDecoder) removeBarrierAt(idx int) {
+	if idx < 0 || idx >= len(d.textQueue) {
+		return
+	}
+	d.releaseOrderCost(d.textQueue[idx])
+	d.textQueue = append(d.textQueue[:idx], d.textQueue[idx+1:]...)
+	d.resetEmptyQueue()
+}
+
+func (d *responsesToolDecoder) removeBarrier(call *responsesToolCall) {
+	d.removeBarrierAt(d.barrierIndex(call))
+}
+
+func (d *responsesToolDecoder) checkPendingDelta(byteDelta, eventDelta int) error {
+	if eventDelta > 0 && d.textQueueEvents > d.maxPendingEvents-eventDelta {
+		return ir.ProtocolError("pending message text exceeded limit")
+	}
+	if byteDelta > 0 && byteDelta > d.maxPendingBytes-d.queueBytes {
+		return ir.ProtocolError("pending message text exceeded limit")
+	}
+	return nil
+}
+
+func (d *responsesToolDecoder) replaceBarrier(idx int, call *responsesToolCall, events []ir.StreamEvent) error {
+	if idx < 0 || idx >= len(d.textQueue) {
+		return nil
+	}
+	old := d.textQueue[idx]
+	works := make([]pendingOrderWork, len(events))
+	addBytes := 0
+	for i, ev := range events {
+		cost := pendingOrderEventBytes(ev)
+		addBytes += cost
+		works[i] = pendingOrderWork{
+			kind: pendingOrderTool, call: call, event: ev, cost: cost, heldForItem: true,
+		}
+	}
+	if err := d.checkPendingDelta(addBytes-old.cost, len(events)-1); err != nil {
+		return err
+	}
+	d.releaseOrderCost(old)
+	tail := append([]pendingOrderWork(nil), d.textQueue[idx+1:]...)
+	d.textQueue = d.textQueue[:idx]
+	for _, w := range works {
+		d.appendPending(w)
+	}
+	d.textQueue = append(d.textQueue, tail...)
+	d.resetEmptyQueue()
+	return nil
+}
+
+func (d *responsesToolDecoder) appendHeld(call *responsesToolCall, events []ir.StreamEvent) error {
+	works := make([]pendingOrderWork, 0, len(events))
+	addBytes := 0
+	for _, ev := range events {
+		cost := pendingOrderEventBytes(ev)
+		addBytes += cost
+		works = append(works, pendingOrderWork{
+			kind: pendingOrderTool, call: call, event: ev, cost: cost, heldForItem: true,
+		})
+	}
+	if err := d.checkPendingDelta(addBytes, len(works)); err != nil {
+		return err
+	}
+	for _, w := range works {
+		d.insertPending(w)
+	}
+	return nil
+}
+
+func (d *responsesToolDecoder) blockedByEarlierBarrier(call *responsesToolCall) bool {
+	for _, w := range d.textQueue {
+		if w.kind == pendingOrderItemBarrier && w.call != nil && w.call != call && w.call.seq < call.seq {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *responsesToolDecoder) canEmitCallNow(call *responsesToolCall, idx int) bool {
+	if d.messagePrecedes(call.orderMsgs) || d.blockedByEarlierBarrier(call) {
+		return false
+	}
+	if idx > 0 {
+		return false
+	}
+	if idx < 0 && d.itemQueueStrict() {
+		return false
+	}
+	return true
+}
+
+func (d *responsesToolDecoder) pendingCallEvents(call *responsesToolCall) []ir.StreamEvent {
+	var events []ir.StreamEvent
+	if !call.started {
+		events = append(events, ir.StreamEvent{
+			Kind: ir.EventToolCallStart, Index: call.index,
+			ToolID: call.callID, ToolName: call.name, ResponsesItemID: call.itemID,
+		})
+	}
+	if call.emitted < call.args.Len() {
+		events = append(events, ir.StreamEvent{
+			Kind: ir.EventToolCallDelta, Index: call.index,
+			ArgsFrag:        call.args.String()[call.emitted:],
+			ResponsesItemID: call.itemID,
+		})
+	}
+	return events
+}
+
+func (d *responsesToolDecoder) commitCallEvents(call *responsesToolCall) {
 	if !call.started {
 		call.started = true
 		d.sawTool = true
-		if err := d.orderEmitTool(call, ir.StreamEvent{
-			Kind: ir.EventToolCallStart, Index: call.index,
-			ToolID: call.callID, ToolName: call.name,
-		}); err != nil {
+	}
+	call.emitted = call.args.Len()
+}
+
+func (d *responsesToolDecoder) emitEvents(call *responsesToolCall, events []ir.StreamEvent) error {
+	for _, ev := range events {
+		if err := d.emit(ev); err != nil {
 			return err
 		}
+		if call != nil {
+			call.wired = true
+			d.noteItemWire(call)
+		}
 	}
-	if call.emitted >= call.args.Len() {
+	return nil
+}
+
+// placeCallEvents inserts a ready call at its barrier. A front call is delivered
+// now. A call behind an earlier barrier or an open message stays there, so a
+// later id cannot pass it.
+func (d *responsesToolDecoder) placeCallEvents(call *responsesToolCall, events []ir.StreamEvent) error {
+	if d.bypassOrder {
+		d.removeBarrier(call)
+		return d.emitEvents(call, events)
+	}
+	if err := d.drainOrdered(); err != nil {
+		return err
+	}
+	idx := d.barrierIndex(call)
+	if d.canEmitCallNow(call, idx) {
+		if idx >= 0 {
+			d.removeBarrierAt(idx)
+		}
+		return d.emitEvents(call, events)
+	}
+	if idx >= 0 {
+		return d.replaceBarrier(idx, call, events)
+	}
+	if len(events) == 0 {
 		return nil
 	}
-	frag := call.args.String()[call.emitted:]
-	call.emitted = call.args.Len()
-	return d.orderEmitTool(call, ir.StreamEvent{Kind: ir.EventToolCallDelta, Index: call.index, ArgsFrag: frag})
+	if d.messagePrecedes(call.orderMsgs) && !d.deferItemID(call.seq) && !d.itemQueueStrict() {
+		for _, ev := range events {
+			if err := d.orderEmitTool(call, ev); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return d.appendHeld(call, events)
+}
+
+// releaseItemBarriers turns resolved barriers into queued events at the same
+// position. EOF and the terminal drain use it so a missing id still emits in
+// stream order, with an empty item id for the synthetic fallback.
+func (d *responsesToolDecoder) releaseItemBarriers() error {
+	for {
+		idx := -1
+		var call *responsesToolCall
+		for i, w := range d.textQueue {
+			if w.kind != pendingOrderItemBarrier || w.call == nil {
+				continue
+			}
+			if w.call.awaitingItemID && w.call.itemID == "" && !w.call.itemIDAbsent {
+				continue
+			}
+			idx = i
+			call = w.call
+			break
+		}
+		if call == nil {
+			return nil
+		}
+		if call.itemID == "" {
+			call.itemIDAbsent = true
+		}
+		call.awaitingItemID = false
+		// A call that still has no name or call id is not emitted here. Dropping
+		// the barrier lets later queued work drain; EOF force-emits the call.
+		if call.name == "" || call.callID == "" {
+			d.removeBarrierAt(idx)
+			continue
+		}
+		events := d.pendingCallEvents(call)
+		if err := d.replaceBarrier(idx, call, events); err != nil {
+			return err
+		}
+		d.commitCallEvents(call)
+	}
+}
+
+func (d *responsesToolDecoder) emitCall(call *responsesToolCall, force bool) error {
+	// Grok Build waits for a native item id. Emitting a start without one lets
+	// the encoder publish a synthetic id that a later frame cannot rename.
+	if d.awaitNativeItemID && call.itemID == "" && !force && !call.itemIDAbsent {
+		return d.noteAwaitingItem(call)
+	}
+	if !force && (call.name == "" || call.callID == "") {
+		return nil
+	}
+	call.awaitingItemID = false
+	if err := d.ensureMessageStart(); err != nil {
+		return err
+	}
+	events := d.pendingCallEvents(call)
+	d.commitCallEvents(call)
+	if err := d.placeCallEvents(call, events); err != nil {
+		return err
+	}
+	if d.bypassOrder {
+		return nil
+	}
+	return d.drainOrdered()
 }
 
 func (d *responsesToolDecoder) ensureMessageStart() error {
@@ -2675,13 +3313,14 @@ type respOpenPart struct {
 }
 
 type respTool struct {
-	itemID  string
-	outIdx  int
-	callID  string
-	name    string
-	pending string
-	args    strings.Builder
-	done    bool
+	itemID     string
+	sourceItem string
+	outIdx     int
+	callID     string
+	name       string
+	pending    string
+	args       strings.Builder
+	done       bool
 }
 
 func NewStreamEncoder(model string) *StreamEncoder {
@@ -2857,7 +3496,13 @@ func (e *StreamEncoder) openFunctionItem(w *sse.Writer, t *respTool) error {
 		return err
 	}
 	e.open = openFunction
-	t.itemID = ir.NewID("fc_")
+	// A provider item id is distinct from call_id. Missing identity keeps the
+	// historical synthetic fallback rather than inventing a Grok-specific id.
+	if t.sourceItem != "" {
+		t.itemID = t.sourceItem
+	} else {
+		t.itemID = ir.NewID("fc_")
+	}
 	t.outIdx = e.outputIndex
 	e.outputIndex++
 	e.openItemID = t.itemID
@@ -3048,6 +3693,9 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 		if ev.ToolID != "" {
 			t.callID = ev.ToolID
 		}
+		if ev.ResponsesItemID != "" {
+			t.sourceItem = ev.ResponsesItemID
+		}
 		if ev.ToolName != "" {
 			t.name = ev.ToolName
 		}
@@ -3055,6 +3703,9 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 
 	case ir.EventToolCallDelta:
 		t := e.tool(ev.Index)
+		if ev.ResponsesItemID != "" && t.sourceItem == "" {
+			t.sourceItem = ev.ResponsesItemID
+		}
 		if t.itemID == "" {
 			// No item for this index yet: buffer instead of emitting a delta
 			// keyed to a nonexistent item or writing into another item's args.

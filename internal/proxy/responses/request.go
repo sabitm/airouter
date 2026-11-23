@@ -142,6 +142,7 @@ func decodeInput(raw json.RawMessage, systemOut *string) ([]ir.Message, error) {
 		case "function_call":
 			appendBlock(ir.RoleAssistant, ir.ContentBlock{
 				Type: ir.BlockToolUse, ToolID: it.CallID, ToolName: it.Name, ToolInput: rawArgs(it.Arguments),
+				ResponsesItemID: it.ID,
 			})
 		case "function_call_output":
 			appendBlock(ir.RoleUser, ir.ContentBlock{
@@ -392,9 +393,13 @@ func encodeInput(req *ir.Request) []map[string]any {
 					if args == "" {
 						args = "{}"
 					}
-					items = append(items, map[string]any{
+					item := map[string]any{
 						"type": "function_call", "call_id": b.ToolID, "name": b.ToolName, "arguments": args,
-					})
+					}
+					if b.ResponsesItemID != "" {
+						item["id"] = b.ResponsesItemID
+					}
+					items = append(items, item)
 				}
 			}
 			flushText()

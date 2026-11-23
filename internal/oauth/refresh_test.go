@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"airouter/internal/domain"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/store"
 )
@@ -37,8 +38,9 @@ type fakeStore struct {
 }
 
 type fakeConn struct {
-	method domain.AuthMethod
-	proto  domain.Protocol
+	method  domain.AuthMethod
+	proto   domain.Protocol
+	baseURL string
 }
 
 func newFakeStore() *fakeStore {
@@ -54,7 +56,16 @@ func (f *fakeStore) connection(id int64) fakeConn {
 
 func (f *fakeStore) setConnection(id int64, method domain.AuthMethod, proto domain.Protocol) {
 	f.mu.Lock()
-	f.conns[id] = fakeConn{method: method, proto: proto}
+	base := f.conns[id].baseURL
+	f.conns[id] = fakeConn{method: method, proto: proto, baseURL: base}
+	f.mu.Unlock()
+}
+
+func (f *fakeStore) setBase(id int64, baseURL string) {
+	f.mu.Lock()
+	c := f.conns[id]
+	c.baseURL = baseURL
+	f.conns[id] = c
 	f.mu.Unlock()
 }
 
@@ -71,8 +82,13 @@ func (f *fakeStore) GetProvider(_ context.Context, id int64) (*domain.Provider, 
 	cp := *c
 	conn := f.connection(id)
 	p := &domain.Provider{ID: id, Protocol: conn.proto, AuthMethod: conn.method, OAuthCreds: &cp}
-	if conn.proto == domain.ProtocolOpencode {
+	switch {
+	case conn.baseURL != "":
+		p.BaseURL = conn.baseURL
+	case conn.proto == domain.ProtocolOpencode:
 		p.BaseURL = opencode.GoBaseURL
+	case conn.proto == domain.ProtocolGrokBuild:
+		p.BaseURL = grokbuild.BaseURL
 	}
 	return p, nil
 }

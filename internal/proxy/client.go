@@ -23,6 +23,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/opencode"
@@ -164,6 +165,10 @@ func prepareUpstreamRequest(ctx context.Context, p *Proxy, backend codec, provid
 		if backend.id == "opencode-responses" {
 			return opencode.PrepareMuseSparkResponse(body)
 		}
+		return body, nil
+	case "grok-build":
+		// Unsupported ingress fields are rejected on the original body before
+		// decode. The encoded body has already dropped them.
 		return body, nil
 	case "cursor":
 		// Cursor needs no body mutation; headers (checksum, identity) are applied
@@ -519,6 +524,9 @@ func applyUpstreamHeaders(req *http.Request, provider *domain.Provider, clientHe
 	// Authorization keeps the scheme-switch value ("public" or a real key).
 	if provider.Protocol == domain.ProtocolOpencode {
 		applyOpencodeHeaders(req, provider, ctx, body)
+	}
+	if grokbuild.Involved(provider) {
+		applyGrokBuildHeaders(req, provider, ctx, body)
 	}
 }
 
@@ -1048,6 +1056,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
 			return 0, nil, err
 		}
+		if err := grokbuild.RejectUnsafeSend(provider, url); err != nil {
+			return 0, nil, err
+		}
 		started := time.Now()
 		wire, err := claudeWireBody(ctx, provider, path, body)
 		if err != nil {
@@ -1152,6 +1163,9 @@ func upstreamURL(provider *domain.Provider, path string) string {
 	if provider != nil && provider.Protocol == domain.ProtocolOpencode {
 		return strings.TrimRight(opencode.InferenceBaseURL(provider.BaseURL, path), "/") + path
 	}
+	if grokbuild.Involved(provider) {
+		return strings.TrimRight(grokbuild.BaseURL, "/") + path
+	}
 	return strings.TrimRight(effectiveProviderBaseURL(provider), "/") + path
 }
 
@@ -1181,6 +1195,9 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 	}
 	send := func(ctx context.Context) (*http.Response, error) {
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
+			return nil, err
+		}
+		if err := grokbuild.RejectUnsafeSend(provider, url); err != nil {
 			return nil, err
 		}
 		started := time.Now()
@@ -1322,6 +1339,9 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 
 	send := func() (*http.Response, error) {
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
+			return nil, err
+		}
+		if err := grokbuild.RejectUnsafeSend(provider, url); err != nil {
 			return nil, err
 		}
 		closeWrite() // release the previous attempt's pipe, if any
@@ -1545,7 +1565,15 @@ func (c *harCaptureBody) Close() error {
 // provider is the request-local hydrated copy, so the mutation is request-scoped.
 // On error the best-available token is still written, so callers may proceed.
 func (p *Proxy) resolveToken(ctx context.Context, provider *domain.Provider, force bool) error {
-	if provider == nil || p == nil || p.oauth == nil {
+	if provider == nil || p == nil {
+		return nil
+	}
+	// A subscription marker or preset on an API-key row is misconfigured.
+	// Fail before the static key can be sent as a generic bearer.
+	if grokbuild.Involved(provider) && provider.Method() != domain.AuthOAuth {
+		return grokbuild.ValidateCredentialUse(provider)
+	}
+	if p.oauth == nil {
 		return nil
 	}
 	// Method gates the credential. Scheme and protocol do not. An API-key
@@ -1570,7 +1598,8 @@ func (p *Proxy) resolveToken(ctx context.Context, provider *domain.Provider, for
 
 func abortOnOAuthResolveError(provider *domain.Provider, err error) bool {
 	return oauth.IsCredentialConflict(err) ||
-		provider.Protocol == domain.ProtocolOpencode && provider.Method() == domain.AuthOAuth
+		provider.Protocol == domain.ProtocolOpencode && provider.Method() == domain.AuthOAuth ||
+		grokbuild.Involved(provider)
 }
 
 // isAuthFailure reports whether an upstream status indicates a rejected

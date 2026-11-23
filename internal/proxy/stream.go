@@ -13,6 +13,7 @@ import (
 	"airouter/internal/observability"
 	"airouter/internal/proxy/anthropic"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/opencode"
@@ -290,6 +291,11 @@ func forceOpenAIStreamIncludeUsage(body []byte) ([]byte, error) {
 // SSE. Pre-commit failures are retryable so the resolution loop can fail over;
 // once the 200 header is written, errors mid-stream simply terminate.
 func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, body []byte, prep *attachmentPrep) attemptResult {
+	if backend.id == "grok-build" {
+		if err := grokbuild.RejectUnsupportedIngress(body); err != nil {
+			return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
+		}
+	}
 	req, err := ingress.decodeRequest(body)
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
@@ -565,9 +571,10 @@ type translatedSink struct {
 // It is keyed by the IR tool index and addressed through a pointer so the
 // embedded builder is never copied by map growth.
 type translatedToolState struct {
-	id   string
-	name string
-	args strings.Builder
+	id     string
+	itemID string
+	name   string
+	args   strings.Builder
 }
 
 func (s *translatedSink) anthropicIngress() bool {
@@ -699,6 +706,7 @@ func (s *translatedSink) buffer(ev ir.StreamEvent) error {
 
 func pendingEventBytes(ev ir.StreamEvent) int {
 	n := len(ev.ID) + len(ev.Model) + len(ev.Text) + len(ev.ToolID) + len(ev.ToolName) +
+		len(ev.ResponsesItemID) +
 		len(ev.ArgsFrag) + len(ev.Signature) + len(ev.Data) + len(ev.ReasoningID) +
 		len(ev.ServerType) + len(ev.Container) + len(ev.ContextManagement) +
 		len(ev.StopDetails) + len(ev.InputTransformations)
@@ -734,11 +742,18 @@ func (s *translatedSink) note(ev ir.StreamEvent) {
 		if ev.ToolID != "" {
 			st.id = ev.ToolID
 		}
+		if ev.ResponsesItemID != "" {
+			st.itemID = ev.ResponsesItemID
+		}
 		if ev.ToolName != "" {
 			st.name = ev.ToolName
 		}
 	case ir.EventToolCallDelta:
-		s.toolState(ev.Index).args.WriteString(ev.ArgsFrag)
+		st := s.toolState(ev.Index)
+		if ev.ResponsesItemID != "" {
+			st.itemID = ev.ResponsesItemID
+		}
+		st.args.WriteString(ev.ArgsFrag)
 	case ir.EventFinish:
 		s.stopReason = ev.StopReason
 	}
@@ -757,10 +772,11 @@ func (s *translatedSink) response() *ir.Response {
 		// Raw concatenated fragments, unvalidated and unrepaired. Incomplete or
 		// malformed JSON still counts toward the character estimate.
 		resp.Content = append(resp.Content, ir.ContentBlock{
-			Type:      ir.BlockToolUse,
-			ToolID:    st.id,
-			ToolName:  st.name,
-			ToolInput: json.RawMessage(st.args.String()),
+			Type:            ir.BlockToolUse,
+			ToolID:          st.id,
+			ToolName:        st.name,
+			ResponsesItemID: st.itemID,
+			ToolInput:       json.RawMessage(st.args.String()),
 		})
 	}
 	return resp
@@ -852,7 +868,7 @@ func finalizeEncodedBody(body []byte, req *ir.Request, backend codec, provider *
 	dialect := provider.Reasoning()
 	// Protocol-managed: codecs own their shape; do not run the generic writer.
 	switch provider.Protocol {
-	case domain.ProtocolKiro, domain.ProtocolQoder, domain.ProtocolAntigravity, domain.ProtocolCursor:
+	case domain.ProtocolKiro, domain.ProtocolQoder, domain.ProtocolAntigravity, domain.ProtocolCursor, domain.ProtocolGrokBuild:
 		return body, nil
 	}
 	// Explicit none: strip any transport-default reasoning the encoder may have

@@ -15,6 +15,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/observability"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/media"
@@ -407,6 +408,11 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// drops unknown session fields. Tenant scope is the verified access-key
 		// hash, or openTenantScope in open mode.
 		r = r.WithContext(withCodexRequest(r.Context(), auth.Scope, r.Header, body))
+	}
+	if hasGrokBuildTarget(candidates) {
+		// Capture Grok Build affinity before translation drops unknown fields.
+		// Tenant scope is the verified access-key hash, or open in open mode.
+		r = r.WithContext(withGrokBuildRequest(r.Context(), auth.Scope, r.Header, body))
 	}
 	if hasClaudeCodeTarget(candidates) {
 		// Capture Claude Code session identity before translation drops metadata.
@@ -813,6 +819,11 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 // serveTranslated converts the request to the backend protocol, forwards it, and
 // converts the response back to the ingress protocol.
 func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res *reqResult, ingress, backend codec, provider *domain.Provider, upstreamModel string, body []byte, prep *attachmentPrep) attemptResult {
+	if backend.id == "grok-build" {
+		if err := grokbuild.RejectUnsupportedIngress(body); err != nil {
+			return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
+		}
+	}
 	req, err := ingress.decodeRequest(body)
 	if err != nil {
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
@@ -1560,6 +1571,7 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 	type toolBuf struct {
 		blockIdx int
 		id       string
+		itemID   string
 		name     string
 		args     strings.Builder
 	}
@@ -1854,26 +1866,36 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 			// Identity may arrive after argument fragments, or split across
 			// repeated Starts. Update in place so retained args and already-
 			// learned id/name survive; charge only the net identity change.
-			id, name := tb.id, tb.name
+			// ResponsesItemID is not call_id and must not replace ToolID.
+			id, itemID, name := tb.id, tb.itemID, tb.name
 			if ev.ToolID != "" {
 				id = ev.ToolID
+			}
+			if ev.ResponsesItemID != "" {
+				itemID = ev.ResponsesItemID
 			}
 			if ev.ToolName != "" {
 				name = ev.ToolName
 			}
-			if err := reserve(len(id) + len(name) - len(tb.id) - len(tb.name)); err != nil {
+			if err := reserve(len(id) + len(itemID) + len(name) - len(tb.id) - len(tb.itemID) - len(tb.name)); err != nil {
 				return err
 			}
 			tb.id = id
+			tb.itemID = itemID
 			tb.name = name
 		case ir.EventToolCallDelta:
 			tb, err := newTool(ev.Index)
 			if err != nil {
 				return err
 			}
-			if err := reserve(len(ev.ArgsFrag)); err != nil {
+			itemID := tb.itemID
+			if ev.ResponsesItemID != "" {
+				itemID = ev.ResponsesItemID
+			}
+			if err := reserve(len(ev.ArgsFrag) + len(itemID) - len(tb.itemID)); err != nil {
 				return err
 			}
+			tb.itemID = itemID
 			tb.args.WriteString(ev.ArgsFrag)
 		case ir.EventFinish:
 			// A reported finish replaces the whole usage object. Nonzero-only
@@ -1932,6 +1954,7 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 		block := &resp.Content[tb.blockIdx]
 		block.ToolID = tb.id
 		block.ToolName = tb.name
+		block.ResponsesItemID = tb.itemID
 		block.ToolInput = json.RawMessage(args)
 	}
 	return resp, nil

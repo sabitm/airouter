@@ -7,6 +7,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
@@ -21,6 +22,7 @@ const (
 	kindCursor           recipeKind = "cursor"
 	kindGenericAPIKey    recipeKind = "generic-apikey"
 	kindOpencode         recipeKind = "opencode"
+	kindGrokBuild        recipeKind = "grok-build"
 )
 
 // recipe is a provider-creation template: a card in the gallery that, when
@@ -40,6 +42,7 @@ type recipe struct {
 
 var recipes = []recipe{
 	{ID: "xai", Label: "Grok", Sublabel: "xAI", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "xai", BaseURL: "https://api.x.ai/v1", ReasoningDialect: domain.ReasoningGrok},
+	{ID: "grok-build", Label: "Grok Build", Sublabel: "CLI subscription", Tag: "OAuth device", Kind: kindGrokBuild, Protocol: domain.ProtocolGrokBuild, Method: domain.AuthOAuth, Preset: grokbuild.Preset, BaseURL: grokbuild.BaseURL},
 	{ID: "codex", Label: "OpenAI Codex", Sublabel: "ChatGPT", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAICodex, Method: domain.AuthOAuth, Preset: "codex", BaseURL: "https://chatgpt.com/backend-api/codex"},
 	{ID: "cline", Label: "Cline", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "cline", BaseURL: "https://api.cline.bot/api/v1", ReasoningDialect: domain.ReasoningCline},
 	{ID: "clinepass", Label: "ClinePass", Sublabel: "cline.bot", Tag: "OAuth", Kind: kindInteractiveOAuth, Protocol: domain.ProtocolOpenAI, Method: domain.AuthOAuth, Preset: "clinepass", BaseURL: "https://api.cline.bot/api/v1", ReasoningDialect: domain.ReasoningCline},

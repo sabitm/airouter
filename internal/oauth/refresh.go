@@ -119,6 +119,10 @@ func refresh(ctx context.Context, c *domain.OAuthCreds, now time.Time) error {
 	if c != nil && c.OpencodeConsoleAuth {
 		return refreshOpencodeConsole(ctx, c, now)
 	}
+	// Grok Build refresh ignores a stored token URL and does not follow redirects.
+	if c != nil && c.GrokBuildAuth {
+		return refreshGrokBuild(ctx, c, now)
+	}
 	// Qoder device tokens cannot refresh (center.qoder.sh returns 403).
 	if c.QoderAuth {
 		return refreshQoder(ctx, c, now)

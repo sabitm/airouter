@@ -395,6 +395,63 @@ func assembleCalls(evs []ir.StreamEvent) ([]decodedCall, *ir.StreamEvent) {
 	return calls, finish
 }
 
+func TestAwaitNativeItemIDUntilTerminalSnapshot(t *testing.T) {
+	body := sseData(
+		`{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_late","name":"read","arguments":""}}`,
+		`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":"}`,
+		`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"\"b\"}"}`,
+		`{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_late","call_id":"call_late","name":"read","arguments":"{\"path\":\"b\"}"}}`,
+		`{"type":"response.completed","response":{"id":"resp_late","status":"completed","output":[{"type":"function_call","id":"fc_late","call_id":"call_late","name":"read","arguments":"{\"path\":\"b\"}"}]}}`,
+	)
+	var events []ir.StreamEvent
+	err := DecodeStreamAwaitingItemID(strings.NewReader(body), func(ev ir.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start, delta string
+	for _, ev := range events {
+		switch ev.Kind {
+		case ir.EventToolCallStart:
+			start = ev.ResponsesItemID
+		case ir.EventToolCallDelta:
+			if ev.ResponsesItemID != "" {
+				delta = ev.ResponsesItemID
+			}
+		}
+	}
+	if start != "fc_late" || delta != "fc_late" {
+		t.Fatalf("late id was not on the first start: start=%q delta=%q", start, delta)
+	}
+
+	missing := sseData(
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_none","name":"read","arguments":""}}`,
+		`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{}"}`,
+	)
+	var fallback []ir.StreamEvent
+	err = DecodeStreamAwaitingItemID(strings.NewReader(missing), func(ev ir.StreamEvent) error {
+		fallback = append(fallback, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ev := range fallback {
+		if ev.Kind == ir.EventToolCallStart {
+			found = true
+			if ev.ResponsesItemID != "" {
+				t.Fatalf("EOF invented an item id %q", ev.ResponsesItemID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("EOF did not release the withheld tool")
+	}
+}
+
 func sseData(events ...string) string {
 	var b strings.Builder
 	for _, ev := range events {

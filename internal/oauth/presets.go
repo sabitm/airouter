@@ -14,6 +14,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
 )
@@ -59,6 +60,9 @@ type Preset struct {
 	// refresh against the official token endpoint, plus the pinned CLI profile.
 	// Refresh does not reuse the generic JSON path.
 	ClaudeCodeAuth bool
+	// GrokBuildAuth marks a Grok Build device-code connection. The client id
+	// matches the public xAI client; tokens still belong to this preset only.
+	GrokBuildAuth bool
 }
 
 // Presets is the set of built-in OAuth configurations. Add an entry here to
@@ -77,6 +81,18 @@ var Presets = []Preset{
 		PKCE:        true, // xAI is a public client; no client_secret
 		APIBase:     "https://api.x.ai/v1",
 		Protocol:    domain.ProtocolOpenAI,
+	},
+	// Grok Build is the CLI subscription proxy, not api.x.ai. Device-code login
+	// is separate from the xAI PKCE preset even though the public client id matches.
+	{
+		Name:          "grok-build",
+		Label:         "Grok Build",
+		TokenURL:      grokbuild.TokenURL,
+		ClientID:      grokbuild.ClientID,
+		Scopes:        grokbuild.Scopes,
+		APIBase:       grokbuild.BaseURL,
+		Protocol:      domain.ProtocolGrokBuild,
+		GrokBuildAuth: true,
 	},
 	// Codex is the ChatGPT-subscription-backed coding agent API. The client id is
 	// public (embedded in the official Codex CLI); the ChatGPT token endpoint
@@ -241,5 +257,6 @@ func Apply(p Preset) (provider *domain.Provider, creds *domain.OAuthCreds) {
 			AntigravityAuth: p.AntigravityAuth,
 			CursorAuth:      p.CursorAuth,
 			ClaudeCodeAuth:  p.ClaudeCodeAuth,
+			GrokBuildAuth:   p.GrokBuildAuth,
 		}
 }

@@ -464,6 +464,31 @@ templ ProviderRecipeForm(r recipe) {
 					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
 				</div>
 			</form>
+		case kindGrokBuild:
+			<form class="provider-form provider-form-grid" data-method="oauth" data-protocol="grok-build" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+				<input type="hidden" name="protocol" value="grok-build"/>
+				<input type="hidden" name="auth_method" value="oauth"/>
+				<input type="hidden" name="preset" value="grok-build"/>
+				<input type="hidden" name="reasoning_dialect" value="none"/>
+				<label class="field">
+					<span class="field-name">Name</span>
+					<input name="name" placeholder="e.g. grok-build" required/>
+				</label>
+				<p class="field-hint">Host is fixed at https://cli-chat-proxy.grok.com/v1. This is not the public xAI API.</p>
+				<button type="button" class="link" hx-post="/dashboard/providers/grok-build/device/begin" hx-include="closest form" hx-target="#oauth-region-new-grok-build" hx-swap="innerHTML">Connect (Grok Build)</button>
+				<div id="oauth-region-new-grok-build" class="oauth-region" aria-live="polite">
+					@OAuthConnectIdle()
+				</div>
+				<p class="field-hint">Save after device login succeeds. Tokens cannot be pasted.</p>
+				@providerTagsField("")
+				<div class="form-actions">
+					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
+					<span class="check-indicator htmx-indicator">checking...</span>
+					<span class="check-result" aria-live="polite"></span>
+					<button type="submit">Add</button>
+					<button type="button" class="link" onclick="airouterCloseProviderForm()">Cancel</button>
+				</div>
+			</form>
 		case kindGenericAPIKey:
 			<form class="provider-form provider-form-grid" data-method="apikey" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
@@ -650,6 +675,8 @@ templ ProviderEditRow(p *domain.Provider) {
 				@providerEditRowCursor(p)
 			} else if p.Protocol == domain.ProtocolOpencode {
 				@providerEditRowOpencode(p)
+			} else if p.Protocol == domain.ProtocolGrokBuild {
+				@providerEditRowGrokBuild(p)
 			} else if p.Method() == domain.AuthOAuth && providerEditInteractiveOAuth(p.Protocol) {
 				@providerEditRowInteractiveOAuth(p)
 			} else {
@@ -813,6 +840,41 @@ templ providerEditRowKiro(p *domain.Provider) {
 		</div>
 		<div class="oauth-fields">
 			@kiroEditOAuthBlock(p)
+		</div>
+		@providerTagsField(domain.FormatTags(p.Tags))
+		<div class="form-actions">
+			@providerEditCheck()
+			@providerEditSaveCancel(p)
+		</div>
+	</form>
+}
+
+templ providerEditRowGrokBuild(p *domain.Provider) {
+	{{ c := orEmptyCreds(p.OAuthCreds) }}
+	<form
+		class="provider-form provider-form-grid"
+		data-method="oauth"
+		data-protocol="grok-build"
+		hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) }
+		hx-target="#provider-list"
+		hx-swap="outerHTML"
+	>
+		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
+		<input type="hidden" name="protocol" value="grok-build"/>
+		<input type="hidden" name="auth_method" value="oauth"/>
+		<input type="hidden" name="preset" value="grok-build"/>
+		<input type="hidden" name="reasoning_dialect" value="none"/>
+		<label class="field">
+			<span class="field-name">Name</span>
+			<input name="name" value={ p.Name } required/>
+		</label>
+		if c.Email != "" {
+			<p class="field-hint">Connected as { c.Email }</p>
+		}
+		<p class="field-hint">Host stays https://cli-chat-proxy.grok.com/v1. Reconnect replaces the stored device login.</p>
+		<button type="button" class="link" hx-post="/dashboard/providers/grok-build/device/begin" hx-include="closest form" hx-target={ "#oauth-region-edit-grok-build-" + strconv.FormatInt(p.ID, 10) } hx-swap="innerHTML">Reconnect (Grok Build)</button>
+		<div id={ "oauth-region-edit-grok-build-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
+			@OAuthConnectIdle()
 		</div>
 		@providerTagsField(domain.FormatTags(p.Tags))
 		<div class="form-actions">

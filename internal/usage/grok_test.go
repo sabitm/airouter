@@ -103,6 +103,50 @@ func TestGrokSupportedDetection(t *testing.T) {
 	}
 }
 
+func TestGrokBuildBlockedFromGenericUsage(t *testing.T) {
+	sent := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(up.Close)
+	prev := CodexUsageURL
+	CodexUsageURL = up.URL + "/backend-api/wham/usage"
+	t.Cleanup(func() { CodexUsageURL = prev })
+
+	marked := &domain.Provider{
+		ID: 9, Protocol: domain.ProtocolOpenAICodex, AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{GrokBuildAuth: true, AccessToken: "secret-token", Preset: "xai"},
+	}
+	presetOnly := &domain.Provider{
+		ID: 10, Protocol: domain.ProtocolClaudeCode, AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{Preset: "grok-build", AccessToken: "secret-token"},
+	}
+	protocolOnly := &domain.Provider{
+		ID: 11, Protocol: domain.ProtocolGrokBuild, AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		OAuthCreds: &domain.OAuthCreds{AccessToken: "secret-token", Preset: "xai"},
+	}
+	svc := testSvc(t, nil)
+	for _, p := range []*domain.Provider{marked, presetOnly, protocolOnly} {
+		if Supported(p) || isGrok(p) {
+			t.Fatalf("generic usage accepted %+v", p)
+		}
+		if _, err := svc.Fetch(context.Background(), p); err != ErrUnsupported {
+			t.Fatalf("Fetch err = %v", err)
+		}
+		if tok, err := svc.resolveToken(context.Background(), p, false); tok != "" || err != ErrUnsupported {
+			t.Fatalf("resolveToken = %q err=%v", tok, err)
+		}
+	}
+	if sent != 0 {
+		t.Fatalf("generic usage sent a subscription token %d times", sent)
+	}
+	xai := grokProvider("tok")
+	if !Supported(xai) || !isGrok(xai) {
+		t.Fatal("unmarked xAI usage changed")
+	}
+}
+
 func TestGrokFetchBillingAndUserHeaders(t *testing.T) {
 	var gotAuth, gotUA, gotTokenAuth, gotIdent, gotVer, gotMode, gotEmail, gotUserID string
 

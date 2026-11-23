@@ -382,9 +382,13 @@ func buildOutput(blocks []ir.ContentBlock) ([]map[string]any, error) {
 			if args == "" {
 				args = "{}"
 			}
+			itemID := b.ResponsesItemID
+			if itemID == "" {
+				itemID = ir.NewID("fc_")
+			}
 			output = append(output, map[string]any{
 				"type":      "function_call",
-				"id":        ir.NewID("fc_"),
+				"id":        itemID,
 				"status":    "completed",
 				"call_id":   b.ToolID,
 				"name":      b.ToolName,

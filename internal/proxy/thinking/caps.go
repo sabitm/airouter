@@ -64,7 +64,7 @@ func CapsFor(model string, protocol domain.Protocol, dialect domain.ReasoningDia
 	switch protocol {
 	case domain.ProtocolCursor:
 		return Caps{Reasoning: true, CanDisable: true, Format: FormatCursor}
-	case domain.ProtocolKiro, domain.ProtocolQoder, domain.ProtocolAntigravity:
+	case domain.ProtocolKiro, domain.ProtocolQoder, domain.ProtocolAntigravity, domain.ProtocolGrokBuild:
 		return Caps{Reasoning: false, CanDisable: true, Format: FormatNone}
 	}
 

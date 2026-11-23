@@ -21,6 +21,7 @@ type connector interface {
 }
 
 const opencodeConsoleFlow = "opencode-console"
+const grokBuildFlow = "grok-build"
 
 // connectSession is one in-flight OAuth connect attempt. It outlives the begin
 // request so the later status-poll / paste / save requests can reach the same
@@ -102,6 +103,40 @@ func (cs *connectSessions) claimOpencodeConsole(state string, targetID int64) (*
 		return nil, false
 	}
 	s.claimed = true
+	cp := *creds
+	return &cp, true
+}
+
+// claimGrokBuild returns a copy of a completed Grok Build attempt when the
+// flow and edit target match and the attempt has not already been claimed.
+func (cs *connectSessions) claimGrokBuild(state string, targetID int64) (*domain.OAuthCreds, bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	s, ok := cs.getLocked(state)
+	if !ok || s.claimed || !s.bound || s.flow != grokBuildFlow || s.targetID != targetID {
+		return nil, false
+	}
+	creds, err, done := s.conn.Result()
+	if !done || err != nil || creds == nil || !creds.GrokBuildAuth || creds.AccessToken == "" || creds.RefreshToken == "" {
+		return nil, false
+	}
+	s.claimed = true
+	cp := *creds
+	return &cp, true
+}
+
+// peekGrokBuild reads a completed Grok Build attempt without claiming it.
+func (cs *connectSessions) peekGrokBuild(state string, targetID int64) (*domain.OAuthCreds, bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	s, ok := cs.getLocked(state)
+	if !ok || s.claimed || !s.bound || s.flow != grokBuildFlow || s.targetID != targetID {
+		return nil, false
+	}
+	creds, err, done := s.conn.Result()
+	if !done || err != nil || creds == nil || !creds.GrokBuildAuth || creds.AccessToken == "" || creds.RefreshToken == "" {
+		return nil, false
+	}
 	cp := *creds
 	return &cp, true
 }

@@ -52,6 +52,27 @@ templ KiroDeviceView(state, verificationURI, userCode string) {
 	</div>
 }
 
+templ GrokBuildDeviceView(state, verificationURI, userCode string) {
+	<div class="oauth-connect">
+		<p class="muted">Open the Grok Build verification page and enter the code. This page detects completion automatically.</p>
+		if verificationURI != "" {
+			<a class="button" href={ templ.SafeURL(verificationURI) } target="_blank" rel="noopener">Open verification page</a>
+		}
+		if userCode != "" {
+			<p class="muted">Verification code: <span class="mono">{ userCode }</span></p>
+		}
+		<button
+			type="button"
+			class="link danger"
+			hx-post="/dashboard/providers/oauth/cancel"
+			hx-vals={ `{"state":"` + state + `"}` }
+			hx-target="closest .oauth-region"
+			hx-swap="innerHTML"
+		>Cancel</button>
+		@OAuthStatusLine(state, true, "pending", "", "")
+	</div>
+}
+
 templ QoderDeviceView(state, verificationURI string) {
 	<div class="oauth-connect">
 		<p class="muted">Open the Qoder authorization page and approve the request. This page detects completion automatically.</p>

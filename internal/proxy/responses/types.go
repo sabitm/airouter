@@ -60,6 +60,7 @@ type inputItem struct {
 	Summary []reasoningSummary `json:"summary"`
 
 	// function_call
+	ID        string `json:"id"`
 	CallID    string `json:"call_id"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`

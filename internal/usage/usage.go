@@ -187,7 +187,7 @@ func (s *Service) SetClientForTest(c *http.Client) {
 // Supported reports whether the provider protocol has a quota endpoint.
 // Archived filtering is the caller's job.
 func Supported(p *domain.Provider) bool {
-	if p == nil {
+	if p == nil || grokBuildUsageBlocked(p) {
 		return false
 	}
 	if isGrok(p) || isOpenCodeGoConsole(p) {
@@ -209,7 +209,24 @@ func isGrok(p *domain.Provider) bool {
 	if p.Protocol != domain.ProtocolOpenAI && p.Protocol != domain.ProtocolOpenAIResponses {
 		return false
 	}
+	// A subscription marker, preset, or protocol is not the public xAI connection.
+	if grokBuildUsageBlocked(p) {
+		return false
+	}
 	return p.OAuthCreds.Preset == "xai"
+}
+
+// grokBuildUsageBlocked reports a row that generic quota fetches must not use.
+// Protocol, marker, and preset are each sufficient. This is not a quota implementation.
+func grokBuildUsageBlocked(p *domain.Provider) bool {
+	if p == nil {
+		return false
+	}
+	if p.Protocol == domain.ProtocolGrokBuild {
+		return true
+	}
+	c := p.OAuthCreds
+	return c != nil && (c.GrokBuildAuth || c.Preset == "grok-build")
 }
 
 // Fetch returns a cached or live quota report. Soft upstream failures are a
@@ -311,6 +328,9 @@ func (s *Service) dropCache(id int64) {
 }
 
 func (s *Service) fetchLive(ctx context.Context, p *domain.Provider) (*Report, error) {
+	if grokBuildUsageBlocked(p) {
+		return nil, ErrUnsupported
+	}
 	s.logger.Debug("usage_fetch",
 		"event", "usage_fetch",
 		"provider_id", p.ID,

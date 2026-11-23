@@ -16,6 +16,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/proxy/responses"
@@ -74,6 +75,14 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 			}
 		} else if provider.Protocol == domain.ProtocolKiro {
 			tok, err = kirocatalog.ResolveToken(r.Context(), h.oauth, h.store, provider, false)
+		} else if provider.Protocol == domain.ProtocolGrokBuild {
+			var creds *domain.OAuthCreds
+			creds, err = h.oauth.ResolveCreds(r.Context(), provider, false)
+			if creds != nil {
+				cp := *creds
+				provider.OAuthCreds = &cp
+				tok = cp.AccessToken
+			}
 		} else {
 			tok, err = h.oauth.Resolve(r.Context(), provider, false)
 		}
@@ -101,6 +110,9 @@ func (h *Handler) providerModels(w http.ResponseWriter, r *http.Request) {
 // credential header follows the effective auth scheme (oauth always bearer),
 // not the protocol, so an oauth provider speaking Anthropic still sends bearer.
 func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Provider) ([]string, error) {
+	if p != nil && p.Protocol != domain.ProtocolGrokBuild && grokBuildCredential(p.OAuthCreds) {
+		return nil, errors.New("grok-build: use the subscription check")
+	}
 	if p.Protocol == domain.ProtocolOpenAICodex {
 		models, _, _, err := fetchCodexModels(ctx, logger, p)
 		if err != nil || len(models) == 0 {
@@ -136,6 +148,24 @@ func fetchUpstreamModels(ctx context.Context, logger *slog.Logger, p *domain.Pro
 		ids := cursor.ListModelIDs(ctx, p)
 		if len(ids) == 0 {
 			return append([]string(nil), cursor.StaticModels...), nil
+		}
+		return ids, nil
+	}
+	if p.Protocol == domain.ProtocolGrokBuild {
+		if err := grokbuild.RejectUnsafeSend(p, grokbuild.ModelsURL); err != nil {
+			return nil, err
+		}
+		userID := ""
+		if p.OAuthCreds != nil {
+			userID = p.OAuthCreds.UserID
+		}
+		models, err := grokbuild.ListModels(ctx, p.APIKey, userID)
+		if err != nil {
+			return nil, err
+		}
+		ids := make([]string, 0, len(models))
+		for _, model := range models {
+			ids = append(ids, model.ID)
 		}
 		return ids, nil
 	}

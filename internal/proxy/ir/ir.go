@@ -227,6 +227,11 @@ type ContentBlock struct {
 	ToolID    string
 	ToolName  string
 	ToolInput json.RawMessage
+	// ResponsesItemID is the provider-owned Responses function_call item id
+	// (fc_...), distinct from the caller-visible call_id in ToolID. Empty means
+	// the source had no item id. Codecs that cannot represent it must not invent
+	// one and must not copy it into ToolID.
+	ResponsesItemID string
 
 	// BlockToolResult: the caller's response to a prior tool use. Tool results
 	// are normalized Anthropic-style: carried as blocks inside a user message.

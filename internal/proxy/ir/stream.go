@@ -138,6 +138,10 @@ type StreamEvent struct {
 	Index    int
 	ToolID   string
 	ToolName string
+	// ResponsesItemID is the provider-owned Responses function_call item id.
+	// It is not ToolID and must not be copied into call_id. Empty means the
+	// source has not supplied one; encoders keep their existing synthetic id.
+	ResponsesItemID string
 	// ArgsFrag is consumed from EventToolCallDelta and EventServerDelta. Start
 	// is identity (id/name/index) or a full start object; putting complete args
 	// on Start drops them at every ingress encoder and the unary collector.

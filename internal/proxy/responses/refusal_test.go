@@ -386,7 +386,7 @@ func TestDecodeStreamRefusalLimits(t *testing.T) {
 		)), func(ev ir.StreamEvent) error {
 			out = append(out, ev)
 			return nil
-		}, maxRetainedToolArgBytes, maxTrackedToolCalls, 4096, 4, 1, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts)
+		}, maxRetainedToolArgBytes, maxTrackedToolCalls, 4096, 4, 1, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, false)
 		if err == nil || !strings.Contains(err.Error(), "message text part index out of range") {
 			t.Fatalf("err = %v events=%+v", err, out)
 		}

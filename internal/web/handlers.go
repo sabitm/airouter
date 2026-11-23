@@ -19,6 +19,7 @@ import (
 	"airouter/internal/proxy/antigravity"
 	"airouter/internal/proxy/claudecode"
 	"airouter/internal/proxy/cursor"
+	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/proxy/qoder"
@@ -122,6 +123,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dashboard/providers/oauth/refresh-all", h.refreshAllOAuth)
 	mux.HandleFunc("POST /dashboard/providers/kiro/device/begin", h.kiroDeviceBegin)
 	mux.HandleFunc("POST /dashboard/providers/qoder/device/begin", h.qoderDeviceBegin)
+	mux.HandleFunc("POST /dashboard/providers/grok-build/device/begin", h.grokBuildDeviceBegin)
 	mux.HandleFunc("POST /dashboard/providers/cursor/begin", h.cursorConnectBegin)
 	mux.HandleFunc("POST /dashboard/providers/opencode/console/begin", h.opencodeConsoleBegin)
 	mux.HandleFunc("POST /dashboard/providers/opencode/console/org", h.opencodeConsoleChoose)
@@ -257,6 +259,9 @@ func providerBaseURLOrDefault(proto domain.Protocol, base string) string {
 	if proto == domain.ProtocolOpencode && strings.TrimSpace(base) == "" {
 		return opencode.ZenBaseURL
 	}
+	if proto == domain.ProtocolGrokBuild {
+		return grokbuild.BaseURL
+	}
 	return base
 }
 
@@ -304,6 +309,14 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	if proto == domain.ProtocolOpencode {
 		h.createOpencodeProvider(w, r)
+		return
+	}
+	if proto == domain.ProtocolGrokBuild || r.FormValue("preset") == grokbuild.Preset {
+		if proto != domain.ProtocolGrokBuild || r.FormValue("preset") != grokbuild.Preset {
+			htmxBadRequest(w, r, "provider-flash", "Grok Build protocol and preset must match")
+			return
+		}
+		h.createGrokBuildProvider(w, r)
 		return
 	}
 	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
@@ -442,7 +455,7 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
-	h.sessions.drop(r.FormValue("oauth_session"))
+	h.dropGenericConnectSession(r.FormValue("oauth_session"))
 	h.renderProviderList(w, r)
 }
 
@@ -457,10 +470,22 @@ func (h *Handler) connectedCreds(state string) (*domain.OAuthCreds, bool) {
 		return nil, false
 	}
 	creds, err, done := sess.conn.Result()
-	if !done || err != nil || creds == nil || creds.AccessToken == "" || creds.OpencodeConsoleAuth {
+	if !done || err != nil || creds == nil || creds.AccessToken == "" || creds.OpencodeConsoleAuth || grokBuildSessionIsolated(sess, creds) {
 		return nil, false
 	}
 	return creds, true
+}
+
+// dropGenericConnectSession removes a generic connect attempt. A bound Grok
+// Build session is left in place so a generic save cannot consume it.
+func (h *Handler) dropGenericConnectSession(state string) {
+	if state == "" {
+		return
+	}
+	if sess, ok := h.sessions.get(state); ok && grokBuildSessionIsolated(sess, nil) {
+		return
+	}
+	h.sessions.drop(state)
 }
 
 func (h *Handler) editProvider(w http.ResponseWriter, r *http.Request) {
@@ -522,6 +547,15 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.saveOpencodeProvider(w, r, cur, stored.OAuthBlob)
+		return
+	}
+	if proto == domain.ProtocolGrokBuild || cur.Protocol == domain.ProtocolGrokBuild ||
+		grokBuildCredential(cur.OAuthCreds) {
+		if proto != domain.ProtocolGrokBuild || cur.Protocol != domain.ProtocolGrokBuild {
+			htmxBadRequest(w, r, "provider-flash", "Grok Build providers cannot change protocol")
+			return
+		}
+		h.saveGrokBuildProvider(w, r, cur, stored.OAuthBlob)
 		return
 	}
 	if domain.AuthMethod(r.FormValue("auth_method")) == domain.AuthOAuth {
@@ -607,6 +641,12 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	}
 	reconnected := false
 	imported := false
+	if state := r.FormValue("oauth_session"); state != "" {
+		if sess, ok := h.sessions.get(state); ok && grokBuildSessionIsolated(sess, nil) {
+			htmxBadRequest(w, r, "provider-flash", "Grok Build sign-in cannot be saved on this provider")
+			return
+		}
+	}
 	if creds, ok := h.connectedCreds(r.FormValue("oauth_session")); ok {
 		// Copy before identity or config merges. A rejected save must leave the
 		// retained session snapshot unchanged.
@@ -716,9 +756,7 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
-	if s := r.FormValue("oauth_session"); s != "" {
-		h.sessions.drop(s)
-	}
+	h.dropGenericConnectSession(r.FormValue("oauth_session"))
 	h.renderProviderList(w, r)
 }
 
@@ -764,9 +802,7 @@ func (h *Handler) saveOAuthCredentials(w http.ResponseWriter, r *http.Request, c
 		htmxBadRequest(w, r, "provider-flash", providerSaveErr(err))
 		return
 	}
-	if s := r.FormValue("oauth_session"); s != "" {
-		h.sessions.drop(s)
-	}
+	h.dropGenericConnectSession(r.FormValue("oauth_session"))
 	h.renderProviderList(w, r)
 }
 
