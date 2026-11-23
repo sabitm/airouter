@@ -115,6 +115,17 @@ templ providerTagFilter(providers []*domain.Provider) {
 	</div>
 }
 
+templ grokTransportField(proto domain.Protocol) {
+	<label class="field">
+		<span class="field-name">Transport</span>
+		<select name="protocol" aria-label="transport">
+			<option value="openai" selected?={ proto == domain.ProtocolOpenAI }>Chat Completions</option>
+			<option value="openai-responses" selected?={ proto == domain.ProtocolOpenAIResponses }>Responses</option>
+		</select>
+		<span class="field-hint">Use Responses with a Responses client such as Grok CLI. The base URL stays the same.</span>
+	</label>
+}
+
 // reasoningDialectField renders a dialect selector for editable protocols or a
 // locked hidden input for fixed backends. current is the stored value (may be empty).
 templ reasoningDialectField(proto domain.Protocol, current domain.ReasoningDialect) {
@@ -185,7 +196,9 @@ templ ProviderRecipeForm(r recipe) {
 	switch r.Kind {
 		case kindInteractiveOAuth:
 			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="web" data-protocol={ string(r.Protocol) } hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
-				<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
+				if r.Preset != "xai" {
+					<input type="hidden" name="protocol" value={ string(r.Protocol) }/>
+				}
 				<input type="hidden" name="auth_method" value="oauth"/>
 				<input type="hidden" name="preset" value={ r.Preset }/>
 				<label class="field">
@@ -196,6 +209,9 @@ templ ProviderRecipeForm(r recipe) {
 					<span class="field-name">Base URL</span>
 					<input name="base_url" placeholder="https://api.example.com/v1" value={ r.BaseURL } required/>
 				</label>
+				if r.Preset == "xai" {
+					@grokTransportField(r.Protocol)
+				}
 				if recipeReasoningLocked(r) {
 					@lockedReasoningDialectField(recipeLockedReasoningDialect(r))
 				} else {
@@ -939,6 +955,7 @@ templ providerEditRowCursor(p *domain.Provider) {
 
 templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 	{{ c := orEmptyCreds(p.OAuthCreds) }}
+	{{ grokEditable := grokTransportEditable(p) }}
 	<form
 		class="provider-form provider-form-grid"
 		data-method="oauth"
@@ -949,7 +966,9 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 		hx-swap="outerHTML"
 	>
 		<input type="hidden" name="id" value={ strconv.FormatInt(p.ID, 10) }/>
-		<input type="hidden" name="protocol" value={ string(p.Protocol) }/>
+		if !grokEditable {
+			<input type="hidden" name="protocol" value={ string(p.Protocol) }/>
+		}
 		<input type="hidden" name="auth_method" value="oauth"/>
 		if c.Preset != "" {
 			<input type="hidden" name="preset" value={ c.Preset }/>
@@ -969,6 +988,10 @@ templ providerEditRowInteractiveOAuth(p *domain.Provider) {
 			<span class="field-name">Base URL</span>
 			<input name="base_url" value={ p.BaseURL } required/>
 		</label>
+		if grokEditable {
+			@grokTransportField(p.Protocol)
+			<p class="field-hint">Changing transport affects every combo that uses this provider.</p>
+		}
 		if providerReasoningLocked(p) {
 			@lockedReasoningDialectField(providerLockedReasoningDialect(p))
 		} else {

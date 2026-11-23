@@ -378,6 +378,10 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 		}
 		creds = c
 	}
+	if creds.Preset == "xai" && !grokTransport(proto) {
+		htmxBadRequest(w, r, "provider-flash", "Grok transport must be Chat Completions or Responses")
+		return
+	}
 	// Kiro oauth providers carry the profile ARN/region and the auth-flavor marker
 	// that routes token refresh to Kiro's flow.
 	if proto == domain.ProtocolKiro {
@@ -593,6 +597,7 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	fromMethod := cur.AuthMethod
 	fromProto := cur.Protocol
 	claudeInvolved := fromProto == domain.ProtocolClaudeCode || proto == domain.ProtocolClaudeCode
+	grokInvolved := grokTransportEditable(cur)
 	var prevCursorMachineID string
 	var prevKiro *domain.OAuthCreds
 	if cur.OAuthCreds != nil {
@@ -628,9 +633,11 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		htmxBadRequest(w, r, "provider-flash", "connect this provider or paste an access/refresh token before saving")
 		return
 	}
-	// A reconnect or import replaces credentials on either side of a Claude
-	// transition, not only when the target is Claude.
-	claudeCredentialWrite := reconnected || imported
+	grokInvolved = grokInvolved || cur.OAuthCreds.Preset == "xai"
+	if grokInvolved && !grokTransport(proto) {
+		htmxBadRequest(w, r, "provider-flash", "Grok transport must be Chat Completions or Responses")
+		return
+	}
 	if proto == domain.ProtocolKiro {
 		if reconnected {
 			applyKiroConnectionConfig(cur.OAuthCreds, r)
@@ -681,23 +688,28 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 		return
 	}
 	cur.Name = r.FormValue("name")
-	cur.BaseURL = providerBaseURLOrDefault(proto, r.FormValue("base_url"))
+	if !grokInvolved || r.Form.Has("base_url") {
+		cur.BaseURL = providerBaseURLOrDefault(proto, r.FormValue("base_url"))
+	}
 	cur.Protocol = proto
 	cur.AuthMethod = domain.AuthOAuth
 	cur.AuthScheme = domain.AuthBearer
-	cur.APIKey = ""
+	if !grokInvolved || fromMethod != domain.AuthOAuth || reconnected || imported {
+		cur.APIKey = ""
+	}
 	cur.Tags = tags
-	// Preserve current dialect when the form omits the field; fixed backends
-	// still submit a locked hidden value.
-	if r.FormValue("reasoning_dialect") != "" || reasoningDialectEditable(proto) {
+	// A Grok transport edit need not submit the dialect. Explicitly selecting
+	// the protocol default still clears the stored value.
+	updateDialect := r.FormValue("reasoning_dialect") != "" || reasoningDialectEditable(proto)
+	if updateDialect && (!grokInvolved || r.Form.Has("reasoning_dialect")) {
 		cur.ReasoningDialect = dialect
 	}
-	if claudeInvolved {
-		if claudeCredentialWrite {
-			h.saveClaudeOAuthCredentials(w, r, cur, fromMethod, fromProto, basisBlob)
+	if claudeInvolved || grokInvolved {
+		if reconnected || imported {
+			h.saveOAuthCredentials(w, r, cur, fromMethod, fromProto, basisBlob)
 			return
 		}
-		h.saveClaudeOAuthMetadata(w, r, cur, fromMethod, fromProto)
+		h.saveOAuthMetadata(w, r, cur, fromMethod, fromProto)
 		return
 	}
 	if err := h.store.UpdateProvider(r.Context(), cur); err != nil {
@@ -710,12 +722,10 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	h.renderProviderList(w, r)
 }
 
-// saveClaudeOAuthMetadata writes editable fields and does not write
-// oauth_creds. The handler snapshot can be older than a rotation that commits
-// before this save, so the current credentials are kept. The write is
-// conditional on the connection state read before the form, so a concurrent
-// auth or protocol switch is rejected instead of mixed with stale metadata.
-func (h *Handler) saveClaudeOAuthMetadata(w http.ResponseWriter, r *http.Request, cur *domain.Provider, fromMethod domain.AuthMethod, fromProto domain.Protocol) {
+// saveOAuthMetadata leaves oauth_creds untouched so a concurrent token rotation
+// or reconnect is not restored from a stale snapshot. The conditional update
+// also rejects concurrent auth method or protocol changes.
+func (h *Handler) saveOAuthMetadata(w http.ResponseWriter, r *http.Request, cur *domain.Provider, fromMethod domain.AuthMethod, fromProto domain.Protocol) {
 	err := h.store.UpdateProviderMetaIfConnection(r.Context(), cur.ID, store.ProviderMeta{
 		Name:             cur.Name,
 		BaseURL:          cur.BaseURL,
@@ -733,12 +743,10 @@ func (h *Handler) saveClaudeOAuthMetadata(w http.ResponseWriter, r *http.Request
 	h.renderProviderList(w, r)
 }
 
-// saveClaudeOAuthCredentials persists a reconnect or import only while the
-// encrypted credential blob and the connection state are still the ones read
-// before the form merges. A conflicting rotation, reconnect, or connection
-// switch leaves every provider field unchanged and keeps the connect session.
-// The session is dropped only after a successful write.
-func (h *Handler) saveClaudeOAuthCredentials(w http.ResponseWriter, r *http.Request, cur *domain.Provider, fromMethod domain.AuthMethod, fromProto domain.Protocol, basisBlob string) {
+// saveOAuthCredentials persists a reconnect or import only while the stored
+// credential blob and connection state still match the form's read snapshot.
+// A conflicting write leaves the provider and connect session unchanged.
+func (h *Handler) saveOAuthCredentials(w http.ResponseWriter, r *http.Request, cur *domain.Provider, fromMethod domain.AuthMethod, fromProto domain.Protocol, basisBlob string) {
 	err := h.store.UpdateProviderIfConnection(r.Context(), cur.ID, store.ProviderConnectionSave{
 		ProviderMeta: store.ProviderMeta{
 			Name:             cur.Name,

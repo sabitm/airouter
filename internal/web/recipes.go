@@ -70,6 +70,15 @@ func genericProtocolEditable(p domain.Protocol) bool {
 	return p == domain.ProtocolOpenAI || p == domain.ProtocolOpenAIResponses || p == domain.ProtocolAnthropic
 }
 
+func grokTransport(proto domain.Protocol) bool {
+	return proto == domain.ProtocolOpenAI || proto == domain.ProtocolOpenAIResponses
+}
+
+func grokTransportEditable(p *domain.Provider) bool {
+	return p != nil && p.Method() == domain.AuthOAuth && p.OAuthCreds != nil &&
+		p.OAuthCreds.Preset == "xai" && grokTransport(p.Protocol)
+}
+
 // reasoningDialectEditable reports whether the dashboard should expose a
 // reasoning-dialect selector. Generic OpenAI/Anthropic-compatible providers can
 // choose; fixed backends lock to their effective dialect. Cline/ClinePass

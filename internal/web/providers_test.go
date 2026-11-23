@@ -174,8 +174,11 @@ func TestGrokRecipeDefaultsToGrokDialect(t *testing.T) {
 	if !strings.Contains(html, `data-protocol="openai"`) {
 		t.Fatalf("recipe HTML missing openai protocol; html=%s", html)
 	}
-	if strings.Contains(html, `data-protocol="openai-responses"`) || strings.Contains(html, `value="openai-responses"`) {
-		t.Fatalf("xai recipe must not default to openai-responses; html=%s", html)
+	if strings.Contains(html, `type="hidden" name="protocol"`) ||
+		!strings.Contains(html, `<select name="protocol" aria-label="transport">`) ||
+		!strings.Contains(html, `value="openai" selected>Chat Completions`) ||
+		!strings.Contains(html, `value="openai-responses">Responses`) {
+		t.Fatalf("xai recipe should offer both transports and default to Chat Completions; html=%s", html)
 	}
 	if r.Protocol != domain.ProtocolOpenAI {
 		t.Fatalf("xai recipe protocol = %q, want openai", r.Protocol)
@@ -185,9 +188,29 @@ func TestGrokRecipeDefaultsToGrokDialect(t *testing.T) {
 	}
 }
 
+func TestGrokOAuthEditTransport(t *testing.T) {
+	for _, proto := range []domain.Protocol{domain.ProtocolOpenAI, domain.ProtocolOpenAIResponses} {
+		p := &domain.Provider{
+			ID: 1, Name: "grok", BaseURL: "https://api.x.ai/v1", Protocol: proto,
+			AuthMethod: domain.AuthOAuth, ReasoningDialect: domain.ReasoningGrok,
+			OAuthCreds: &domain.OAuthCreds{Preset: "xai"},
+		}
+		html := renderComponent(t, ProviderEditRow(p))
+		if strings.Contains(html, `type="hidden" name="protocol"`) ||
+			!strings.Contains(html, `<select name="protocol" aria-label="transport">`) ||
+			!strings.Contains(html, `value="`+string(proto)+`" selected`) ||
+			!strings.Contains(html, `name="base_url" value="https://api.x.ai/v1"`) {
+			t.Fatalf("want saved transport %q selected and the same base URL; html=%s", proto, html)
+		}
+	}
+}
+
 func TestProviderEditRowReasoningDialectLocked(t *testing.T) {
 	p := &domain.Provider{ID: 2, Name: "p", BaseURL: "https://x", Protocol: domain.ProtocolOpenAICodex, AuthMethod: domain.AuthOAuth}
 	html := renderComponent(t, providerEditRowInteractiveOAuth(p))
+	if !strings.Contains(html, `type="hidden" name="protocol" value="openai-codex"`) || strings.Contains(html, `<select name="protocol"`) {
+		t.Fatalf("want locked codex transport; html=%s", html)
+	}
 	if !strings.Contains(html, `type="hidden" name="reasoning_dialect" value="codex"`) {
 		t.Fatalf("want locked codex dialect; html=%s", html)
 	}
@@ -287,6 +310,121 @@ func TestClineOAuthEditLocksEffectiveDialect(t *testing.T) {
 	}
 	if strings.Contains(html, `type="hidden" name="reasoning_dialect" value="cline"`) {
 		t.Fatalf("must not override explicit non-cline dialect; html=%s", html)
+	}
+}
+
+func TestCreateGrokOAuthWithSelectedTransport(t *testing.T) {
+	for _, proto := range []domain.Protocol{domain.ProtocolOpenAI, domain.ProtocolOpenAIResponses, domain.ProtocolAnthropic} {
+		t.Run(string(proto), func(t *testing.T) {
+			h := testHandler(t)
+			form := url.Values{
+				"name": {"grok"}, "base_url": {"https://api.x.ai/v1"}, "auth_method": {"oauth"},
+				"protocol": {string(proto)}, "preset": {"xai"}, "reasoning_dialect": {"grok"},
+				"access_token": {"test-access"}, "refresh_token": {"test-refresh"},
+			}
+			rec := httptest.NewRecorder()
+			h.createProvider(rec, reqWithForm(form))
+			ps, err := h.store.ListProviders(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if proto == domain.ProtocolAnthropic {
+				if rec.Code != http.StatusBadRequest || len(ps) != 0 {
+					t.Fatalf("invalid Grok transport was not rejected: status=%d rows=%d", rec.Code, len(ps))
+				}
+				return
+			}
+			if rec.Code != http.StatusOK || len(ps) != 1 {
+				t.Fatalf("create status=%d rows=%d body=%s", rec.Code, len(ps), rec.Body.String())
+			}
+			p := ps[0]
+			if p.Protocol != proto || p.BaseURL != "https://api.x.ai/v1" || p.Reasoning() != domain.ReasoningGrok ||
+				p.Method() != domain.AuthOAuth || p.Auth() != domain.AuthBearer || p.OAuthCreds == nil ||
+				p.OAuthCreds.Preset != "xai" || p.OAuthCreds.AccessToken != "test-access" || p.OAuthCreds.RefreshToken != "test-refresh" {
+				t.Fatal("create did not save the selected transport and xAI connection")
+			}
+		})
+	}
+}
+
+func TestSwitchGrokOAuthTransportPreservesConnectionAndCombos(t *testing.T) {
+	for _, baseURL := range []string{"https://api.x.ai/v1", "https://custom.example.test/api/v1"} {
+		t.Run(baseURL, func(t *testing.T) {
+			h := testHandler(t)
+			ctx := context.Background()
+			p := &domain.Provider{
+				Name: "grok", BaseURL: baseURL, Protocol: domain.ProtocolOpenAI, AuthMethod: domain.AuthOAuth,
+				AuthScheme: domain.AuthBearer, ReasoningDialect: domain.ReasoningGrok, Tags: []string{"test"},
+				OAuthCreds: &domain.OAuthCreds{Preset: "xai", Mode: domain.OAuthAuto, AccessToken: "test-access", RefreshToken: "test-refresh"},
+			}
+			if err := h.store.CreateProvider(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.store.CreateCombo(ctx, &domain.Combo{Name: "grok-cli", Targets: []domain.ComboTarget{
+				{ProviderID: p.ID, UpstreamModel: "grok-4.7", Enabled: true},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			before, err := h.store.GetProviderOAuthStored(ctx, p.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			combo, err := h.store.GetComboByName(ctx, "grok-cli")
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetID := combo.Targets[0].ID
+
+			wantProto := domain.ProtocolOpenAI
+			for _, proto := range []domain.Protocol{domain.ProtocolOpenAIResponses, domain.ProtocolAnthropic, domain.ProtocolOpenAI} {
+				form := url.Values{
+					"name": {p.Name}, "base_url": {baseURL}, "protocol": {string(proto)},
+					"auth_method": {"oauth"}, "preset": {"xai"}, "reasoning_dialect": {"grok"}, "tags": {"test"},
+				}
+				if proto == domain.ProtocolOpenAI {
+					form.Del("base_url")
+					form.Del("reasoning_dialect")
+				}
+				req := reqWithForm(form)
+				req.SetPathValue("id", strconv.FormatInt(p.ID, 10))
+				rec := httptest.NewRecorder()
+				h.updateProvider(rec, req)
+				wantStatus := http.StatusOK
+				if proto == domain.ProtocolAnthropic {
+					wantStatus = http.StatusBadRequest
+				} else {
+					wantProto = proto
+				}
+				if rec.Code != wantStatus {
+					t.Fatalf("switch to %s: status=%d want=%d body=%s", proto, rec.Code, wantStatus, rec.Body.String())
+				}
+
+				after, err := h.store.GetProviderOAuthStored(ctx, p.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if after.OAuthBlob != before.OAuthBlob {
+					t.Fatal("transport edit rewrote the encrypted OAuth credentials")
+				}
+				got := after.Provider
+				if got.Protocol != wantProto || got.BaseURL != baseURL || got.Reasoning() != domain.ReasoningGrok ||
+					got.Method() != domain.AuthOAuth || got.Auth() != domain.AuthBearer || strings.Join(got.Tags, ",") != "test" {
+					t.Fatalf("switch to %s did not preserve provider metadata or save the expected transport %s", proto, wantProto)
+				}
+				combo, err := h.store.GetComboByName(ctx, "grok-cli")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(combo.Targets) != 1 {
+					t.Fatalf("target count = %d, want 1", len(combo.Targets))
+				}
+				target := combo.Targets[0]
+				if target.ID != targetID || target.ProviderID != p.ID || target.UpstreamModel != "grok-4.7" || !target.Enabled ||
+					target.Provider == nil || target.Provider.Protocol != wantProto {
+					t.Fatal("combo did not retain its target with the new transport")
+				}
+			}
+		})
 	}
 }
 
