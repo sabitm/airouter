@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/proxy/grokbuild"
+	"airouter/internal/proxy/opencode"
 )
 
 func TestGrokBuildDevicePendingSlowDownAndCancel(t *testing.T) {
@@ -354,4 +355,205 @@ func grokBuildServiceCreds(access, refresh, connection, user string) *domain.OAu
 func cloneGrokBuild(c *domain.OAuthCreds) *domain.OAuthCreds {
 	cp := *c
 	return &cp
+}
+
+func TestMixedGrokBuildGrantDoesNotReachTokenEndpoint(t *testing.T) {
+	var mu sync.Mutex
+	var urls []string
+	record := func(raw string) {
+		mu.Lock()
+		urls = append(urls, raw)
+		mu.Unlock()
+	}
+	snapshot := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), urls...)
+	}
+	reset := func() {
+		mu.Lock()
+		urls = nil
+		mu.Unlock()
+	}
+	SetGrokBuildTestTransport(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		record(r.URL.String())
+		return jsonResponse(http.StatusOK, map[string]any{
+			"access_token": "rotated-access", "refresh_token": "rotated-refresh", "expires_in": 60,
+		}), nil
+	}))
+	restore := SetOpencodeConsoleClientForTest(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		record("console:" + r.URL.String())
+		return jsonResponse(http.StatusOK, map[string]any{
+			"access_token": "console-access", "refresh_token": "console-refresh", "expires_in": 60,
+		}), nil
+	})})
+	t.Cleanup(restore)
+
+	mixed := grokBuildServiceCreds("access-secret", "refresh-secret", "conn-1", "user-1")
+	mixed.OpencodeConsoleAuth = true
+	mixed.OpencodeOrgID = "org-secret"
+	mixed.ExpiresAt = 1
+	st := newFakeStore()
+	st.creds[9] = mixed
+	st.setConnection(9, domain.AuthOAuth, domain.ProtocolGrokBuild)
+	svc := New(st)
+	svc.now = func() time.Time { return time.Unix(10_000, 0) }
+	ctx := context.Background()
+	p, err := st.GetProvider(ctx, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"resolve", func() error { _, err := svc.ResolveCreds(ctx, p, false); return err }},
+		{"force", func() error { _, err := svc.ResolveCreds(ctx, p, true); return err }},
+		{"persist", func() error { _, err := svc.RefreshAndPersist(ctx, 9, cloneGrokBuild(mixed)); return err }},
+		{"refresh", func() error { return refresh(ctx, cloneGrokBuild(mixed), time.Unix(10_000, 0)) }},
+		{"direct", func() error { return refreshGrokBuild(ctx, cloneGrokBuild(mixed), time.Unix(10_000, 0)) }},
+	} {
+		err := call.fn()
+		if err == nil {
+			t.Fatalf("%s accepted mixed credentials", call.name)
+		}
+		for _, secret := range []string{"access-secret", "refresh-secret", "org-secret"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("%s leaked %s: %v", call.name, secret, err)
+			}
+		}
+	}
+	if got := snapshot(); len(got) != 0 {
+		t.Fatalf("mixed grant reached a token endpoint: %v", got)
+	}
+	if st.writes.Load() != 0 || st.creds[9].AccessToken != "access-secret" || st.creds[9].RefreshToken != "refresh-secret" || st.creds[9].GrokBuildConnection != "conn-1" {
+		t.Fatalf("mixed row changed writes=%d creds=%+v", st.writes.Load(), st.creds[9])
+	}
+
+	reset()
+	console := &domain.OAuthCreds{
+		OpencodeConsoleAuth: true, AccessToken: "console-old", RefreshToken: "console-refresh",
+		OpencodeOrgID: "org-1", ExpiresAt: 1,
+	}
+	if err := refresh(ctx, console, time.Unix(10_000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if console.AccessToken != "console-access" || len(snapshot()) != 1 || snapshot()[0] != "console:"+opencode.ConsoleTokenURL() {
+		t.Fatalf("ordinary console refresh = %+v urls=%v", console, snapshot())
+	}
+
+	reset()
+	valid := grokBuildServiceCreds("old-access", "old-refresh", "conn-1", "user-1")
+	if err := refresh(ctx, valid, time.Unix(10_000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if valid.AccessToken != "rotated-access" || len(snapshot()) != 1 || snapshot()[0] != grokbuild.TokenURL {
+		t.Fatalf("ordinary grok refresh = %+v urls=%v", valid, snapshot())
+	}
+}
+
+func TestMixedOpenCodeResolveCredsFailsClosed(t *testing.T) {
+	var mu sync.Mutex
+	var urls []string
+	record := func(raw string) {
+		mu.Lock()
+		urls = append(urls, raw)
+		mu.Unlock()
+	}
+	hits := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), urls...)
+	}
+	reset := func() {
+		mu.Lock()
+		urls = nil
+		mu.Unlock()
+	}
+	SetGrokBuildTestTransport(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		record(r.URL.String())
+		return jsonResponse(http.StatusOK, map[string]any{
+			"access_token": "rotated-access", "refresh_token": "rotated-refresh", "expires_in": 60,
+		}), nil
+	}))
+	restore := SetOpencodeConsoleClientForTest(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		record("console:" + r.URL.String())
+		return jsonResponse(http.StatusOK, map[string]any{
+			"access_token": "console-access", "refresh_token": "console-refresh", "expires_in": 60,
+		}), nil
+	})})
+	t.Cleanup(restore)
+
+	now := time.Unix(10_000, 0)
+	unexpired := now.Add(time.Hour).Unix()
+	ctx := context.Background()
+	reject := func(t *testing.T, svc *Service, p *domain.Provider, secrets ...string) {
+		t.Helper()
+		for _, force := range []bool{false, true} {
+			got, err := svc.ResolveCreds(ctx, p, force)
+			if got != nil || !IsCredentialConflict(err) {
+				t.Fatalf("force=%v creds=%v err=%v", force, got != nil, err)
+			}
+			for _, secret := range secrets {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("force=%v leaked %s", force, secret)
+				}
+			}
+		}
+	}
+
+	t.Run("unexpired mixed row", func(t *testing.T) {
+		reset()
+		mixed := grokBuildServiceCreds("access-secret", "refresh-secret", "conn-1", "user-1")
+		mixed.OpencodeConsoleAuth = true
+		mixed.OpencodeOrgID = "org-secret"
+		mixed.ExpiresAt = unexpired
+		st := newFakeStore()
+		st.creds[11] = mixed
+		st.setConnection(11, domain.AuthOAuth, domain.ProtocolOpencode)
+		svc := New(st)
+		svc.now = func() time.Time { return now }
+		p, err := st.GetProvider(ctx, 11)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reject(t, svc, p, "access-secret", "refresh-secret", "org-secret")
+		if got := hits(); len(got) != 0 {
+			t.Fatalf("mixed OpenCode row reached a token endpoint: %v", got)
+		}
+		if st.writes.Load() != 0 || st.creds[11].AccessToken != "access-secret" || st.creds[11].RefreshToken != "refresh-secret" {
+			t.Fatalf("mixed OpenCode row changed writes=%d", st.writes.Load())
+		}
+	})
+
+	// force reuses a newer live grant when the generation changed, without refresh.
+	t.Run("ordinary snapshot mixed live", func(t *testing.T) {
+		reset()
+		ordinary := &domain.OAuthCreds{
+			OpencodeConsoleAuth: true, AccessToken: "old-access", RefreshToken: "old-refresh",
+			OpencodeOrgID: "org-1", ExpiresAt: unexpired,
+		}
+		live := cloneConsoleCreds(ordinary)
+		live.GrokBuildAuth = true
+		live.Preset = grokbuild.Preset
+		live.AccessToken = "newer-secret"
+		live.RefreshToken = "newer-refresh"
+		live.ExpiresAt = unexpired + 60
+		st := newFakeStore()
+		st.creds[12] = live
+		st.setConnection(12, domain.AuthOAuth, domain.ProtocolOpencode)
+		svc := New(st)
+		svc.now = func() time.Time { return now }
+		p := &domain.Provider{
+			ID: 12, BaseURL: opencode.GoBaseURL, Protocol: domain.ProtocolOpencode,
+			AuthMethod: domain.AuthOAuth, OAuthCreds: ordinary,
+		}
+		reject(t, svc, p, "newer-secret", "newer-refresh", "old-access", "old-refresh")
+		if got := hits(); len(got) != 0 {
+			t.Fatalf("mixed live row reached a token endpoint: %v", got)
+		}
+		if st.writes.Load() != 0 || st.creds[12].AccessToken != "newer-secret" || st.creds[12].RefreshToken != "newer-refresh" || !st.creds[12].GrokBuildAuth {
+			t.Fatalf("mixed live row changed writes=%d", st.writes.Load())
+		}
+	})
 }

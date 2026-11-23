@@ -64,7 +64,7 @@ templ usageCardTags(p *domain.Provider) {
 templ UsageGridIdle(all, shown []*domain.Provider) {
 	<div id="usage-grid" class="usage-grid">
 		if len(all) == 0 {
-			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, or Grok (xAI).</p>
+			<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, Grok (xAI), or Grok Build.</p>
 		} else if len(shown) == 0 {
 			<p class="empty">No providers match this tag.</p>
 		} else {
@@ -100,7 +100,7 @@ templ UsageGridLoading(providers []*domain.Provider, filter string) {
 			if filter != "" {
 				<p class="empty">No providers match this tag.</p>
 			} else {
-				<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, or Grok (xAI).</p>
+				<p class="empty">No providers with a quota API. Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, Grok (xAI), or Grok Build.</p>
 			}
 		} else {
 			for _, p := range providers {
@@ -150,7 +150,7 @@ templ UsageCard(p *domain.Provider, report *usage.Report, errMsg string) {
 		</div>
 		if errMsg != "" {
 			<p class="usage-msg">{ errMsg }</p>
-		} else if report != nil && report.Message != "" && len(report.Quotas) == 0 {
+		} else if report != nil && report.Message != "" && len(report.Quotas) == 0 && len(report.Details) == 0 {
 			<p class="usage-msg">{ report.Message }</p>
 		} else if report != nil {
 			if p.Protocol == domain.ProtocolOpenAICodex && report.ResetCredits > 0 {
@@ -173,6 +173,9 @@ templ UsageCard(p *domain.Provider, report *usage.Report, errMsg string) {
 			for _, q := range report.Quotas {
 				@quotaRow(q)
 			}
+			for _, d := range report.Details {
+				<p class="muted">{ d.Label }: { d.Value }</p>
+			}
 		}
 	</div>
 }
@@ -188,7 +191,11 @@ templ quotaRow(q usage.Quota) {
 		</div>
 		<div class="quota-row-foot">
 			<span class="quota-used">{ quotaUsedText(q) }</span>
-			<span class="quota-reset">{ quotaResetText(q) }</span>
+			if q.ResetTitle != "" {
+				<span class="quota-reset" title={ q.ResetTitle }>{ quotaResetText(q) }</span>
+			} else {
+				<span class="quota-reset">{ quotaResetText(q) }</span>
+			}
 		</div>
 	</div>
 }

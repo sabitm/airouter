@@ -402,6 +402,10 @@ func refreshGrokBuild(ctx context.Context, c *domain.OAuthCreds, now time.Time) 
 	if c == nil || !c.GrokBuildAuth {
 		return errors.New("grok-build: credentials are not valid for this provider")
 	}
+	// Direct callers skip refresh. A mixed grant must fail before the token POST.
+	if err := grokbuild.RejectMixedGrant(c); err != nil {
+		return err
+	}
 	if c.ClientID != "" && c.ClientID != grokbuild.ClientID {
 		return errors.New("grok-build: client id is not the subscription client")
 	}

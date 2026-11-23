@@ -1539,6 +1539,20 @@ func (h *Handler) usageCard(w http.ResponseWriter, r *http.Request) {
 	}
 	force := r.URL.Query().Get("force") == "1"
 	rep, ferr := h.usage.FetchWith(r.Context(), p, usage.FetchOpts{Force: force})
+	if usage.GrokBuildUsage(p) {
+		fresh, loadErr := h.store.GetProvider(r.Context(), id)
+		if loadErr != nil || fresh == nil || fresh.Archived || !usage.GrokBuildUsage(fresh) {
+			http.NotFound(w, r)
+			return
+		}
+		// Compare the stored row after the read. This does not refresh the token.
+		// A save that lands after this read can still be missed.
+		if !usage.GrokBuildStillCurrent(p, fresh, rep) {
+			render(w, r, UsageCard(fresh, usage.GrokBuildConflictReport(), ""))
+			return
+		}
+		p = fresh
+	}
 	render(w, r, UsageCard(p, rep, usageErrMessage(p, ferr)))
 }
 

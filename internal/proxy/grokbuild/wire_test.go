@@ -1,8 +1,10 @@
 package grokbuild
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +28,22 @@ func TestVersionPin(t *testing.T) {
 func TestFixedHostsRejectUserHosts(t *testing.T) {
 	if !IsFixedBase(BaseURL) || !IsFixedInferenceURL(ModelsURL) || !IsFixedTokenURL(TokenURL) {
 		t.Fatal("official URLs were rejected")
+	}
+	if !isExactBillingURL(BillingURL) || IsFixedInferenceURL(BillingURL) || IsFixedBase(BillingURL) {
+		t.Fatal("billing URL was added to the inference allowlist")
+	}
+	for _, raw := range []string{
+		BaseURL + "/billing",
+		BaseURL + "/billing?format=credits&x=1",
+		BaseURL + "/billing?format=Credits",
+		"https://user:pw@cli-chat-proxy.grok.com/v1/billing?format=credits",
+		"https://cli-chat-proxy.grok.com/v1/billing?format=credits#frag",
+		"http://cli-chat-proxy.grok.com/v1/billing?format=credits",
+		"https://api.x.ai/v1/billing?format=credits",
+	} {
+		if isExactBillingURL(raw) {
+			t.Fatalf("accepted billing URL %s", raw)
+		}
 	}
 	for _, raw := range []string{
 		"https://api.x.ai/v1",
@@ -88,6 +106,74 @@ func TestValidateProviderKeepsXAISeparate(t *testing.T) {
 	}
 	if err := RejectUnsafeSend(presetOnly, "https://api.x.ai/v1/chat/completions"); err == nil {
 		t.Fatal("preset-only row passed send backstop")
+	}
+}
+
+func TestValidateRejectsMixedOpenCodeConsoleMarker(t *testing.T) {
+	valid := &domain.Provider{
+		Protocol: domain.ProtocolGrokBuild, AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		BaseURL: BaseURL,
+		OAuthCreds: &domain.OAuthCreds{
+			Preset: Preset, GrokBuildAuth: true, GrokBuildConnection: "conn-1",
+			AccessToken: "access-secret", RefreshToken: "refresh-secret",
+			ClientID: ClientID, TokenURL: TokenURL, AuthURL: Issuer, Scopes: Scopes,
+		},
+	}
+	if err := ValidateProvider(valid); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCredentialUse(valid); err != nil {
+		t.Fatal(err)
+	}
+	if err := RejectMixedGrant(valid.OAuthCreds); err != nil {
+		t.Fatal(err)
+	}
+	mixed := *valid
+	creds := *valid.OAuthCreds
+	creds.OpencodeConsoleAuth = true
+	creds.OpencodeOrgID = "org-secret"
+	mixed.OAuthCreds = &creds
+	for _, err := range []error{
+		ValidateProvider(&mixed), ValidateCredentialUse(&mixed),
+		RejectMixedGrant(mixed.OAuthCreds), RejectUnsafeSend(&mixed, ModelsURL),
+	} {
+		if err == nil {
+			t.Fatal("mixed marker accepted")
+		}
+		for _, secret := range []string{"access-secret", "refresh-secret", "org-secret"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error leaked %s: %v", secret, err)
+			}
+		}
+	}
+	preset := *valid
+	presetCreds := *valid.OAuthCreds
+	presetCreds.GrokBuildAuth = false
+	presetCreds.OpencodeConsoleAuth = true
+	presetCreds.OpencodeOrgID = "org-secret"
+	preset.OAuthCreds = &presetCreds
+	if err := ValidateCredentialUse(&preset); err == nil || strings.Contains(err.Error(), "org-secret") {
+		t.Fatalf("preset plus console marker err=%v", err)
+	}
+	ordinary := &domain.Provider{
+		Protocol: domain.ProtocolOpencode, AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+		BaseURL: "https://opencode.ai/zen/go",
+		OAuthCreds: &domain.OAuthCreds{
+			OpencodeConsoleAuth: true, OpencodeOrgID: "org-1",
+			AccessToken: "console-access", RefreshToken: "console-refresh",
+		},
+	}
+	if err := ValidateProvider(ordinary); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCredentialUse(ordinary); err != nil {
+		t.Fatal(err)
+	}
+	if err := RejectMixedGrant(ordinary.OAuthCreds); err != nil {
+		t.Fatal(err)
+	}
+	if err := RejectMixedGrant(&domain.OAuthCreds{Preset: "xai", AccessToken: "xai-token", RefreshToken: "xai-refresh"}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -229,6 +315,161 @@ func TestListModelsDoesNotFollowRedirect(t *testing.T) {
 	if seen != "" {
 		t.Fatal("token reached the redirect target")
 	}
+}
+
+func TestDoFixedRejectsBillingURL(t *testing.T) {
+	called := false
+	SetTestTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return nil, errors.New("transport called")
+	}))
+	t.Cleanup(func() { SetTestTransport(nil) })
+	req, err := http.NewRequest(http.MethodGet, BillingURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DoFixed(context.Background(), req); err == nil || called {
+		t.Fatalf("billing URL entered DoFixed err=%v called=%v", err, called)
+	}
+}
+
+func TestFetchBillingFixedRequest(t *testing.T) {
+	var got *http.Request
+	SetTestTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		cp := r.Clone(r.Context())
+		got = cp
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"config":{}}`)),
+			Request:    r,
+		}, nil
+	}))
+	t.Cleanup(func() { SetTestTransport(nil) })
+	status, body, err := FetchBilling(context.Background(), "access-secret", " user-1 ")
+	if err != nil || status != http.StatusOK || string(body) != `{"config":{}}` {
+		t.Fatalf("status=%d err=%v body=%s", status, err, body)
+	}
+	if got == nil || got.Method != http.MethodGet || got.URL.String() != BillingURL {
+		t.Fatalf("request = %v", got)
+	}
+	if got.Header.Get("Authorization") != "Bearer access-secret" || got.Header.Get("Accept") != "application/json" {
+		t.Fatalf("auth headers = %v", got.Header)
+	}
+	if got.Header.Get(TokenAuthHeader) != TokenAuthValue || got.Header.Get("X-Grok-Client-Version") != Version || got.Header.Get("X-Grok-Client-Mode") != ClientMode {
+		t.Fatalf("client headers = %v", got.Header)
+	}
+	if got.Header.Get("User-Agent") != UserAgent() || got.Header.Get("X-Userid") != "user-1" {
+		t.Fatalf("identity headers = %v", got.Header)
+	}
+	for _, name := range []string{"X-Email", "X-Grok-Model-Override", "X-Grok-Session-Id", "X-Grok-Conv-Id", "X-Grok-Req-Id", "X-Grok-Agent-Id"} {
+		if got.Header.Get(name) != "" {
+			t.Fatalf("routing header %s = %q", name, got.Header.Get(name))
+		}
+	}
+}
+
+func TestFetchBillingOmitsEmptyUserID(t *testing.T) {
+	var got http.Header
+	SetTestTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		got = r.Header.Clone()
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+	}))
+	t.Cleanup(func() { SetTestTransport(nil) })
+	for _, userID := range []string{"  ", "bad\nid"} {
+		got = nil
+		if _, _, err := FetchBilling(context.Background(), "access-secret", userID); err != nil {
+			t.Fatal(err)
+		}
+		if got.Get("X-Userid") != "" || got.Get("X-Email") != "" {
+			t.Fatalf("user %q headers = %v", userID, got)
+		}
+	}
+}
+
+func TestFetchBillingRedirectOversizeAndSanitizedTransport(t *testing.T) {
+	const location = "https://evil.example/steal?token=access-secret"
+	var upstream string
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dest.Close()
+
+	t.Run("redirect", func(t *testing.T) {
+		upstream = ""
+		SetTestTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			http.Redirect(w, r, location, http.StatusFound)
+			return w.Result(), nil
+		}))
+		t.Cleanup(func() { SetTestTransport(nil) })
+		status, body, err := FetchBilling(context.Background(), "access-secret", "user-1")
+		if status != 0 || body != nil || !errors.Is(err, errBillingRedirect) {
+			t.Fatalf("status=%d err=%v body=%q", status, err, body)
+		}
+		if strings.Contains(err.Error(), "evil.example") || strings.Contains(err.Error(), "access-secret") || upstream != "" {
+			t.Fatalf("redirect leaked err=%v upstream=%q", err, upstream)
+		}
+	})
+
+	t.Run("transport", func(t *testing.T) {
+		SetTestTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("dial failed for " + r.Header.Get("Authorization") + " via " + location)
+		}))
+		t.Cleanup(func() { SetTestTransport(nil) })
+		_, _, err := FetchBilling(context.Background(), "access-secret", "user-1")
+		if !errors.Is(err, errBillingTransport) || strings.Contains(err.Error(), "access-secret") || strings.Contains(err.Error(), "evil.example") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("oversize", func(t *testing.T) {
+		SetTestTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			body := bytes.Repeat([]byte("x"), billingBodyLimit+1)
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body)), Request: r}, nil
+		}))
+		t.Cleanup(func() { SetTestTransport(nil) })
+		status, body, err := FetchBilling(context.Background(), "access-secret", "user-1")
+		if status != 0 || body != nil || !errors.Is(err, errBillingOversize) || strings.Contains(err.Error(), "xxx") {
+			t.Fatalf("status=%d err=%v bodylen=%d", status, err, len(body))
+		}
+	})
+
+	t.Run("error body dropped", func(t *testing.T) {
+		SetTestTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("secret-body access-secret")),
+				Request:    r,
+			}, nil
+		}))
+		t.Cleanup(func() { SetTestTransport(nil) })
+		status, body, err := FetchBilling(context.Background(), "access-secret", "user-1")
+		if err != nil || status != http.StatusBadGateway || body != nil {
+			t.Fatalf("status=%d err=%v body=%q", status, err, body)
+		}
+	})
+
+	t.Run("version mismatch", func(t *testing.T) {
+		SetTestTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUpgradeRequired,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("secret-body")),
+				Request:    r,
+			}, nil
+		}))
+		t.Cleanup(func() { SetTestTransport(nil) })
+		status, body, err := FetchBilling(context.Background(), "access-secret", "user-1")
+		if status != http.StatusUpgradeRequired || body != nil || err == nil || err.Error() != VersionMismatchError().Error() {
+			t.Fatalf("status=%d err=%v body=%q", status, err, body)
+		}
+		if strings.Contains(err.Error(), "secret-body") || strings.Contains(err.Error(), "access-secret") {
+			t.Fatalf("426 leaked: %v", err)
+		}
+	})
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

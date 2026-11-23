@@ -10,6 +10,7 @@ import (
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
+	"airouter/internal/proxy/grokbuild"
 )
 
 // Quota is one named bucket of upstream account allowance.
@@ -25,6 +26,15 @@ type Quota struct {
 	NeverExpires bool
 	Unlimited    bool
 	Unit         string
+	// ResetTitle is an exact upstream reset timestamp for a title attribute.
+	// Empty omits the attribute so other cards stay unchanged.
+	ResetTitle string
+}
+
+// UsageDetail is one billing fact that is not a remaining-percent bar.
+type UsageDetail struct {
+	Label string
+	Value string
 }
 
 // Report is the dashboard-facing snapshot of a provider account's quota.
@@ -32,8 +42,17 @@ type Report struct {
 	Plan         string
 	Message      string
 	Quotas       []Quota
+	Details      []UsageDetail
 	ResetCredits int
 	FetchedAt    time.Time
+
+	// grokBuildID, grokBuildGeneration, and grokBuildAccount stamp the
+	// connection that produced a Grok Build report. They are not credentials
+	// and are not rendered. The dashboard compares them with the stored row
+	// before display. A match does not prove a save that lands later is visible.
+	grokBuildID         int64
+	grokBuildGeneration string
+	grokBuildAccount    string
 }
 
 // FetchOpts controls a single Fetch.
@@ -136,6 +155,14 @@ type Service struct {
 	consoleLatest   map[consoleIdentity][32]byte
 	consoleOwner    map[int64]consoleIdentity
 	consoleEpoch    map[int64]uint64
+
+	// Grok Build keeps one report per provider. The entry identity is the
+	// connection generation and account, not a raw credential. In-flight work
+	// is keyed by that identity so a reconnect does not join the old fetch.
+	grokBuildCache    map[int64]grokBuildCacheEntry
+	grokBuildInflight map[grokBuildInflightKey]*inflight
+	grokBuildLatest   map[int64]grokBuildIdentity
+	grokBuildEpoch    map[int64]uint64
 }
 
 // NewService builds a Service. client may be nil (15s timeout). logger may be nil.
@@ -155,19 +182,23 @@ func newService(o tokenResolver, logger *slog.Logger, client *http.Client) *Serv
 		client = &http.Client{Timeout: httpTimeout}
 	}
 	return &Service{
-		oauth:           o,
-		logger:          logger.With("component", "usage"),
-		client:          client,
-		now:             time.Now,
-		cache:           map[int64]cacheEntry{},
-		inflight:        map[int64]*inflight{},
-		cacheGen:        map[int64]uint64{},
-		cooldownUntil:   map[int64]time.Time{},
-		consoleCache:    map[consoleIdentity]consoleCacheEntry{},
-		consoleInflight: map[consoleInflightKey]*inflight{},
-		consoleLatest:   map[consoleIdentity][32]byte{},
-		consoleOwner:    map[int64]consoleIdentity{},
-		consoleEpoch:    map[int64]uint64{},
+		oauth:             o,
+		logger:            logger.With("component", "usage"),
+		client:            client,
+		now:               time.Now,
+		cache:             map[int64]cacheEntry{},
+		inflight:          map[int64]*inflight{},
+		cacheGen:          map[int64]uint64{},
+		cooldownUntil:     map[int64]time.Time{},
+		consoleCache:      map[consoleIdentity]consoleCacheEntry{},
+		consoleInflight:   map[consoleInflightKey]*inflight{},
+		consoleLatest:     map[consoleIdentity][32]byte{},
+		consoleOwner:      map[int64]consoleIdentity{},
+		consoleEpoch:      map[int64]uint64{},
+		grokBuildCache:    map[int64]grokBuildCacheEntry{},
+		grokBuildInflight: map[grokBuildInflightKey]*inflight{},
+		grokBuildLatest:   map[int64]grokBuildIdentity{},
+		grokBuildEpoch:    map[int64]uint64{},
 	}
 }
 
@@ -187,6 +218,9 @@ func (s *Service) SetClientForTest(c *http.Client) {
 // Supported reports whether the provider protocol has a quota endpoint.
 // Archived filtering is the caller's job.
 func Supported(p *domain.Provider) bool {
+	if GrokBuildUsage(p) {
+		return true
+	}
 	if p == nil || grokBuildUsageBlocked(p) {
 		return false
 	}
@@ -217,16 +251,10 @@ func isGrok(p *domain.Provider) bool {
 }
 
 // grokBuildUsageBlocked reports a row that generic quota fetches must not use.
-// Protocol, marker, and preset are each sufficient. This is not a quota implementation.
+// Protocol, marker, and preset are each sufficient. This is not the Grok Build
+// quota implementation. GrokBuildUsage is the only supported path.
 func grokBuildUsageBlocked(p *domain.Provider) bool {
-	if p == nil {
-		return false
-	}
-	if p.Protocol == domain.ProtocolGrokBuild {
-		return true
-	}
-	c := p.OAuthCreds
-	return c != nil && (c.GrokBuildAuth || c.Preset == "grok-build")
+	return grokbuild.Involved(p)
 }
 
 // Fetch returns a cached or live quota report. Soft upstream failures are a
@@ -244,6 +272,11 @@ func (s *Service) FetchWith(ctx context.Context, p *domain.Provider, opts FetchO
 	// generic cache so a reconnect cannot read or join another account.
 	if isOpenCodeGoConsole(p) {
 		return s.fetchOpenCodeGoWith(ctx, p, opts)
+	}
+	// Grok Build identity is not the provider ID. Keep this branch ahead of the
+	// generic cache so a reconnect cannot read or join another connection.
+	if GrokBuildUsage(p) {
+		return s.fetchGrokBuildWith(ctx, p, opts)
 	}
 	if p.ID == 0 {
 		return s.fetchLive(ctx, p)

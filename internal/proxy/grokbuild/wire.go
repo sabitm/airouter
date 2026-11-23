@@ -37,6 +37,9 @@ const (
 	BaseURL       = "https://cli-chat-proxy.grok.com/v1"
 	ModelsURL     = BaseURL + "/models"
 	ResponsesPath = "/responses"
+	// BillingURL is the read-only credits endpoint from the official CLI.
+	// It is not an inference URL. DoFixed and RejectUnsafeSend do not accept it.
+	BillingURL    = BaseURL + "/billing?format=credits"
 	Issuer        = "https://auth.x.ai"
 	DeviceCodeURL = Issuer + "/oauth2/device/code"
 	TokenURL      = Issuer + "/oauth2/token"
@@ -64,9 +67,16 @@ const (
 	accountsHost  = "accounts.x.ai"
 )
 
+const billingBodyLimit = 1 << 20
+
 var (
-	errUnsafeHost = errors.New("grok-build: credentials are only sent to the fixed subscription host")
-	errBadCreds   = errors.New("grok-build: credentials are not valid for this provider")
+	errUnsafeHost       = errors.New("grok-build: credentials are only sent to the fixed subscription host")
+	errBadCreds         = errors.New("grok-build: credentials are not valid for this provider")
+	errRedirectRefused  = errors.New("grok-build: redirect refused")
+	errBillingTransport = errors.New("grok-build: billing request failed")
+	errBillingRedirect  = errors.New("grok-build: redirect refused")
+	errBillingOversize  = errors.New("grok-build: billing response was too large")
+	errBillingRead      = errors.New("grok-build: billing response read failed")
 )
 
 // Marked reports a subscription credential. The bool and the preset are each
@@ -187,12 +197,26 @@ func ValidateVerificationURI(raw string) error {
 	}
 }
 
+// RejectMixedGrant fails closed when one credential carries both a Grok Build
+// marker and the OpenCode Console marker. Refresh tests the Console marker
+// first, so a mixed grant must not reach either token endpoint. The error
+// does not include a secret or an upstream body.
+func RejectMixedGrant(c *domain.OAuthCreds) error {
+	if c == nil || !c.OpencodeConsoleAuth || !Marked(c) {
+		return nil
+	}
+	return errBadCreds
+}
+
 // ValidateProvider rejects an imported or saved row that would attach these
 // credentials to another host, protocol, or auth method. A preset-only row is
-// not treated as generic.
+// not treated as generic. A mixed OpenCode Console marker fails closed.
 func ValidateProvider(p *domain.Provider) error {
 	if !Involved(p) {
 		return nil
+	}
+	if err := RejectMixedGrant(p.OAuthCreds); err != nil {
+		return err
 	}
 	if !Marked(p.OAuthCreds) || p.Protocol != domain.ProtocolGrokBuild || p.Method() != domain.AuthOAuth || p.Auth() != domain.AuthBearer {
 		return errBadCreds
@@ -228,14 +252,18 @@ func ValidateProvider(p *domain.Provider) error {
 	return nil
 }
 
-// ValidateCredentialUse is the request-time backstop. A wrong host or a missing
-// marker fails before a token or refresh request is built.
+// ValidateCredentialUse is the request-time backstop. A wrong host, a missing
+// marker, or a mixed OpenCode Console marker fails before a token or refresh
+// request is built.
 func ValidateCredentialUse(p *domain.Provider) error {
 	if p == nil {
 		return errBadCreds
 	}
 	if !Involved(p) {
 		return nil
+	}
+	if err := RejectMixedGrant(p.OAuthCreds); err != nil {
+		return err
 	}
 	if p.Protocol != domain.ProtocolGrokBuild || !Marked(p.OAuthCreds) || p.Method() != domain.AuthOAuth || p.Auth() != domain.AuthBearer {
 		return errBadCreds
@@ -570,7 +598,7 @@ func ClientNoRedirect(base *http.Client) *http.Client {
 }
 
 // DoFixed sends req only when its URL is a fixed auth or inference URL. The
-// client does not follow redirects.
+// client does not follow redirects. Billing is not part of this allowlist.
 func DoFixed(ctx context.Context, req *http.Request) (*http.Response, error) {
 	if req == nil || req.URL == nil {
 		return nil, errUnsafeHost
@@ -579,18 +607,110 @@ func DoFixed(ctx context.Context, req *http.Request) (*http.Response, error) {
 	if !IsFixedDeviceURL(raw) && !IsFixedTokenURL(raw) && !IsFixedInferenceURL(raw) {
 		return nil, errUnsafeHost
 	}
+	return doNoRedirect(ctx, req)
+}
+
+func fixedClient() *http.Client {
 	transportMu.RLock()
 	rt := testTransport
 	transportMu.RUnlock()
-	client := &http.Client{
+	return &http.Client{
 		Timeout:   20 * time.Second,
 		Transport: rt,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return errors.New("grok-build: redirect refused")
+			return errRedirectRefused
 		},
 	}
-	if ctx != nil {
+}
+
+func doNoRedirect(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if ctx != nil && req != nil {
 		req = req.WithContext(ctx)
 	}
-	return client.Do(req)
+	return fixedClient().Do(req)
+}
+
+// isExactBillingURL accepts only the fixed credits URL, including the
+// format=credits query. Any other query, userinfo, fragment, or path fails.
+// This check is not the inference allowlist.
+func isExactBillingURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.User != nil || u.Fragment != "" {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, "https") || !strings.EqualFold(u.Hostname(), inferenceHost) {
+		return false
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		return false
+	}
+	if u.EscapedPath() != "/v1/billing" || u.RawQuery != "format=credits" {
+		return false
+	}
+	return true
+}
+
+// FetchBilling reads the fixed credits billing endpoint. The URL and method
+// are not taken from a provider, a form, or a caller argument. accountUserID
+// is sent as x-userid only after NormalizeIdentity. An empty result omits the
+// header. A returned error does not include the upstream body, a redirect
+// location, or the credential. The body is returned only for a 2xx response
+// that fits in billingBodyLimit.
+func FetchBilling(ctx context.Context, accessToken, accountUserID string) (int, []byte, error) {
+	if strings.TrimSpace(accessToken) == "" {
+		return 0, nil, errors.New("grok-build: access token is missing")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, BillingURL, nil)
+	if err != nil || req.URL == nil || req.Method != http.MethodGet || !isExactBillingURL(req.URL.String()) {
+		return 0, nil, errBillingTransport
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set(TokenAuthHeader, TokenAuthValue)
+	req.Header.Set("X-Grok-Client-Version", Version)
+	req.Header.Set("X-Grok-Client-Mode", ClientMode)
+	req.Header.Set("User-Agent", UserAgent())
+	if userID := NormalizeIdentity(accountUserID); userID != "" {
+		req.Header.Set("X-Userid", userID)
+	}
+	resp, err := doNoRedirect(ctx, req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		if errors.Is(err, errRedirectRefused) {
+			return 0, nil, errBillingRedirect
+		}
+		return 0, nil, errBillingTransport
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return 0, nil, errBillingRedirect
+	}
+	body, err := readBounded(resp.Body, billingBodyLimit)
+	if err != nil {
+		return 0, nil, err
+	}
+	if resp.StatusCode == http.StatusUpgradeRequired {
+		return resp.StatusCode, nil, VersionMismatchError()
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, nil, nil
+	}
+	return resp.StatusCode, body, nil
+}
+
+// readBounded rejects a body larger than limit instead of parsing a prefix.
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, errBillingRead
+	}
+	if int64(len(data)) > limit {
+		return nil, errBillingOversize
+	}
+	return data, nil
 }

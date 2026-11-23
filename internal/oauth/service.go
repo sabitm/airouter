@@ -800,8 +800,12 @@ func (s *Service) loadOpencodeConsole(ctx context.Context, id int64) (*domain.Pr
 
 func hasOpencodeConsoleCreds(c *domain.OAuthCreds) bool { return c != nil && c.OpencodeConsoleAuth }
 
+// A mixed Grok Build marker fails here. Resolve can return an unexpired token,
+// or reuse a newer live grant on force, before refresh runs. The same check
+// covers the requested snapshot and every live load.
 func opencodeConsoleConnection(p *domain.Provider) bool {
 	return p != nil && hasOpencodeConsoleCreds(p.OAuthCreds) &&
+		grokbuild.RejectMixedGrant(p.OAuthCreds) == nil &&
 		opencode.RejectUnsafeSend(p, opencode.GoBaseURL+"/models") == nil
 }
 

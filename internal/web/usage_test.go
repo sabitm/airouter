@@ -96,7 +96,7 @@ func TestUsagePageEmptyCopyMentionsCursor(t *testing.T) {
 		t.Fatalf("status = %d", rr.Code)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, or Grok (xAI).") {
+	if !strings.Contains(body, "Add Codex, Claude Code, Kiro, Qoder, Antigravity, Cursor, Grok (xAI), or Grok Build.") {
 		t.Fatalf("empty copy missing Cursor: %s", body)
 	}
 }
