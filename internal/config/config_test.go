@@ -121,6 +121,25 @@ func TestEffectiveSecret(t *testing.T) {
 	})
 }
 
+func TestPrivateReplaySecret(t *testing.T) {
+	if secret, ok := (Config{}).PrivateReplaySecret(); ok || secret != "" {
+		t.Fatalf("default replay = %q ok=%v", secret, ok)
+	}
+	if _, isDev := (Config{}).EffectiveSecret(); !isDev {
+		t.Fatal("empty config did not report the development secret")
+	}
+	if secret, ok := (Config{Secret: devSecret}).PrivateReplaySecret(); ok || secret != "" {
+		t.Fatalf("explicit development secret was accepted for replay: %q ok=%v", secret, ok)
+	}
+	if !IsInsecureDevSecret(devSecret) {
+		t.Fatal("built-in secret was not recognized")
+	}
+	secret, ok := (Config{Secret: "private-instance"}).PrivateReplaySecret()
+	if !ok || secret != "private-instance" {
+		t.Fatalf("private replay = %q ok=%v", secret, ok)
+	}
+}
+
 func TestEnvBool(t *testing.T) {
 	cases := []struct {
 		name string

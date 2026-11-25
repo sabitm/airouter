@@ -16,6 +16,36 @@ const (
 	maxEventBytes = 8 << 20
 )
 
+// EventByteLimit is the assembled SSE event budget. A single optional payload
+// emitted as one event must stay within it.
+func EventByteLimit() int { return maxEventBytes }
+
+// LineByteLimit is the single-line budget. A data line includes the "data: "
+// prefix, so a payload at EventByteLimit does not fit one line.
+func LineByteLimit() int { return maxLineBytes }
+
+// FrameFits reports whether WriteEvent can emit name and data as one event
+// that Reader accepts. It does not split data. A raw newline would become
+// another data line and must not be used to wrap a JSON string.
+func FrameFits(name string, data []byte, lineLimit, eventLimit int) bool {
+	if lineLimit <= 0 {
+		lineLimit = maxLineBytes
+	}
+	if eventLimit <= 0 {
+		eventLimit = maxEventBytes
+	}
+	if bytes.Contains(data, []byte("\n")) || bytes.Contains(data, []byte("\r")) {
+		return false
+	}
+	if name != "" && len("event: ")+len(name) > lineLimit {
+		return false
+	}
+	if len("data: ")+len(data) > lineLimit {
+		return false
+	}
+	return len(name)+len(data) <= eventLimit
+}
+
 // SizeLimitError reports an SSE line or assembled event that exceeded its
 // parser budget.
 type SizeLimitError struct {
@@ -37,11 +67,30 @@ type Event struct {
 // Reader parses an SSE byte stream into events. ReadSlice keeps allocation
 // bounded while still allowing lines larger than the internal 64 KiB buffer.
 type Reader struct {
-	br *bufio.Reader
+	br         *bufio.Reader
+	lineLimit  int
+	eventLimit int
 }
 
 func NewReader(r io.Reader) *Reader {
-	return &Reader{br: bufio.NewReaderSize(r, 64*1024)}
+	return newReader(r, maxLineBytes, maxEventBytes)
+}
+
+// NewLimitedReader uses the given line and event budgets. Zero keeps the
+// production budget. Tests use it to check a frame against the same parser
+// rules without changing the process-wide limits.
+func NewLimitedReader(r io.Reader, line, event int) *Reader {
+	if line <= 0 {
+		line = maxLineBytes
+	}
+	if event <= 0 {
+		event = maxEventBytes
+	}
+	return newReader(r, line, event)
+}
+
+func newReader(r io.Reader, line, event int) *Reader {
+	return &Reader{br: bufio.NewReaderSize(r, 64*1024), lineLimit: line, eventLimit: event}
 }
 
 // Next returns the next event, or io.EOF when the stream ends. Comment lines
@@ -58,8 +107,8 @@ func (r *Reader) Next() (Event, error) {
 				// Comment, ignore.
 			case bytes.HasPrefix(line, []byte("event:")):
 				name := strings.TrimSpace(string(line[len("event:"):]))
-				if len(name)+len(ev.Data) > maxEventBytes {
-					return Event{}, &SizeLimitError{Scope: "event", Limit: maxEventBytes}
+				if len(name)+len(ev.Data) > r.eventLimit {
+					return Event{}, &SizeLimitError{Scope: "event", Limit: r.eventLimit}
 				}
 				ev.Name = name
 			case bytes.HasPrefix(line, []byte("data:")):
@@ -71,8 +120,8 @@ func (r *Reader) Next() (Event, error) {
 				if hasData {
 					extra++
 				}
-				if len(ev.Name)+len(ev.Data)+extra > maxEventBytes {
-					return Event{}, &SizeLimitError{Scope: "event", Limit: maxEventBytes}
+				if len(ev.Name)+len(ev.Data)+extra > r.eventLimit {
+					return Event{}, &SizeLimitError{Scope: "event", Limit: r.eventLimit}
 				}
 				if hasData {
 					ev.Data = append(ev.Data, '\n')
@@ -103,8 +152,8 @@ func (r *Reader) readLine() ([]byte, error) {
 		if hasNewline {
 			fragment = fragment[:len(fragment)-1]
 		}
-		if len(line)+len(fragment) > maxLineBytes+1 {
-			return nil, &SizeLimitError{Scope: "line", Limit: maxLineBytes}
+		if len(line)+len(fragment) > r.lineLimit+1 {
+			return nil, &SizeLimitError{Scope: "line", Limit: r.lineLimit}
 		}
 		line = append(line, fragment...)
 
@@ -112,13 +161,13 @@ func (r *Reader) readLine() ([]byte, error) {
 			if len(line) > 0 && line[len(line)-1] == '\r' {
 				line = line[:len(line)-1]
 			}
-			if len(line) > maxLineBytes {
-				return nil, &SizeLimitError{Scope: "line", Limit: maxLineBytes}
+			if len(line) > r.lineLimit {
+				return nil, &SizeLimitError{Scope: "line", Limit: r.lineLimit}
 			}
 			return line, err
 		}
-		if len(line) > maxLineBytes && line[len(line)-1] != '\r' {
-			return nil, &SizeLimitError{Scope: "line", Limit: maxLineBytes}
+		if len(line) > r.lineLimit && line[len(line)-1] != '\r' {
+			return nil, &SizeLimitError{Scope: "line", Limit: r.lineLimit}
 		}
 		if err != nil && err != bufio.ErrBufferFull {
 			return line, err

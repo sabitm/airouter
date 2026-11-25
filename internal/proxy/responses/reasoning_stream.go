@@ -97,6 +97,9 @@ type responsesReasoningDecoder struct {
 	// identity assign stored: nested item id for added and done, envelope
 	// item_id then nested id for summary frames.
 	bindSeq func(item *responsesReasoningItem)
+	// noteOrder delivers Chat-bridge source metadata. It is nil unless the
+	// Chat observer is active. It must not emit, set wired, or touch the queue.
+	noteOrder func(ir.StreamEvent)
 }
 
 func newResponsesReasoningDecoder(emit func(ir.StreamEvent) error, ensureStarted func() error, maxBytes, maxItems, maxParts int) *responsesReasoningDecoder {
@@ -408,6 +411,16 @@ func (r *responsesReasoningDecoder) bind(id reasoningIdentity, create, fromFinal
 	// the item the decoder accepted.
 	if r.bindSeq != nil {
 		r.bindSeq(found)
+	}
+	// Identity reaches the Chat observer only. A silent item has no wire rank
+	// until a real snapshot is emitted, so native final-order checks stay put.
+	if r.noteOrder != nil && !found.fromFinal && (found.id != "" || found.hasIndex) {
+		r.noteOrder(ir.StreamEvent{
+			Kind:              ir.EventReasoningReserve,
+			ReasoningID:       found.id,
+			ReasoningIndexSet: found.hasIndex,
+			ReasoningIndex:    found.outputIndex,
+		})
 	}
 	return found, nil
 }
@@ -868,6 +881,17 @@ func (r *responsesReasoningDecoder) emitDone(item *responsesReasoningItem) error
 	snap := r.snapshot(item)
 	if err := r.ensureMessageStart(); err != nil {
 		return err
+	}
+	// The Chat observer keeps the snapshot outside the client emit path. The
+	// emit below is the native wire event and is unchanged when noteOrder is nil.
+	if r.noteOrder != nil {
+		r.noteOrder(ir.StreamEvent{
+			Kind:              ir.EventReasoningItemDone,
+			ReasoningID:       item.id,
+			ReasoningIndexSet: item.hasIndex,
+			ReasoningIndex:    item.outputIndex,
+			Reasoning:         snap,
+		})
 	}
 	if err := r.emitOrdered(item, ir.StreamEvent{
 		Kind:              ir.EventReasoningItemDone,

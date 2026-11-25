@@ -83,6 +83,12 @@ func main() {
 		mainLog.Error("init_cipher_failed", "event", "init_cipher_failed", "error", err)
 		os.Exit(1)
 	}
+	if err := enableConfiguredReplay(cipher, cfg, isDev); err != nil {
+		mainLog.Warn("grok_build_replay_disabled",
+			"event", "grok_build_replay_disabled",
+			"msg_detail", "Grok Build chat replay signing is disabled",
+		)
+	}
 
 	st, err := store.Open(cfg.DBPath, cipher)
 	if err != nil {

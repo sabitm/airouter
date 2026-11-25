@@ -478,7 +478,7 @@ func TestAwaitItemBarrierFullPathBudget(t *testing.T) {
 	err := decodeStreamBoundedParts(strings.NewReader(body), func(ev ir.StreamEvent) error {
 		evs = append(evs, ev)
 		return nil
-	}, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, textQueueEntryOverhead, 1, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, true)
+	}, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, textQueueEntryOverhead, 1, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, true, nil)
 	if err == nil || !strings.Contains(err.Error(), "pending message text exceeded limit") {
 		t.Fatalf("err = %v, want pending limit", err)
 	}
@@ -751,7 +751,7 @@ func TestAwaitMisleadingEnvelopeIDsDoNotAliasReasoning(t *testing.T) {
 		)
 		err := decodeStreamBoundedParts(strings.NewReader(body), func(ir.StreamEvent) error { return nil },
 			maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts,
-			maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, 1, maxTrackedReasoningParts, true)
+			maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, 1, maxTrackedReasoningParts, true, nil)
 		if err == nil || !strings.Contains(err.Error(), "too many reasoning items") {
 			t.Fatalf("err = %v, want too many reasoning items", err)
 		}

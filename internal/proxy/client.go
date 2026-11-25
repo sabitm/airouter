@@ -1053,6 +1053,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		t.UpstreamURL = url
 	}
 	send := func() (int, []byte, error) {
+		if err := guardGrokBuildReplay(ctx, provider); err != nil {
+			return 0, nil, err
+		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
 			return 0, nil, err
 		}
@@ -1194,6 +1197,9 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		accept = "text/event-stream"
 	}
 	send := func(ctx context.Context) (*http.Response, error) {
+		if err := guardGrokBuildReplay(ctx, provider); err != nil {
+			return nil, err
+		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
 			return nil, err
 		}
@@ -1338,6 +1344,9 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 	}()
 
 	send := func() (*http.Response, error) {
+		if err := guardGrokBuildReplay(ctx, provider); err != nil {
+			return nil, err
+		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
 			return nil, err
 		}

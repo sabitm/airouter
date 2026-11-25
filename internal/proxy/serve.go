@@ -20,6 +20,7 @@ import (
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/media"
 	"airouter/internal/proxy/opencode"
+	"airouter/internal/proxy/responses"
 	"airouter/internal/proxy/thinking"
 	"airouter/internal/store"
 )
@@ -389,6 +390,26 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		}
 	}
 
+	var chatDecision grokbuild.ChatDecision
+	var chatPortable []byte
+	if ingress.id == "oai-chat" {
+		r = r.WithContext(withGrokChatEmit(r.Context(), auth.Scope, combo.ID))
+		decision, err := grokbuild.ParseChatBridge(body, auth.Scope, combo.ID, p.verifyBridgeMAC)
+		if err != nil {
+			res.fail(w, ingress, http.StatusBadRequest, grokChatRejectedMessage, "invalid_request_error")
+			return
+		}
+		chatDecision = decision
+		if decision.Strip {
+			portable, err := grokbuild.PortableChatBody(body, decision)
+			if err != nil {
+				res.fail(w, ingress, http.StatusBadRequest, grokChatRejectedMessage, "invalid_request_error")
+				return
+			}
+			chatPortable = portable
+		}
+	}
+
 	candidates, filterReason := p.orderTargets(r.Context(), combo, ingress, &prep)
 	if len(candidates) == 0 {
 		if msg, ok := emptyCandidateMessage(combo, &prep, filterReason, meta.Model); ok {
@@ -397,6 +418,34 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		}
 		res.fail(w, ingress, http.StatusInternalServerError, "combo has no targets: "+meta.Model, "api_error")
 		return
+	}
+	// ordered is the normal relative order. A verified source may be attempted
+	// first, but a change discovered by the fresh check must not promote that
+	// provider's portable attempt ahead of this order.
+	ordered := candidates
+	var pinTarget *domain.ComboTarget
+	if chatDecision.Pin {
+		if testGrokChatBeforeFresh != nil {
+			testGrokChatBeforeFresh()
+		}
+		if _, ok := pinGrokChatTarget(ordered, chatDecision.Turn.Bind); ok {
+			for i := range ordered {
+				if !grokChatSourceAvailable(ordered[i], chatDecision.Turn.Bind) {
+					continue
+				}
+				fresh, ok := p.freshGrokChatTarget(r.Context(), ordered[i], chatDecision.Turn.Bind)
+				if ok {
+					pinTarget = &fresh
+				}
+				break
+			}
+		}
+	}
+	if pinTarget != nil {
+		if next, ok := pinGrokChatTarget(ordered, chatDecision.Turn.Bind); ok {
+			next[0] = *pinTarget
+			candidates = next
+		}
 	}
 	if hasOpencodeTarget(candidates) {
 		// Capture only for requests that can reach OpenCode. The original body is
@@ -439,19 +488,35 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		provider := t.Provider
 		rec.Provider = provider.Name
 		rec.UpstreamModel = t.UpstreamModel
+		attemptBody := body
+		attemptCtx := r.Context()
+		if chatDecision.Strip {
+			if pinTarget != nil && i == 0 {
+				provider = t.Provider
+				attemptCtx = withGrokChatReplay(attemptCtx, chatDecision.Turn, chatDecision.Assistants, grokBuildReplayGuard{
+					providerID: chatDecision.Turn.Bind.ProviderID,
+					generation: chatDecision.Turn.Bind.Generation,
+					principal:  chatDecision.Turn.Bind.Principal,
+					model:      chatDecision.Turn.Bind.Model,
+					routeModel: chatDecision.Turn.Bind.RouteModel,
+				})
+			} else if chatPortable != nil {
+				attemptBody = chatPortable
+			}
+		}
 		backend := backendCodecForProvider(provider.Protocol, provider, t.UpstreamModel)
 
 		attemptStart := time.Now()
 		if ingress.id == backend.id {
 			if meta.Stream {
-				last = p.streamPassthrough(w, r.Context(), res, ingress, provider, t.UpstreamModel, body, r.Header, &prep)
+				last = p.streamPassthrough(w, attemptCtx, res, ingress, provider, t.UpstreamModel, attemptBody, r.Header, &prep)
 			} else {
-				last = p.servePassthrough(w, r.Context(), res, ingress, provider, t.UpstreamModel, body, r.Header, &prep)
+				last = p.servePassthrough(w, attemptCtx, res, ingress, provider, t.UpstreamModel, attemptBody, r.Header, &prep)
 			}
 		} else if meta.Stream {
-			last = p.streamTranslated(w, r.Context(), res, ingress, backend, provider, t.UpstreamModel, body, &prep)
+			last = p.streamTranslated(w, attemptCtx, res, ingress, backend, provider, t.UpstreamModel, attemptBody, &prep)
 		} else {
-			last = p.serveTranslated(w, r.Context(), res, ingress, backend, provider, t.UpstreamModel, body, &prep)
+			last = p.serveTranslated(w, attemptCtx, res, ingress, backend, provider, t.UpstreamModel, attemptBody, &prep)
 		}
 
 		attachmentSkip := last.retry && (last.logErr == skipLogAttachment || last.logErr == skipLogThinking)
@@ -505,6 +570,31 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 				"format", backend.id,
 				"reason", last.errMsg,
 			)
+			continue
+		}
+		if last.retry && last.logErr == skipLogGrokReplay {
+			// The signed connection changed before send. Do not penalize health
+			// and do not include marker bytes in the log.
+			observability.Logger(r.Context(), p.logger).Debug("grok_build_replay_unavailable",
+				"event", "grok_build_replay_unavailable",
+				"combo", combo.Name,
+				"provider", provider.Name,
+				"upstream_model", t.UpstreamModel,
+			)
+			willRetry := i < len(candidates)-1
+			if willRetry {
+				p.recordLog(r.Context(), &domain.RequestLog{
+					AccessKeyName: rec.AccessKeyName,
+					Combo:         rec.Combo,
+					Provider:      provider.Name,
+					UpstreamModel: t.UpstreamModel,
+					Format:        ingress.id,
+					Stream:        meta.Stream,
+					Status:        last.status,
+					ErrMsg:        last.errMsg,
+					LatencyMS:     time.Since(attemptStart).Milliseconds(),
+				})
+			}
 			continue
 		}
 		// The attempt failed over before committing bytes: penalize the provider so
@@ -800,6 +890,9 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 
 	status, respBody, err := p.forward(ctx, provider, ingress.upstreamPath, rewritten, clientHeaders)
 	if err != nil {
+		if ar, ok := mapGrokReplayErr(err); ok {
+			return ar
+		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	if status < 200 || status >= 300 {
@@ -840,6 +933,9 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err := prep.materialize(ctx, req, backend); err != nil {
 		return materializeSkip(err)
 	}
+	if err := applyGrokChatReplay(ctx, req); err != nil {
+		return terminal(http.StatusBadRequest, grokChatRejectedMessage, "invalid_request_error")
+	}
 	if captured := thinking.Capture(body); captured != nil {
 		req.Thinking = thinking.ToIR(captured)
 	}
@@ -873,6 +969,9 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 
 	status, respBody, err := p.forward(ctx, provider, backend.upstreamPath, upstreamBody, nil)
 	if err != nil {
+		if ar, ok := mapGrokReplayErr(err); ok {
+			return ar
+		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	if status < 200 || status >= 300 {
@@ -928,6 +1027,9 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	}
 	defer closeWrite()
 	if err != nil {
+		if ar, ok := mapGrokReplayErr(err); ok {
+			return ar
+		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	defer resp.Body.Close()
@@ -935,7 +1037,17 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorMax))
 		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
-	irResp, err := collectStreamResponse(resp.Body, opencodeBackendForAttempt(ctx, backend), writeFrame, upstreamModel, req.Tools)
+	collectBackend := opencodeBackendForAttempt(ctx, backend)
+	order := p.grokChatOrder(ctx, ingress, backend, provider, upstreamModel, res)
+	if order != nil {
+		collectBackend.decodeStream = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			return responses.DecodeStreamAwaitingItemIDObserved(r, func(ev ir.StreamEvent) error {
+				order.noteVisible(ev)
+				return emit(ev)
+			}, order.observe)
+		}
+	}
+	irResp, err := collectStreamResponse(resp.Body, collectBackend, writeFrame, upstreamModel, req.Tools)
 	if err != nil {
 		// Client disconnect: duplex streams surface it as a body-closed read
 		// error (see forwardStreamDuplex). Stop quietly instead of failing
@@ -953,9 +1065,6 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	}
 	if responseDropsOpaque(irResp.Content) {
 		noteAnthropicOmission(res, observability.Logger(ctx, p.logger), ingress.id)
-	}
-	if responseDropsResponsesOpaque(irResp.Content) {
-		noteResponsesOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
 	// Collect-only usage is decoded before the ingress encoder can reject the
 	// response, so a failed attempt reports its own counts. Do not add the
@@ -975,6 +1084,20 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 			return retryableResponseIncompatibility(inTok, outTok, usageEstimated)
 		}
 		return terminalResponseEncodeError(inTok, outTok, usageEstimated)
+	}
+	stamped := false
+	if order != nil {
+		if details, ok := order.details(); ok {
+			stampedOut, stampErr := grokbuild.InjectChatDetails(out, details)
+			// Adding the marker must not push a readable body over the output cap.
+			if stampErr == nil && int64(len(stampedOut)) <= grokChatUnaryCap() {
+				out = stampedOut
+				stamped = true
+			}
+		}
+	}
+	if responseDropsResponsesOpaque(irResp.Content) && !stamped {
+		noteResponsesOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
 	if int64(len(out)) > maxUnaryUpstreamResponseBytes {
 		return retryable(http.StatusBadGateway, "upstream response too large", "api_error")
@@ -1685,6 +1808,15 @@ func collectStreamResponseWithLimits(r io.Reader, backend codec, writeFrame func
 				index = ev.Index
 			}
 			if err := appendCitation(index, ev.Data); err != nil {
+				return err
+			}
+		case ir.EventReasoningReserve:
+			// Reserve the source slot before later tools. A following done snapshot
+			// updates this block in place. An identity-less frame creates nothing.
+			if ev.ReasoningID == "" && !ev.ReasoningIndexSet {
+				break
+			}
+			if _, err := reasoningFor(ev); err != nil {
 				return err
 			}
 		case ir.EventReasoningDelta:

@@ -66,9 +66,19 @@ func newUpstream(t *testing.T, cap *capturedUpstream) *httptest.Server {
 
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
+	return openTestStore(t, true)
+}
+
+func openTestStore(t *testing.T, replay bool) *store.Store {
+	t.Helper()
 	c, err := crypto.New("test-secret")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if replay {
+		if err := c.EnableGrokBuildChatReplay("test-secret"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"), c)
 	if err != nil {

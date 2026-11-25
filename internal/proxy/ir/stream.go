@@ -66,6 +66,10 @@ const (
 	// Data holds the citation object. It is a read-only annotation, never a tool
 	// call. A stream with no matching text block opens one.
 	EventTextCitation
+	// EventReasoningReserve is Chat-bridge order metadata. It carries identity
+	// only. The native decoder must not emit it, mark an item wired, or queue it.
+	// It is not client output and must not commit a stream.
+	EventReasoningReserve
 )
 
 // StreamEvent is one decoded delta from a backend stream, in a format-neutral
@@ -114,6 +118,18 @@ type StreamEvent struct {
 	ReasoningIndexSet bool
 	// ReasoningIndex is the source streamed output_index when ReasoningIndexSet.
 	ReasoningIndex int
+	// SourceOutputSet reports that SourceOutputIndex is the Responses streamed
+	// output_index for a tool or text event. It is not an IR tool index. Zero is
+	// a valid index when the flag is set. Only the Chat-bridge observer sets it.
+	// Native encoders ignore both fields.
+	SourceOutputSet   bool
+	SourceOutputIndex int
+	// TerminalSet reports that TerminalIndex is an accepted Responses
+	// output-array ordinal. It is not a streamed output_index. Only the
+	// Chat-bridge observer sets it, and only after the decoder accepted the
+	// terminal array. Native encoders ignore both fields.
+	TerminalSet   bool
+	TerminalIndex int
 	// SummaryIndex is the ordered summary part ordinal within a Responses
 	// reasoning item. It is meaningful only with ReasoningID/ReasoningIndexSet.
 	SummaryIndex int

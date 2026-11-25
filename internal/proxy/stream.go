@@ -64,6 +64,9 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 		if resp != nil {
 			resp.Body.Close()
 		}
+		if ar, ok := mapGrokReplayErr(err); ok {
+			return ar
+		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	defer resp.Body.Close()
@@ -312,6 +315,9 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err := prep.materialize(ctx, req, backend); err != nil {
 		return materializeSkip(err)
 	}
+	if err := applyGrokChatReplay(ctx, req); err != nil {
+		return terminal(http.StatusBadRequest, grokChatRejectedMessage, "invalid_request_error")
+	}
 	// Prefer Capture over typed decode so unfamiliar reasoning fields survive.
 	if captured := thinking.Capture(body); captured != nil {
 		req.Thinking = thinking.ToIR(captured)
@@ -352,6 +358,9 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		if resp != nil {
 			resp.Body.Close()
 		}
+		if ar, ok := mapGrokReplayErr(err); ok {
+			return ar
+		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
 	}
 	defer resp.Body.Close()
@@ -366,8 +375,9 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
 	}
 
-	enc := ingress.newStreamEncoder(upstreamModel)
-	sink := &translatedSink{w: w, res: res, enc: enc, ingressID: ingress.id, logger: observability.Logger(ctx, p.logger)}
+	order := p.grokChatOrder(ctx, ingress, backend, provider, upstreamModel, res)
+	enc := wrapGrokChatEncoder(ingress.newStreamEncoder(upstreamModel), order)
+	sink := &translatedSink{w: w, res: res, enc: enc, ingressID: ingress.id, logger: observability.Logger(ctx, p.logger), grokChatRetains: order != nil}
 	var inTok, outTok int
 	publishUsage := func() {
 		res.inTok = inTok
@@ -389,6 +399,13 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	}
 	if isOpencodeCodec(backend.id) {
 		decode = opencode.DecodeStream(decode, opencodeToolMapFrom(ctx))
+	}
+	if order != nil {
+		// Snapshots and source indexes go to attempt-local retention. They do
+		// not enter the pending lifecycle queue and do not change native decode.
+		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			return responses.DecodeStreamAwaitingItemIDObserved(r, emit, order.observe)
+		}
 	}
 	cursorBackend := backend.protocol == domain.ProtocolCursor
 	cursorReported := false
@@ -561,10 +578,14 @@ type translatedSink struct {
 	committed    bool
 	ingressID    string
 	logger       *slog.Logger
-	text         strings.Builder
-	tools        map[int]*translatedToolState
-	toolOrder    []int
-	stopReason   ir.StopReason
+	// grokChatRetains means the Chat observer already holds reasoning
+	// snapshots. Those events stay out of the pending queue and are not an
+	// omission until the optional marker is actually skipped.
+	grokChatRetains bool
+	text            strings.Builder
+	tools           map[int]*translatedToolState
+	toolOrder       []int
+	stopReason      ir.StopReason
 }
 
 // translatedToolState accumulates one streamed tool call for usage estimation.
@@ -628,6 +649,11 @@ func (s *translatedSink) handle(ev ir.StreamEvent) error {
 // carried opaque bytes.
 func (s *translatedSink) projectAway(ev ir.StreamEvent) bool {
 	if ev.Kind == ir.EventReasoningItemDone {
+		// The Chat bridge reads the snapshot from its observer. Keeping it here
+		// would put bridge-only bytes in the mandatory pre-commit queue.
+		if s.grokChatRetains {
+			return true
+		}
 		return !preservesResponsesReasoning(s.ingressID)
 	}
 	if s.anthropicIngress() {
@@ -685,6 +711,9 @@ func (s *translatedSink) visible(ev ir.StreamEvent) bool {
 }
 
 func (s *translatedSink) noteProjectedOmission(ev ir.StreamEvent) {
+	if s.grokChatRetains && ev.Kind == ir.EventReasoningItemDone {
+		return
+	}
 	if responsesOpaqueOmitted(ev) {
 		noteResponsesOmission(s.res, s.logger, s.ingressID)
 		return

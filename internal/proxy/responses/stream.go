@@ -263,7 +263,15 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 // ordering queue, so a later item cannot pass an earlier one. DecodeStream is
 // unchanged.
 func DecodeStreamAwaitingItemID(r io.Reader, emit func(ir.StreamEvent) error) error {
-	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, true)
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, true, nil)
+}
+
+// DecodeStreamAwaitingItemIDObserved is the Grok Build Chat-bridge decode.
+// observe receives source-order metadata and reasoning snapshots. It is not
+// the client emit path. A nil observe is DecodeStreamAwaitingItemID. The
+// observer cannot change item.wired, the ordering queue, or final-order checks.
+func DecodeStreamAwaitingItemIDObserved(r io.Reader, emit func(ir.StreamEvent) error, observe func(ir.StreamEvent)) error {
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, true, observe)
 }
 
 func decodeStreamLimited(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls int) error {
@@ -278,7 +286,7 @@ func decodeStreamLimitedAll(r io.Reader, emit func(ir.StreamEvent) error, maxArg
 // keep their package constants; tests inject small budgets. The content-part
 // budget uses the production cap.
 func decodeStreamBounded(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int) error {
-	return decodeStreamBoundedParts(r, emit, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTrackedTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts, false)
+	return decodeStreamBoundedParts(r, emit, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTrackedTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts, false, nil)
 }
 
 // testCaptureDecoder, when set, receives the decoder for an in-flight decode.
@@ -287,7 +295,7 @@ var testCaptureDecoder func(*responsesToolDecoder)
 
 // decodeStreamBoundedParts adds the content-part budget so tests can inject a
 // small part cap independently of the item cap and byte budgets.
-func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int, awaitItemID bool) error {
+func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int, awaitItemID bool, observe func(ir.StreamEvent)) error {
 	reader := sse.NewReader(r)
 	started := false
 	startID, startModel := "", ""
@@ -315,12 +323,17 @@ func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxA
 		maxPendingBytes: maxPendingBytes, maxPendingEvents: maxPendingEvents,
 		ensureStarted:     func() error { return ensureStarted("", "") },
 		awaitNativeItemID: awaitItemID,
+		observe:           observe,
 	}
 	dec.reasoning = newResponsesReasoningDecoder(emit, dec.ensureStarted, maxReasoningBytes, maxReasoningItems, maxReasoningParts)
 	dec.reasoning.orderEmit = dec.orderEmitReasoning
 	dec.reasoning.msgCount = func() int { return len(dec.texts) }
 	if awaitItemID {
 		dec.reasoning.bindSeq = dec.noteReasonBound
+	}
+	// Chat metadata stays off the emit path. Native decode passes a nil observer.
+	if observe != nil {
+		dec.reasoning.noteOrder = observe
 	}
 	if testCaptureDecoder != nil {
 		testCaptureDecoder(dec)
@@ -641,8 +654,10 @@ type responsesToolDecoder struct {
 	// is set while that queue is being delivered, so a release does not queue
 	// the same event again.
 	awaitNativeItemID bool
-	drainingOrder     bool
-	nextSeq           int
+	// observe is the Chat-bridge side channel. Nil leaves wire order unchanged.
+	observe       func(ir.StreamEvent)
+	drainingOrder bool
+	nextSeq       int
 	// seqByOutput and seqByID record a bound reasoning item's output index and
 	// id. Keys are copied from the item after the reasoning decoder accepts it.
 	// An envelope item_id that the decoder ignored is not a key.
@@ -1089,7 +1104,7 @@ func (d *responsesToolDecoder) emitOrderWork(w pendingOrderWork) error {
 		w.reason.wired = true
 		d.noteItemWire(w.reason)
 	}
-	return d.emit(w.event)
+	return d.emitObserved(w.call, w.event)
 }
 
 func (d *responsesToolDecoder) releaseOrderCost(w pendingOrderWork) {
@@ -1169,7 +1184,7 @@ func (d *responsesToolDecoder) flushOrderedForCall(call *responsesToolCall) erro
 				w.call.wired = true
 				d.noteItemWire(w.call)
 			}
-			if err := d.emit(w.event); err != nil {
+			if err := d.emitObserved(w.call, w.event); err != nil {
 				return err
 			}
 			continue
@@ -1793,6 +1808,7 @@ func (d *responsesToolDecoder) emitClaimedSpan(item *responsesTextItem, from, to
 		return err
 	}
 	d.noteItemWire(item)
+	d.noteTextOrder(item, item.text.String()[from:to], refusal)
 	item.emitted = to
 	return nil
 }
@@ -1826,10 +1842,12 @@ func (d *responsesToolDecoder) emitLooseTail(item *responsesTextItem, limit int)
 		if end <= item.emitted {
 			return ir.ProtocolError("conflicting message text")
 		}
-		if err := d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: text[item.emitted:end], Refusal: refusal}); err != nil {
+		frag := text[item.emitted:end]
+		if err := d.emit(ir.StreamEvent{Kind: ir.EventTextDelta, Text: frag, Refusal: refusal}); err != nil {
 			return err
 		}
 		d.noteItemWire(item)
+		d.noteTextOrder(item, frag, refusal)
 		item.emitted = end
 	}
 	return nil
@@ -2276,7 +2294,46 @@ func (d *responsesToolDecoder) observeFinal(items []respOutputItem) error {
 	if err := d.drainOrdered(); err != nil {
 		return err
 	}
-	return d.rejectEmittedFinalOrder()
+	if err := d.rejectEmittedFinalOrder(); err != nil {
+		return err
+	}
+	// Terminal ordinals are metadata for the Chat observer. They are recorded
+	// only after the native order check accepts this array.
+	if d.observe != nil {
+		for i := range slots {
+			ev := ir.StreamEvent{TerminalSet: true, TerminalIndex: i}
+			switch {
+			case slots[i].call != nil:
+				call := slots[i].call
+				ev.Kind = ir.EventToolCallStart
+				ev.ToolID = call.callID
+				ev.ToolName = call.name
+				ev.ResponsesItemID = call.itemID
+				if call.hasIndex {
+					ev.SourceOutputSet = true
+					ev.SourceOutputIndex = call.outputIndex
+				}
+			case slots[i].reasoning != nil:
+				item := slots[i].reasoning
+				ev.Kind = ir.EventReasoningReserve
+				ev.ReasoningID = item.id
+				ev.ReasoningIndexSet = item.hasIndex
+				ev.ReasoningIndex = item.outputIndex
+			case slots[i].text != nil:
+				item := slots[i].text
+				ev.Kind = ir.EventTextDelta
+				ev.ID = item.itemID
+				if item.hasIndex {
+					ev.SourceOutputSet = true
+					ev.SourceOutputIndex = item.outputIndex
+				}
+			default:
+				continue
+			}
+			d.observe(ev)
+		}
+	}
+	return nil
 }
 
 // rejectReorderedEmission fails when a terminal slot at ordinal still has new
@@ -2764,6 +2821,37 @@ func (d *responsesToolDecoder) rememberSeq(seq int, hasIndex bool, index int, id
 	}
 }
 
+// noteToolOrder reports an accepted tool source index to the Chat observer.
+// The emitted start event is unchanged.
+func (d *responsesToolDecoder) noteToolOrder(call *responsesToolCall) {
+	if d == nil || d.observe == nil || call == nil || !call.hasIndex {
+		return
+	}
+	d.observe(ir.StreamEvent{
+		Kind:              ir.EventToolCallStart,
+		ToolID:            call.callID,
+		ToolName:          call.name,
+		ResponsesItemID:   call.itemID,
+		SourceOutputSet:   true,
+		SourceOutputIndex: call.outputIndex,
+	})
+}
+
+// noteTextOrder reports an accepted text source index to the Chat observer.
+// Refusal bytes stay out of the layout. The emitted delta is unchanged.
+func (d *responsesToolDecoder) noteTextOrder(item *responsesTextItem, text string, refusal bool) {
+	if d == nil || d.observe == nil || item == nil || refusal || text == "" || !item.hasIndex {
+		return
+	}
+	d.observe(ir.StreamEvent{
+		Kind:              ir.EventTextDelta,
+		ID:                item.itemID,
+		Text:              text,
+		SourceOutputSet:   true,
+		SourceOutputIndex: item.outputIndex,
+	})
+}
+
 // noteReasonBound reserves the stream position of a reasoning item after that
 // decoder has accepted it. added and done frames bind only the nested item id.
 // Summary frames bind the envelope item_id, then the nested id. A repeated bind
@@ -3034,13 +3122,25 @@ func (d *responsesToolDecoder) commitCallEvents(call *responsesToolCall) {
 
 func (d *responsesToolDecoder) emitEvents(call *responsesToolCall, events []ir.StreamEvent) error {
 	for _, ev := range events {
-		if err := d.emit(ev); err != nil {
+		if err := d.emitObserved(call, ev); err != nil {
 			return err
 		}
 		if call != nil {
 			call.wired = true
 			d.noteItemWire(call)
 		}
+	}
+	return nil
+}
+
+// emitObserved emits one client event and, for a tool start, tells the Chat
+// observer the accepted source index. The emitted event is unchanged.
+func (d *responsesToolDecoder) emitObserved(call *responsesToolCall, ev ir.StreamEvent) error {
+	if err := d.emit(ev); err != nil {
+		return err
+	}
+	if ev.Kind == ir.EventToolCallStart {
+		d.noteToolOrder(call)
 	}
 	return nil
 }

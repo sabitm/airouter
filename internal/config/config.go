@@ -90,6 +90,24 @@ func (c Config) EffectiveSecret() (secret string, isDev bool) {
 	return c.Secret, false
 }
 
+// IsInsecureDevSecret reports whether secret is the built-in public development
+// value. An explicit copy is still not a private instance secret.
+func IsInsecureDevSecret(secret string) bool {
+	return secret == devSecret
+}
+
+// PrivateReplaySecret returns the configured secret only when it can
+// authenticate Grok Build Chat replay. The development fallback and an
+// explicit copy of that built-in value are rejected. This does not change the
+// at-rest encryption key.
+func (c Config) PrivateReplaySecret() (string, bool) {
+	secret, isDev := c.EffectiveSecret()
+	if isDev || IsInsecureDevSecret(secret) {
+		return "", false
+	}
+	return secret, true
+}
+
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

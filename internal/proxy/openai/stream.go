@@ -3,12 +3,42 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"time"
 
 	"airouter/internal/proxy/ir"
 	"airouter/internal/proxy/sse"
 )
+
+// ErrReasoningFrameOmitted means the optional reasoning_details chunk does not
+// fit one SSE data line and event payload. Callers skip that chunk. The error
+// text does not include the payload.
+var ErrReasoningFrameOmitted = errors.New("reasoning details frame omitted")
+
+// testReasoningFrameLine and testReasoningFrameEvent, when positive, replace
+// the production SSE limits for the optional reasoning chunk only. They do not
+// change Reader and they do not raise the production cap.
+var testReasoningFrameLine int
+var testReasoningFrameEvent int
+
+// SetTestReasoningFrameLimits sets the optional-chunk SSE check. Zero restores
+// the production limit. Tests must restore both values.
+func SetTestReasoningFrameLimits(line, event int) {
+	testReasoningFrameLine = line
+	testReasoningFrameEvent = event
+}
+
+func reasoningFrameLimits() (int, int) {
+	line, event := sse.LineByteLimit(), sse.EventByteLimit()
+	if testReasoningFrameLine > 0 {
+		line = testReasoningFrameLine
+	}
+	if testReasoningFrameEvent > 0 {
+		event = testReasoningFrameEvent
+	}
+	return line, event
+}
 
 // --- chunk wire types (streaming) ---
 
@@ -363,6 +393,37 @@ func (e *StreamEncoder) ensureToolIndex(irIndex int) int {
 	e.nextTool++
 	e.toolIndex[irIndex] = idx
 	return idx
+}
+
+// EmitReasoningDetails writes one Chat delta carrying reasoning_details.
+// It does not set a finish reason and does not commit a stream by itself.
+// The caller decides when the chunk is written. An optional chunk that does
+// not fit one SSE data line is omitted. The JSON payload is not split.
+func (e *StreamEncoder) EmitReasoningDetails(w *sse.Writer, details []json.RawMessage) error {
+	if e == nil || w == nil || len(details) == 0 {
+		return nil
+	}
+	if e.id == "" {
+		e.id = ir.NewID("chatcmpl-")
+	}
+	raw, err := e.reasoningChunk(details)
+	if err != nil {
+		return err
+	}
+	line, event := reasoningFrameLimits()
+	if !sse.FrameFits("", raw, line, event) {
+		return ErrReasoningFrameOmitted
+	}
+	return w.WriteEvent("", raw)
+}
+
+func (e *StreamEncoder) reasoningChunk(details []json.RawMessage) ([]byte, error) {
+	chunk := chatChunk{
+		ID:      e.id,
+		Model:   e.model,
+		Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{ReasoningDetails: details}}},
+	}
+	return marshalChunk(chunk, e.created)
 }
 
 func (e *StreamEncoder) emit(w *sse.Writer, delta chunkDelta, finish *string) error {

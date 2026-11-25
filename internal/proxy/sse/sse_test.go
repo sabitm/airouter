@@ -101,6 +101,37 @@ func TestReaderMultipleEvents(t *testing.T) {
 	}
 }
 
+func TestFrameFitsMatchesLimitedReader(t *testing.T) {
+	payload := []byte(`{"id":"chatcmpl-1","model":"grok-4.7","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.summary","summary":"s"}]}}]}`)
+	line := len("data: ") + len(payload)
+	frame := "data: " + string(payload) + "\n\n"
+	if !FrameFits("", payload, line, len(payload)) {
+		t.Fatal("frame at both limits was rejected")
+	}
+	ev, err := NewLimitedReader(strings.NewReader(frame), line, len(payload)).Next()
+	if err != nil || string(ev.Data) != string(payload) {
+		t.Fatalf("reader at limit: %v %q", err, ev.Data)
+	}
+	if FrameFits("", payload, line-1, len(payload)) {
+		t.Fatal("line over limit was accepted")
+	}
+	_, err = NewLimitedReader(strings.NewReader(frame), line-1, len(payload)).Next()
+	var sizeErr *SizeLimitError
+	if !errors.As(err, &sizeErr) || sizeErr.Scope != "line" {
+		t.Fatalf("reader line: %v", err)
+	}
+	if FrameFits("", payload, line, len(payload)-1) {
+		t.Fatal("event over limit was accepted")
+	}
+	_, err = NewLimitedReader(strings.NewReader(frame), line, len(payload)-1).Next()
+	if !errors.As(err, &sizeErr) || sizeErr.Scope != "event" {
+		t.Fatalf("reader event: %v", err)
+	}
+	if FrameFits("", append(append([]byte(nil), payload...), '\n'), line+8, len(payload)+8) {
+		t.Fatal("newline payload was treated as one JSON line")
+	}
+}
+
 func TestReaderSizeLimits(t *testing.T) {
 	t.Run("line at limit", func(t *testing.T) {
 		payload := strings.Repeat("x", maxLineBytes-len("data: "))

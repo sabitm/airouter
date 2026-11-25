@@ -1,6 +1,8 @@
 package crypto
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"strings"
 	"testing"
@@ -11,6 +13,15 @@ func mustCipher(t *testing.T, secret string) *Cipher {
 	c, err := New(secret)
 	if err != nil {
 		t.Fatalf("New(%q): %v", secret, err)
+	}
+	return c
+}
+
+func mustReplayCipher(t *testing.T, secret string) *Cipher {
+	t.Helper()
+	c := mustCipher(t, secret)
+	if err := c.EnableGrokBuildChatReplay(secret); err != nil {
+		t.Fatal(err)
 	}
 	return c
 }
@@ -72,6 +83,55 @@ func TestEncryptDoesNotLeakPlaintext(t *testing.T) {
 	}
 	if strings.Contains(enc, pt) {
 		t.Fatalf("ciphertext contains plaintext: %s", enc)
+	}
+}
+
+func TestGrokBuildChatMACIsDomainSeparated(t *testing.T) {
+	const secret = "instance-secret"
+	payload := []byte("replay-payload")
+	c := mustReplayCipher(t, secret)
+	got, ok := c.GrokBuildChatMAC(payload)
+	if !ok || len(got) != sha256.Size {
+		t.Fatalf("mac = %d ok=%v", len(got), ok)
+	}
+	if !c.VerifyGrokBuildChatMAC(payload, got) {
+		t.Fatal("verify rejected a fresh mac")
+	}
+	flipped := append([]byte(nil), got...)
+	flipped[0] ^= 0x01
+	if c.VerifyGrokBuildChatMAC(payload, flipped) || c.VerifyGrokBuildChatMAC([]byte("other"), got) {
+		t.Fatal("verify accepted a tampered mac")
+	}
+	if !mustReplayCipher(t, secret).VerifyGrokBuildChatMAC(payload, got) {
+		t.Fatal("mac changed across New with the same secret")
+	}
+	if mustCipher(t, secret).VerifyGrokBuildChatMAC(payload, got) {
+		t.Fatal("New alone signed replay")
+	}
+	if mustReplayCipher(t, secret+"-other").VerifyGrokBuildChatMAC(payload, got) {
+		t.Fatal("mac verified under a different secret")
+	}
+	dev := mustCipher(t, "airouter-insecure-dev-secret")
+	if err := dev.EnableGrokBuildChatReplay("airouter-insecure-dev-secret"); err == nil {
+		t.Fatal("built-in development secret was accepted for replay")
+	}
+	if dev.VerifyGrokBuildChatMAC(payload, got) {
+		t.Fatal("development secret verified replay")
+	}
+	if err := mustCipher(t, secret).EnableGrokBuildChatReplay(""); err == nil {
+		t.Fatal("empty replay secret was accepted")
+	}
+	aesKey := sha256.Sum256([]byte(secret))
+	aesMAC := hmac.New(sha256.New, aesKey[:])
+	_, _ = aesMAC.Write(payload)
+	if hmac.Equal(aesMAC.Sum(nil), got) {
+		t.Fatal("bridge mac reused the AES key")
+	}
+	if (*Cipher)(nil).VerifyGrokBuildChatMAC(payload, got) {
+		t.Fatal("nil cipher verified")
+	}
+	if err := (*Cipher)(nil).EnableGrokBuildChatReplay(secret); err == nil {
+		t.Fatal("nil cipher enabled replay")
 	}
 }
 
