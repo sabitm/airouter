@@ -51,6 +51,8 @@ type responsesReasoningItem struct {
 	// wired records that at least one event reached the consumer, so a later
 	// final-only slot at an earlier array ordinal cannot silently reorder it.
 	wired bool
+	// opened reserves the wire position of a Codex item even with no summary.
+	opened bool
 
 	// done marks that a terminal snapshot was accepted. Later summary growth is
 	// a conflict; late absent-to-present opaque metadata is still allowed.
@@ -100,6 +102,10 @@ type responsesReasoningDecoder struct {
 	// noteOrder delivers Chat-bridge source metadata. It is nil unless the
 	// Chat observer is active. It must not emit, set wired, or touch the queue.
 	noteOrder func(ir.StreamEvent)
+	// reconcileCodex drops provisional ciphertext and reserves the position of
+	// indexed reasoning items for the matching streaming encoder.
+	reconcileCodex bool
+	canOpenEarly   func(*responsesReasoningItem) bool
 }
 
 func newResponsesReasoningDecoder(emit func(ir.StreamEvent) error, ensureStarted func() error, maxBytes, maxItems, maxParts int) *responsesReasoningDecoder {
@@ -144,7 +150,27 @@ func (r *responsesReasoningDecoder) observeAdded(env *streamEnvelope) error {
 	if err != nil {
 		return err
 	}
-	return r.applyItemSnapshot(item, reasoningSnapshot{Summary: env.Item.Summary, SummarySet: env.Item.SummarySet, EncryptedContent: env.Item.EncryptedContent, Status: env.Item.Status}, false, true)
+	// Codex may put a provisional opaque value on the added frame. Only a
+	// completion frame or the terminal snapshot may confirm it, so it is not
+	// retained here.
+	encrypted := env.Item.EncryptedContent
+	if r.reconcileCodex {
+		encrypted = nil
+		// An unindexed placeholder does not establish an output position.
+		if !item.opened && !item.wired && !item.done && item.hasIndex && item.id != "" && r.canOpenEarly(item) {
+			if err := r.ensureMessageStart(); err != nil {
+				return err
+			}
+			if err := r.emitOrdered(item, ir.StreamEvent{
+				Kind: ir.EventReasoningItemStart, ReasoningID: item.id,
+				ReasoningIndexSet: true, ReasoningIndex: item.outputIndex,
+			}); err != nil {
+				return err
+			}
+			item.opened = true
+		}
+	}
+	return r.applyItemSnapshot(item, reasoningSnapshot{Summary: env.Item.Summary, SummarySet: env.Item.SummarySet, EncryptedContent: encrypted, Status: env.Item.Status}, false, true)
 }
 
 // observeDelta appends one summary delta. An empty delta binds identity but

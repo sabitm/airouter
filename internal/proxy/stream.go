@@ -376,7 +376,15 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	}
 
 	order := p.grokChatOrder(ctx, ingress, backend, provider, upstreamModel, res)
-	enc := wrapGrokChatEncoder(ingress.newStreamEncoder(upstreamModel), order)
+	// Codex may publish the authoritative reasoning snapshot only in the
+	// terminal response, so the Responses encoder must keep that item open and
+	// the decoder must reconcile it. Both halves are gated to this one pair.
+	codexReconcile := ingress.id == responsesCodec.id && backend.id == codexCodec.id
+	enc := ingress.newStreamEncoder(upstreamModel)
+	if codexReconcile {
+		enc = responses.NewCodexStreamEncoder(upstreamModel)
+	}
+	enc = wrapGrokChatEncoder(enc, order)
 	sink := &translatedSink{w: w, res: res, enc: enc, ingressID: ingress.id, logger: observability.Logger(ctx, p.logger), grokChatRetains: order != nil}
 	var inTok, outTok int
 	publishUsage := func() {
@@ -400,7 +408,10 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if isOpencodeCodec(backend.id) {
 		decode = opencode.DecodeStream(decode, opencodeToolMapFrom(ctx))
 	}
-	if order != nil {
+	switch {
+	case codexReconcile:
+		decode = responses.DecodeStreamCodexReconciled
+	case order != nil:
 		// Snapshots and source indexes go to attempt-local retention. They do
 		// not enter the pending lifecycle queue and do not change native decode.
 		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
@@ -660,6 +671,8 @@ func (s *translatedSink) projectAway(ev ir.StreamEvent) bool {
 		return false
 	}
 	switch ev.Kind {
+	case ir.EventReasoningItemStart:
+		return !preservesResponsesReasoning(s.ingressID)
 	case ir.EventReasoningSignature, ir.EventReasoningEnd, ir.EventRedactedReasoning:
 		return true
 	case ir.EventReasoningStart:

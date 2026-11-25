@@ -3,6 +3,7 @@ package responses
 import (
 	"encoding/json"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -263,7 +264,16 @@ func DecodeStream(r io.Reader, emit func(ir.StreamEvent) error) error {
 // ordering queue, so a later item cannot pass an earlier one. DecodeStream is
 // unchanged.
 func DecodeStreamAwaitingItemID(r io.Reader, emit func(ir.StreamEvent) error) error {
-	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, true, nil)
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{awaitItemID: true})
+}
+
+// DecodeStreamCodexReconciled is the Codex-to-Responses policy. Codex may send
+// the authoritative reasoning encrypted_content after the completion frame, or
+// only in the terminal output array, so a completion without explicit bytes is
+// withheld until the terminal pass. Provisional bytes on output_item.added are
+// never promoted. Every other decode path is unchanged.
+func DecodeStreamCodexReconciled(r io.Reader, emit func(ir.StreamEvent) error) error {
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileCodex: true})
 }
 
 // DecodeStreamAwaitingItemIDObserved is the Grok Build Chat-bridge decode.
@@ -271,7 +281,7 @@ func DecodeStreamAwaitingItemID(r io.Reader, emit func(ir.StreamEvent) error) er
 // the client emit path. A nil observe is DecodeStreamAwaitingItemID. The
 // observer cannot change item.wired, the ordering queue, or final-order checks.
 func DecodeStreamAwaitingItemIDObserved(r io.Reader, emit func(ir.StreamEvent) error, observe func(ir.StreamEvent)) error {
-	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, true, observe)
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{awaitItemID: true, observe: observe})
 }
 
 func decodeStreamLimited(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls int) error {
@@ -286,16 +296,30 @@ func decodeStreamLimitedAll(r io.Reader, emit func(ir.StreamEvent) error, maxArg
 // keep their package constants; tests inject small budgets. The content-part
 // budget uses the production cap.
 func decodeStreamBounded(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int) error {
-	return decodeStreamBoundedParts(r, emit, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTrackedTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts, false, nil)
+	return decodeStreamBoundedParts(r, emit, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTrackedTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts, decodePolicy{})
 }
 
 // testCaptureDecoder, when set, receives the decoder for an in-flight decode.
 // Tests inspect reasoning registration through it. Production leaves it nil.
 var testCaptureDecoder func(*responsesToolDecoder)
 
+// decodePolicy selects the backend-specific ordering rules for one decode.
+// Every field defaults to the unchanged standard Responses behavior.
+type decodePolicy struct {
+	// awaitItemID withholds a function item until its native id arrives or a
+	// terminal snapshot proves it absent (Grok Build).
+	awaitItemID bool
+	// reconcileCodex withholds provisional reasoning encrypted_content until a
+	// completion frame or the terminal snapshot confirms it.
+	reconcileCodex bool
+	// observe receives source-order metadata without changing client emission.
+	observe func(ir.StreamEvent)
+}
+
 // decodeStreamBoundedParts adds the content-part budget so tests can inject a
 // small part cap independently of the item cap and byte budgets.
-func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int, awaitItemID bool, observe func(ir.StreamEvent)) error {
+func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int, policy decodePolicy) error {
+	awaitItemID, reconcileCodex, observe := policy.awaitItemID, policy.reconcileCodex, policy.observe
 	reader := sse.NewReader(r)
 	started := false
 	startID, startModel := "", ""
@@ -326,6 +350,10 @@ func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxA
 		observe:           observe,
 	}
 	dec.reasoning = newResponsesReasoningDecoder(emit, dec.ensureStarted, maxReasoningBytes, maxReasoningItems, maxReasoningParts)
+	dec.reasoning.reconcileCodex = reconcileCodex
+	if reconcileCodex {
+		dec.reasoning.canOpenEarly = dec.canOpenCodexReasoningEarly
+	}
 	dec.reasoning.orderEmit = dec.orderEmitReasoning
 	dec.reasoning.msgCount = func() int { return len(dec.texts) }
 	if awaitItemID {
@@ -2758,6 +2786,17 @@ func (d *responsesToolDecoder) messagePrecedes(orderMsgs int) bool {
 	return ok && idx < orderMsgs
 }
 
+// An added-only reasoning placeholder must not close a preceding function
+// call while its argument fragments still arrive.
+func (d *responsesToolDecoder) canOpenCodexReasoningEarly(item *responsesReasoningItem) bool {
+	for _, call := range d.calls {
+		if !call.terminal && (!call.hasIndex || call.outputIndex < item.outputIndex) {
+			return false
+		}
+	}
+	return true
+}
+
 // orderEmitReasoning is the reasoning decoder hook. It defers one reasoning
 // item's event behind a message registered after the item, using the same
 // bounded queue and the same pending budget as tool and text work.
@@ -3397,6 +3436,12 @@ type StreamEncoder struct {
 	pendingBytes  int
 	flushing      bool
 
+	// reconcileCodex is the narrow Codex-to-Responses policy. A reasoning
+	// completion without explicit encrypted bytes is held open instead of
+	// closed, and later text, tools, or another reasoning item wait in
+	// pendingEvents, so the terminal snapshot can still supply the bytes.
+	reconcileCodex bool
+
 	tools      map[int]*respTool
 	pendingLen int
 
@@ -3421,6 +3466,14 @@ type respTool struct {
 	pending    string
 	args       strings.Builder
 	done       bool
+}
+
+// NewCodexStreamEncoder pairs with DecodeStreamCodexReconciled for a
+// translated Codex stream on Responses ingress.
+func NewCodexStreamEncoder(model string) *StreamEncoder {
+	e := NewStreamEncoder(model)
+	e.reconcileCodex = true
+	return e
 }
 
 func NewStreamEncoder(model string) *StreamEncoder {
@@ -3681,6 +3734,15 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 			// Finish flushes the whole queue in arrival order before closing, so
 			// encoding it now cannot reorder output and must not risk the cap.
 			return e.encodeEvent(ev, w)
+		case e.passesAwaitingReasoning(ev):
+			// The awaited item's own frames and its completion must pass the
+			// queue, or a queued tool or text event at the head could never be
+			// released. A separately deferred identity still binds from the
+			// queue in arrival order.
+			if err := e.encodeEvent(ev, w); err != nil {
+				return err
+			}
+			return e.drainPending(w)
 		default:
 			// FIFO: a resolving event is appended like any other so its content
 			// never overtakes queued predecessors.
@@ -3690,35 +3752,51 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		}
 		return e.drainPending(w)
 	}
-	if !e.flushing && e.mustQueueForDeferred(ev) {
+	if !e.flushing && (e.mustQueueForDeferred(ev) || e.mustQueueForAwaitingReasoning(ev)) {
 		return e.queueEvent(ev)
 	}
 	return e.encodeEvent(ev, w)
 }
 
-// drainPending processes queued work strictly in arrival order. Before each
-// stop decision, a queued event that carries the blocking item's identity binds
-// it, so retained summary bytes replay under the source ID even when the
-// identity-bearing event itself is still queued. Queue and budget release
-// happen before encodeEvent so a rejected replay never retains twice.
+// drainPending keeps item order while letting the current Codex reasoning
+// item consume its own queued updates. Bind a deferred ID before emitting and
+// release each queue charge before encoding that event.
 func (e *StreamEncoder) drainPending(w *sse.Writer) error {
 	for len(e.pendingEvents) > 0 {
-		ev := e.pendingEvents[0]
-		if !e.flushing && e.mustQueueForDeferred(ev) {
-			if err := e.bindPendingIdentity(e.blockingDeferredReasoning()); err != nil {
-				return err
-			}
-			if e.mustQueueForDeferred(ev) {
-				return nil
-			}
-		} else if blocking := e.blockingDeferredReasoning(); blocking != nil {
+		i := 0
+		ev := e.pendingEvents[i]
+		if blocking := e.blockingDeferredReasoning(); blocking != nil {
 			if err := e.bindPendingIdentity(blocking); err != nil {
 				return err
 			}
 		}
-		e.pendingEvents[0] = ir.StreamEvent{}
-		e.pendingEvents = e.pendingEvents[1:]
-		e.pendingBytes -= encoderPendingEventBytes(ev)
+		if e.mustQueueForAwaitingReasoning(ev) {
+			// A second reasoning item can become the head while its final
+			// snapshot is already queued. Reconcile its own frames in order
+			// before opening the next item, including during the final drain.
+			for i++; i < len(e.pendingEvents); i++ {
+				if e.passesAwaitingReasoning(e.pendingEvents[i]) {
+					break
+				}
+			}
+			if i == len(e.pendingEvents) {
+				if !e.flushing {
+					return nil
+				}
+				i = 0 // Successful end of stream. No more snapshots can arrive.
+			}
+		}
+		if i == 0 && !e.flushing && !e.passesAwaitingReasoning(ev) && e.mustQueueForDeferred(ev) {
+			return nil
+		}
+		ev = e.pendingEvents[i]
+		if i == 0 {
+			e.pendingEvents[0] = ir.StreamEvent{}
+			e.pendingEvents = e.pendingEvents[1:]
+		} else {
+			e.pendingEvents = slices.Delete(e.pendingEvents, i, i+1)
+		}
+		e.pendingBytes -= e.pendingEventBytes(ev)
 		if err := e.encodeEvent(ev, w); err != nil {
 			return err
 		}
@@ -3769,6 +3847,8 @@ func (e *StreamEncoder) encodeEvent(ev ir.StreamEvent, w *sse.Writer) error {
 			"item_id": e.openItemID, "output_index": e.openOutIdx, "content_index": e.partIdx, "delta": ev.Text,
 		})
 
+	case ir.EventReasoningItemStart:
+		return e.encodeReasoningItemStart(w, ev)
 	case ir.EventReasoningDelta, ir.EventReasoningStart:
 		return e.encodeReasoningDelta(w, ev)
 	case ir.EventReasoningItemDone:

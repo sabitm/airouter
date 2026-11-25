@@ -73,6 +73,97 @@ func encoderPendingEventBytes(ev ir.StreamEvent) int {
 	return n
 }
 
+// awaitingReasoning returns the earliest Codex reasoning item that can still
+// receive ciphertext. A deferred summary must keep its position even after
+// its source ID is known, until its completion is reconciled.
+func (e *StreamEncoder) awaitingReasoning() *respReasoningItem {
+	if !e.reconcileCodex {
+		return nil
+	}
+	if item := e.reasoningOpen; item != nil && !item.done && item.encrypted == nil {
+		return item
+	}
+	for _, item := range e.reasoningDeferred {
+		if !item.done && !item.open {
+			return item
+		}
+	}
+	return nil
+}
+
+// holdsCompletion reports that ev is a completion without explicit encrypted
+// bytes. Under reconcileCodex that frame is never closed on its own: the item
+// is opened to keep its output position, then left open so the terminal
+// snapshot can still supply the authoritative value. Close emits the single
+// completion when no snapshot arrives.
+func (e *StreamEncoder) holdsCompletion(ev ir.StreamEvent) bool {
+	if !e.reconcileCodex || ev.Kind != ir.EventReasoningItemDone {
+		return false
+	}
+	return ev.Reasoning == nil || ev.Reasoning.EncryptedContent == nil
+}
+
+// passesAwaitingReasoning selects the awaited item's own events. They can
+// pass work for later items without changing the order of output items.
+func (e *StreamEncoder) passesAwaitingReasoning(ev ir.StreamEvent) bool {
+	// An index-only summary delta can pass even before the ID arrives.
+	// encodeReasoningDelta retains it without opening the item. It must be
+	// applied before a later ID-bearing completion reconciles that summary.
+	if !reasoningEventTargets(ev, e.awaitingReasoning()) {
+		return false
+	}
+	switch ev.Kind {
+	case ir.EventReasoningStart, ir.EventReasoningDelta, ir.EventReasoningItemStart, ir.EventReasoningItemDone:
+		return true
+	}
+	return false
+}
+
+// mustQueueForAwaitingReasoning reports whether ev would close, open, or append
+// output ahead of the awaited Codex completion. Text and tool bytes stay queued
+// so the reasoning item keeps its arrival position, and a later reasoning item
+// waits because it would close the awaited one.
+func (e *StreamEncoder) mustQueueForAwaitingReasoning(ev ir.StreamEvent) bool {
+	item := e.awaitingReasoning()
+	if item == nil {
+		return false
+	}
+	switch ev.Kind {
+	case ir.EventTextStart, ir.EventTextDelta:
+		return ev.Text != "" || ev.Refusal
+	case ir.EventToolCallStart:
+		if ev.ToolName == "" {
+			return false
+		}
+		t := e.tools[ev.Index]
+		return t == nil || t.itemID == ""
+	case ir.EventToolCallDelta:
+		// Keep arguments with the tool start buffered behind this item.
+		t := e.tools[ev.Index]
+		return (t == nil || t.itemID == "") && ev.ArgsFrag != ""
+	case ir.EventReasoningItemDone, ir.EventReasoningItemStart:
+		return !reasoningEventTargets(ev, item)
+	case ir.EventReasoningDelta, ir.EventReasoningStart:
+		// Empty frames emit nothing and close nothing, so they never wait.
+		if ev.Text == "" {
+			return false
+		}
+		return !reasoningEventTargets(ev, item)
+	default:
+		return false
+	}
+}
+
+func reasoningEventTargets(ev ir.StreamEvent, item *respReasoningItem) bool {
+	if item == nil {
+		return false
+	}
+	if ev.ReasoningID != "" && item.id != "" {
+		return ev.ReasoningID == item.id
+	}
+	return item.srcIndexSet && ev.ReasoningIndexSet && ev.ReasoningIndex == item.srcIndex
+}
+
 // mustQueueForDeferred reports whether ev would close, open, or append content
 // ahead of an unresolved deferred item. Events that do not force output
 // ordering pass through. An event that supplies the head identity passes too.
@@ -105,7 +196,7 @@ func (e *StreamEncoder) mustQueueForDeferred(ev ir.StreamEvent) bool {
 			return false
 		}
 		return !e.resolvesDeferredHead(ev, head)
-	case ir.EventReasoningItemDone:
+	case ir.EventReasoningItemDone, ir.EventReasoningItemStart:
 		return !e.resolvesDeferredHead(ev, head)
 	case ir.EventReasoningStart:
 		// An Anthropic thinking start carries the block index, not Responses
@@ -119,11 +210,21 @@ func (e *StreamEncoder) mustQueueForDeferred(ev ir.StreamEvent) bool {
 	}
 }
 
-// queueEvent retains one event behind an unresolved identity. The count and
-// payload budgets mirror the translated pending bound and never grow the
-// reasoning retention budget.
-func (e *StreamEncoder) queueEvent(ev ir.StreamEvent) error {
+func (e *StreamEncoder) pendingEventBytes(ev ir.StreamEvent) int {
 	n := encoderPendingEventBytes(ev)
+	if e.reconcileCodex {
+		n += len(ev.ResponsesItemID)
+		if ev.Reasoning != nil {
+			n += len(ev.Reasoning.Summary) * encoderReasoningPartOverhead
+		}
+	}
+	return n
+}
+
+// queueEvent retains one event behind an unresolved reasoning item. The count
+// and payload budgets stay separate from the reasoning retention budget.
+func (e *StreamEncoder) queueEvent(ev ir.StreamEvent) error {
+	n := e.pendingEventBytes(ev)
 	if len(e.pendingEvents) >= maxEncoderPendingEvents || n > maxEncoderPendingBytes-e.pendingBytes {
 		return ir.ProtocolError("reasoning identity pending limit exceeded")
 	}
@@ -549,6 +650,23 @@ func (e *StreamEncoder) closeDeferredReasoning(w *sse.Writer) error {
 	return nil
 }
 
+func (e *StreamEncoder) encodeReasoningItemStart(w *sse.Writer, ev ir.StreamEvent) error {
+	if !e.reconcileCodex {
+		return nil
+	}
+	item, err := e.structuredReasoningForEvent(ev)
+	if err != nil {
+		return err
+	}
+	if err := e.bindReasoningID(item, ev.ReasoningID); err != nil {
+		return err
+	}
+	if item.done {
+		return nil
+	}
+	return e.openReasoning(w, item)
+}
+
 // encodeReasoningDelta appends readable summary bytes to the tracked item and
 // emits one delta frame. An index-only item defers frames until its ID is known
 // or the item must close.
@@ -631,6 +749,11 @@ func (e *StreamEncoder) encodeReasoningDone(w *sse.Writer, ev ir.StreamEvent) er
 		if err := e.applyReasoningMetadata(item, snap); err != nil {
 			return err
 		}
+	}
+	if e.holdsCompletion(ev) {
+		// Keep the item open at the position its completion claimed. The
+		// terminal snapshot, or Close when none arrives, emits the one done.
+		return nil
 	}
 	return e.closeReasoningItem(w, item)
 }

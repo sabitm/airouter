@@ -70,6 +70,9 @@ const (
 	// only. The native decoder must not emit it, mark an item wired, or queue it.
 	// It is not client output and must not commit a stream.
 	EventReasoningReserve
+	// EventReasoningItemStart opens an indexed Responses reasoning item before
+	// summary or ciphertext is available. Only the Codex relay emits it.
+	EventReasoningItemStart
 )
 
 // StreamEvent is one decoded delta from a backend stream, in a format-neutral
