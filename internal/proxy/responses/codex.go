@@ -38,6 +38,16 @@ var codexEffortSuffix = map[string]string{
 // trailing token the backend recognizes as an effort level (e.g.
 // gpt-5.3-codex-high -> base gpt-5.3-codex, effort high) is stripped; any other
 // suffix (e.g. -spark) leaves the model id intact and defaults effort to "low".
+// CodexWireModel is the model id EncodeCodexRequest sends after stripping a
+// recognized effort suffix. An empty model uses the encoder default.
+func CodexWireModel(model string) string {
+	base, _ := codexEffortForModel(model)
+	if base == "" {
+		return codexDefaultModel
+	}
+	return base
+}
+
 func codexEffortForModel(model string) (base, effort string) {
 	base = model
 	effort = "low"

@@ -64,7 +64,7 @@ func (p *Proxy) streamPassthrough(w http.ResponseWriter, ctx context.Context, re
 		if resp != nil {
 			resp.Body.Close()
 		}
-		if ar, ok := mapGrokReplayErr(err); ok {
+		if ar, ok := mapChatReplayErr(err); ok {
 			return ar
 		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
@@ -316,7 +316,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		return materializeSkip(err)
 	}
 	if err := applyGrokChatReplay(ctx, req); err != nil {
-		return terminal(http.StatusBadRequest, grokChatRejectedMessage, "invalid_request_error")
+		return terminal(http.StatusBadRequest, chatReplayRejectedMessage(err), "invalid_request_error")
 	}
 	// Prefer Capture over typed decode so unfamiliar reasoning fields survive.
 	if captured := thinking.Capture(body); captured != nil {
@@ -358,7 +358,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		if resp != nil {
 			resp.Body.Close()
 		}
-		if ar, ok := mapGrokReplayErr(err); ok {
+		if ar, ok := mapChatReplayErr(err); ok {
 			return ar
 		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
@@ -375,10 +375,11 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		return terminal(http.StatusInternalServerError, "streaming unsupported by server", "api_error")
 	}
 
-	order := p.grokChatOrder(ctx, ingress, backend, provider, upstreamModel, res)
+	order := p.chatOrder(ctx, ingress, backend, provider, upstreamModel, reqModelFromBody(upstreamBody), res)
 	// Codex may publish the authoritative reasoning snapshot only in the
 	// terminal response, so the Responses encoder must keep that item open and
 	// the decoder must reconcile it. Both halves are gated to this one pair.
+	// Chat capture reconciles in the decoder only and does not use that encoder.
 	codexReconcile := ingress.id == responsesCodec.id && backend.id == codexCodec.id
 	enc := ingress.newStreamEncoder(upstreamModel)
 	if codexReconcile {
@@ -411,6 +412,12 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	switch {
 	case codexReconcile:
 		decode = responses.DecodeStreamCodexReconciled
+	case order != nil && backend.id == codexCodec.id:
+		// Chat observation uses the Codex reconcile policy without the Grok
+		// tool-id wait and without the Responses encoder lifecycle hold.
+		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			return responses.DecodeStreamCodexReconciledObserved(r, emit, order.observe)
+		}
 	case order != nil:
 		// Snapshots and source indexes go to attempt-local retention. They do
 		// not enter the pending lifecycle queue and do not change native decode.

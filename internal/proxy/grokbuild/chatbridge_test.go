@@ -338,6 +338,56 @@ func TestStampAndParseShareBudget(t *testing.T) {
 	}
 }
 
+func TestCodexEmptyOnlyStampsAndGrokDoesNot(t *testing.T) {
+	mac, _ := testMAC(t)
+	empty := ""
+	content := []ir.ContentBlock{{Type: ir.BlockText, Text: "answer"}, {Type: ir.BlockReasoning, ResponsesReasoning: &ir.ResponsesReasoning{
+		ID: "rs_empty", Status: "completed", EncryptedContent: &empty,
+	}}}
+	grok, err := StampChatDetails(content, sampleBind(), mac)
+	if err != nil || len(grok) != 0 {
+		t.Fatalf("grok empty-only stamped: %v %d", err, len(grok))
+	}
+	bind := sampleBind()
+	bind.Endpoint = "https://chatgpt.com/backend-api/codex"
+	bind.Principal = "acct"
+	details, err := StampChatDetailsProfile(CodexReplayProfile(), content, bind, mac)
+	if err != nil || len(details) == 0 || !bytes.Contains(details[0], []byte(`"data":""`)) {
+		t.Fatalf("codex empty-only = %v %s", err, details)
+	}
+}
+
+func TestHiddenMarkerRejectedBeforeCollapse(t *testing.T) {
+	mac, verify := testMAC(t)
+	details, err := StampChatDetails(sampleContent(), sampleBind(), mac)
+	if err != nil || len(details) == 0 {
+		t.Fatal(err)
+	}
+	signed := string(mustMarshal(t, details))
+	ordinary := []byte(`{"model":"combo","messages":[{"role":"user","content":"see airouter-grok-build-v1"},{"role":"assistant","content":"ok","reasoning_details":[{"type":"reasoning.encrypted","format":"xai-responses-v1","data":"foreign"}]}],"content":"duplicate","content":"kept"}`)
+	decision, err := ParseChatBridge(ordinary, "caller-1", 7, verify)
+	if err != nil || decision.Strip || decision.Pin {
+		t.Fatalf("ordinary mention or duplicate rejected: %v %+v", err, decision)
+	}
+	cases := []string{
+		`{"model":"combo","metadata":{"extra":` + signed + `},"messages":[{"role":"user","content":"first"}]}`,
+		`{"model":"combo","messages":[{"role":"assistant","content":"HelloWorld","reasoning_details":` + signed + `,"reasoning_details":[]},{"role":"user","content":"next"}]}`,
+		`{"model":"combo","messages":[{"role":"assistant","content":"HelloWorld","reasoning_details":` + signed + `}],"messages":[{"role":"user","content":"clean"}]}`,
+		`{"model":"combo","Messages":[{"role":"assistant","content":"HelloWorld","reasoning_details":` + signed + `}],"messages":[{"role":"user","content":"clean"}]}`,
+		`{"model":"combo","messages":[{"role":"assistant","content":"HelloWorld","reasoning_\u0064etails":` + signed + `,"reasoning_details":[]}]}`,
+		`{"model":"combo","messages":[{"role":"assistant","content":"HelloWorld","reasoning_details":[{"type":"reasoning.encrypted","format":"airouter-grok-build-v1","data":"cipher","format":"xai-responses-v1","data":"other"}]}]}`,
+	}
+	for i, body := range cases {
+		if _, err := ParseChatBridge([]byte(body), "caller-1", 7, verify); err == nil {
+			t.Fatalf("case %d accepted hidden marker", i)
+		}
+	}
+	body := []byte(`{"messages":[{"role":"assistant","content":"HelloWorld","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}],"reasoning_details":` + signed + `]}`)
+	if _, err := ParseChatBridge(body, "caller-1", 7, verify); err != nil {
+		t.Fatalf("visible marker rejected: %v", err)
+	}
+}
+
 func TestNestedStampedEntryRejected(t *testing.T) {
 	mac, verify := testMAC(t)
 	details, err := StampChatDetails(sampleContent(), sampleBind(), mac)

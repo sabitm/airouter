@@ -50,6 +50,14 @@ func applyCodexHeaders(req *http.Request, provider *domain.Provider, ctx context
 	if provider.OAuthCreds != nil && provider.OAuthCreds.AccountID != "" {
 		req.Header.Set("chatgpt-account-id", provider.OAuthCreds.AccountID)
 	}
+	// A pinned replay cannot adopt a caller-supplied account. The signed
+	// principal is the stored account, already copied above.
+	if req != nil && codexReplayGuardFrom(req.Context()) != nil {
+		req.Header.Del("chatgpt-account-id")
+		if provider.OAuthCreds != nil && strings.TrimSpace(provider.OAuthCreds.AccountID) != "" {
+			req.Header.Set("chatgpt-account-id", strings.TrimSpace(provider.OAuthCreds.AccountID))
+		}
+	}
 }
 
 // prepareUpstreamRequest applies backend-specific post-encode patches to the
@@ -1056,6 +1064,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if err := guardGrokBuildReplay(ctx, provider); err != nil {
 			return 0, nil, err
 		}
+		if err := guardCodexReplay(ctx, provider, url, body); err != nil {
+			return 0, nil, err
+		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
 			return 0, nil, err
 		}
@@ -1198,6 +1209,9 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 	}
 	send := func(ctx context.Context) (*http.Response, error) {
 		if err := guardGrokBuildReplay(ctx, provider); err != nil {
+			return nil, err
+		}
+		if err := guardCodexReplay(ctx, provider, url, body); err != nil {
 			return nil, err
 		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
@@ -1345,6 +1359,9 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 
 	send := func() (*http.Response, error) {
 		if err := guardGrokBuildReplay(ctx, provider); err != nil {
+			return nil, err
+		}
+		if err := guardCodexReplay(ctx, provider, url, body); err != nil {
 			return nil, err
 		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {

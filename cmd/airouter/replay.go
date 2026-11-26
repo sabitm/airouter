@@ -5,10 +5,11 @@ import (
 	"airouter/internal/crypto"
 )
 
-// enableConfiguredReplay signs Grok Build Chat replay only with a private
-// instance secret. isDev covers the unset configuration path. A configured
-// copy of the built-in development secret is also rejected. At-rest encryption
-// stays on the cipher created by the caller.
+// enableConfiguredReplay signs Chat replay only with a private instance
+// secret. isDev covers the unset configuration path. A configured copy of the
+// built-in development secret is also rejected. Grok Build and Codex use
+// separate MAC domains. At-rest encryption stays on the cipher created by the
+// caller.
 func enableConfiguredReplay(cipher *crypto.Cipher, cfg config.Config, isDev bool) error {
 	if cipher == nil || isDev {
 		return nil
@@ -17,5 +18,8 @@ func enableConfiguredReplay(cipher *crypto.Cipher, cfg config.Config, isDev bool
 	if !ok {
 		return nil
 	}
-	return cipher.EnableGrokBuildChatReplay(replay)
+	if err := cipher.EnableGrokBuildChatReplay(replay); err != nil {
+		return err
+	}
+	return cipher.EnableCodexChatReplay(replay)
 }

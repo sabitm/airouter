@@ -394,16 +394,16 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 	var chatPortable []byte
 	if ingress.id == "oai-chat" {
 		r = r.WithContext(withGrokChatEmit(r.Context(), auth.Scope, combo.ID))
-		decision, err := grokbuild.ParseChatBridge(body, auth.Scope, combo.ID, p.verifyBridgeMAC)
+		decision, err := grokbuild.ParseChatReplay(body, auth.Scope, combo.ID, grokbuild.KnownReplayProfiles(), p.verifyChatReplay)
 		if err != nil {
-			res.fail(w, ingress, http.StatusBadRequest, grokChatRejectedMessage, "invalid_request_error")
+			res.fail(w, ingress, http.StatusBadRequest, chatReplayRejectedMessage(err), "invalid_request_error")
 			return
 		}
 		chatDecision = decision
 		if decision.Strip {
-			portable, err := grokbuild.PortableChatBody(body, decision)
+			portable, err := grokbuild.PortableChatReplay(body, decision, grokbuild.KnownReplayProfiles())
 			if err != nil {
-				res.fail(w, ingress, http.StatusBadRequest, grokChatRejectedMessage, "invalid_request_error")
+				res.fail(w, ingress, http.StatusBadRequest, chatReplayRejectedMessage(err), "invalid_request_error")
 				return
 			}
 			chatPortable = portable
@@ -428,21 +428,45 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		if testGrokChatBeforeFresh != nil {
 			testGrokChatBeforeFresh()
 		}
-		if _, ok := pinGrokChatTarget(ordered, chatDecision.Turn.Bind); ok {
-			for i := range ordered {
-				if !grokChatSourceAvailable(ordered[i], chatDecision.Turn.Bind) {
-					continue
+		switch {
+		case chatDecision.Grok():
+			if _, ok := pinGrokChatTarget(ordered, chatDecision.Turn.Bind); ok {
+				for i := range ordered {
+					if !grokChatSourceAvailable(ordered[i], chatDecision.Turn.Bind) {
+						continue
+					}
+					fresh, ok := p.freshGrokChatTarget(r.Context(), ordered[i], chatDecision.Turn.Bind)
+					if ok {
+						pinTarget = &fresh
+					}
+					break
 				}
-				fresh, ok := p.freshGrokChatTarget(r.Context(), ordered[i], chatDecision.Turn.Bind)
-				if ok {
-					pinTarget = &fresh
+			}
+		case chatDecision.Codex():
+			if _, ok := pinCodexChatTarget(ordered, chatDecision.Turn.Bind); ok {
+				for i := range ordered {
+					if !codexChatSourceAvailable(ordered[i], chatDecision.Turn.Bind) {
+						continue
+					}
+					fresh, ok := p.freshCodexChatTarget(r.Context(), ordered[i], chatDecision.Turn.Bind)
+					if ok {
+						pinTarget = &fresh
+					}
+					break
 				}
-				break
 			}
 		}
 	}
 	if pinTarget != nil {
-		if next, ok := pinGrokChatTarget(ordered, chatDecision.Turn.Bind); ok {
+		var next []domain.ComboTarget
+		var ok bool
+		switch {
+		case chatDecision.Grok():
+			next, ok = pinGrokChatTarget(ordered, chatDecision.Turn.Bind)
+		case chatDecision.Codex():
+			next, ok = pinCodexChatTarget(ordered, chatDecision.Turn.Bind)
+		}
+		if ok {
 			next[0] = *pinTarget
 			candidates = next
 		}
@@ -478,7 +502,10 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 	var last attemptResult
 	var sawRealAttempt bool
 	var lastReal attemptResult
-	for i, t := range candidates {
+	targets := candidates
+	var codexModelFallback bool
+	for i := 0; i < len(targets); i++ {
+		t := targets[i]
 		// A canceled caller must not dispatch another provider after the previous
 		// attempt completed. The first attempt still handles its own cancellation.
 		if i > 0 && ctxErr(r.Context()) {
@@ -493,13 +520,30 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		if chatDecision.Strip {
 			if pinTarget != nil && i == 0 {
 				provider = t.Provider
-				attemptCtx = withGrokChatReplay(attemptCtx, chatDecision.Turn, chatDecision.Assistants, grokBuildReplayGuard{
-					providerID: chatDecision.Turn.Bind.ProviderID,
-					generation: chatDecision.Turn.Bind.Generation,
-					principal:  chatDecision.Turn.Bind.Principal,
-					model:      chatDecision.Turn.Bind.Model,
-					routeModel: chatDecision.Turn.Bind.RouteModel,
-				})
+				switch {
+				case chatDecision.Grok():
+					attemptCtx = withGrokChatReplay(attemptCtx, chatDecision.Turn, chatDecision.Assistants, grokBuildReplayGuard{
+						providerID: chatDecision.Turn.Bind.ProviderID,
+						generation: chatDecision.Turn.Bind.Generation,
+						principal:  chatDecision.Turn.Bind.Principal,
+						model:      chatDecision.Turn.Bind.Model,
+						routeModel: chatDecision.Turn.Bind.RouteModel,
+					})
+				case chatDecision.Codex():
+					// Notes restore same-source turns. The zero Grok guard must not
+					// block this send; the Codex guard is checked against the URL.
+					// The request context also carries the pinned model so encode can
+					// refuse a caller model that does not match the signed route.
+					attemptCtx = withGrokChatReplay(attemptCtx, chatDecision.Turn, chatDecision.Assistants, grokBuildReplayGuard{})
+					attemptCtx = withCodexReplayGuard(attemptCtx, codexReplayGuard{
+						providerID: chatDecision.Turn.Bind.ProviderID,
+						generation: chatDecision.Turn.Bind.Generation,
+						principal:  chatDecision.Turn.Bind.Principal,
+						endpoint:   chatDecision.Turn.Bind.Endpoint,
+						model:      chatDecision.Turn.Bind.Model,
+						routeModel: chatDecision.Turn.Bind.RouteModel,
+					})
+				}
 			} else if chatPortable != nil {
 				attemptBody = chatPortable
 			}
@@ -517,6 +561,26 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 			last = p.streamTranslated(w, attemptCtx, res, ingress, backend, provider, t.UpstreamModel, attemptBody, &prep)
 		} else {
 			last = p.serveTranslated(w, attemptCtx, res, ingress, backend, provider, t.UpstreamModel, attemptBody, &prep)
+		}
+
+		if last.logErr == skipLogCodexModel && !codexModelFallback {
+			// The signed route is eligible, but the prepared wire model differs.
+			// Do not send ciphertext, penalize health, or retry the pinned body.
+			codexModelFallback = true
+			observability.Logger(r.Context(), p.logger).Debug("codex_replay_model_mismatch",
+				"event", "codex_replay_model_mismatch",
+				"combo", combo.Name,
+				"provider", provider.Name,
+				"upstream_model", t.UpstreamModel,
+			)
+			if chatPortable == nil {
+				last = terminal(http.StatusBadRequest, chatReplayRejectedMessage(grokbuild.ErrCodexReplayRejected), "invalid_request_error")
+				break
+			}
+			pinTarget = nil
+			targets = ordered
+			i = -1
+			continue
 		}
 
 		attachmentSkip := last.retry && (last.logErr == skipLogAttachment || last.logErr == skipLogThinking)
@@ -581,7 +645,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 				"provider", provider.Name,
 				"upstream_model", t.UpstreamModel,
 			)
-			willRetry := i < len(candidates)-1
+			willRetry := i < len(targets)-1
 			if willRetry {
 				p.recordLog(r.Context(), &domain.RequestLog{
 					AccessKeyName: rec.AccessKeyName,
@@ -601,7 +665,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// subsequent requests defer it behind healthy targets. Applies to the last
 		// target too, so a whole-combo outage still grows the window.
 		p.penalizeProvider(provider.ID)
-		willRetry := i < len(candidates)-1
+		willRetry := i < len(targets)-1
 		p.logUpstreamAttemptFailed(r.Context(), combo.Name, provider, t.UpstreamModel, backend, i+1, last, willRetry)
 		if willRetry {
 			// Persist a row per failed-and-superseded target so the Logs tab shows
@@ -890,7 +954,7 @@ func (p *Proxy) servePassthrough(w http.ResponseWriter, ctx context.Context, res
 
 	status, respBody, err := p.forward(ctx, provider, ingress.upstreamPath, rewritten, clientHeaders)
 	if err != nil {
-		if ar, ok := mapGrokReplayErr(err); ok {
+		if ar, ok := mapChatReplayErr(err); ok {
 			return ar
 		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
@@ -934,7 +998,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		return materializeSkip(err)
 	}
 	if err := applyGrokChatReplay(ctx, req); err != nil {
-		return terminal(http.StatusBadRequest, grokChatRejectedMessage, "invalid_request_error")
+		return terminal(http.StatusBadRequest, chatReplayRejectedMessage(err), "invalid_request_error")
 	}
 	if captured := thinking.Capture(body); captured != nil {
 		req.Thinking = thinking.ToIR(captured)
@@ -969,7 +1033,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 
 	status, respBody, err := p.forward(ctx, provider, backend.upstreamPath, upstreamBody, nil)
 	if err != nil {
-		if ar, ok := mapGrokReplayErr(err); ok {
+		if ar, ok := mapChatReplayErr(err); ok {
 			return ar
 		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
@@ -1027,7 +1091,7 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 	}
 	defer closeWrite()
 	if err != nil {
-		if ar, ok := mapGrokReplayErr(err); ok {
+		if ar, ok := mapChatReplayErr(err); ok {
 			return ar
 		}
 		return retryable(http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error")
@@ -1038,13 +1102,19 @@ func (p *Proxy) serveStreamOnlyUnary(w http.ResponseWriter, ctx context.Context,
 		return retryableUpstreamStatus(resp.StatusCode, errBody)
 	}
 	collectBackend := opencodeBackendForAttempt(ctx, backend)
-	order := p.grokChatOrder(ctx, ingress, backend, provider, upstreamModel, res)
+	order := p.chatOrder(ctx, ingress, backend, provider, upstreamModel, reqModelFromBody(upstreamBody), res)
 	if order != nil {
 		collectBackend.decodeStream = func(r io.Reader, emit func(ir.StreamEvent) error) error {
-			return responses.DecodeStreamAwaitingItemIDObserved(r, func(ev ir.StreamEvent) error {
+			observeEmit := func(ev ir.StreamEvent) error {
 				order.noteVisible(ev)
 				return emit(ev)
-			}, order.observe)
+			}
+			// Codex capture reconciles terminal ciphertext. It must not use the
+			// Grok tool-id wait or the Responses encoder hold.
+			if backend.id == "oai-codex" {
+				return responses.DecodeStreamCodexReconciledObserved(r, observeEmit, order.observe)
+			}
+			return responses.DecodeStreamAwaitingItemIDObserved(r, observeEmit, order.observe)
 		}
 	}
 	irResp, err := collectStreamResponse(resp.Body, collectBackend, writeFrame, upstreamModel, req.Tools)

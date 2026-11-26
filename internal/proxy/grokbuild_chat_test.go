@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"airouter/internal/codexgrant"
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/grokbuild"
@@ -125,7 +126,7 @@ type authRouteTransport struct {
 
 func (a authRouteTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	base := ""
-	if grokbuild.IsFixedInferenceURL(r.URL.String()) {
+	if grokbuild.IsFixedInferenceURL(r.URL.String()) || codexgrant.IsStandardResponsesURL(r.URL.String()) {
 		base = a.byAuth[r.Header.Get("Authorization")]
 	} else if a.plain != "" {
 		base = a.plain

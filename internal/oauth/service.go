@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"airouter/internal/codexgrant"
 	"airouter/internal/domain"
 	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
@@ -113,6 +114,7 @@ type refreshKey struct {
 	force        bool
 	console      bool
 	grok         bool
+	codex        bool
 	refreshGrant [sha256.Size]byte
 	generation   [sha256.Size]byte
 }
@@ -183,6 +185,9 @@ func (s *Service) ResolveCreds(ctx context.Context, provider *domain.Provider, f
 	}
 	if grokBuildInvolved(provider) {
 		return s.resolveGrokBuild(ctx, provider, force)
+	}
+	if codexInvolved(provider) {
+		return s.resolveCodex(ctx, provider, force)
 	}
 	if err := rejectGrokBuildMismatch(provider, grokBuildCredsOf(provider)); err != nil {
 		return nil, err
@@ -360,6 +365,14 @@ func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCr
 	if grokBuildCredsMarked(creds) {
 		return s.doRefreshGrokBuild(ctx, id, creds)
 	}
+	if codexgrant.IsGrant(creds) {
+		return s.doRefreshCodex(ctx, id, creds)
+	}
+	// A stored official Codex row must not take the generic whole-row write,
+	// even when the submitted copy no longer looks like that grant.
+	if s.storedCodexGrant(ctx, id) {
+		return nil, ErrCredentialConflict
+	}
 	if hasOpencodeConsoleCreds(creds) {
 		return s.doRefreshOpencodeConsole(ctx, id, creds)
 	}
@@ -374,6 +387,9 @@ func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCr
 		return s.persistClaudeAuthoritative(ctx, id, &cp, creds)
 	}
 	if err := s.store.UpdateProviderOAuth(ctx, id, &cp); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			return nil, ErrCredentialConflict
+		}
 		return nil, err
 	}
 	out := cp
@@ -428,12 +444,18 @@ func (s *Service) persistClaudeAuthoritative(ctx context.Context, id int64, rota
 	cas, ok := s.store.(OAuthCredsCASStore)
 	if !ok {
 		if err := s.store.UpdateProviderOAuth(ctx, id, rotated); err != nil {
+			if errors.Is(err, store.ErrConflict) {
+				return nil, ErrCredentialConflict
+			}
 			return nil, err
 		}
 		out := *rotated
 		return &out, nil
 	}
 	return cas.UpdateProviderOAuthCAS(ctx, id, func(current *domain.OAuthCreds) (*domain.OAuthCreds, bool, error) {
+		if codexgrant.IsGrant(current) {
+			return nil, false, ErrCredentialConflict
+		}
 		if current == nil {
 			return nil, false, errors.New("oauth: Claude credential row was deleted")
 		}
@@ -678,6 +700,18 @@ func (s *Service) RefreshTokens(ctx context.Context, creds *domain.OAuthCreds) (
 func (s *Service) RefreshAndPersist(ctx context.Context, id int64, creds *domain.OAuthCreds) (*domain.OAuthCreds, error) {
 	if grokBuildCredsMarked(creds) {
 		return s.refreshGrokBuildGrant(ctx, id, creds)
+	}
+	// Saved Codex refresh follows the stored connection, not the form's token
+	// URL, client, or preset. An incompatible override never reaches the generic
+	// writer or another token endpoint.
+	if live, ok := s.storedCodexProvider(ctx, id); ok {
+		if codexSubmittedOverrides(creds, live.OAuthCreds) {
+			return nil, ErrCredentialConflict
+		}
+		return s.refreshCodexGrant(ctx, id, live.OAuthCreds)
+	}
+	if codexgrant.IsGrant(creds) {
+		return s.refreshCodexGrant(ctx, id, creds)
 	}
 	if hasOpencodeConsoleCreds(creds) {
 		return s.refreshOpencodeConsoleGrant(ctx, id, creds)

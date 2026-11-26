@@ -354,6 +354,13 @@ type OAuthCreds struct {
 	// Empty means the row predates the id; a token change then fails closed
 	// instead of being treated as a rotation.
 	GrokBuildConnection string `json:"grok_build_connection,omitempty"`
+
+	// CodexGrantGeneration is a random id minted for one Codex OAuth grant.
+	// Refresh keeps it. Login, reconnect, reimport, and portable import replace
+	// it so an imported or stale id cannot keep ciphertext affinity. Empty means
+	// the row predates the id; resolution may initialize it without replacing
+	// the grant.
+	CodexGrantGeneration string `json:"codex_grant_generation,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

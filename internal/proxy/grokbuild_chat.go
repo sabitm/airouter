@@ -78,7 +78,7 @@ func grokChatReplayFrom(ctx context.Context) (grokChatReplayState, bool) {
 
 func grokBuildReplayGuardFrom(ctx context.Context) *grokBuildReplayGuard {
 	st, ok := grokChatReplayFrom(ctx)
-	if !ok {
+	if !ok || st.guard.providerID == 0 {
 		return nil
 	}
 	return &st.guard
@@ -217,8 +217,12 @@ func applyGrokChatReplay(ctx context.Context, req *ir.Request) error {
 	if !ok {
 		return nil
 	}
+	rejected := grokbuild.ErrChatBridgeRejected
+	if codexReplayGuardFrom(ctx) != nil {
+		rejected = grokbuild.ErrCodexReplayRejected
+	}
 	if req == nil {
-		return grokbuild.ErrChatBridgeRejected
+		return rejected
 	}
 	var assistants []int
 	for i := range req.Messages {
@@ -227,7 +231,7 @@ func applyGrokChatReplay(ctx context.Context, req *ir.Request) error {
 		}
 	}
 	if len(assistants) != len(st.notes) {
-		return grokbuild.ErrChatBridgeRejected
+		return rejected
 	}
 	pin := st.turn.Bind
 	for n, idx := range assistants {
@@ -237,7 +241,7 @@ func applyGrokChatReplay(ctx context.Context, req *ir.Request) error {
 		if note.Turn != nil && note.Turn.Bind == pin {
 			next, err := grokbuild.ApplyChatTurn(req.Messages[idx].Content, *note.Turn)
 			if err != nil {
-				return err
+				return rejected
 			}
 			req.Messages[idx].Content = next
 			continue

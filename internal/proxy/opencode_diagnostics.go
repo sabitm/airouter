@@ -27,6 +27,11 @@ func (p *Proxy) doUpstreamRequest(req *http.Request, provider *domain.Provider, 
 		provider.OAuthCreds != nil && provider.OAuthCreds.GrokBuildAuth) {
 		client = grokbuild.ClientNoRedirect(client)
 	}
+	// Opaque Codex replay must not follow a redirect onto another host. Clone
+	// the client so the shared proxy client keeps its redirect policy.
+	if req != nil && codexReplayGuardFrom(req.Context()) != nil {
+		client = codexClientNoRedirect(client)
+	}
 	if p.logger == nil || !p.logger.Enabled(req.Context(), observability.LevelTrace) ||
 		provider == nil || provider.Protocol != domain.ProtocolOpencode ||
 		!opencode.IsOfficialFreeTierURL(req.URL.String()) ||

@@ -50,6 +50,7 @@ type grokChatSlot struct {
 // observe is not a client emit path and never fails the decode.
 type grokChatOrder struct {
 	bind      grokbuild.ChatBind
+	profile   grokbuild.ReplayProfile
 	mac       func([]byte) ([]byte, bool)
 	budget    int
 	res       *reqResult
@@ -70,8 +71,12 @@ type grokChatOrder struct {
 }
 
 func newGrokChatOrder(bind grokbuild.ChatBind, mac func([]byte) ([]byte, bool), res *reqResult, logger *slog.Logger, ingressID string) *grokChatOrder {
+	return newChatOrder(grokbuild.GrokReplayProfile(), bind, mac, res, logger, ingressID)
+}
+
+func newChatOrder(profile grokbuild.ReplayProfile, bind grokbuild.ChatBind, mac func([]byte) ([]byte, bool), res *reqResult, logger *slog.Logger, ingressID string) *grokChatOrder {
 	return &grokChatOrder{
-		bind: bind, mac: mac, budget: grokChatWireBudget(),
+		bind: bind, mac: mac, budget: grokChatWireBudget(), profile: profile,
 		res: res, logger: logger, ingressID: ingressID,
 	}
 }
@@ -359,7 +364,11 @@ func (o *grokChatOrder) details() ([]json.RawMessage, bool) {
 	if !ok {
 		return nil, false
 	}
-	details, err := grokbuild.StampChatDetails(blocks, o.bind, o.mac)
+	profile := o.profile
+	if profile.Format == "" {
+		profile = grokbuild.GrokReplayProfile()
+	}
+	details, err := grokbuild.StampChatDetailsProfile(profile, blocks, o.bind, o.mac)
 	if err != nil || len(details) == 0 {
 		return nil, false
 	}

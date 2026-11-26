@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"airouter/internal/codexgrant"
 	"airouter/internal/domain"
 	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
@@ -260,6 +261,9 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 		if err := grokbuild.ValidateProvider(cur); err != nil {
 			return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
 		}
+		if err := rotateImportedCodexGrant(cur); err != nil {
+			return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
+		}
 		if err := s.updateProvider(ctx, ex, cur); err != nil {
 			return fmt.Sprintf("provider %q: %v", pp.Name, err)
 		}
@@ -277,6 +281,9 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
 	}
 	if err := grokbuild.ValidateProvider(np); err != nil {
+		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
+	}
+	if err := rotateImportedCodexGrant(np); err != nil {
 		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
 	}
 	if err := s.createProvider(ctx, ex, np); err != nil {
@@ -325,4 +332,13 @@ func (s *Store) importCombo(ctx context.Context, ex executor, pc portableCombo, 
 	comboByName[nc.Name] = nc
 	sum.CombosCreated++
 	return ""
+}
+
+// rotateImportedCodexGrant discards a portable generation. An imported id is
+// not a local login and must not keep ciphertext affinity. Tokens stay.
+func rotateImportedCodexGrant(p *domain.Provider) error {
+	if p == nil || p.Protocol != domain.ProtocolOpenAICodex || p.Method() != domain.AuthOAuth || p.OAuthCreds == nil {
+		return nil
+	}
+	return codexgrant.Rotate(p.OAuthCreds)
 }

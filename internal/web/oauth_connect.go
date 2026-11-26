@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"airouter/internal/codexgrant"
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/observability"
@@ -45,6 +46,27 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 		return c, nil
 	}
 	return manualCredsFromForm(r), nil
+}
+
+// codexRefreshFormOverrides reports a saved-refresh form that names a
+// different token URL, client, or preset than the official Codex grant.
+// Blank fields are filled from the stored row and are not overrides.
+func codexRefreshFormOverrides(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if raw := strings.TrimSpace(r.FormValue("token_url")); raw != "" {
+		if _, ok := codexgrant.NormalizeTokenURL(raw); !ok {
+			return true
+		}
+	}
+	if id := strings.TrimSpace(r.FormValue("client_id")); id != "" && id != codexgrant.ClientID {
+		return true
+	}
+	if preset := strings.TrimSpace(r.FormValue("preset")); preset != "" && preset != "custom" && preset != codexgrant.Preset {
+		return true
+	}
+	return false
 }
 
 func manualCredsFromForm(r *http.Request) *domain.OAuthCreds {
@@ -720,7 +742,16 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 		renderErr(nil, "Grok Build credentials come only from device login")
 		return
 	}
-	if saved != nil && saved.Protocol == domain.ProtocolClaudeCode {
+	if saved != nil && saved.Protocol == domain.ProtocolOpenAICodex && saved.Method() == domain.AuthOAuth && codexgrant.IsGrant(saved.OAuthCreds) {
+		// The stored grant selects the token endpoint. A changed form URL, client,
+		// or preset is not a Codex refresh.
+		if codexRefreshFormOverrides(r) {
+			renderErr(saved.OAuthCreds, "credentials changed during refresh; reload and retry")
+			return
+		}
+		savedID = true
+		creds = cloneOAuthCreds(saved.OAuthCreds)
+	} else if saved != nil && saved.Protocol == domain.ProtocolClaudeCode {
 		// A config-only row is effective APIKey even when a credential blob is
 		// present. Do not rotate those tokens through the OAuth refresh path.
 		if saved.Method() != domain.AuthOAuth {

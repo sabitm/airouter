@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 
+	"airouter/internal/codexgrant"
 	"airouter/internal/proxy/ir"
 )
 
@@ -42,6 +44,68 @@ const (
 // log. Callers must not wrap it with marker bytes, ciphertext, or tokens.
 var ErrChatBridgeRejected = errors.New("invalid grok build replay state")
 
+// ErrCodexReplayRejected is the sanitized rejection for a Codex Chat marker.
+var ErrCodexReplayRejected = errors.New("invalid codex replay state")
+
+// CodexReplayFormat is the versioned reasoning_details format for Codex.
+// It is not the Grok Build format and is not an OpenRouter carrier.
+const CodexReplayFormat = "airouter-codex-v1"
+
+const codexReplayCanonical = "airouter-codex-chat/1\n"
+const codexReplayProtocol = "codex"
+
+// ReplayProfile selects one Chat replay proof domain. The Grok profile keeps
+// the original format, canonical prefix, and protocol bytes.
+type ReplayProfile struct {
+	Format          string
+	Canonical       string
+	Protocol        string
+	Rejected        error
+	IncludeEndpoint bool
+	// AuthoritativeEmpty keeps an explicit empty encrypted_content as replay
+	// state when no nonempty sibling exists. Grok leaves this false, so its
+	// historical nonempty requirement and marker bytes stay unchanged.
+	AuthoritativeEmpty bool
+}
+
+// GrokReplayProfile is the historical Grok Build proof domain.
+func GrokReplayProfile() ReplayProfile {
+	return grokReplayProfile()
+}
+
+func grokReplayProfile() ReplayProfile {
+	return ReplayProfile{
+		Format: ChatBridgeFormat, Canonical: chatBridgeCanonical,
+		Protocol: chatBridgeProtocol, Rejected: ErrChatBridgeRejected,
+	}
+}
+
+// CodexReplayProfile is the Codex proof domain. Its canonical prefix, protocol,
+// format, and MAC key are distinct from Grok Build.
+func CodexReplayProfile() ReplayProfile {
+	return ReplayProfile{
+		Format: CodexReplayFormat, Canonical: codexReplayCanonical,
+		Protocol: codexReplayProtocol, Rejected: ErrCodexReplayRejected,
+		IncludeEndpoint: true, AuthoritativeEmpty: true,
+	}
+}
+
+// KnownReplayProfiles is the set of recognizable Chat replay formats.
+func KnownReplayProfiles() []ReplayProfile {
+	return []ReplayProfile{grokReplayProfile(), CodexReplayProfile()}
+}
+
+func (p ReplayProfile) rejected() error {
+	if p.Rejected != nil {
+		return p.Rejected
+	}
+	return ErrChatBridgeRejected
+}
+
+func (p ReplayProfile) valid() bool {
+	return p.Format != "" && p.Canonical != "" && p.Protocol != ""
+}
+
 // errChatBridgeBudget means the replay marker does not fit the retention
 // budget. Callers omit the marker and keep the readable reply.
 var errChatBridgeBudget = errors.New("grok build replay budget")
@@ -62,6 +126,9 @@ type ChatBind struct {
 	Principal  string
 	Model      string
 	RouteModel string
+	// Endpoint is the normalized inference origin. Grok markers leave it empty
+	// so their canonical payload bytes stay unchanged.
+	Endpoint string
 }
 
 // ChatLayoutItem is one ordered output item. Text is not copied; TextLen and
@@ -102,9 +169,10 @@ type ChatTurn struct {
 // Airouter provenance. It is not a claim that ciphertext is portable across
 // accounts.
 type AssistantNote struct {
-	Summary string
-	Turn    *ChatTurn
-	Marked  bool
+	Summary  string
+	Turn     *ChatTurn
+	Marked   bool
+	Protocol string
 }
 
 // ChatDecision is the pre-token classification of one Chat request.
@@ -114,12 +182,55 @@ type AssistantNote struct {
 type ChatDecision struct {
 	Pin        bool
 	Strip      bool
+	Protocol   string
 	Turn       ChatTurn
 	Assistants []AssistantNote
 }
 
+// Grok reports whether the pinned marker is a Grok Build marker.
+func (d ChatDecision) Grok() bool { return d.Pin && d.Protocol == chatBridgeProtocol }
+
+// Codex reports whether the pinned marker is a Codex marker.
+func (d ChatDecision) Codex() bool { return d.Pin && d.Protocol == codexReplayProtocol }
+
 type macFunc func([]byte) ([]byte, bool)
 type verifyFunc func([]byte, []byte) bool
+type protocolVerifyFunc func(protocol string, payload, mac []byte) bool
+
+type parseState struct {
+	profiles []ReplayProfile
+	verify   protocolVerifyFunc
+}
+
+func (s parseState) rejected(raw []byte) error {
+	text := string(raw)
+	for _, p := range s.profiles {
+		if p.Format != "" && strings.Contains(text, p.Format) {
+			return p.rejected()
+		}
+		if p.Protocol != "" && strings.Contains(text, p.Protocol) {
+			return p.rejected()
+		}
+	}
+	if len(s.profiles) > 0 {
+		return s.profiles[0].rejected()
+	}
+	return ErrChatBridgeRejected
+}
+
+func (s parseState) profile(format, protocol string) (ReplayProfile, bool) {
+	for _, p := range s.profiles {
+		if format != "" && format == p.Format {
+			return p, true
+		}
+	}
+	for _, p := range s.profiles {
+		if protocol != "" && protocol == p.Protocol {
+			return p, true
+		}
+	}
+	return ReplayProfile{}, false
+}
 
 type wirePart struct {
 	Type string `json:"type,omitempty"`
@@ -152,6 +263,7 @@ type wireBind struct {
 	Principal  string `json:"principal"`
 	Model      string `json:"model"`
 	Route      string `json:"route"`
+	Endpoint   string `json:"endpoint,omitempty"`
 }
 
 type wireEncrypted struct {
@@ -182,17 +294,29 @@ type wireSummary struct {
 // claim those turns replay. The MAC covers ciphertext, ids, summary parts,
 // status, layout, and bind. Ciphertext is stored once, in data.
 func StampChatDetails(content []ir.ContentBlock, bind ChatBind, mac macFunc) ([]json.RawMessage, error) {
-	if strings.TrimSpace(bind.Generation) == "" || bind.ProviderID == 0 || bind.ComboID == 0 {
+	return StampChatDetailsProfile(grokReplayProfile(), content, bind, mac)
+}
+
+// StampChatDetailsProfile builds reasoning_details for one replay profile.
+// A Grok profile produces the historical marker bytes. A blank generation, or a
+// Grok turn with no nonempty ciphertext, returns nil, nil. A Codex profile also
+// stamps an explicit empty encrypted_content. That empty value is authoritative,
+// not absent and not provisional.
+func StampChatDetailsProfile(profile ReplayProfile, content []ir.ContentBlock, bind ChatBind, mac macFunc) ([]json.RawMessage, error) {
+	if !profile.valid() || strings.TrimSpace(bind.Generation) == "" || bind.ProviderID == 0 || bind.ComboID == 0 {
 		return nil, nil
 	}
-	turn, err := turnFromContent(content, bind)
+	if profile.IncludeEndpoint && strings.TrimSpace(bind.Endpoint) == "" {
+		return nil, nil
+	}
+	turn, err := turnFromContentProfile(profile, content, bind)
 	if err != nil || turn == nil {
 		if errors.Is(err, errChatBridgeBudget) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	details, err := marshalTurn(*turn, mac)
+	details, err := marshalTurn(profile, *turn, mac)
 	if errors.Is(err, errChatBridgeBudget) {
 		return nil, nil
 	}
@@ -200,6 +324,10 @@ func StampChatDetails(content []ir.ContentBlock, bind ChatBind, mac macFunc) ([]
 }
 
 func turnFromContent(content []ir.ContentBlock, bind ChatBind) (*ChatTurn, error) {
+	return turnFromContentProfile(grokReplayProfile(), content, bind)
+}
+
+func turnFromContentProfile(profile ReplayProfile, content []ir.ContentBlock, bind ChatBind) (*ChatTurn, error) {
 	turn := &ChatTurn{Bind: bind}
 	var sawData bool
 	for _, b := range content {
@@ -231,6 +359,11 @@ func turnFromContent(content []ir.ContentBlock, bind ChatBind) (*ChatTurn, error
 					item.Data = *rr.EncryptedContent
 					item.HasData = true
 					sawData = true
+				} else if profile.AuthoritativeEmpty {
+					// Explicit empty is present. Do not require a nonempty sibling.
+					item.HasData = true
+					item.EmptyData = true
+					sawData = true
 				} else {
 					item.EmptyData = true
 				}
@@ -249,29 +382,29 @@ func turnFromContent(content []ir.ContentBlock, bind ChatBind) (*ChatTurn, error
 		return nil, nil
 	}
 	// One charge, before signing or encoding. The parser uses this same function.
-	if err := newBridgeAccount().chargeTurn(turn); err != nil {
+	if err := newBridgeAccount().chargeTurnProfile(profile, turn); err != nil {
 		return nil, err
 	}
 	return turn, nil
 }
 
-func marshalTurn(turn ChatTurn, mac macFunc) ([]json.RawMessage, error) {
-	if err := newBridgeAccount().chargeTurn(&turn); err != nil {
+func marshalTurn(profile ReplayProfile, turn ChatTurn, mac macFunc) ([]json.RawMessage, error) {
+	if err := newBridgeAccount().chargeTurnProfile(profile, &turn); err != nil {
 		return nil, err
 	}
 	layout := wireLayoutOf(turn.Layout)
 	plains := wirePlainsOf(turn.Reasoning)
-	bind := wireBindOf(turn.Bind)
+	bind := wireBindOf(profile, turn.Bind)
 	var out []json.RawMessage
 	for _, item := range turn.Reasoning {
 		if !item.HasData {
-			out = append(out, summaryDetails(item)...)
+			out = append(out, summaryDetails(profile, item)...)
 			continue
 		}
 		enc := wireEncrypted{
 			Type:   "reasoning.encrypted",
 			ID:     item.ID,
-			Format: ChatBridgeFormat,
+			Format: profile.Format,
 			Index:  item.Index,
 			Data:   item.Data,
 			Status: item.Status,
@@ -284,13 +417,13 @@ func marshalTurn(turn ChatTurn, mac macFunc) ([]json.RawMessage, error) {
 		// MAC cannot depend on Go's in-memory field presence.
 		normRaw, err := json.Marshal(enc)
 		if err != nil {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		var norm wireEncrypted
 		if json.Unmarshal(normRaw, &norm) != nil {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
-		payload, err := payloadFromWire(norm)
+		payload, err := payloadFromWire(profile, norm)
 		if err != nil {
 			return nil, err
 		}
@@ -300,20 +433,20 @@ func marshalTurn(turn ChatTurn, mac macFunc) ([]json.RawMessage, error) {
 			return nil, nil
 		}
 		if len(sum) != sha256.Size {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		enc.MAC = base64.RawURLEncoding.EncodeToString(sum)
 		raw, err := json.Marshal(enc)
 		if err != nil {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		out = append(out, raw)
-		out = append(out, summaryDetails(item)...)
+		out = append(out, summaryDetails(profile, item)...)
 	}
 	return out, nil
 }
 
-func summaryDetails(item ChatReasoningItem) []json.RawMessage {
+func summaryDetails(profile ReplayProfile, item ChatReasoningItem) []json.RawMessage {
 	var out []json.RawMessage
 	for _, p := range item.Parts {
 		if p.Text == "" {
@@ -322,7 +455,7 @@ func summaryDetails(item ChatReasoningItem) []json.RawMessage {
 		raw, err := json.Marshal(wireSummary{
 			Type:    "reasoning.summary",
 			ID:      item.ID,
-			Format:  ChatBridgeFormat,
+			Format:  profile.Format,
 			Index:   item.Index,
 			Summary: p.Text,
 		})
@@ -339,31 +472,57 @@ func summaryDetails(item ChatReasoningItem) []json.RawMessage {
 // unmatched markers return ErrChatBridgeRejected. A legitimate marker whose
 // source is gone is still returned so the caller can fail over without it.
 func ParseChatBridge(body []byte, scope string, comboID int64, verify verifyFunc) (ChatDecision, error) {
+	return ParseChatReplay(body, scope, comboID, []ReplayProfile{grokReplayProfile()}, func(protocol string, payload, mac []byte) bool {
+		return protocol == chatBridgeProtocol && verify != nil && verify(payload, mac)
+	})
+}
+
+// ParseChatReplay classifies every recognizable profile before any token or
+// inference call. A verifier that cannot check a profile fails that marker
+// closed. Unrelated third-party details stay on the ordinary path.
+func ParseChatReplay(body []byte, scope string, comboID int64, profiles []ReplayProfile, verify protocolVerifyFunc) (ChatDecision, error) {
+	return parseChatReplay(body, scope, comboID, parseState{profiles: profiles, verify: verify})
+}
+
+func parseChatReplay(body []byte, scope string, comboID int64, state parseState) (ChatDecision, error) {
 	var decision ChatDecision
+	// Collapsing maps drop duplicate and losing case-alias keys. Reject a
+	// recognizable marker in a dropped value before any later path can forward
+	// the original body.
+	marked, err := rejectHiddenReplayMarkers(body, state.profiles)
+	if err != nil {
+		return ChatDecision{}, err
+	}
 	msgs, ok := chatMessages(body)
 	if !ok {
+		if marked {
+			return decision, state.rejected(body)
+		}
 		return decision, nil
 	}
 	var assistants []int
 	for i, msg := range msgs {
 		role := jsonString(msg["role"])
 		if role != "assistant" {
-			if messageHasBridge(msg) {
-				return ChatDecision{}, ErrChatBridgeRejected
+			if messageHasBridge(state, msg) {
+				return ChatDecision{}, state.rejected(body)
 			}
 			continue
 		}
-		if fieldsOutsideDetailsHaveBridge(msg) {
-			return ChatDecision{}, ErrChatBridgeRejected
+		if fieldsOutsideDetailsHaveBridge(state, msg) {
+			return ChatDecision{}, state.rejected(body)
 		}
 		assistants = append(assistants, i)
 	}
 	if len(assistants) == 0 {
+		if marked {
+			return decision, state.rejected(body)
+		}
 		return decision, nil
 	}
 	decision.Assistants = make([]AssistantNote, len(assistants))
 	for n, idx := range assistants {
-		note, err := parseAssistant(msgs[idx], scope, comboID, verify)
+		note, err := parseAssistant(state, msgs[idx], scope, comboID)
 		if err != nil {
 			return ChatDecision{}, err
 		}
@@ -373,15 +532,19 @@ func ParseChatBridge(body []byte, scope string, comboID int64, verify verifyFunc
 			decision.Strip = true
 		}
 	}
+	if marked && !decision.Strip {
+		return ChatDecision{}, state.rejected(body)
+	}
 	last := decision.Assistants[len(decision.Assistants)-1]
 	if last.Turn != nil {
 		decision.Pin = true
 		decision.Turn = *last.Turn
+		decision.Protocol = last.Protocol
 	}
 	return decision, nil
 }
 
-func parseAssistant(msg map[string]json.RawMessage, scope string, comboID int64, verify verifyFunc) (AssistantNote, error) {
+func parseAssistant(state parseState, msg map[string]json.RawMessage, scope string, comboID int64) (AssistantNote, error) {
 	var note AssistantNote
 	rawDetails, ok := msg["reasoning_details"]
 	trimmed := bytes.TrimSpace(rawDetails)
@@ -391,8 +554,8 @@ func parseAssistant(msg map[string]json.RawMessage, scope string, comboID int64,
 	if trimmed[0] != '[' {
 		// A wrong container is not a detail array. Decode it before the raw
 		// substring check so an escaped format or bind cannot bypass rejection.
-		if structuralBridge(trimmed) {
-			return note, ErrChatBridgeRejected
+		if structuralBridge(state, trimmed) {
+			return note, state.rejected(trimmed)
 		}
 		return note, nil
 	}
@@ -400,34 +563,52 @@ func parseAssistant(msg map[string]json.RawMessage, scope string, comboID int64,
 	if json.Unmarshal(rawDetails, &details) != nil {
 		// Unrelated malformed details stay on the generic Chat path.
 		// A broken copy of this bridge is rejected instead of forwarded.
-		if structuralBridge(trimmed) {
-			return note, ErrChatBridgeRejected
+		if structuralBridge(state, trimmed) {
+			return note, state.rejected(trimmed)
 		}
 		return note, nil
 	}
 	if len(details) > chatBridgeMaxItems*2 {
 		// Do not decode an oversized array unless it already has a bridge marker.
-		if structuralBridge(trimmed) {
-			return note, ErrChatBridgeRejected
+		if structuralBridge(state, trimmed) {
+			return note, state.rejected(trimmed)
 		}
 		return note, nil
 	}
 	var ours []wireEncrypted
+	var profile ReplayProfile
+	haveProfile := false
 	foreignEncrypted := false
 	sawSummary := false
 	for _, raw := range details {
-		switch classifyDetail(raw) {
+		kind, matched, ok := classifyDetail(state, raw)
+		if !ok {
+			return note, state.rejected(raw)
+		}
+		switch kind {
 		case detailMalformed:
-			return note, ErrChatBridgeRejected
+			return note, state.rejected(raw)
 		case detailOursSummary:
 			// An unsigned companion may be absent. A companion without a signed
 			// entry is still recognizable and is not authenticated.
+			if haveProfile && matched.Protocol != profile.Protocol {
+				return note, state.rejected(raw)
+			}
 			sawSummary = true
+			if !haveProfile {
+				profile = matched
+				haveProfile = true
+			}
 		case detailOursEncrypted:
 			var item wireEncrypted
-			if json.Unmarshal(raw, &item) != nil || item.Type != "reasoning.encrypted" || item.Format != ChatBridgeFormat {
-				return note, ErrChatBridgeRejected
+			if json.Unmarshal(raw, &item) != nil || item.Type != "reasoning.encrypted" || item.Format != matched.Format {
+				return note, state.rejected(raw)
 			}
+			if haveProfile && matched.Protocol != profile.Protocol {
+				return note, state.rejected(raw)
+			}
+			profile = matched
+			haveProfile = true
 			ours = append(ours, item)
 		case detailForeignEncrypted:
 			foreignEncrypted = true
@@ -435,22 +616,23 @@ func parseAssistant(msg map[string]json.RawMessage, scope string, comboID int64,
 	}
 	if len(ours) == 0 {
 		if sawSummary {
-			return note, ErrChatBridgeRejected
+			return note, state.rejected(trimmed)
 		}
 		return note, nil
 	}
-	if foreignEncrypted {
-		return note, ErrChatBridgeRejected
+	if foreignEncrypted || !haveProfile {
+		return note, state.rejected(trimmed)
 	}
 	note.Marked = true
-	turn, err := verifyEncrypted(ours, verify)
+	note.Protocol = profile.Protocol
+	turn, err := verifyEncrypted(state, profile, ours)
 	if err != nil {
 		return note, err
 	}
 	if turn.Bind.Scope != scope || turn.Bind.ComboID != comboID {
-		return note, ErrChatBridgeRejected
+		return note, profile.rejected()
 	}
-	if err := matchAssistant(msg, *turn); err != nil {
+	if err := matchAssistant(profile, msg, *turn); err != nil {
 		return note, err
 	}
 	note.Summary = readableSummary(turn.Reasoning)
@@ -458,55 +640,56 @@ func parseAssistant(msg map[string]json.RawMessage, scope string, comboID int64,
 	return note, nil
 }
 
-func verifyEncrypted(items []wireEncrypted, verify verifyFunc) (*ChatTurn, error) {
-	if len(items) == 0 {
-		return nil, ErrChatBridgeRejected
-	}
-	if verify == nil || len(items) == 0 {
-		return nil, ErrChatBridgeRejected
+func verifyEncrypted(state parseState, profile ReplayProfile, items []wireEncrypted) (*ChatTurn, error) {
+	if len(items) == 0 || state.verify == nil || !profile.valid() {
+		return nil, profile.rejected()
 	}
 	first := items[0]
-	bind, err := bindFromWire(first.Bind)
+	bind, err := bindFromWire(profile, first.Bind)
 	if err != nil {
 		return nil, err
 	}
 	layout, err := layoutFromWire(first.Layout)
 	if err != nil {
-		return nil, err
+		return nil, profile.rejected()
 	}
 	plains := plainsFromWire(first.Plain)
 	turn := &ChatTurn{Bind: bind, Layout: layout}
 	seen := map[string]bool{}
 	for _, item := range items {
-		gotBind, err := bindFromWire(item.Bind)
+		gotBind, err := bindFromWire(profile, item.Bind)
 		if err != nil || gotBind != bind {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		gotLayout, err := layoutFromWire(item.Layout)
 		if err != nil || !sameLayout(gotLayout, layout) {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		if !samePlains(plainsFromWire(item.Plain), plains) {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
-		if item.Data == "" || item.Index < 0 || item.Index >= len(layout) {
-			return nil, ErrChatBridgeRejected
+		if item.Index < 0 || item.Index >= len(layout) {
+			return nil, profile.rejected()
+		}
+		if item.Data == "" && !profile.AuthoritativeEmpty {
+			return nil, profile.rejected()
 		}
 		if layout[item.Index].Kind != "reasoning" || layout[item.Index].ID != item.ID {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		if seen[item.ID] {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		seen[item.ID] = true
 		// A wrong encoded length is structural. Do not decode it or build the
 		// canonical payload before the shared budget accepts the turn.
 		if len(item.MAC) != macEncodedLen() {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		turn.Reasoning = append(turn.Reasoning, ChatReasoningItem{
 			ID: item.ID, Status: item.Status, Data: item.Data, HasData: true,
-			Parts: partsFromWire(item.Parts), Index: item.Index,
+			EmptyData: item.Data == "" && profile.AuthoritativeEmpty,
+			Parts:     partsFromWire(item.Parts), Index: item.Index,
 		})
 	}
 	for _, plain := range plains {
@@ -517,37 +700,37 @@ func verifyEncrypted(items []wireEncrypted, verify verifyFunc) (*ChatTurn, error
 		}
 		seen[plain.ID] = true
 		if plain.Index < 0 || plain.Index >= len(layout) || layout[plain.Index].Kind != "reasoning" || layout[plain.Index].ID != plain.ID {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 		turn.Reasoning = append(turn.Reasoning, plain)
 	}
 	for _, item := range layout {
 		if item.Kind == "reasoning" && !seen[item.ID] {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
 	}
-	if err := newBridgeAccount().chargeTurn(turn); err != nil {
-		return nil, ErrChatBridgeRejected
+	if err := newBridgeAccount().chargeTurnProfile(profile, turn); err != nil {
+		return nil, profile.rejected()
 	}
 	for _, item := range items {
 		mac, err := base64.RawURLEncoding.DecodeString(item.MAC)
 		if err != nil || len(mac) != chatBridgeMACBytes {
-			return nil, ErrChatBridgeRejected
+			return nil, profile.rejected()
 		}
-		payload, err := payloadFromWire(item)
-		if err != nil || !verify(payload, mac) {
-			return nil, ErrChatBridgeRejected
+		payload, err := payloadFromWire(profile, item)
+		if err != nil || !state.verify(profile.Protocol, payload, mac) {
+			return nil, profile.rejected()
 		}
 	}
 	sortReasoning(turn.Reasoning)
 	return turn, nil
 }
 
-func matchAssistant(msg map[string]json.RawMessage, turn ChatTurn) error {
+func matchAssistant(profile ReplayProfile, msg map[string]json.RawMessage, turn ChatTurn) error {
 	content := chatContentText(msg["content"])
 	tools, err := chatToolCalls(msg["tool_calls"])
 	if err != nil {
-		return err
+		return profile.rejected()
 	}
 	off := 0
 	used := map[string]bool{}
@@ -555,25 +738,25 @@ func matchAssistant(msg map[string]json.RawMessage, turn ChatTurn) error {
 		switch item.Kind {
 		case "text":
 			if item.TextLen < 0 || off+item.TextLen > len(content) || hashText(content[off:off+item.TextLen]) != item.TextHash {
-				return ErrChatBridgeRejected
+				return profile.rejected()
 			}
 			off += item.TextLen
 		case "tool":
 			got, ok := tools[item.ID]
 			if !ok || used[item.ID] || got != item.Name {
-				return ErrChatBridgeRejected
+				return profile.rejected()
 			}
 			used[item.ID] = true
 		case "reasoning":
 			if item.ID == "" {
-				return ErrChatBridgeRejected
+				return profile.rejected()
 			}
 		default:
-			return ErrChatBridgeRejected
+			return profile.rejected()
 		}
 	}
 	if off != len(content) || len(used) != len(tools) {
-		return ErrChatBridgeRejected
+		return profile.rejected()
 	}
 	return nil
 }
@@ -584,9 +767,17 @@ func matchAssistant(msg map[string]json.RawMessage, turn ChatTurn) error {
 // scalar reasoning field is missing, signed summary text is restored.
 // A body with nothing to remove is returned unchanged.
 func PortableChatBody(body []byte, decision ChatDecision) ([]byte, error) {
+	return PortableChatReplay(body, decision, []ReplayProfile{grokReplayProfile()})
+}
+
+// PortableChatReplay strips every recognized profile's signed details,
+// companions, and provider-owned item ids. Readable text, summaries, tool
+// call ids, names, arguments, and results stay.
+func PortableChatReplay(body []byte, decision ChatDecision, profiles []ReplayProfile) ([]byte, error) {
 	if !decision.Strip {
 		return body, nil
 	}
+	state := parseState{profiles: profiles}
 	var root map[string]json.RawMessage
 	if json.Unmarshal(body, &root) != nil {
 		return nil, ErrChatBridgeRejected
@@ -609,7 +800,7 @@ func PortableChatBody(body []byte, decision ChatDecision) ([]byte, error) {
 		if !note.Marked {
 			continue
 		}
-		next, did, err := stripAssistant(msgs[i], note.Summary)
+		next, did, err := stripAssistant(state, msgs[i], note.Summary)
 		if err != nil {
 			return nil, err
 		}
@@ -633,16 +824,20 @@ func PortableChatBody(body []byte, decision ChatDecision) ([]byte, error) {
 	return out, nil
 }
 
-func stripAssistant(msg map[string]json.RawMessage, summary string) (map[string]json.RawMessage, bool, error) {
+func stripAssistant(state parseState, msg map[string]json.RawMessage, summary string) (map[string]json.RawMessage, bool, error) {
 	rawDetails := msg["reasoning_details"]
 	var details []json.RawMessage
 	if json.Unmarshal(rawDetails, &details) != nil {
-		return nil, false, ErrChatBridgeRejected
+		return nil, false, state.rejected(rawDetails)
 	}
 	kept := make([]json.RawMessage, 0, len(details))
 	removed := false
 	for _, raw := range details {
-		switch classifyDetail(raw) {
+		kind, _, ok := classifyDetail(state, raw)
+		if !ok {
+			return nil, false, state.rejected(raw)
+		}
+		switch kind {
 		case detailOursEncrypted, detailOursSummary, detailMalformed:
 			removed = true
 			continue
@@ -650,21 +845,21 @@ func stripAssistant(msg map[string]json.RawMessage, summary string) (map[string]
 		kept = append(kept, append(json.RawMessage(nil), raw...))
 	}
 	if !removed {
-		return nil, false, ErrChatBridgeRejected
+		return nil, false, state.rejected(rawDetails)
 	}
 	if len(kept) == 0 {
 		delete(msg, "reasoning_details")
 	} else {
 		raw, err := json.Marshal(kept)
 		if err != nil {
-			return nil, false, ErrChatBridgeRejected
+			return nil, false, state.rejected(nil)
 		}
 		msg["reasoning_details"] = raw
 	}
 	if summary != "" && jsonString(msg["reasoning_content"]) == "" && jsonString(msg["reasoning"]) == "" {
 		raw, err := json.Marshal(summary)
 		if err != nil {
-			return nil, false, ErrChatBridgeRejected
+			return nil, false, state.rejected(nil)
 		}
 		msg["reasoning_content"] = raw
 	}
@@ -793,8 +988,8 @@ func readableSummary(items []ChatReasoningItem) string {
 	return b.String()
 }
 
-func payloadFromWire(item wireEncrypted) ([]byte, error) {
-	bind, err := bindFromWire(item.Bind)
+func payloadFromWire(profile ReplayProfile, item wireEncrypted) ([]byte, error) {
+	bind, err := bindFromWire(profile, item.Bind)
 	if err != nil {
 		return nil, err
 	}
@@ -805,25 +1000,29 @@ func payloadFromWire(item wireEncrypted) ([]byte, error) {
 	plains := plainsFromWire(item.Plain)
 	rr := ChatReasoningItem{
 		ID: item.ID, Status: item.Status, Data: item.Data, HasData: true,
-		Parts: partsFromWire(item.Parts), Index: item.Index,
+		EmptyData: item.Data == "" && profile.AuthoritativeEmpty,
+		Parts:     partsFromWire(item.Parts), Index: item.Index,
 	}
 	joined := make([]ChatReasoningItem, len(plains)+1)
 	copy(joined, plains)
 	joined[len(plains)] = rr
-	return canonicalPayload(bind, layout, joined, rr), nil
+	return canonicalPayload(profile, bind, layout, joined, rr), nil
 }
 
-func canonicalPayload(bind ChatBind, layout []ChatLayoutItem, reasoning []ChatReasoningItem, item ChatReasoningItem) []byte {
+func canonicalPayload(profile ReplayProfile, bind ChatBind, layout []ChatLayoutItem, reasoning []ChatReasoningItem, item ChatReasoningItem) []byte {
 	var b bytes.Buffer
-	b.WriteString(chatBridgeCanonical)
+	b.WriteString(profile.Canonical)
 	putStr(&b, bind.Scope)
 	putStr(&b, strconv.FormatInt(bind.ComboID, 10))
 	putStr(&b, strconv.FormatInt(bind.ProviderID, 10))
-	putStr(&b, chatBridgeProtocol)
+	putStr(&b, profile.Protocol)
 	putStr(&b, bind.Generation)
 	putStr(&b, bind.Principal)
 	putStr(&b, bind.Model)
 	putStr(&b, bind.RouteModel)
+	if profile.IncludeEndpoint {
+		putStr(&b, bind.Endpoint)
+	}
 	putU32(&b, uint32(len(layout)))
 	for _, it := range layout {
 		putStr(&b, it.Kind)
@@ -867,30 +1066,44 @@ func putReasoning(b *bytes.Buffer, item ChatReasoningItem, withData bool) {
 	}
 }
 
-func wireBindOf(bind ChatBind) wireBind {
-	return wireBind{
+func wireBindOf(profile ReplayProfile, bind ChatBind) wireBind {
+	w := wireBind{
 		Scope: bind.Scope, Combo: strconv.FormatInt(bind.ComboID, 10),
-		Provider: strconv.FormatInt(bind.ProviderID, 10), Protocol: chatBridgeProtocol,
+		Provider: strconv.FormatInt(bind.ProviderID, 10), Protocol: profile.Protocol,
 		Generation: bind.Generation, Principal: bind.Principal,
 		Model: bind.Model, Route: bind.RouteModel,
 	}
+	if profile.IncludeEndpoint {
+		w.Endpoint = bind.Endpoint
+	}
+	return w
 }
 
-func bindFromWire(w wireBind) (ChatBind, error) {
-	if w.Protocol != chatBridgeProtocol || w.Generation == "" || w.Model == "" || w.Route == "" || w.Scope == "" {
-		return ChatBind{}, ErrChatBridgeRejected
+func bindFromWire(profile ReplayProfile, w wireBind) (ChatBind, error) {
+	if w.Protocol != profile.Protocol || w.Generation == "" || w.Model == "" || w.Route == "" || w.Scope == "" {
+		return ChatBind{}, profile.rejected()
+	}
+	endpoint := ""
+	if profile.IncludeEndpoint {
+		norm, ok := codexgrant.NormalizeEndpoint(w.Endpoint)
+		if !ok || strings.TrimSpace(w.Principal) == "" {
+			return ChatBind{}, profile.rejected()
+		}
+		endpoint = norm
+	} else if w.Endpoint != "" {
+		return ChatBind{}, profile.rejected()
 	}
 	combo, err := strconv.ParseInt(w.Combo, 10, 64)
 	if err != nil || combo == 0 {
-		return ChatBind{}, ErrChatBridgeRejected
+		return ChatBind{}, profile.rejected()
 	}
 	provider, err := strconv.ParseInt(w.Provider, 10, 64)
 	if err != nil || provider == 0 {
-		return ChatBind{}, ErrChatBridgeRejected
+		return ChatBind{}, profile.rejected()
 	}
 	return ChatBind{
 		Scope: w.Scope, ComboID: combo, ProviderID: provider, Generation: w.Generation,
-		Principal: w.Principal, Model: w.Model, RouteModel: w.Route,
+		Principal: w.Principal, Model: w.Model, RouteModel: w.Route, Endpoint: endpoint,
 	}, nil
 }
 
@@ -1086,15 +1299,6 @@ const (
 	detailMalformed
 )
 
-func messageHasBridge(msg map[string]json.RawMessage) bool {
-	for _, raw := range msg {
-		if recognizableBridgeRaw(raw) {
-			return true
-		}
-	}
-	return false
-}
-
 // bridgeAccount is the one stamp/parse budget. Lengths are logical field
 // sizes. The MAC is the encoded size of chatBridgeMACBytes, not a computed tag.
 type bridgeAccount struct {
@@ -1120,11 +1324,19 @@ func addBounded(dst *int, n, limit int) bool {
 	return true
 }
 
-func bindMetaLen(bind ChatBind) int {
-	return len(bind.Scope) + len(bind.Generation) + len(bind.Principal) + len(bind.Model) + len(bind.RouteModel) + len(chatBridgeProtocol) + len(strconv.FormatInt(bind.ComboID, 10)) + len(strconv.FormatInt(bind.ProviderID, 10))
+func bindMetaLen(profile ReplayProfile, bind ChatBind) int {
+	n := len(bind.Scope) + len(bind.Generation) + len(bind.Principal) + len(bind.Model) + len(bind.RouteModel) + len(profile.Protocol) + len(strconv.FormatInt(bind.ComboID, 10)) + len(strconv.FormatInt(bind.ProviderID, 10))
+	if profile.IncludeEndpoint {
+		n += len(bind.Endpoint)
+	}
+	return n
 }
 
 func (a *bridgeAccount) chargeTurn(turn *ChatTurn) error {
+	return a.chargeTurnProfile(grokReplayProfile(), turn)
+}
+
+func (a *bridgeAccount) chargeTurnProfile(profile ReplayProfile, turn *ChatTurn) error {
 	if a == nil || turn == nil {
 		return errChatBridgeBudget
 	}
@@ -1144,7 +1356,7 @@ func (a *bridgeAccount) chargeTurn(turn *ChatTurn) error {
 			return errChatBridgeBudget
 		}
 	}
-	bindLen := bindMetaLen(turn.Bind)
+	bindLen := bindMetaLen(profile, turn.Bind)
 	if !addBounded(&a.meta, bindLen, chatBridgeMaxMeta) {
 		return errChatBridgeBudget
 	}
@@ -1204,56 +1416,88 @@ func (a *bridgeAccount) chargeTurn(turn *ChatTurn) error {
 	return nil
 }
 
-func fieldsOutsideDetailsHaveBridge(msg map[string]json.RawMessage) bool {
+func fieldsOutsideDetailsHaveBridge(state parseState, msg map[string]json.RawMessage) bool {
 	for key, raw := range msg {
 		if key == "reasoning_details" {
 			continue
 		}
-		if recognizableBridgeRaw(raw) {
+		if recognizableBridgeRaw(state, raw) {
 			return true
 		}
 	}
 	return false
 }
 
-func recognizableBridgeRaw(raw json.RawMessage) bool {
-	return structuralBridge(raw)
+func messageHasBridge(state parseState, msg map[string]json.RawMessage) bool {
+	for _, raw := range msg {
+		if recognizableBridgeRaw(state, raw) {
+			return true
+		}
+	}
+	return false
+}
+
+func recognizableBridgeRaw(state parseState, raw json.RawMessage) bool {
+	return structuralBridge(state, raw)
+}
+
+func profileNeedle(state parseState, raw []byte) bool {
+	for _, p := range state.profiles {
+		if p.Format != "" && bytes.Contains(raw, []byte(p.Format)) {
+			return true
+		}
+		if p.Protocol != "" && bytes.Contains(raw, []byte(p.Protocol)) {
+			return true
+		}
+	}
+	return false
 }
 
 // structuralBridge decodes before it decides. A JSON escape can hide the
 // format or protocol name from a raw substring scan. A string that only quotes
 // those names is not a bridge artifact.
-func structuralBridge(raw json.RawMessage) bool {
+func structuralBridge(state parseState, raw json.RawMessage) bool {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || (raw[0] != '{' && raw[0] != '[') {
 		return false
 	}
 	// An unescaped ordinary value cannot hide a format or bind. Escapes use a
 	// backslash, so this does not skip a unicode-escaped name.
-	if !bytes.Contains(raw, []byte(`\`)) && !bytes.Contains(raw, []byte(ChatBridgeFormat)) && !bytes.Contains(raw, []byte(chatBridgeProtocol)) && !bytes.Contains(raw, []byte(`"format"`)) && !bytes.Contains(raw, []byte(`"bind"`)) && !bytes.Contains(raw, []byte(`"mac"`)) && !bytes.Contains(raw, []byte(`"layout"`)) {
+	if !bytes.Contains(raw, []byte(`\`)) && !profileNeedle(state, raw) && !bytes.Contains(raw, []byte(`"format"`)) && !bytes.Contains(raw, []byte(`"bind"`)) && !bytes.Contains(raw, []byte(`"mac"`)) && !bytes.Contains(raw, []byte(`"layout"`)) {
 		return false
 	}
 	var v any
-	if json.Unmarshal(raw, &v) != nil {
+	if !decodeReplayJSON(raw, &v) {
 		return false
 	}
-	return valueHasBridge(v)
+	return valueHasBridge(state, v)
 }
 
-func valueHasBridge(v any) bool {
+func decodeReplayJSON(raw []byte, dst any) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// An unrelated large number must not hide a marker from an untyped decode.
+	dec.UseNumber()
+	if dec.Decode(dst) != nil {
+		return false
+	}
+	_, err := dec.Token()
+	return err == io.EOF
+}
+
+func valueHasBridge(state parseState, v any) bool {
 	switch t := v.(type) {
 	case map[string]any:
-		if objectIsBridge(t) {
+		if _, ok := objectIsBridge(state, t); ok {
 			return true
 		}
 		for _, child := range t {
-			if valueHasBridge(child) {
+			if valueHasBridge(state, child) {
 				return true
 			}
 		}
 	case []any:
 		for _, child := range t {
-			if valueHasBridge(child) {
+			if valueHasBridge(state, child) {
 				return true
 			}
 		}
@@ -1261,88 +1505,98 @@ func valueHasBridge(v any) bool {
 	return false
 }
 
-func objectIsBridge(obj map[string]any) bool {
-	if format, _ := obj["format"].(string); format == ChatBridgeFormat {
-		return true
+func objectIsBridge(state parseState, obj map[string]any) (ReplayProfile, bool) {
+	format, _ := obj["format"].(string)
+	if p, ok := state.profile(format, ""); ok {
+		return p, true
 	}
 	bind, _ := obj["bind"].(map[string]any)
 	if bind == nil {
-		return false
+		return ReplayProfile{}, false
 	}
 	proto, _ := bind["protocol"].(string)
-	if proto != chatBridgeProtocol {
-		return false
+	p, ok := state.profile("", proto)
+	if !ok {
+		return ReplayProfile{}, false
 	}
 	_, hasMAC := obj["mac"].(string)
 	_, hasLayout := obj["layout"].([]any)
-	return hasMAC || hasLayout
+	if hasMAC || hasLayout {
+		return p, true
+	}
+	return ReplayProfile{}, false
 }
 
-func nestedBridgeObject(obj map[string]any) bool {
+func nestedBridgeObject(state parseState, obj map[string]any) bool {
 	for _, child := range obj {
-		if valueHasBridge(child) {
+		if valueHasBridge(state, child) {
 			return true
 		}
 	}
 	return false
 }
 
-func classifyDetail(raw json.RawMessage) int {
+// classifyDetail returns the detail class and, for a recognized profile, that
+// profile. ok is false when the value is a recognizable malformed marker.
+func classifyDetail(state parseState, raw json.RawMessage) (int, ReplayProfile, bool) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
-		return detailNone
+		return detailNone, ReplayProfile{}, true
 	}
 	if raw[0] != '{' {
 		// An array can hide a stamped entry. A quoted format name cannot.
-		if structuralBridge(raw) {
-			return detailMalformed
+		if structuralBridge(state, raw) {
+			return detailMalformed, ReplayProfile{}, false
 		}
-		return detailNone
+		return detailNone, ReplayProfile{}, true
 	}
 	var obj map[string]any
-	if json.Unmarshal(raw, &obj) != nil {
-		return detailNone
+	if !decodeReplayJSON(raw, &obj) {
+		return detailNone, ReplayProfile{}, true
 	}
 	kind, _ := obj["type"].(string)
 	format, _ := obj["format"].(string)
 	// Nested structure wins over a third-party type. Returning foreign here
 	// would accept a signed entry hidden under reasoning.encrypted.
-	if nestedBridgeObject(obj) {
-		return detailMalformed
+	if nestedBridgeObject(state, obj) {
+		return detailMalformed, ReplayProfile{}, false
 	}
-	if !objectIsBridge(obj) {
+	matched, ours := objectIsBridge(state, obj)
+	if !ours {
 		// Summary companions intentionally omit the signed bind. Their format
 		// and id are still bridge fields and must be removed or rejected.
-		if kind == "reasoning.summary" && format == ChatBridgeFormat {
-			if _, ok := obj["summary"].(string); !ok {
-				return detailMalformed
+		if kind == "reasoning.summary" {
+			if p, ok := state.profile(format, ""); ok {
+				if _, has := obj["summary"].(string); !has {
+					return detailMalformed, p, false
+				}
+				return detailOursSummary, p, true
 			}
-			return detailOursSummary
 		}
 		if kind == "reasoning.encrypted" {
-			return detailForeignEncrypted
+			return detailForeignEncrypted, ReplayProfile{}, true
 		}
-		return detailNone
+		return detailNone, ReplayProfile{}, true
 	}
 	switch kind {
 	case "reasoning.encrypted":
-		if format != ChatBridgeFormat {
-			return detailMalformed
+		if format != matched.Format {
+			return detailMalformed, matched, false
 		}
 		if _, ok := obj["data"].(string); !ok {
-			return detailMalformed
+			return detailMalformed, matched, false
 		}
-		return detailOursEncrypted
+		return detailOursEncrypted, matched, true
 	case "reasoning.summary":
-		if format != ChatBridgeFormat {
-			return detailMalformed
+		if format != matched.Format {
+			return detailMalformed, matched, false
 		}
 		if _, ok := obj["summary"].(string); !ok {
-			return detailMalformed
+			return detailMalformed, matched, false
 		}
-		return detailOursSummary
+		return detailOursSummary, matched, true
 	default:
-		return detailMalformed
+		return detailMalformed, matched, false
 	}
 }
 
@@ -1367,4 +1621,334 @@ func putU32(b *bytes.Buffer, n uint32) {
 func putStr(b *bytes.Buffer, s string) {
 	putU32(b, uint32(len(s)))
 	_, _ = b.WriteString(s)
+}
+
+// Match encoding/json's nesting limit even when reading individual tokens.
+const replayScanMaxDepth = 10000
+
+// errReplayHidden is internal. Callers map it to a profile rejection and must
+// not wrap it with request bytes.
+var errReplayHidden = errors.New("hidden replay marker")
+
+// rejectHiddenReplayMarkers rejects a recognizable marker that encoding/json
+// would drop before the typed parser sees it. Dropped values include an
+// earlier duplicate key, a losing case-alias of the root messages field, and
+// marker fields whose last typed value is no longer recognizable. Ordinary
+// strings, unrelated details, and duplicate keys that hide no marker stay on
+// the normal path. The walk is one pass and stops at the body length.
+func rejectHiddenReplayMarkers(body []byte, profiles []ReplayProfile) (bool, error) {
+	if len(bytes.TrimSpace(body)) == 0 || !replayMarkerMayHide(body, profiles) {
+		return false, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	w := &replayWalker{dec: dec, profiles: profiles, limit: len(body) + 8}
+	val, err := w.consume(0)
+	if err != nil {
+		if errors.Is(err, errReplayHidden) {
+			return false, w.rejected()
+		}
+		return false, nil
+	}
+	if val.hidden {
+		return false, w.rejected()
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return false, nil
+	}
+	return val.marked, nil
+}
+
+func replayMarkerMayHide(body []byte, profiles []ReplayProfile) bool {
+	if bytes.Contains(body, []byte(`\`)) || bytes.Contains(body, []byte(`"bind"`)) || bytes.Contains(body, []byte(`"format"`)) || bytes.Contains(body, []byte(`"mac"`)) || bytes.Contains(body, []byte(`"layout"`)) {
+		return true
+	}
+	for _, p := range profiles {
+		if p.Format != "" && bytes.Contains(body, []byte(p.Format)) ||
+			p.Protocol != "" && bytes.Contains(body, []byte(p.Protocol)) {
+			return true
+		}
+	}
+	return false
+}
+
+type replayScan struct {
+	hidden      bool
+	marked      bool
+	recAny      bool
+	recWin      bool
+	role        string
+	details     *replayScan
+	array       bool
+	messages    bool
+	detailOK    bool
+	anyProtocol string
+	protocol    string
+}
+
+type replayWalker struct {
+	dec      *json.Decoder
+	profiles []ReplayProfile
+	limit    int
+	tokens   int
+	format   string
+	protocol string
+}
+
+func (w *replayWalker) tick() error {
+	if w.tokens >= w.limit {
+		return errReplayHidden
+	}
+	w.tokens++
+	return nil
+}
+
+func (w *replayWalker) note(format, protocol string) {
+	for _, p := range w.profiles {
+		if w.format == "" && format == p.Format {
+			w.format = format
+		}
+		if w.protocol == "" && protocol == p.Protocol {
+			w.protocol = protocol
+		}
+	}
+}
+
+func (w *replayWalker) rejected() error {
+	for _, p := range w.profiles {
+		if w.format != "" && w.format == p.Format {
+			return p.rejected()
+		}
+	}
+	for _, p := range w.profiles {
+		if w.protocol != "" && w.protocol == p.Protocol {
+			return p.rejected()
+		}
+	}
+	if len(w.profiles) > 0 {
+		return w.profiles[0].rejected()
+	}
+	return ErrChatBridgeRejected
+}
+
+func (w *replayWalker) consume(depth int) (replayScan, error) {
+	if depth > replayScanMaxDepth {
+		return replayScan{}, errReplayHidden
+	}
+	if err := w.tick(); err != nil {
+		return replayScan{}, err
+	}
+	tok, err := w.dec.Token()
+	if err != nil {
+		return replayScan{}, err
+	}
+	switch t := tok.(type) {
+	case json.Delim:
+		switch t {
+		case '{':
+			return w.object(depth, depth == 0)
+		case '[':
+			return w.array(depth)
+		default:
+			return replayScan{}, io.ErrUnexpectedEOF
+		}
+	case string:
+		return replayScan{role: t}, nil
+	default:
+		return replayScan{}, nil
+	}
+}
+
+func (w *replayWalker) object(depth int, root bool) (replayScan, error) {
+	var out replayScan
+	var messages replayScan
+	haveMessages := false
+	var anyFormat, winFormat, anyProto, winProto string
+	var anyMAC, winMAC, anyLayout, winLayout bool
+	for w.dec.More() {
+		if err := w.tick(); err != nil {
+			return replayScan{}, err
+		}
+		keyTok, err := w.dec.Token()
+		if err != nil {
+			return replayScan{}, err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return replayScan{}, io.ErrUnexpectedEOF
+		}
+		val, err := w.consume(depth + 1)
+		if err != nil {
+			return replayScan{}, err
+		}
+		if strings.EqualFold(key, "protocol") {
+			if key == "protocol" {
+				out.protocol = val.role
+			}
+			if w.knownProtocol(val.role) {
+				out.anyProtocol = val.role
+			}
+		}
+		w.absorbIdentity(key, val, &anyFormat, &winFormat, &anyProto, &winProto, &anyMAC, &winMAC, &anyLayout, &winLayout)
+		switch {
+		case root && strings.EqualFold(key, "messages"):
+			if haveMessages && (messages.marked || messages.hidden) {
+				out.hidden = true
+			}
+			messages, haveMessages = val, true
+		case !root && key == "reasoning_details":
+			if out.details != nil && (out.details.marked || out.details.hidden) {
+				out.hidden = true
+			}
+			cp := val
+			out.details = &cp
+		case val.marked || val.hidden:
+			// A nested marker is never valid in an arbitrary field. Record it
+			// immediately so no field map or arbitrary key limit is needed.
+			out.hidden = true
+		case !root && key == "role":
+			out.role = val.role
+		}
+	}
+	if err := w.tick(); err != nil {
+		return replayScan{}, err
+	}
+	if _, err := w.dec.Token(); err != nil {
+		return replayScan{}, err
+	}
+	out.recAny = w.recognizable(anyFormat, anyProto, anyMAC, anyLayout)
+	out.recWin = w.recognizable(winFormat, winProto, winMAC, winLayout)
+	if out.recAny {
+		out.marked = true
+		w.note(anyFormat, anyProto)
+		// Only entries in an assistant's detail array may carry identity.
+		if root || !out.recWin {
+			out.hidden = true
+		}
+	}
+	if root && (messages.marked || messages.hidden) {
+		out.marked = true
+		out.hidden = out.hidden || messages.hidden || !messages.messages
+	}
+	if out.details != nil && (out.details.marked || out.details.hidden) {
+		out.marked = true
+		out.hidden = out.hidden || out.details.hidden
+	}
+	return out, nil
+}
+
+func (w *replayWalker) absorbIdentity(key string, val replayScan, anyFormat, winFormat, anyProto, winProto *string, anyMAC, winMAC, anyLayout, winLayout *bool) {
+	switch {
+	case strings.EqualFold(key, "format"):
+		if w.knownFormat(val.role) {
+			*anyFormat = val.role
+		}
+		if key == "format" {
+			*winFormat = val.role
+		}
+	case strings.EqualFold(key, "mac"):
+		*anyMAC = *anyMAC || val.role != ""
+		if key == "mac" {
+			*winMAC = val.role != ""
+		}
+	case strings.EqualFold(key, "layout"):
+		*anyLayout = *anyLayout || val.array
+		if key == "layout" {
+			*winLayout = val.array
+		}
+	case strings.EqualFold(key, "bind"):
+		if val.anyProtocol != "" {
+			*anyProto = val.anyProtocol
+		}
+		if key == "bind" {
+			*winProto = val.protocol
+		}
+	}
+}
+
+func (w *replayWalker) knownFormat(s string) bool {
+	for _, p := range w.profiles {
+		if s != "" && s == p.Format {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *replayWalker) knownProtocol(s string) bool {
+	for _, p := range w.profiles {
+		if s != "" && s == p.Protocol {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *replayWalker) recognizable(format, protocol string, mac, layout bool) bool {
+	for _, p := range w.profiles {
+		if format != "" && format == p.Format {
+			return true
+		}
+	}
+	for _, p := range w.profiles {
+		if protocol != "" && protocol == p.Protocol && (mac || layout) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *replayWalker) array(depth int) (replayScan, error) {
+	out := replayScan{array: true, messages: true, detailOK: true}
+	for w.dec.More() {
+		el, err := w.consume(depth + 1)
+		if err != nil {
+			return replayScan{}, err
+		}
+		if el.hidden {
+			out.hidden = true
+		}
+		if el.marked || el.hidden {
+			out.marked = true
+		}
+		if !messageAllowsMarker(el) {
+			out.messages = false
+		}
+		if !detailAllowsMarker(el) {
+			out.detailOK = false
+		}
+	}
+	if err := w.tick(); err != nil {
+		return replayScan{}, err
+	}
+	if _, err := w.dec.Token(); err != nil {
+		return replayScan{}, err
+	}
+	return out, nil
+}
+
+func messageAllowsMarker(el replayScan) bool {
+	if el.hidden {
+		return false
+	}
+	if !el.marked {
+		return true
+	}
+	if el.role != "assistant" || el.recAny {
+		return false
+	}
+	if el.details == nil {
+		return false
+	}
+	return el.details.array && el.details.detailOK && !el.details.hidden
+}
+
+func detailAllowsMarker(el replayScan) bool {
+	if el.hidden {
+		return false
+	}
+	if !el.marked {
+		return true
+	}
+	return el.recWin && (el.details == nil || !el.details.marked)
 }

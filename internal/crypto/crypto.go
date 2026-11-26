@@ -14,18 +14,24 @@ import (
 	"airouter/internal/config"
 )
 
-// grokBuildChatBridgeInfo domain-separates the Chat replay MAC from the
-// AES-256-GCM key. The MAC key is not the database key and is not exported.
+// grokBuildChatBridgeInfo domain-separates the Grok Build Chat replay MAC
+// from the AES-256-GCM key and from the Codex Chat replay MAC. The MAC key is
+// not the database key and is not exported.
 const grokBuildChatBridgeInfo = "airouter/grok-build-chat-bridge/v1"
+
+// codexChatBridgeInfo domain-separates the Codex Chat replay MAC from the
+// Grok Build marker and from the at-rest encryption key.
+const codexChatBridgeInfo = "airouter/codex-chat-bridge/v1"
 
 // Cipher encrypts and decrypts short secrets (API keys) with AES-256-GCM. The
 // key is derived from the configured secret via SHA-256, so any secret length
-// is accepted. bridgeKey is an optional HMAC key for the Grok Build Chat
-// replay marker. It is not derived by New. A caller enables it only from a
+// is accepted. bridgeKey and codexKey are optional HMAC keys for Chat replay
+// markers. They are not derived by New. A caller enables them only from a
 // private instance secret, never from the built-in development secret.
 type Cipher struct {
 	aead      cipher.AEAD
 	bridgeKey []byte
+	codexKey  []byte
 }
 
 func New(secret string) (*Cipher, error) {
@@ -73,6 +79,43 @@ func (c *Cipher) GrokBuildChatMAC(payload []byte) ([]byte, bool) {
 // Comparison is constant-time. A missing key or empty mac fails closed.
 func (c *Cipher) VerifyGrokBuildChatMAC(payload, mac []byte) bool {
 	sum, ok := c.GrokBuildChatMAC(payload)
+	if !ok || len(mac) == 0 {
+		return false
+	}
+	return hmac.Equal(sum, mac)
+}
+
+// EnableCodexChatReplay derives the Codex Chat replay MAC key. The built-in
+// development secret and an empty secret are rejected. The key is not the Grok
+// Build replay key.
+func (c *Cipher) EnableCodexChatReplay(secret string) error {
+	if c == nil {
+		return errors.New("crypto: nil cipher")
+	}
+	if secret == "" || config.IsInsecureDevSecret(secret) {
+		return errors.New("crypto: codex replay requires a private instance secret")
+	}
+	mac := hmac.New(sha256.New, []byte(codexChatBridgeInfo))
+	_, _ = mac.Write([]byte(secret))
+	c.codexKey = mac.Sum(nil)
+	return nil
+}
+
+// CodexChatMAC returns the domain-separated HMAC-SHA256 of payload.
+// A nil cipher or a cipher without the Codex key returns nil, false.
+func (c *Cipher) CodexChatMAC(payload []byte) ([]byte, bool) {
+	if c == nil || len(c.codexKey) == 0 {
+		return nil, false
+	}
+	mac := hmac.New(sha256.New, c.codexKey)
+	_, _ = mac.Write(payload)
+	return mac.Sum(nil), true
+}
+
+// VerifyCodexChatMAC reports whether mac is the HMAC of payload.
+// Comparison is constant-time. A missing key or empty mac fails closed.
+func (c *Cipher) VerifyCodexChatMAC(payload, mac []byte) bool {
+	sum, ok := c.CodexChatMAC(payload)
 	if !ok || len(mac) == 0 {
 		return false
 	}

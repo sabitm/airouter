@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"airouter/internal/codexgrant"
 	"airouter/internal/domain"
 	"airouter/internal/proxy/claudecode"
 )
@@ -403,5 +404,10 @@ func exchangeCode(ctx context.Context, c *domain.OAuthCreds, code, verifier, sta
 	}
 
 	applyExchangeToken(c, tr, time.Now())
+	if c.Preset == codexgrant.Preset {
+		if err := codexgrant.Rotate(c); err != nil {
+			return err
+		}
+	}
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/a-h/templ"
 
+	"airouter/internal/codexgrant"
 	"airouter/internal/domain"
 	"airouter/internal/harlog"
 	"airouter/internal/kirocatalog"
@@ -441,6 +442,13 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
+	if proto == domain.ProtocolOpenAICodex {
+		creds = cloneOAuthCreds(creds)
+		if err := codexgrant.Rotate(creds); err != nil {
+			htmxBadRequest(w, r, "provider-flash", err.Error())
+			return
+		}
+	}
 	p := &domain.Provider{
 		Name:             r.FormValue("name"),
 		BaseURL:          providerBaseURLOrDefault(proto, r.FormValue("base_url")),
@@ -702,6 +710,12 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	}
 	if proto == domain.ProtocolClaudeCode && prevKiro != nil {
 		preserveClaudeIdentity(cur.OAuthCreds, prevKiro, reconnected || imported)
+	}
+	if proto == domain.ProtocolOpenAICodex && (reconnected || imported) {
+		if err := codexgrant.Rotate(cur.OAuthCreds); err != nil {
+			htmxBadRequest(w, r, "provider-flash", err.Error())
+			return
+		}
 	}
 	if proto == domain.ProtocolCursor {
 		applyCursorConfig(cur.OAuthCreds, r)

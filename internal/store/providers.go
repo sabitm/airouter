@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"airouter/internal/codexgrant"
 	"airouter/internal/domain"
 )
 
@@ -308,18 +309,20 @@ func (s *Store) updateProvider(ctx context.Context, ex executor, p *domain.Provi
 	return err
 }
 
-// UpdateProviderOAuth refreshes only the OAuth credentials for a provider,
-// leaving the rest of the row (name, base URL, protocol, key) untouched. Used by
-// the token refresh path, which must persist a rotated token without clobbering
-// unrelated fields a concurrent dashboard edit might be changing.
+// UpdateProviderOAuth is the legacy refresh write for non-Codex grants. Check
+// the current grant inside the compare-and-swap so a refresh that started on
+// a custom connection cannot overwrite a Codex reconnect or import.
 func (s *Store) UpdateProviderOAuth(ctx context.Context, id int64, creds *domain.OAuthCreds) error {
-	oauthEnc, err := s.encryptOAuth(creds)
-	if err != nil {
-		return err
+	_, err := s.UpdateProviderConnectionCAS(ctx, id, func(current *domain.OAuthCreds, method domain.AuthMethod, proto domain.Protocol) (*domain.OAuthCreds, bool, error) {
+		if method == domain.AuthOAuth && proto == domain.ProtocolOpenAICodex && codexgrant.IsGrant(current) {
+			return nil, false, ErrConflict
+		}
+		return creds, true, nil
+	})
+	if errors.Is(err, ErrNotFound) {
+		// Preserve the legacy UPDATE behavior when the row no longer exists.
+		return nil
 	}
-	_, err = s.db.ExecContext(ctx,
-		"UPDATE providers SET oauth_creds=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		oauthEnc, id)
 	return err
 }
 
@@ -439,6 +442,9 @@ func (s *Store) UpdateProviderConnectionCAS(ctx context.Context, id int64, updat
 			return nil, err
 		}
 		if n == 1 {
+			if next == nil {
+				return nil, nil
+			}
 			out := *next
 			return &out, nil
 		}

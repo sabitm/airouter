@@ -276,6 +276,14 @@ func DecodeStreamCodexReconciled(r io.Reader, emit func(ir.StreamEvent) error) e
 	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileCodex: true})
 }
 
+// DecodeStreamCodexReconciledObserved is the Codex Chat-bridge decode.
+// It reconciles terminal ciphertext for capture and reports source order to
+// observe. It does not withhold tool ids and it does not apply the Responses
+// encoder hold. A nil observe is DecodeStreamCodexReconciled.
+func DecodeStreamCodexReconciledObserved(r io.Reader, emit func(ir.StreamEvent) error, observe func(ir.StreamEvent)) error {
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileCodex: true, observe: observe})
+}
+
 // DecodeStreamAwaitingItemIDObserved is the Grok Build Chat-bridge decode.
 // observe receives source-order metadata and reasoning snapshots. It is not
 // the client emit path. A nil observe is DecodeStreamAwaitingItemID. The
