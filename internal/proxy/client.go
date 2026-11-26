@@ -1061,7 +1061,7 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		t.UpstreamURL = url
 	}
 	send := func() (int, []byte, error) {
-		if err := guardGrokBuildReplay(ctx, provider); err != nil {
+		if err := guardGrokBuildReplay(ctx, provider, body); err != nil {
 			return 0, nil, err
 		}
 		if err := guardCodexReplay(ctx, provider, url, body); err != nil {
@@ -1208,7 +1208,7 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 		accept = "text/event-stream"
 	}
 	send := func(ctx context.Context) (*http.Response, error) {
-		if err := guardGrokBuildReplay(ctx, provider); err != nil {
+		if err := guardGrokBuildReplay(ctx, provider, body); err != nil {
 			return nil, err
 		}
 		if err := guardCodexReplay(ctx, provider, url, body); err != nil {
@@ -1358,7 +1358,7 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 	}()
 
 	send := func() (*http.Response, error) {
-		if err := guardGrokBuildReplay(ctx, provider); err != nil {
+		if err := guardGrokBuildReplay(ctx, provider, body); err != nil {
 			return nil, err
 		}
 		if err := guardCodexReplay(ctx, provider, url, body); err != nil {

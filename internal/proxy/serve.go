@@ -503,7 +503,6 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 	var sawRealAttempt bool
 	var lastReal attemptResult
 	targets := candidates
-	var codexModelFallback bool
 	for i := 0; i < len(targets); i++ {
 		t := targets[i]
 		// A canceled caller must not dispatch another provider after the previous
@@ -512,42 +511,26 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 			last = callerCanceledResult()
 			break
 		}
+		pinned := pinTarget != nil && i == 0
+		attemptBody := body
+		attemptCtx := r.Context()
+		if chatPortable != nil {
+			// Every attempt starts with scrubbed history. Only translated
+			// attempts with a verified source can restore opaque state.
+			attemptBody = chatPortable
+			switch {
+			case pinned:
+				attemptCtx = withChatReplayAttempt(attemptCtx, chatDecision.Assistants, chatDecision.Turn.Bind.Model)
+			default:
+				if fresh, ok := p.freshChatReplayTarget(attemptCtx, t, chatDecision.Assistants); ok {
+					t = fresh
+					attemptCtx = withChatReplayAttempt(attemptCtx, chatDecision.Assistants, "")
+				}
+			}
+		}
 		provider := t.Provider
 		rec.Provider = provider.Name
 		rec.UpstreamModel = t.UpstreamModel
-		attemptBody := body
-		attemptCtx := r.Context()
-		if chatDecision.Strip {
-			if pinTarget != nil && i == 0 {
-				provider = t.Provider
-				switch {
-				case chatDecision.Grok():
-					attemptCtx = withGrokChatReplay(attemptCtx, chatDecision.Turn, chatDecision.Assistants, grokBuildReplayGuard{
-						providerID: chatDecision.Turn.Bind.ProviderID,
-						generation: chatDecision.Turn.Bind.Generation,
-						principal:  chatDecision.Turn.Bind.Principal,
-						model:      chatDecision.Turn.Bind.Model,
-						routeModel: chatDecision.Turn.Bind.RouteModel,
-					})
-				case chatDecision.Codex():
-					// Notes restore same-source turns. The zero Grok guard must not
-					// block this send; the Codex guard is checked against the URL.
-					// The request context also carries the pinned model so encode can
-					// refuse a caller model that does not match the signed route.
-					attemptCtx = withGrokChatReplay(attemptCtx, chatDecision.Turn, chatDecision.Assistants, grokBuildReplayGuard{})
-					attemptCtx = withCodexReplayGuard(attemptCtx, codexReplayGuard{
-						providerID: chatDecision.Turn.Bind.ProviderID,
-						generation: chatDecision.Turn.Bind.Generation,
-						principal:  chatDecision.Turn.Bind.Principal,
-						endpoint:   chatDecision.Turn.Bind.Endpoint,
-						model:      chatDecision.Turn.Bind.Model,
-						routeModel: chatDecision.Turn.Bind.RouteModel,
-					})
-				}
-			} else if chatPortable != nil {
-				attemptBody = chatPortable
-			}
-		}
 		backend := backendCodecForProvider(provider.Protocol, provider, t.UpstreamModel)
 
 		attemptStart := time.Now()
@@ -563,20 +546,13 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 			last = p.serveTranslated(w, attemptCtx, res, ingress, backend, provider, t.UpstreamModel, attemptBody, &prep)
 		}
 
-		if last.logErr == skipLogCodexModel && !codexModelFallback {
-			// The signed route is eligible, but the prepared wire model differs.
-			// Do not send ciphertext, penalize health, or retry the pinned body.
-			codexModelFallback = true
-			observability.Logger(r.Context(), p.logger).Debug("codex_replay_model_mismatch",
-				"event", "codex_replay_model_mismatch",
-				"combo", combo.Name,
-				"provider", provider.Name,
-				"upstream_model", t.UpstreamModel,
-			)
-			if chatPortable == nil {
-				last = terminal(http.StatusBadRequest, chatReplayRejectedMessage(grokbuild.ErrCodexReplayRejected), "invalid_request_error")
+		if pinned && last.retry && last.logErr == skipLogCodexModel {
+			if ctxErr(r.Context()) {
+				last = callerCanceledResult()
 				break
 			}
+			// The wire model cannot honor the pin. Restore the normal order,
+			// but allow older markers matching the actual model to replay.
 			pinTarget = nil
 			targets = ordered
 			i = -1
@@ -636,11 +612,10 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 			)
 			continue
 		}
-		if last.retry && last.logErr == skipLogGrokReplay {
-			// The signed connection changed before send. Do not penalize health
-			// and do not include marker bytes in the log.
-			observability.Logger(r.Context(), p.logger).Debug("grok_build_replay_unavailable",
-				"event", "grok_build_replay_unavailable",
+		if last.retry && isChatReplayDecline(last.logErr) {
+			// A local decline is not an upstream health signal.
+			observability.Logger(r.Context(), p.logger).Debug(last.logErr,
+				"event", last.logErr,
 				"combo", combo.Name,
 				"provider", provider.Name,
 				"upstream_model", t.UpstreamModel,
@@ -997,9 +972,6 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err := prep.materialize(ctx, req, backend); err != nil {
 		return materializeSkip(err)
 	}
-	if err := applyGrokChatReplay(ctx, req); err != nil {
-		return terminal(http.StatusBadRequest, chatReplayRejectedMessage(err), "invalid_request_error")
-	}
 	if captured := thinking.Capture(body); captured != nil {
 		req.Thinking = thinking.ToIR(captured)
 	}
@@ -1019,6 +991,10 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 			return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 		}
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
+	}
+	ctx, upstreamBody, err = restoreChatReplay(ctx, req, backend, provider, upstreamModel, upstreamBody)
+	if err != nil {
+		return chatReplayBuildError(err)
 	}
 	upstreamBody, err = p.prepareUpstreamRequestFor(ctx, backend, provider, req, upstreamBody)
 	if err != nil {

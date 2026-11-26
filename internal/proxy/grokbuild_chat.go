@@ -46,17 +46,10 @@ type grokBuildReplayGuard struct {
 	generation string
 	principal  string
 	model      string
-	routeModel string
-}
-
-type grokChatReplayState struct {
-	turn  grokbuild.ChatTurn
-	notes []grokbuild.AssistantNote
-	guard grokBuildReplayGuard
 }
 
 type grokChatEmitKey struct{}
-type grokChatReplayKey struct{}
+type grokBuildReplayGuardKey struct{}
 
 func withGrokChatEmit(ctx context.Context, scope string, comboID int64) context.Context {
 	return context.WithValue(ctx, grokChatEmitKey{}, grokChatEmitState{scope: scope, comboID: comboID})
@@ -67,21 +60,16 @@ func grokChatEmitFrom(ctx context.Context) (grokChatEmitState, bool) {
 	return st, ok && st.comboID != 0 && st.scope != ""
 }
 
-func withGrokChatReplay(ctx context.Context, turn grokbuild.ChatTurn, notes []grokbuild.AssistantNote, guard grokBuildReplayGuard) context.Context {
-	return context.WithValue(ctx, grokChatReplayKey{}, grokChatReplayState{turn: turn, notes: notes, guard: guard})
-}
-
-func grokChatReplayFrom(ctx context.Context) (grokChatReplayState, bool) {
-	st, ok := ctx.Value(grokChatReplayKey{}).(grokChatReplayState)
-	return st, ok
+func withGrokBuildReplayGuard(ctx context.Context, guard grokBuildReplayGuard) context.Context {
+	return context.WithValue(ctx, grokBuildReplayGuardKey{}, guard)
 }
 
 func grokBuildReplayGuardFrom(ctx context.Context) *grokBuildReplayGuard {
-	st, ok := grokChatReplayFrom(ctx)
-	if !ok || st.guard.providerID == 0 {
+	guard, ok := ctx.Value(grokBuildReplayGuardKey{}).(grokBuildReplayGuard)
+	if !ok {
 		return nil
 	}
-	return &st.guard
+	return &guard
 }
 
 func replayUnavailableResult() attemptResult {
@@ -101,11 +89,9 @@ func mapGrokReplayErr(err error) (attemptResult, bool) {
 	return attemptResult{}, false
 }
 
-// guardGrokBuildReplay refuses to send a pinned ciphertext body when the
-// resolved connection is not the one that signed it. Ordinary refresh keeps
-// the generation and is allowed. A nil guard means this attempt has no
-// ciphertext affinity.
-func guardGrokBuildReplay(ctx context.Context, provider *domain.Provider) error {
+// guardGrokBuildReplay checks the resolved connection and prepared wire model.
+// Ordinary refresh keeps the generation and is allowed.
+func guardGrokBuildReplay(ctx context.Context, provider *domain.Provider, body []byte) error {
 	g := grokBuildReplayGuardFrom(ctx)
 	if g == nil {
 		return nil
@@ -113,7 +99,7 @@ func guardGrokBuildReplay(ctx context.Context, provider *domain.Provider) error 
 	if testGrokBuildReplayResolved != nil {
 		testGrokBuildReplayResolved(provider)
 	}
-	if !grokReplayGuardMatches(provider, *g) {
+	if !grokReplayGuardMatches(provider, *g) || strings.TrimSpace(reqModelFromBody(body)) != g.model {
 		return errGrokBuildReplayUnavailable
 	}
 	return nil
@@ -180,7 +166,6 @@ func grokChatSourceAvailable(t domain.ComboTarget, bind grokbuild.ChatBind) bool
 		generation: bind.Generation,
 		principal:  bind.Principal,
 		model:      bind.Model,
-		routeModel: bind.RouteModel,
 	})
 }
 
@@ -210,57 +195,6 @@ func pinGrokChatTarget(candidates []domain.ComboTarget, bind grokbuild.ChatBind)
 		out = append(out, t)
 	}
 	return out, true
-}
-
-func applyGrokChatReplay(ctx context.Context, req *ir.Request) error {
-	st, ok := grokChatReplayFrom(ctx)
-	if !ok {
-		return nil
-	}
-	rejected := grokbuild.ErrChatBridgeRejected
-	if codexReplayGuardFrom(ctx) != nil {
-		rejected = grokbuild.ErrCodexReplayRejected
-	}
-	if req == nil {
-		return rejected
-	}
-	var assistants []int
-	for i := range req.Messages {
-		if req.Messages[i].Role == ir.RoleAssistant {
-			assistants = append(assistants, i)
-		}
-	}
-	if len(assistants) != len(st.notes) {
-		return rejected
-	}
-	pin := st.turn.Bind
-	for n, idx := range assistants {
-		note := st.notes[n]
-		// Only turns from the exact pinned source replay opaque layout. An older
-		// incompatible turn stays readable. A portable attempt has no replay state.
-		if note.Turn != nil && note.Turn.Bind == pin {
-			next, err := grokbuild.ApplyChatTurn(req.Messages[idx].Content, *note.Turn)
-			if err != nil {
-				return rejected
-			}
-			req.Messages[idx].Content = next
-			continue
-		}
-		if note.Summary == "" || assistantHasReasoningText(req.Messages[idx].Content) {
-			continue
-		}
-		req.Messages[idx].Content = append([]ir.ContentBlock{{Type: ir.BlockReasoning, Text: note.Summary}}, req.Messages[idx].Content...)
-	}
-	return nil
-}
-
-func assistantHasReasoningText(blocks []ir.ContentBlock) bool {
-	for _, b := range blocks {
-		if b.Type == ir.BlockReasoning && b.Text != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func (p *Proxy) bridgeMAC(payload []byte) ([]byte, bool) {

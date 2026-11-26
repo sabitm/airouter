@@ -315,9 +315,6 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err := prep.materialize(ctx, req, backend); err != nil {
 		return materializeSkip(err)
 	}
-	if err := applyGrokChatReplay(ctx, req); err != nil {
-		return terminal(http.StatusBadRequest, chatReplayRejectedMessage(err), "invalid_request_error")
-	}
 	// Prefer Capture over typed decode so unfamiliar reasoning fields survive.
 	if captured := thinking.Capture(body); captured != nil {
 		req.Thinking = thinking.ToIR(captured)
@@ -337,6 +334,10 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 			return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 		}
 		return terminal(http.StatusInternalServerError, "failed to finalize upstream request", "api_error")
+	}
+	ctx, upstreamBody, err = restoreChatReplay(ctx, req, backend, provider, upstreamModel, upstreamBody)
+	if err != nil {
+		return chatReplayBuildError(err)
 	}
 	upstreamBody, err = p.prepareUpstreamRequestFor(ctx, backend, provider, req, upstreamBody)
 	if err != nil {

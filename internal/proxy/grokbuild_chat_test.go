@@ -889,10 +889,11 @@ func TestGrokChatOlderMarkerDoesNotPin(t *testing.T) {
 	st := newTestStore(t)
 	a := addGrokChatProvider(t, st, "ga", "conn-a", "user-a")
 	b := addGrokChatProvider(t, st, "gb", "conn-b", "user-b")
-	if err := st.CreateCombo(context.Background(), &domain.Combo{Name: "combo", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+	combo := &domain.Combo{Name: "combo", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
 		{ProviderID: b.ID, UpstreamModel: "grok-4.7", Enabled: true},
 		{ProviderID: a.ID, UpstreamModel: "grok-4.7", Enabled: true},
-	}}); err != nil {
+	}}
+	if err := st.CreateCombo(context.Background(), combo); err != nil {
 		t.Fatal(err)
 	}
 	key, err := st.NewAccessKey(context.Background(), "k")
@@ -916,11 +917,21 @@ func TestGrokChatOlderMarkerDoesNotPin(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || origin.n != beforeA {
 		t.Fatalf("older marker changed order: status %d A=%d", resp.StatusCode, origin.n-beforeA)
 	}
-	if strings.Contains(other.lastBody(), "cipher-b") || strings.Contains(other.lastBody(), grokbuild.ChatBridgeFormat) {
-		t.Fatalf("older marker replayed: %s", other.lastBody())
+	if sent := other.lastBody(); !strings.Contains(sent, `"encrypted_content":"cipher-b"`) || !strings.Contains(sent, `"id":"rs_out"`) || strings.Contains(sent, grokbuild.ChatBridgeFormat) {
+		t.Fatalf("matching older state was not restored: %s", sent)
 	}
-	if !strings.Contains(other.lastBody(), "sum-b") || !strings.Contains(other.lastBody(), "plain latest") {
-		t.Fatalf("readable history lost: %s", other.lastBody())
+	combo.Targets[0], combo.Targets[1] = combo.Targets[1], combo.Targets[0]
+	if err := st.UpdateCombo(context.Background(), combo); err != nil {
+		t.Fatal(err)
+	}
+	beforeB := other.n
+	resp, out = chatPost(t, ts.URL+"/v1/chat/completions", key.Token, string(raw))
+	if resp.StatusCode != http.StatusOK || origin.n != beforeA+1 || other.n != beforeB {
+		t.Fatalf("older marker changed normal order: status=%d A=%d B=%d: %s", resp.StatusCode, origin.n, other.n, out)
+	}
+	if sent := origin.lastBody(); strings.Contains(sent, "cipher-b") || strings.Contains(sent, "rs_out") || strings.Contains(sent, grokbuild.ChatBridgeFormat) ||
+		!strings.Contains(sent, "sum-b") || !strings.Contains(sent, "plain latest") {
+		t.Fatalf("other account did not receive readable history only: %s", sent)
 	}
 }
 

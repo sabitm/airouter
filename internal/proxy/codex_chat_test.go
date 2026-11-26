@@ -231,8 +231,8 @@ func TestCodexChatPortableFailoverAndOlderHistory(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || bCap.n != 1 {
 		t.Fatalf("older marker pinned or failed: %d B=%d %s", resp.StatusCode, bCap.n, out)
 	}
-	if strings.Contains(bCap.lastBody(), "cipher-a") || strings.Contains(bCap.lastBody(), "rs_a") {
-		t.Fatalf("older ciphertext forwarded: %s", bCap.lastBody())
+	if !strings.Contains(aCap.lastBody(), `"encrypted_content":"cipher-a"`) || strings.Contains(bCap.lastBody(), "cipher-a") || strings.Contains(bCap.lastBody(), "rs_a") || !strings.Contains(bCap.lastBody(), "sum-a") {
+		t.Fatalf("wrong history on failover: A=%s B=%s", aCap.lastBody(), bCap.lastBody())
 	}
 	latest := extractChatDetails(t, out)
 	aCap.failN = 0
@@ -255,6 +255,77 @@ func TestCodexChatPortableFailoverAndOlderHistory(t *testing.T) {
 	}
 	if !strings.Contains(aCap.lastBody(), "sum-b") {
 		t.Fatalf("readable summary lost: %s", aCap.lastBody())
+	}
+}
+
+func TestCodexChatOlderHistoryReplaysOnMatchingWireModel(t *testing.T) {
+	cap := &codexChatCapture{sse: codexChatSSE("first answer", "rs_base", "cipher-base", "sum-base", `fc_base|call_base|read|{"path":"a"}`)}
+	up := httptest.NewServer(cap)
+	t.Cleanup(up.Close)
+	st := newTestStore(t)
+	a := addCodexChatProvider(t, st, "ca", "acct-a", "gen-a")
+	if err := st.CreateCombo(context.Background(), &domain.Combo{Name: "combo", Strategy: domain.StrategyFailover, Targets: []domain.ComboTarget{
+		{ProviderID: a.ID, UpstreamModel: "gpt-5.3-codex-high", Enabled: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.NewAccessKey(context.Background(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := startChatProxyTransport(t, st, codexRouteTransport{base: up.URL})
+	endpoint := ts.URL + "/v1/chat/completions"
+	postOK := func(body string) []byte {
+		t.Helper()
+		resp, out := chatPost(t, endpoint, key.Token, body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d body=%s", resp.StatusCode, out)
+		}
+		return out
+	}
+	base := extractChatDetails(t, postOK(`{"model":"combo","messages":[{"role":"user","content":"first"}]}`))
+	cap.mu.Lock()
+	cap.sse = codexChatSSE("second answer", "rs_high", "cipher-high", "sum-high")
+	cap.mu.Unlock()
+	high := extractChatDetails(t, postOK(`{"model":"combo","reasoning_effort":"high","messages":[{"role":"user","content":"second"}]}`))
+	cap.mu.Lock()
+	cap.sse = codexChatSSE("no new reasoning", "", "", "")
+	cap.mu.Unlock()
+
+	messages := fmt.Sprintf(`[
+		{"role":"user","content":"first"},
+		{"role":"assistant","content":"first answer","reasoning_details":%s,"tool_calls":[{"id":"call_base","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]},
+		{"role":"tool","tool_call_id":"call_base","content":"file result"},
+		{"role":"user","content":"second"},
+		{"role":"assistant","content":"second answer","reasoning_details":%s},
+		{"role":"assistant","content":"no new reasoning"},
+		{"role":"user","content":"follow-up"}]`, mustChatJSON(base), mustChatJSON(high))
+	for _, stream := range []bool{false, true} {
+		for _, explicit := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/explicit=%t", stream, explicit), func(t *testing.T) {
+				effort := ""
+				wantModel, wantCipher, wantID, otherCipher, otherID := "gpt-5.3-codex", "cipher-base", "rs_base", "cipher-high", "rs_high"
+				if explicit {
+					effort = `,"reasoning_effort":"high"`
+					wantModel, wantCipher, wantID, otherCipher, otherID = "gpt-5.3-codex-high", "cipher-high", "rs_high", "cipher-base", "rs_base"
+				}
+				postOK(fmt.Sprintf(`{"model":"combo","stream":%t%s,"messages":%s}`, stream, effort, messages))
+				sent := cap.lastBody()
+				if reqModelFromBody([]byte(sent)) != wantModel || !strings.Contains(sent, `"encrypted_content":"`+wantCipher+`"`) ||
+					!strings.Contains(sent, `"id":"`+wantID+`"`) || strings.Contains(sent, otherCipher) || strings.Contains(sent, otherID) ||
+					strings.Contains(sent, "airouter-codex-v1") {
+					t.Fatalf("incorrect match for %s: %s", wantModel, sent)
+				}
+				for _, want := range []string{"sum-base", "sum-high", "no new reasoning", `"call_id":"call_base"`, "file result"} {
+					if !strings.Contains(sent, want) {
+						t.Fatalf("history missing %q: %s", want, sent)
+					}
+				}
+				if strings.Contains(sent, `"id":"fc_base"`) == explicit {
+					t.Fatalf("tool item ID did not follow the reasoning source: %s", sent)
+				}
+			})
+		}
 	}
 }
 
