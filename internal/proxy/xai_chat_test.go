@@ -325,6 +325,59 @@ func TestXAIChatOlderSourceReplaysFirstTurnOnly(t *testing.T) {
 	}
 }
 
+func TestXAIChatCacheAffinityIsScopedAndStable(t *testing.T) {
+	cap := &xaiCapture{sse: xaiPlainSSE("ok")}
+	up := httptest.NewServer(cap)
+	t.Cleanup(up.Close)
+	st := newTestStore(t)
+	p := addXAIChatProvider(t, st, "xai", "gen-1", "user-1")
+	xaiCombo(t, st, domain.ComboTarget{ProviderID: p.ID, UpstreamModel: "grok-4.7", Enabled: true})
+	key := xaiAccessKey(t, st)
+	ts := startChatProxyTransport(t, st, xaiRouteTransport{base: up.URL})
+
+	request := `{"model":"combo","stream":true,"prompt_cache_key":"explicit-key","messages":[{"role":"user","content":"first"}]}`
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(request))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("X-Grok-Conv-Id", "header-key")
+	req.Header.Set("X-Client-Request-Id", "volatile-request")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	first := cap.lastBody()
+	var firstDoc map[string]any
+	if json.Unmarshal([]byte(first), &firstDoc) != nil {
+		t.Fatalf("body not JSON: %s", first)
+	}
+	firstKey, _ := firstDoc["prompt_cache_key"].(string)
+	if firstKey == "" || firstKey == "explicit-key" || firstKey == "header-key" || strings.Contains(first, "volatile-request") {
+		t.Fatalf("affinity forwarded or unscoped: %s", first)
+	}
+	if len(firstKey) != 64 {
+		t.Fatalf("cache key length = %d", len(firstKey))
+	}
+	resp, out := chatPost(t, ts.URL+"/v1/chat/completions", key, request)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.StatusCode, string(out))
+	}
+	var secondDoc map[string]any
+	if json.Unmarshal([]byte(cap.lastBody()), &secondDoc) != nil {
+		t.Fatal("second body not JSON")
+	}
+	if secondDoc["prompt_cache_key"] != firstKey {
+		t.Fatalf("cache key changed: %v %v", firstKey, secondDoc["prompt_cache_key"])
+	}
+	resp, out = chatPost(t, ts.URL+"/v1/chat/completions", key, `{"model":"combo","stream":true,"messages":[{"role":"user","content":"none"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.StatusCode, string(out))
+	}
+	if strings.Contains(cap.lastBody(), "prompt_cache_key") {
+		t.Fatalf("absent affinity invented a key: %s", cap.lastBody())
+	}
+}
+
 func TestXAIChatRejectsTamperedMarkerBeforeUpstream(t *testing.T) {
 	cap := &xaiCapture{sse: grokChatSSE("hello", "cipher-x", "think", false)}
 	up := httptest.NewServer(cap)
@@ -1192,6 +1245,77 @@ func TestXAIChatSilentAddedReasoningDoesNotBlock(t *testing.T) {
 	raw := string(mustChatJSON(extractChatDetails(t, out)))
 	if !strings.Contains(raw, "cipher-late") || !strings.Contains(raw, `"item":"fc_late"`) {
 		t.Fatalf("late authoritative state was lost: %s", raw)
+	}
+}
+
+func TestXAIRequestHintIgnoresStandaloneRequestID(t *testing.T) {
+	header := http.Header{}
+	header.Set("X-Client-Request-Id", "request-1")
+	if hint := xaiRequestHint(header, []byte(`{"model":"combo"}`)); hint != "" {
+		t.Fatalf("standalone X-Client-Request-Id became a hint: %q", hint)
+	}
+	header.Set("X-Client-Request-Id", "request-2")
+	if hint := xaiRequestHint(header, nil); hint != "" {
+		t.Fatalf("successive request id invented a hint: %q", hint)
+	}
+	header.Set("X-Session-Id", "stable-session")
+	if hint := xaiRequestHint(header, nil); hint != "stable-session" {
+		t.Fatalf("stable session hint = %q", hint)
+	}
+	header.Del("X-Session-Id")
+	header.Set("X-Session-Affinity", "affinity")
+	if hint := xaiRequestHint(header, nil); hint != "affinity" {
+		t.Fatalf("session affinity hint = %q", hint)
+	}
+	header.Set("X-Grok-Conv-Id", "conv")
+	header.Set("X-Client-Request-Id", "volatile")
+	if hint := xaiRequestHint(header, nil); hint != "conv" {
+		t.Fatalf("explicit conversation hint = %q", hint)
+	}
+	if hint := xaiRequestHint(header, []byte(`{"prompt_cache_key":"prompt"}`)); hint != "prompt" {
+		t.Fatalf("explicit prompt cache key = %q", hint)
+	}
+}
+
+func TestXAIChatCacheIgnoresStandaloneRequestID(t *testing.T) {
+	cap := &xaiCapture{sse: xaiPlainSSE("ok")}
+	up := httptest.NewServer(cap)
+	t.Cleanup(up.Close)
+	st := newTestStore(t)
+	p := addXAIChatProvider(t, st, "xai", "gen-1", "user-1")
+	xaiCombo(t, st, domain.ComboTarget{ProviderID: p.ID, UpstreamModel: "grok-4.7", Enabled: true})
+	key := xaiAccessKey(t, st)
+	ts := startChatProxyTransport(t, st, xaiRouteTransport{base: up.URL})
+	post := func(requestID, session string) string {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(`{"model":"combo","stream":true,"messages":[{"role":"user","content":"first"}]}`))
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("X-Client-Request-Id", requestID)
+		if session != "" {
+			req.Header.Set("X-Session-Id", session)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return cap.lastBody()
+	}
+	first := post("request-1", "")
+	second := post("request-2", "")
+	if strings.Contains(first, "prompt_cache_key") || strings.Contains(second, "prompt_cache_key") {
+		t.Fatalf("standalone request id injected a cache key: %s %s", first, second)
+	}
+	first = post("request-3", "stable-session")
+	second = post("request-4", "stable-session")
+	var firstDoc, secondDoc map[string]any
+	if json.Unmarshal([]byte(first), &firstDoc) != nil || json.Unmarshal([]byte(second), &secondDoc) != nil {
+		t.Fatalf("cache bodies: %s %s", first, second)
+	}
+	firstKey, _ := firstDoc["prompt_cache_key"].(string)
+	secondKey, _ := secondDoc["prompt_cache_key"].(string)
+	if firstKey == "" || firstKey != secondKey || strings.Contains(first, "stable-session") || strings.Contains(first, "request-3") {
+		t.Fatalf("stable session key unstable or leaked: %s %s", first, second)
 	}
 }
 

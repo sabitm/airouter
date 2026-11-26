@@ -502,6 +502,11 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 		// Tenant scope is the verified access-key hash, or open in open mode.
 		r = r.WithContext(withGrokBuildRequest(r.Context(), auth.Scope, r.Header, body))
 	}
+	if ingress.id == "oai-chat" && hasXAIChatTarget(candidates) {
+		// Capture only supported affinity hints before translation. The bridge
+		// derives its own scoped key; it never forwards the caller value.
+		r = r.WithContext(withXAIChatRequest(r.Context(), auth.Scope, combo.ID, r.Header, body))
+	}
 	if hasClaudeCodeTarget(candidates) {
 		// Capture Claude Code session identity before translation drops metadata.
 		// The account UUID is never taken from this body.

@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -72,6 +75,9 @@ func (a *xaiChatAttempt) transportProtected() bool {
 // Chat-only gates as the marker, so other targets keep their client policy.
 func (p *Proxy) xaiChatAttemptContext(ctx context.Context, provider *domain.Provider, upstreamModel string, body []byte) context.Context {
 	if !p.xaiChatCanSign() {
+		return ctx
+	}
+	if _, ok := xaiChatRequestFrom(ctx); !ok {
 		return ctx
 	}
 	emit, ok := grokChatEmitFrom(ctx)
@@ -412,17 +418,17 @@ func (p *Proxy) ensureXAIChatProvider(ctx context.Context, provider *domain.Prov
 // ensureXAIChatProviderForModel initializes a legacy generation only when the
 // request is an eligible Chat translation for the exact signed wire model.
 func (p *Proxy) ensureXAIChatProviderForModel(ctx context.Context, provider *domain.Provider, model string) *domain.Provider {
-	if _, ok := grokChatEmitFrom(ctx); !ok || !xaigrant.IsWireModel(model) {
+	if _, ok := xaiChatRequestFrom(ctx); !ok || !xaigrant.IsWireModel(model) {
 		return provider
 	}
 	return p.ensureXAIChatProvider(ctx, provider)
 }
 
-// prepareXAIChatBody adds the stateless envelope to an already finalized xAI
-// request. It preserves tools, effort, model, stream, and unknown fields. A
-// body that cannot be made bridge-safe is left unchanged.
+// prepareXAIChatBody adds the stateless envelope and a scoped cache key to an
+// already finalized xAI request. It preserves tools, effort, model, stream, and
+// unknown fields. A body that cannot be made bridge-safe is left unchanged.
 func (p *Proxy) prepareXAIChatBody(ctx context.Context, body []byte, provider *domain.Provider) ([]byte, error) {
-	_, ok := grokChatEmitFrom(ctx)
+	state, ok := xaiChatRequestFrom(ctx)
 	if !ok || !p.xaiChatCanSign() || !xaigrant.Eligible(provider) {
 		return body, nil
 	}
@@ -444,6 +450,17 @@ func (p *Proxy) prepareXAIChatBody(ctx context.Context, body []byte, provider *d
 		return nil, err
 	}
 	root["include"] = rawInclude
+	delete(root, "prompt_cache_key")
+	if state.hint != "" {
+		key := xaiCacheKey(state.scope, state.comboID, provider.ID, provider.OAuthCreds.XAIGrantGeneration, model, state.hint)
+		if key != "" {
+			rawKey, err := json.Marshal(key)
+			if err != nil {
+				return nil, err
+			}
+			root["prompt_cache_key"] = rawKey
+		}
+	}
 	return json.Marshal(root)
 }
 
@@ -472,4 +489,20 @@ func xaiReasoningIncludes(raw json.RawMessage) ([]json.RawMessage, bool) {
 		out = append(out, json.RawMessage(`"reasoning.encrypted_content"`))
 	}
 	return out, true
+}
+
+func xaiCacheKey(scope string, comboID, providerID int64, generation, model, hint string) string {
+	if scope == "" || comboID == 0 || providerID == 0 || generation == "" || model == "" || hint == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(
+		"airouter-xai-cache-v1\x00" +
+			scope + "\x00" +
+			strconv.FormatInt(comboID, 10) + "\x00" +
+			strconv.FormatInt(providerID, 10) + "\x00" +
+			generation + "\x00" +
+			model + "\x00" +
+			hint,
+	))
+	return hex.EncodeToString(sum[:])
 }
