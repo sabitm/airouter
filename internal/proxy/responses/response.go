@@ -106,6 +106,9 @@ type respOutputItem struct {
 	// and an explicit empty string stay distinct through the pointer.
 	EncryptedContent *string `json:"encrypted_content"`
 	Status           string  `json:"status"`
+	// Unsupported marks an item or nested part that the shared projection drops
+	// or cannot represent for a replay bridge. It never changes generic decode.
+	Unsupported bool `json:"-"`
 }
 
 // UnmarshalJSON records whether the summary array was present and non-null so a
@@ -128,6 +131,7 @@ func (it *respOutputItem) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	}
+	it.Unsupported = outputItemUnsupported(data, it.Type, it.Content, it.Summary)
 	return nil
 }
 
@@ -140,6 +144,8 @@ type respOutputContent struct {
 	// explicit empty refusal from an absent or null field.
 	Refusal    string `json:"refusal"`
 	RefusalSet bool   `json:"-"`
+	// Unsupported marks a part that a replay bridge cannot represent.
+	Unsupported bool `json:"-"`
 }
 
 // UnmarshalJSON keeps text and refusal presence distinct. A wrong-type
@@ -155,6 +161,7 @@ func (c *respOutputContent) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*c = respOutputContent{Type: raw.Type}
+	c.Unsupported = outputContentUnsupported(data, raw.Type)
 	if !isNullish(raw.Text) {
 		if err := json.Unmarshal(raw.Text, &c.Text); err != nil {
 			return err
@@ -170,9 +177,29 @@ func (c *respOutputContent) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// OutputObservation reports one authoritative output item or message part.
+// Supported is false when the shared projection drops the value or a replay
+// bridge cannot reconstruct it. Observations never change decode output.
+type OutputObservation struct {
+	ItemType    string
+	ContentType string
+	Supported   bool
+}
+
 // DecodeResponse parses an OpenAI Responses object into the IR. Used when
 // Responses is the backend format.
 func DecodeResponse(body []byte) (*ir.Response, error) {
+	return decodeResponse(body, nil)
+}
+
+// DecodeResponseObserved is DecodeResponse with an optional observation hook.
+// It reports original output items and message parts before projection, so a
+// bridge can decline an incomplete turn. A nil hook is DecodeResponse.
+func DecodeResponseObserved(body []byte, observe func(OutputObservation)) (*ir.Response, error) {
+	return decodeResponse(body, observe)
+}
+
+func decodeResponse(body []byte, observe func(OutputObservation)) (*ir.Response, error) {
 	var resp respObject
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("responses: decode response: %w", err)
@@ -187,6 +214,9 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 	out := &ir.Response{ID: resp.ID, Model: resp.Model, StopReason: ir.StopEndTurn}
 	sawTool := false
 	for _, it := range resp.Output {
+		if observe != nil {
+			observe(OutputObservation{ItemType: it.Type, Supported: !it.Unsupported})
+		}
 		switch it.Type {
 		case "reasoning":
 			// One structured block per item, in output order, even when the
@@ -208,6 +238,9 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 				seg = nil
 			}
 			for _, c := range it.Content {
+				if observe != nil {
+					observe(OutputObservation{ItemType: it.Type, ContentType: c.Type, Supported: !c.Unsupported})
+				}
 				part, ok := outputContentPart(c)
 				if !ok {
 					continue
@@ -223,8 +256,12 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 			flush()
 		case "function_call":
 			sawTool = true
+			// The native function item id is not call_id. Keep it for bridges
+			// that must replay the same item, while readers that only know
+			// tool calls continue to use CallID.
 			out.Content = append(out.Content, ir.ContentBlock{
 				Type: ir.BlockToolUse, ToolID: it.CallID, ToolName: it.Name, ToolInput: rawArgs(it.Arguments),
+				ResponsesItemID: it.ID,
 			})
 		}
 	}
@@ -233,6 +270,72 @@ func DecodeResponse(body []byte) (*ir.Response, error) {
 		out.Usage = usageFromWire(resp.Usage)
 	}
 	return out, nil
+}
+
+// outputItemUnsupported checks the original item object against the fields a
+// bridge can replay. Null unknown fields carry no state and are ignored.
+func outputItemUnsupported(raw []byte, kind string, content []respOutputContent, summary []reasoningSummary) bool {
+	switch kind {
+	case "reasoning":
+		if unsupportedOutputFields(raw, "id", "type", "summary", "encrypted_content", "status") {
+			return true
+		}
+		for i := range summary {
+			if summary[i].Unsupported {
+				return true
+			}
+		}
+		return false
+	case "message":
+		if unsupportedOutputFields(raw, "id", "type", "role", "status", "content") {
+			return true
+		}
+		for i := range content {
+			if content[i].Unsupported {
+				return true
+			}
+		}
+		return false
+	case "function_call":
+		return unsupportedOutputFields(raw, "id", "type", "call_id", "name", "arguments", "status")
+	default:
+		return true
+	}
+}
+
+// outputContentUnsupported marks parts that have no replayable Chat projection.
+// Refusal is intentionally included: the xAI bridge does not sign a refusal
+// turn even though generic decode can still project it.
+func outputContentUnsupported(raw []byte, kind string) bool {
+	switch kind {
+	case "output_text", "text", "":
+		return unsupportedOutputFields(raw, "type", "text", "annotations", "logprobs")
+	default:
+		return true
+	}
+}
+
+func unsupportedOutputFields(raw []byte, allowed ...string) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return false
+	}
+	for key, value := range fields {
+		if isNullish(value) {
+			continue
+		}
+		ok := false
+		for _, name := range allowed {
+			if key == name {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func usageFromWire(u *respUsage) ir.Usage {

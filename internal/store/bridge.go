@@ -32,3 +32,19 @@ func (s *Store) VerifyCodexChatMAC(payload, mac []byte) bool {
 	}
 	return s.cipher.VerifyCodexChatMAC(payload, mac)
 }
+
+// XAIChatMAC signs payload with the public xAI Chat-replay key.
+func (s *Store) XAIChatMAC(payload []byte) ([]byte, bool) {
+	if s == nil || s.cipher == nil {
+		return nil, false
+	}
+	return s.cipher.XAIChatMAC(payload)
+}
+
+// VerifyXAIChatMAC checks an xAI Chat-replay MAC. A missing cipher fails closed.
+func (s *Store) VerifyXAIChatMAC(payload, mac []byte) bool {
+	if s == nil || s.cipher == nil {
+		return false
+	}
+	return s.cipher.VerifyXAIChatMAC(payload, mac)
+}

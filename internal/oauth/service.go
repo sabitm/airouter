@@ -14,6 +14,7 @@ import (
 	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
 	"airouter/internal/store"
+	"airouter/internal/xaigrant"
 )
 
 // httpClient is the client used for OAuth token endpoint calls (refresh and the
@@ -115,6 +116,7 @@ type refreshKey struct {
 	console      bool
 	grok         bool
 	codex        bool
+	xai          bool
 	refreshGrant [sha256.Size]byte
 	generation   [sha256.Size]byte
 }
@@ -188,6 +190,9 @@ func (s *Service) ResolveCreds(ctx context.Context, provider *domain.Provider, f
 	}
 	if codexInvolved(provider) {
 		return s.resolveCodex(ctx, provider, force)
+	}
+	if xaiInvolved(provider) {
+		return s.resolveXAI(ctx, provider, force)
 	}
 	if err := rejectGrokBuildMismatch(provider, grokBuildCredsOf(provider)); err != nil {
 		return nil, err
@@ -371,6 +376,12 @@ func (s *Service) doRefresh(ctx context.Context, id int64, creds *domain.OAuthCr
 	// A stored official Codex row must not take the generic whole-row write,
 	// even when the submitted copy no longer looks like that grant.
 	if s.storedCodexGrant(ctx, id) {
+		return nil, ErrCredentialConflict
+	}
+	if xaigrant.IsGrant(creds) {
+		return s.doRefreshXAI(ctx, id, creds)
+	}
+	if s.storedXAIGrant(ctx, id) {
 		return nil, ErrCredentialConflict
 	}
 	if hasOpencodeConsoleCreds(creds) {
@@ -712,6 +723,18 @@ func (s *Service) RefreshAndPersist(ctx context.Context, id int64, creds *domain
 	}
 	if codexgrant.IsGrant(creds) {
 		return s.refreshCodexGrant(ctx, id, creds)
+	}
+	// Saved public xAI refresh follows the stored grant, not the form's token
+	// URL, client, preset, or generation. A protocol change does not change the
+	// grant, so the stored credential remains the only basis.
+	if live, ok := s.storedXAIProvider(ctx, id); ok {
+		if xaiSubmittedOverrides(creds, live.OAuthCreds) {
+			return nil, ErrCredentialConflict
+		}
+		return s.refreshXAIGrant(ctx, id, live.OAuthCreds)
+	}
+	if xaigrant.IsGrant(creds) {
+		return s.refreshXAIGrant(ctx, id, creds)
 	}
 	if hasOpencodeConsoleCreds(creds) {
 		return s.refreshOpencodeConsoleGrant(ctx, id, creds)

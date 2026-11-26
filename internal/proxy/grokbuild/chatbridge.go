@@ -14,6 +14,7 @@ import (
 
 	"airouter/internal/codexgrant"
 	"airouter/internal/proxy/ir"
+	"airouter/internal/xaigrant"
 )
 
 // ChatBridgeFormat is the Airouter-owned reasoning_details format. It is not
@@ -47,12 +48,21 @@ var ErrChatBridgeRejected = errors.New("invalid grok build replay state")
 // ErrCodexReplayRejected is the sanitized rejection for a Codex Chat marker.
 var ErrCodexReplayRejected = errors.New("invalid codex replay state")
 
+// ErrXAIReplayRejected is the sanitized rejection for a public xAI Chat marker.
+var ErrXAIReplayRejected = errors.New("invalid xai replay state")
+
 // CodexReplayFormat is the versioned reasoning_details format for Codex.
 // It is not the Grok Build format and is not an OpenRouter carrier.
 const CodexReplayFormat = "airouter-codex-v1"
 
+// XAIReplayFormat is the versioned reasoning_details format for the public
+// xAI Responses bridge. It is not the Grok Build or Codex format.
+const XAIReplayFormat = "airouter-xai-v1"
+
 const codexReplayCanonical = "airouter-codex-chat/1\n"
 const codexReplayProtocol = "codex"
+const xaiReplayCanonical = "airouter-xai-chat/1\n"
+const xaiReplayProtocol = "xai-public"
 
 // ReplayProfile selects one Chat replay proof domain. The Grok profile keeps
 // the original format, canonical prefix, and protocol bytes.
@@ -62,6 +72,11 @@ type ReplayProfile struct {
 	Protocol        string
 	Rejected        error
 	IncludeEndpoint bool
+	// NormalizeEndpoint validates the signed endpoint for profiles that include
+	// it. Nil profiles do not carry an endpoint.
+	NormalizeEndpoint func(string) (string, bool)
+	// RequirePrincipal is true when a signed marker must name a stable account.
+	RequirePrincipal bool
 	// AuthoritativeEmpty keeps an explicit empty encrypted_content as replay
 	// state when no nonempty sibling exists. Grok leaves this false, so its
 	// historical nonempty requirement and marker bytes stay unchanged.
@@ -86,13 +101,25 @@ func CodexReplayProfile() ReplayProfile {
 	return ReplayProfile{
 		Format: CodexReplayFormat, Canonical: codexReplayCanonical,
 		Protocol: codexReplayProtocol, Rejected: ErrCodexReplayRejected,
-		IncludeEndpoint: true, AuthoritativeEmpty: true,
+		IncludeEndpoint: true, NormalizeEndpoint: codexgrant.NormalizeEndpoint,
+		RequirePrincipal: true, AuthoritativeEmpty: true,
+	}
+}
+
+// XAIReplayProfile is the public xAI proof domain. The official endpoint is
+// signed because a different origin cannot replay this provider state.
+func XAIReplayProfile() ReplayProfile {
+	return ReplayProfile{
+		Format: XAIReplayFormat, Canonical: xaiReplayCanonical,
+		Protocol: xaiReplayProtocol, Rejected: ErrXAIReplayRejected,
+		IncludeEndpoint: true, NormalizeEndpoint: xaigrant.NormalizeEndpoint,
+		AuthoritativeEmpty: true,
 	}
 }
 
 // KnownReplayProfiles is the set of recognizable Chat replay formats.
 func KnownReplayProfiles() []ReplayProfile {
-	return []ReplayProfile{grokReplayProfile(), CodexReplayProfile()}
+	return []ReplayProfile{grokReplayProfile(), CodexReplayProfile(), XAIReplayProfile()}
 }
 
 func (p ReplayProfile) rejected() error {
@@ -192,6 +219,9 @@ func (d ChatDecision) Grok() bool { return d.Pin && d.Protocol == chatBridgeProt
 
 // Codex reports whether the pinned marker is a Codex marker.
 func (d ChatDecision) Codex() bool { return d.Pin && d.Protocol == codexReplayProtocol }
+
+// XAI reports whether the pinned marker is a public xAI marker.
+func (d ChatDecision) XAI() bool { return d.Pin && d.Protocol == xaiReplayProtocol }
 
 type macFunc func([]byte) ([]byte, bool)
 type verifyFunc func([]byte, []byte) bool
@@ -1085,8 +1115,11 @@ func bindFromWire(profile ReplayProfile, w wireBind) (ChatBind, error) {
 	}
 	endpoint := ""
 	if profile.IncludeEndpoint {
-		norm, ok := codexgrant.NormalizeEndpoint(w.Endpoint)
-		if !ok || strings.TrimSpace(w.Principal) == "" {
+		if profile.NormalizeEndpoint == nil {
+			return ChatBind{}, profile.rejected()
+		}
+		norm, ok := profile.NormalizeEndpoint(w.Endpoint)
+		if !ok || profile.RequirePrincipal && strings.TrimSpace(w.Principal) == "" {
 			return ChatBind{}, profile.rejected()
 		}
 		endpoint = norm

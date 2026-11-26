@@ -119,6 +119,9 @@ type streamItem struct {
 	SummarySet       bool                `json:"-"`
 	EncryptedContent *string             `json:"encrypted_content"`
 	Status           string              `json:"status"`
+	// Unsupported marks output that the shared projection drops or cannot
+	// represent for a replay bridge. It never changes stream decode.
+	Unsupported bool `json:"-"`
 }
 
 // UnmarshalJSON decodes one item frame while recording whether the summary
@@ -140,6 +143,7 @@ func (it *streamItem) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	}
+	it.Unsupported = outputItemUnsupported(data, it.Type, it.Content, it.Summary)
 	return nil
 }
 
@@ -295,12 +299,69 @@ func DecodeStreamCodexReconciledObserved(r io.Reader, emit func(ir.StreamEvent) 
 	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileReasoning: true, openAddedReasoning: true, observe: observe})
 }
 
+// DecodeStreamXAIReconciledObserved is the public xAI Chat-bridge decode. It
+// waits for a native function item id and promotes only completion or terminal
+// reasoning ciphertext, never provisional added bytes. An added-only silent
+// reasoning placeholder keeps the Grok policy: it takes no wire rank and starts
+// no completion hold. Observe receives source-order metadata without changing
+// client emission. unsupported reports original output that the projection
+// drops, so the optional marker can decline without failing the stream.
+func DecodeStreamXAIReconciledObserved(r io.Reader, emit func(ir.StreamEvent) error, observe func(ir.StreamEvent), unsupported func()) error {
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{awaitItemID: true, reconcileReasoning: true, observe: observe, onUnsupported: unsupported})
+}
+
 // DecodeStreamAwaitingItemIDObserved is the Grok Build Chat-bridge decode.
 // observe receives source-order metadata and reasoning snapshots. It is not
 // the client emit path. A nil observe is DecodeStreamAwaitingItemID. The
 // observer cannot change item.wired, the ordering queue, or final-order checks.
 func DecodeStreamAwaitingItemIDObserved(r io.Reader, emit func(ir.StreamEvent) error, observe func(ir.StreamEvent)) error {
 	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{awaitItemID: true, observe: observe})
+}
+
+// notifyUnsupportedOutput reports original item and part shapes that the
+// shared projection drops or cannot represent. It reads only decoded metadata
+// and never echoes payload values.
+func notifyUnsupportedOutput(env *streamEnvelope, report func()) {
+	if env == nil || report == nil {
+		return
+	}
+	switch env.Type {
+	case "response.output_item.added", "response.output_item.done":
+		if env.Item != nil && env.Item.Unsupported {
+			report()
+		}
+	case "response.content_part.added", "response.content_part.done":
+		if contentPartUnsupported(env.Part) {
+			report()
+		}
+	case "response.refusal.delta", "response.refusal.done":
+		report()
+	case "response.completed", "response.incomplete":
+		if env.Response == nil {
+			return
+		}
+		for i := range env.Response.Output {
+			if env.Response.Output[i].Unsupported {
+				report()
+				return
+			}
+		}
+	}
+}
+
+// contentPartUnsupported checks a content-part frame. The shared summary
+// decoder also carries content-part fields, so the event type decides whether
+// a native refusal or unknown part kind is representable.
+func contentPartUnsupported(part *reasoningSummary) bool {
+	if part == nil {
+		return false
+	}
+	switch part.Type {
+	case "output_text", "text", "":
+		return part.Unsupported
+	default:
+		return true
+	}
 }
 
 func decodeStreamLimited(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls int) error {
@@ -339,12 +400,16 @@ type decodePolicy struct {
 	openAddedReasoning bool
 	// observe receives source-order metadata without changing client emission.
 	observe func(ir.StreamEvent)
+	// onUnsupported reports original output that the projection drops. It is a
+	// side channel and must not change client emission or fail the decode.
+	onUnsupported func()
 }
 
 // decodeStreamBoundedParts adds the content-part budget so tests can inject a
 // small part cap independently of the item cap and byte budgets.
 func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int, policy decodePolicy) error {
 	awaitItemID, reconcileReasoning, observe := policy.awaitItemID, policy.reconcileReasoning, policy.observe
+	onUnsupported := policy.onUnsupported
 	reader := sse.NewReader(r)
 	started := false
 	startID, startModel := "", ""
@@ -415,6 +480,9 @@ func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxA
 				return ir.ProtocolError(msg)
 			}
 			continue
+		}
+		if onUnsupported != nil {
+			notifyUnsupportedOutput(&env, onUnsupported)
 		}
 		// Failure discriminators are authoritative even when nested metadata is
 		// unusable. Check them before the success switch so a failed status on a

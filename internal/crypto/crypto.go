@@ -23,6 +23,10 @@ const grokBuildChatBridgeInfo = "airouter/grok-build-chat-bridge/v1"
 // Grok Build marker and from the at-rest encryption key.
 const codexChatBridgeInfo = "airouter/codex-chat-bridge/v1"
 
+// xaiChatBridgeInfo domain-separates the public xAI Chat replay MAC from the
+// Grok Build and Codex markers and from the at-rest encryption key.
+const xaiChatBridgeInfo = "airouter/xai-chat-bridge/v1"
+
 // Cipher encrypts and decrypts short secrets (API keys) with AES-256-GCM. The
 // key is derived from the configured secret via SHA-256, so any secret length
 // is accepted. bridgeKey and codexKey are optional HMAC keys for Chat replay
@@ -32,6 +36,7 @@ type Cipher struct {
 	aead      cipher.AEAD
 	bridgeKey []byte
 	codexKey  []byte
+	xaiKey    []byte
 }
 
 func New(secret string) (*Cipher, error) {
@@ -116,6 +121,43 @@ func (c *Cipher) CodexChatMAC(payload []byte) ([]byte, bool) {
 // Comparison is constant-time. A missing key or empty mac fails closed.
 func (c *Cipher) VerifyCodexChatMAC(payload, mac []byte) bool {
 	sum, ok := c.CodexChatMAC(payload)
+	if !ok || len(mac) == 0 {
+		return false
+	}
+	return hmac.Equal(sum, mac)
+}
+
+// EnableXAIChatReplay derives the public xAI Chat replay MAC key. The built-in
+// development secret and an empty secret are rejected. The key is not the Grok
+// Build or Codex replay key.
+func (c *Cipher) EnableXAIChatReplay(secret string) error {
+	if c == nil {
+		return errors.New("crypto: nil cipher")
+	}
+	if secret == "" || config.IsInsecureDevSecret(secret) {
+		return errors.New("crypto: xai replay requires a private instance secret")
+	}
+	mac := hmac.New(sha256.New, []byte(xaiChatBridgeInfo))
+	_, _ = mac.Write([]byte(secret))
+	c.xaiKey = mac.Sum(nil)
+	return nil
+}
+
+// XAIChatMAC returns the domain-separated HMAC-SHA256 of payload.
+// A nil cipher or a cipher without the xAI key returns nil, false.
+func (c *Cipher) XAIChatMAC(payload []byte) ([]byte, bool) {
+	if c == nil || len(c.xaiKey) == 0 {
+		return nil, false
+	}
+	mac := hmac.New(sha256.New, c.xaiKey)
+	_, _ = mac.Write(payload)
+	return mac.Sum(nil), true
+}
+
+// VerifyXAIChatMAC reports whether mac is the HMAC of payload.
+// Comparison is constant-time. A missing key or empty mac fails closed.
+func (c *Cipher) VerifyXAIChatMAC(payload, mac []byte) bool {
+	sum, ok := c.XAIChatMAC(payload)
 	if !ok || len(mac) == 0 {
 		return false
 	}

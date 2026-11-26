@@ -39,6 +39,10 @@ func (p *Proxy) freshChatReplayTarget(ctx context.Context, t domain.ComboTarget,
 			if codexChatSourceAvailable(t, bind) {
 				return p.freshCodexChatTarget(ctx, t, bind)
 			}
+		case grokbuild.XAIReplayProfile().Protocol:
+			if xaiChatSourceAvailable(t, bind) {
+				return p.freshXAIChatTarget(ctx, t, bind)
+			}
 		}
 	}
 	return t, false
@@ -70,6 +74,12 @@ func restoreChatReplay(ctx context.Context, req *ir.Request, backend codec, prov
 		profile = grokbuild.GrokReplayProfile()
 		bind, ok = grokChatBind(provider, routeModel, emit.scope, emit.comboID)
 		ok = ok && model == bind.Model
+	case responsesCodec.id:
+		if attempt.pinnedModel != "" && attempt.pinnedModel != model {
+			return ctx, nil, errXAIReplayModelMismatch
+		}
+		profile = grokbuild.XAIReplayProfile()
+		bind, ok = xaiChatBind(provider, routeModel, model, emit.scope, emit.comboID)
 	default:
 		return ctx, body, nil
 	}
@@ -98,13 +108,18 @@ func restoreChatReplay(ctx context.Context, req *ir.Request, backend codec, prov
 		ctx = withGrokBuildReplayGuard(ctx, grokBuildReplayGuard{
 			providerID: bind.ProviderID, generation: bind.Generation, principal: bind.Principal, model: bind.Model,
 		})
+	case responsesCodec.id:
+		ctx = withXAIReplayGuard(ctx, xaiReplayGuard{
+			providerID: bind.ProviderID, generation: bind.Generation, principal: bind.Principal,
+			endpoint: bind.Endpoint, model: bind.Model, routeModel: bind.RouteModel,
+		})
 	}
 	return ctx, body, nil
 }
 
 func isChatReplayDecline(logErr string) bool {
 	switch logErr {
-	case skipLogGrokReplay, skipLogCodexReplay, skipLogCodexModel:
+	case skipLogGrokReplay, skipLogCodexReplay, skipLogCodexModel, skipLogXAIReplay, skipLogXAIModel:
 		return true
 	default:
 		return false

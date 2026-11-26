@@ -455,6 +455,19 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 					break
 				}
 			}
+		case chatDecision.XAI():
+			if _, ok := pinXAIChatTarget(ordered, chatDecision.Turn.Bind); ok {
+				for i := range ordered {
+					if !xaiChatSourceAvailable(ordered[i], chatDecision.Turn.Bind) {
+						continue
+					}
+					fresh, ok := p.freshXAIChatTarget(r.Context(), ordered[i], chatDecision.Turn.Bind)
+					if ok {
+						pinTarget = &fresh
+					}
+					break
+				}
+			}
 		}
 	}
 	if pinTarget != nil {
@@ -465,6 +478,8 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 			next, ok = pinGrokChatTarget(ordered, chatDecision.Turn.Bind)
 		case chatDecision.Codex():
 			next, ok = pinCodexChatTarget(ordered, chatDecision.Turn.Bind)
+		case chatDecision.XAI():
+			next, ok = pinXAIChatTarget(ordered, chatDecision.Turn.Bind)
 		}
 		if ok {
 			next[0] = *pinTarget
@@ -546,7 +561,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, ingress codec) {
 			last = p.serveTranslated(w, attemptCtx, res, ingress, backend, provider, t.UpstreamModel, attemptBody, &prep)
 		}
 
-		if pinned && last.retry && last.logErr == skipLogCodexModel {
+		if pinned && last.retry && (last.logErr == skipLogCodexModel || last.logErr == skipLogXAIModel) {
 			if ctxErr(r.Context()) {
 				last = callerCanceledResult()
 				break
@@ -977,6 +992,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	}
 	applyUpstreamModel(req, upstreamModel)
 	req.Model = applyClaudeCodeTargetModel(ctx, provider, req.Model)
+	provider = p.ensureXAIChatProviderForModel(ctx, provider, req.Model)
 	// Encode the upstream transport: stream-only backends collect SSE and
 	// require stream:true on the wire; regular unary backends stay false.
 	req.Stream = backend.streamOnly
@@ -996,6 +1012,10 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if err != nil {
 		return chatReplayBuildError(err)
 	}
+	upstreamBody, err = p.prepareXAIChatBody(ctx, upstreamBody, provider)
+	if err != nil {
+		return terminal(http.StatusInternalServerError, "failed to prepare upstream request", "api_error")
+	}
 	upstreamBody, err = p.prepareUpstreamRequestFor(ctx, backend, provider, req, upstreamBody)
 	if err != nil {
 		if kiroPrepareCanceled(ctx, backend, err) {
@@ -1003,6 +1023,7 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 		}
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
+	ctx = p.xaiChatAttemptContext(ctx, provider, upstreamModel, upstreamBody)
 	if backend.streamOnly {
 		return p.serveStreamOnlyUnary(w, ctx, res, ingress, backend, provider, upstreamModel, upstreamBody, req)
 	}
@@ -1022,7 +1043,18 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if isOpencodeCodec(backend.id) {
 		decodeResponse = opencode.DecodeResponse(decodeResponse, opencodeToolMapFrom(ctx))
 	}
-	resp, err := decodeResponse(respBody)
+	order := p.chatOrder(ctx, ingress, backend, provider, upstreamModel, reqModelFromBody(upstreamBody), res)
+	unsupported := false
+	var resp *ir.Response
+	if order != nil && order.profile.Protocol == grokbuild.XAIReplayProfile().Protocol {
+		resp, err = responses.DecodeResponseObserved(respBody, func(obs responses.OutputObservation) {
+			if !obs.Supported {
+				unsupported = true
+			}
+		})
+	} else {
+		resp, err = decodeResponse(respBody)
+	}
 	if err != nil {
 		if _, ok := ir.AsStreamFailure(err); ok {
 			return retryableStreamFailure(err)
@@ -1033,8 +1065,8 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 	if responseDropsOpaque(resp.Content) {
 		noteAnthropicOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
-	if responseDropsResponsesOpaque(resp.Content) {
-		noteResponsesOmission(res, observability.Logger(ctx, p.logger), ingress.id)
+	if order != nil {
+		order.captureUnary(resp, unsupported)
 	}
 	out, err := ingress.encodeResponse(resp)
 	if err != nil {
@@ -1042,6 +1074,19 @@ func (p *Proxy) serveTranslated(w http.ResponseWriter, ctx context.Context, res 
 			return retryableResponseIncompatibility(inTok, outTok, false)
 		}
 		return terminalResponseEncodeError(inTok, outTok, false)
+	}
+	stamped := false
+	if order != nil {
+		if details, ok := order.details(); ok {
+			stampedOut, stampErr := grokbuild.InjectChatDetails(out, details)
+			if stampErr == nil && int64(len(stampedOut)) <= grokChatUnaryCap() {
+				out = stampedOut
+				stamped = true
+			}
+		}
+	}
+	if responseDropsResponsesOpaque(resp.Content) && !stamped {
+		noteResponsesOmission(res, observability.Logger(ctx, p.logger), ingress.id)
 	}
 	res.inTok, res.outTok = inTok, outTok
 	res.status = http.StatusOK

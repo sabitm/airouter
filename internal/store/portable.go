@@ -10,6 +10,7 @@ import (
 	"airouter/internal/domain"
 	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/opencode"
+	"airouter/internal/xaigrant"
 )
 
 // Portable config formats. API keys are exported in PLAINTEXT so the config can
@@ -264,6 +265,9 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 		if err := rotateImportedCodexGrant(cur); err != nil {
 			return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
 		}
+		if err := rotateImportedXAIGrant(cur); err != nil {
+			return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
+		}
 		if err := s.updateProvider(ctx, ex, cur); err != nil {
 			return fmt.Sprintf("provider %q: %v", pp.Name, err)
 		}
@@ -284,6 +288,9 @@ func (s *Store) importProvider(ctx context.Context, ex executor, pp portableProv
 		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
 	}
 	if err := rotateImportedCodexGrant(np); err != nil {
+		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
+	}
+	if err := rotateImportedXAIGrant(np); err != nil {
 		return fmt.Sprintf("provider %q: %s", pp.Name, err.Error())
 	}
 	if err := s.createProvider(ctx, ex, np); err != nil {
@@ -341,4 +348,13 @@ func rotateImportedCodexGrant(p *domain.Provider) error {
 		return nil
 	}
 	return codexgrant.Rotate(p.OAuthCreds)
+}
+
+// rotateImportedXAIGrant discards a portable generation for the public xAI
+// grant. Tokens and transport stay.
+func rotateImportedXAIGrant(p *domain.Provider) error {
+	if p == nil || !xaigrant.IsGrant(p.OAuthCreds) {
+		return nil
+	}
+	return xaigrant.Rotate(p.OAuthCreds)
 }

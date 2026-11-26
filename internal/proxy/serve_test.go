@@ -82,6 +82,9 @@ func openTestStore(t *testing.T, replay bool) *store.Store {
 		if err := c.EnableCodexChatReplay("test-secret"); err != nil {
 			t.Fatal(err)
 		}
+		if err := c.EnableXAIChatReplay("test-secret"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"), c)
 	if err != nil {

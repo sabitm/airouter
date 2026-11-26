@@ -361,6 +361,12 @@ type OAuthCreds struct {
 	// the row predates the id; resolution may initialize it without replacing
 	// the grant.
 	CodexGrantGeneration string `json:"codex_grant_generation,omitempty"`
+
+	// XAIGrantGeneration is a random id minted for one public xAI OAuth grant.
+	// Refresh keeps it. Login, reconnect, reimport, and portable import replace
+	// it so an imported or stale id cannot keep replay affinity. Empty means the
+	// row predates the id; the eligible bridge path may initialize it.
+	XAIGrantGeneration string `json:"xai_grant_generation,omitempty"`
 }
 
 // Provider is a named upstream connection: a base URL, a credential, and the

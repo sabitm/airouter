@@ -17,6 +17,7 @@ import (
 	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/proxy/kiro"
 	"airouter/internal/proxy/qoder"
+	"airouter/internal/xaigrant"
 )
 
 // Preset is a built-in OAuth configuration used to prefill a provider's
@@ -74,12 +75,12 @@ var Presets = []Preset{
 		Name:        "xai",
 		Label:       "Grok (xAI)",
 		AuthURL:     "https://auth.x.ai/oauth2/authorize",
-		TokenURL:    "https://auth.x.ai/oauth2/token",
-		ClientID:    "b1a00492-073a-47ea-816f-4c329264a828",
+		TokenURL:    xaigrant.TokenURL,
+		ClientID:    xaigrant.ClientID,
 		Scopes:      "openid profile email offline_access grok-cli:access api:access",
 		RedirectURI: "http://127.0.0.1:56121/callback",
 		PKCE:        true, // xAI is a public client; no client_secret
-		APIBase:     "https://api.x.ai/v1",
+		APIBase:     xaigrant.APIBase,
 		Protocol:    domain.ProtocolOpenAI,
 	},
 	// Grok Build is the CLI subscription proxy, not api.x.ai. Device-code login

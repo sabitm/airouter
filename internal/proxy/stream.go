@@ -321,6 +321,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	}
 	applyUpstreamModel(req, upstreamModel)
 	req.Model = applyClaudeCodeTargetModel(ctx, provider, req.Model)
+	provider = p.ensureXAIChatProviderForModel(ctx, provider, req.Model)
 	req.Stream = true
 
 	upstreamBody, err := backend.encodeRequest(req)
@@ -339,6 +340,10 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	if err != nil {
 		return chatReplayBuildError(err)
 	}
+	upstreamBody, err = p.prepareXAIChatBody(ctx, upstreamBody, provider)
+	if err != nil {
+		return terminal(http.StatusInternalServerError, "failed to prepare upstream request", "api_error")
+	}
 	upstreamBody, err = p.prepareUpstreamRequestFor(ctx, backend, provider, req, upstreamBody)
 	if err != nil {
 		if kiroPrepareCanceled(ctx, backend, err) {
@@ -346,6 +351,7 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		}
 		return terminal(http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
+	ctx = p.xaiChatAttemptContext(ctx, provider, upstreamModel, upstreamBody)
 	var writeFrame func([]byte) error
 	closeWrite := func() {}
 	var resp *http.Response
@@ -422,6 +428,14 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 		// tool-id wait and without the Responses encoder lifecycle hold.
 		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
 			return responses.DecodeStreamCodexReconciledObserved(r, emit, order.observe)
+		}
+	case order != nil && backend.id == responsesCodec.id:
+		// Public xAI uses native function ids and reports reasoning ciphertext
+		// only on a completion or terminal snapshot. The observer never sees an
+		// added-frame ciphertext as authoritative. Unsupported original output
+		// declines the optional marker through the same side channel.
+		decode = func(r io.Reader, emit func(ir.StreamEvent) error) error {
+			return responses.DecodeStreamXAIReconciledObserved(r, emit, order.xaiObserve, order.xaiUnsupported)
 		}
 	case order != nil:
 		// Snapshots and source indexes go to attempt-local retention. They do

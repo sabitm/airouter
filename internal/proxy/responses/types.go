@@ -80,6 +80,9 @@ type reasoningSummary struct {
 	// same object also decodes reasoning summary parts, which ignore this field.
 	Refusal    string `json:"refusal"`
 	RefusalSet bool   `json:"-"`
+	// Unsupported marks a summary or content part with fields outside the
+	// replayable set. Generic decode ignores it.
+	Unsupported bool `json:"-"`
 }
 
 // UnmarshalJSON rejects a null or non-object summary entry. A null entry would
@@ -98,7 +101,7 @@ func (p *reasoningSummary) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	p.Type, p.Text, p.TextSet, p.Refusal, p.RefusalSet = "", "", false, "", false
+	p.Type, p.Text, p.TextSet, p.Refusal, p.RefusalSet, p.Unsupported = "", "", false, "", false, false
 	if !isNullish(raw.Type) {
 		if err := json.Unmarshal(raw.Type, &p.Type); err != nil {
 			return err
@@ -116,6 +119,7 @@ func (p *reasoningSummary) UnmarshalJSON(data []byte) error {
 		}
 		p.RefusalSet = true
 	}
+	p.Unsupported = unsupportedOutputFields(data, "type", "text", "refusal", "annotations", "logprobs")
 	return nil
 }
 

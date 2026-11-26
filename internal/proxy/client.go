@@ -1067,6 +1067,9 @@ func (p *Proxy) forward(ctx context.Context, provider *domain.Provider, path str
 		if err := guardCodexReplay(ctx, provider, url, body); err != nil {
 			return 0, nil, err
 		}
+		if err := p.guardXAIReplay(ctx, provider, url, body); err != nil {
+			return 0, nil, err
+		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
 			return 0, nil, err
 		}
@@ -1212,6 +1215,9 @@ func (p *Proxy) forwardStream(ctx context.Context, provider *domain.Provider, pa
 			return nil, err
 		}
 		if err := guardCodexReplay(ctx, provider, url, body); err != nil {
+			return nil, err
+		}
+		if err := p.guardXAIReplay(ctx, provider, url, body); err != nil {
 			return nil, err
 		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {
@@ -1362,6 +1368,9 @@ func (p *Proxy) forwardStreamDuplex(ctx context.Context, provider *domain.Provid
 			return nil, err
 		}
 		if err := guardCodexReplay(ctx, provider, url, body); err != nil {
+			return nil, err
+		}
+		if err := p.guardXAIReplay(ctx, provider, url, body); err != nil {
 			return nil, err
 		}
 		if err := opencode.RejectUnsafeSend(provider, url); err != nil {

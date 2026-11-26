@@ -26,6 +26,7 @@ import (
 	"airouter/internal/proxy/qoder"
 	"airouter/internal/store"
 	"airouter/internal/usage"
+	"airouter/internal/xaigrant"
 )
 
 type Handler struct {
@@ -449,6 +450,13 @@ func (h *Handler) createOAuthProvider(w http.ResponseWriter, r *http.Request, pr
 			return
 		}
 	}
+	if xaigrant.IsGrant(creds) {
+		creds = cloneOAuthCreds(creds)
+		if err := xaigrant.Rotate(creds); err != nil {
+			htmxBadRequest(w, r, "provider-flash", err.Error())
+			return
+		}
+	}
 	p := &domain.Provider{
 		Name:             r.FormValue("name"),
 		BaseURL:          providerBaseURLOrDefault(proto, r.FormValue("base_url")),
@@ -713,6 +721,13 @@ func (h *Handler) updateOAuthProvider(w http.ResponseWriter, r *http.Request, cu
 	}
 	if proto == domain.ProtocolOpenAICodex && (reconnected || imported) {
 		if err := codexgrant.Rotate(cur.OAuthCreds); err != nil {
+			htmxBadRequest(w, r, "provider-flash", err.Error())
+			return
+		}
+	}
+	if xaigrant.IsGrant(cur.OAuthCreds) && (reconnected || imported) {
+		cur.OAuthCreds = cloneOAuthCreds(cur.OAuthCreds)
+		if err := xaigrant.Rotate(cur.OAuthCreds); err != nil {
 			htmxBadRequest(w, r, "provider-flash", err.Error())
 			return
 		}

@@ -255,6 +255,85 @@ func (o *grokChatOrder) noteReasoning(ev ir.StreamEvent, done bool) {
 	}
 }
 
+// captureUnary records one authoritative unary output array. Content order is
+// the source order; the normal blocks projection still verifies that Chat
+// output can represent every item before a marker is signed. unsupported
+// reports output that the shared decoder could not project.
+func (o *grokChatOrder) captureUnary(resp *ir.Response, unsupported bool) {
+	if o == nil || o.omit || resp == nil {
+		return
+	}
+	if unsupported {
+		o.failBudget()
+		return
+	}
+	for i := range resp.Content {
+		b := &resp.Content[i]
+		switch b.Type {
+		case ir.BlockText:
+			if b.Refusal {
+				o.failBudget()
+				return
+			}
+			if b.Text == "" {
+				continue
+			}
+			if !o.charge(len(b.Text)) {
+				return
+			}
+			slot := o.newSlot("text")
+			slot.hasSource = true
+			slot.source = i
+			slot.text.WriteString(b.Text)
+			o.visibleText.WriteString(b.Text)
+		case ir.BlockReasoning:
+			rr := b.ResponsesReasoning
+			if rr == nil || rr.ID == "" || !rr.ProviderState() {
+				o.failBudget()
+				return
+			}
+			size := snapshotBytes(rr)
+			if !o.charge(len(rr.ID) + size) {
+				return
+			}
+			slot := o.newSlot("reasoning")
+			slot.hasSource = true
+			slot.source = i
+			slot.id = rr.ID
+			slot.reasoning = rr
+			slot.snapBytes = size
+			o.bindReasoning(slot)
+			o.sawOpaque = true
+		case ir.BlockToolUse:
+			if b.ToolID == "" {
+				o.failBudget()
+				return
+			}
+			if !o.charge(len(b.ToolID) + len(b.ToolName) + len(b.ResponsesItemID)) {
+				return
+			}
+			slot := o.newSlot("tool")
+			slot.hasSource = true
+			slot.source = i
+			slot.toolID = b.ToolID
+			slot.toolName = b.ToolName
+			slot.itemID = b.ResponsesItemID
+			if o.toolByID == nil {
+				o.toolByID = map[string]*grokChatSlot{}
+			}
+			o.toolByID[b.ToolID] = slot
+			o.visibleTools = append(o.visibleTools, grokVisibleTool{id: b.ToolID, name: b.ToolName, itemID: b.ResponsesItemID})
+		default:
+			o.failBudget()
+			return
+		}
+		if len(o.slots) > 1024 {
+			o.failBudget()
+			return
+		}
+	}
+}
+
 func (o *grokChatOrder) noteTerminal(ev ir.StreamEvent) {
 	switch ev.Kind {
 	case ir.EventReasoningReserve, ir.EventReasoningItemDone:

@@ -12,6 +12,7 @@ import (
 	"airouter/internal/oauth"
 	"airouter/internal/observability"
 	"airouter/internal/proxy/grokbuild"
+	"airouter/internal/xaigrant"
 )
 
 // credsFromConnectForm builds an OAuthCreds config (no tokens yet) from the
@@ -64,6 +65,27 @@ func codexRefreshFormOverrides(r *http.Request) bool {
 		return true
 	}
 	if preset := strings.TrimSpace(r.FormValue("preset")); preset != "" && preset != "custom" && preset != codexgrant.Preset {
+		return true
+	}
+	return false
+}
+
+// xaiRefreshFormOverrides reports a saved-refresh form that names a different
+// token URL, client, preset, or generation than the official xAI grant. Blank
+// fields are filled from the stored row and are not overrides.
+func xaiRefreshFormOverrides(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if raw := strings.TrimSpace(r.FormValue("token_url")); raw != "" {
+		if _, ok := xaigrant.NormalizeTokenURL(raw); !ok {
+			return true
+		}
+	}
+	if id := strings.TrimSpace(r.FormValue("client_id")); id != "" && id != xaigrant.ClientID {
+		return true
+	}
+	if preset := strings.TrimSpace(r.FormValue("preset")); preset != "" && preset != "custom" && preset != xaigrant.Preset {
 		return true
 	}
 	return false
@@ -746,6 +768,15 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 		// The stored grant selects the token endpoint. A changed form URL, client,
 		// or preset is not a Codex refresh.
 		if codexRefreshFormOverrides(r) {
+			renderErr(saved.OAuthCreds, "credentials changed during refresh; reload and retry")
+			return
+		}
+		savedID = true
+		creds = cloneOAuthCreds(saved.OAuthCreds)
+	} else if saved != nil && saved.Method() == domain.AuthOAuth && xaigrant.IsGrant(saved.OAuthCreds) {
+		// The stored public xAI grant selects the token endpoint. A changed form
+		// URL, client, or preset is not an xAI refresh.
+		if xaiRefreshFormOverrides(r) {
 			renderErr(saved.OAuthCreds, "credentials changed during refresh; reload and retry")
 			return
 		}

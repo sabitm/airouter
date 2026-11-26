@@ -85,7 +85,10 @@ func mapChatReplayErr(err error) (attemptResult, bool) {
 	if ar, ok := mapGrokReplayErr(err); ok {
 		return ar, true
 	}
-	return mapCodexReplayErr(err)
+	if ar, ok := mapCodexReplayErr(err); ok {
+		return ar, true
+	}
+	return mapXAIReplayErr(err)
 }
 
 // guardCodexReplay refuses a pinned ciphertext send when the resolved grant,
@@ -238,6 +241,8 @@ func (p *Proxy) verifyChatReplay(protocol string, payload, mac []byte) bool {
 			return false
 		}
 		return p.store.VerifyCodexChatMAC(payload, mac)
+	case grokbuild.XAIReplayProfile().Protocol:
+		return p.verifyXAIReplay(payload, mac)
 	default:
 		return false
 	}
@@ -267,7 +272,10 @@ func (p *Proxy) chatOrder(ctx context.Context, ingress codec, backend codec, pro
 	if order := p.grokChatOrder(ctx, ingress, backend, provider, upstreamModel, res); order != nil {
 		return order
 	}
-	return p.codexChatOrder(ctx, ingress, backend, provider, upstreamModel, wireModel, res)
+	if order := p.codexChatOrder(ctx, ingress, backend, provider, upstreamModel, wireModel, res); order != nil {
+		return order
+	}
+	return p.xaiChatOrder(ctx, ingress, backend, provider, upstreamModel, wireModel, res)
 }
 
 func codexClientNoRedirect(base *http.Client) *http.Client {
@@ -282,8 +290,12 @@ func codexClientNoRedirect(base *http.Client) *http.Client {
 }
 
 func chatReplayRejectedMessage(err error) string {
-	if errors.Is(err, grokbuild.ErrCodexReplayRejected) {
+	switch {
+	case errors.Is(err, grokbuild.ErrCodexReplayRejected):
 		return codexChatRejectedMessage
+	case errors.Is(err, grokbuild.ErrXAIReplayRejected):
+		return xaiChatRejectedMessage
+	default:
+		return grokChatRejectedMessage
 	}
-	return grokChatRejectedMessage
 }
