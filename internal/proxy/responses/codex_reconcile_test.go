@@ -369,7 +369,7 @@ func TestCodexReconcilePendingCapFails(t *testing.T) {
 		out = append(out, ev)
 		return nil
 	}, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts,
-		textQueueEntryOverhead, 2, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileCodex: true})
+		textQueueEntryOverhead, 2, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileReasoning: true})
 	if err == nil || !strings.Contains(err.Error(), "pending message text exceeded limit") {
 		t.Fatalf("err = %v, want pending limit", err)
 	}

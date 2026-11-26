@@ -60,14 +60,16 @@ func sseFrame(w io.Writer, typ, fields string) {
 // codexReplayScript streams reasoning, a tool call, and a completion. The
 // reasoning completion carries cipher only when doneCipher is set; the terminal
 // snapshot carries cipher only when terminalCipher is set. When interleaved is
-// set, the tool starts before the reasoning completion arrives.
+// set, the tool starts before the reasoning completion arrives unless
+// reasoningDoneBeforeTool confirms the reasoning position first.
 type codexReplayScript struct {
-	cipher         string
-	doneCipher     bool
-	terminalCipher bool
-	provisional    bool
-	interleaved    bool
-	silent         bool
+	cipher                  string
+	doneCipher              bool
+	terminalCipher          bool
+	provisional             bool
+	interleaved             bool
+	silent                  bool
+	reasoningDoneBeforeTool bool
 }
 
 const codexReplayToolItem = `{"type":"function_call","id":"fc_a","call_id":"call_a","name":"f","arguments":"{\"x\":1}"}`
@@ -98,11 +100,16 @@ func (s codexReplayScript) serve(n int, w http.ResponseWriter) {
 	if !s.silent {
 		sseFrame(w, "response.reasoning_summary_text.delta", `"output_index":0,"item_id":"rs_a","summary_index":0,"delta":"readable summary"`)
 	}
+	if s.reasoningDoneBeforeTool {
+		sseFrame(w, "response.output_item.done", `"output_index":0,"item":`+s.reasoningItem(s.doneCipher))
+	}
 	if s.interleaved {
 		sseFrame(w, "response.output_item.added", `"output_index":1,"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"f","arguments":""}`)
 		sseFrame(w, "response.function_call_arguments.delta", `"output_index":1,"item_id":"fc_a","delta":"{\"x\":"`)
 	}
-	sseFrame(w, "response.output_item.done", `"output_index":0,"item":`+s.reasoningItem(s.doneCipher))
+	if !s.reasoningDoneBeforeTool {
+		sseFrame(w, "response.output_item.done", `"output_index":0,"item":`+s.reasoningItem(s.doneCipher))
+	}
 	if s.interleaved {
 		sseFrame(w, "response.function_call_arguments.delta", `"output_index":1,"item_id":"fc_a","delta":"1}"`)
 	}

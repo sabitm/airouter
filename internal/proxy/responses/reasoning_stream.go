@@ -102,10 +102,12 @@ type responsesReasoningDecoder struct {
 	// noteOrder delivers Chat-bridge source metadata. It is nil unless the
 	// Chat observer is active. It must not emit, set wired, or touch the queue.
 	noteOrder func(ir.StreamEvent)
-	// reconcileCodex drops provisional ciphertext and reserves the position of
-	// indexed reasoning items for the matching streaming encoder.
-	reconcileCodex bool
-	canOpenEarly   func(*responsesReasoningItem) bool
+	// reconcileReasoning drops provisional ciphertext for the matching
+	// streaming encoder.
+	reconcileReasoning bool
+	// canOpenEarly is the optional Codex added-frame early-open policy. A nil
+	// callback emits no start for an added-only silent placeholder.
+	canOpenEarly func(*responsesReasoningItem) bool
 }
 
 func newResponsesReasoningDecoder(emit func(ir.StreamEvent) error, ensureStarted func() error, maxBytes, maxItems, maxParts int) *responsesReasoningDecoder {
@@ -150,14 +152,14 @@ func (r *responsesReasoningDecoder) observeAdded(env *streamEnvelope) error {
 	if err != nil {
 		return err
 	}
-	// Codex may put a provisional opaque value on the added frame. Only a
-	// completion frame or the terminal snapshot may confirm it, so it is not
-	// retained here.
+	// Codex or Grok Build may put a provisional opaque value on the added
+	// frame. Only a completion frame or the terminal snapshot may confirm it,
+	// so it is not retained here.
 	encrypted := env.Item.EncryptedContent
-	if r.reconcileCodex {
+	if r.reconcileReasoning {
 		encrypted = nil
 		// An unindexed placeholder does not establish an output position.
-		if !item.opened && !item.wired && !item.done && item.hasIndex && item.id != "" && r.canOpenEarly(item) {
+		if r.canOpenEarly != nil && !item.opened && !item.wired && !item.done && item.hasIndex && item.id != "" && r.canOpenEarly(item) {
 			if err := r.ensureMessageStart(); err != nil {
 				return err
 			}

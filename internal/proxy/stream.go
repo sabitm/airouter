@@ -376,14 +376,16 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	}
 
 	order := p.chatOrder(ctx, ingress, backend, provider, upstreamModel, reqModelFromBody(upstreamBody), res)
-	// Codex may publish the authoritative reasoning snapshot only in the
-	// terminal response, so the Responses encoder must keep that item open and
-	// the decoder must reconcile it. Both halves are gated to this one pair.
-	// Chat capture reconciles in the decoder only and does not use that encoder.
+	// Codex and Grok Build may publish the authoritative reasoning snapshot only
+	// in the terminal response, so the Responses encoder must keep that item open
+	// and the decoder must reconcile it. Grok Build also keeps its late native
+	// tool item-id ordering. Both halves are gated to these pairs. Chat capture
+	// reconciles in the decoder only and does not use that encoder.
 	codexReconcile := ingress.id == responsesCodec.id && backend.id == codexCodec.id
+	grokReconcile := ingress.id == responsesCodec.id && backend.id == grokBuildCodec.id
 	enc := ingress.newStreamEncoder(upstreamModel)
-	if codexReconcile {
-		enc = responses.NewCodexStreamEncoder(upstreamModel)
+	if codexReconcile || grokReconcile {
+		enc = responses.NewReconciledStreamEncoder(upstreamModel)
 	}
 	enc = wrapGrokChatEncoder(enc, order)
 	sink := &translatedSink{w: w, res: res, enc: enc, ingressID: ingress.id, logger: observability.Logger(ctx, p.logger), grokChatRetains: order != nil}
@@ -412,6 +414,8 @@ func (p *Proxy) streamTranslated(w http.ResponseWriter, ctx context.Context, res
 	switch {
 	case codexReconcile:
 		decode = responses.DecodeStreamCodexReconciled
+	case grokReconcile:
+		decode = responses.DecodeStreamAwaitingItemIDReconciled
 	case order != nil && backend.id == codexCodec.id:
 		// Chat observation uses the Codex reconcile policy without the Grok
 		// tool-id wait and without the Responses encoder lifecycle hold.

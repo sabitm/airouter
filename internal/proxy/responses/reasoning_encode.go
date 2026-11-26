@@ -73,11 +73,11 @@ func encoderPendingEventBytes(ev ir.StreamEvent) int {
 	return n
 }
 
-// awaitingReasoning returns the earliest Codex reasoning item that can still
+// awaitingReasoning returns the earliest reconciled reasoning item that can still
 // receive ciphertext. A deferred summary must keep its position even after
 // its source ID is known, until its completion is reconciled.
 func (e *StreamEncoder) awaitingReasoning() *respReasoningItem {
-	if !e.reconcileCodex {
+	if !e.reconcileReasoning {
 		return nil
 	}
 	if item := e.reasoningOpen; item != nil && !item.done && item.encrypted == nil {
@@ -92,12 +92,12 @@ func (e *StreamEncoder) awaitingReasoning() *respReasoningItem {
 }
 
 // holdsCompletion reports that ev is a completion without explicit encrypted
-// bytes. Under reconcileCodex that frame is never closed on its own: the item
+// bytes. Under reconcileReasoning that frame is never closed on its own: the item
 // is opened to keep its output position, then left open so the terminal
 // snapshot can still supply the authoritative value. Close emits the single
 // completion when no snapshot arrives.
 func (e *StreamEncoder) holdsCompletion(ev ir.StreamEvent) bool {
-	if !e.reconcileCodex || ev.Kind != ir.EventReasoningItemDone {
+	if !e.reconcileReasoning || ev.Kind != ir.EventReasoningItemDone {
 		return false
 	}
 	return ev.Reasoning == nil || ev.Reasoning.EncryptedContent == nil
@@ -120,7 +120,7 @@ func (e *StreamEncoder) passesAwaitingReasoning(ev ir.StreamEvent) bool {
 }
 
 // mustQueueForAwaitingReasoning reports whether ev would close, open, or append
-// output ahead of the awaited Codex completion. Text and tool bytes stay queued
+// output ahead of the awaited late completion. Text and tool bytes stay queued
 // so the reasoning item keeps its arrival position, and a later reasoning item
 // waits because it would close the awaited one.
 func (e *StreamEncoder) mustQueueForAwaitingReasoning(ev ir.StreamEvent) bool {
@@ -212,7 +212,7 @@ func (e *StreamEncoder) mustQueueForDeferred(ev ir.StreamEvent) bool {
 
 func (e *StreamEncoder) pendingEventBytes(ev ir.StreamEvent) int {
 	n := encoderPendingEventBytes(ev)
-	if e.reconcileCodex {
+	if e.reconcileReasoning {
 		n += len(ev.ResponsesItemID)
 		if ev.Reasoning != nil {
 			n += len(ev.Reasoning.Summary) * encoderReasoningPartOverhead
@@ -651,7 +651,7 @@ func (e *StreamEncoder) closeDeferredReasoning(w *sse.Writer) error {
 }
 
 func (e *StreamEncoder) encodeReasoningItemStart(w *sse.Writer, ev ir.StreamEvent) error {
-	if !e.reconcileCodex {
+	if !e.reconcileReasoning {
 		return nil
 	}
 	item, err := e.structuredReasoningForEvent(ev)

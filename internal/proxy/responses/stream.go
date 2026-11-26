@@ -267,13 +267,24 @@ func DecodeStreamAwaitingItemID(r io.Reader, emit func(ir.StreamEvent) error) er
 	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{awaitItemID: true})
 }
 
+// DecodeStreamAwaitingItemIDReconciled is the Grok Build native Responses
+// streaming policy. It keeps the late native function item id wait and also
+// withholds provisional reasoning ciphertext until a completion or terminal
+// snapshot confirms it. The matching encoder holds a completion without
+// authoritative bytes so later output cannot pass the open reasoning item.
+// Chat observation and unary collection keep DecodeStreamAwaitingItemID and
+// DecodeStreamAwaitingItemIDObserved, which do not reconcile reasoning.
+func DecodeStreamAwaitingItemIDReconciled(r io.Reader, emit func(ir.StreamEvent) error) error {
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{awaitItemID: true, reconcileReasoning: true})
+}
+
 // DecodeStreamCodexReconciled is the Codex-to-Responses policy. Codex may send
 // the authoritative reasoning encrypted_content after the completion frame, or
 // only in the terminal output array, so a completion without explicit bytes is
 // withheld until the terminal pass. Provisional bytes on output_item.added are
 // never promoted. Every other decode path is unchanged.
 func DecodeStreamCodexReconciled(r io.Reader, emit func(ir.StreamEvent) error) error {
-	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileCodex: true})
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileReasoning: true, openAddedReasoning: true})
 }
 
 // DecodeStreamCodexReconciledObserved is the Codex Chat-bridge decode.
@@ -281,7 +292,7 @@ func DecodeStreamCodexReconciled(r io.Reader, emit func(ir.StreamEvent) error) e
 // observe. It does not withhold tool ids and it does not apply the Responses
 // encoder hold. A nil observe is DecodeStreamCodexReconciled.
 func DecodeStreamCodexReconciledObserved(r io.Reader, emit func(ir.StreamEvent) error, observe func(ir.StreamEvent)) error {
-	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileCodex: true, observe: observe})
+	return decodeStreamBoundedParts(r, emit, maxRetainedToolArgBytes, maxTrackedToolCalls, maxRetainedTextBytes, maxTrackedTextItems, maxTrackedTextParts, maxPendingTextBytes, maxPendingTextEvents, maxRetainedReasoningBytes, maxTrackedReasoningItems, maxTrackedReasoningParts, decodePolicy{reconcileReasoning: true, openAddedReasoning: true, observe: observe})
 }
 
 // DecodeStreamAwaitingItemIDObserved is the Grok Build Chat-bridge decode.
@@ -317,9 +328,15 @@ type decodePolicy struct {
 	// awaitItemID withholds a function item until its native id arrives or a
 	// terminal snapshot proves it absent (Grok Build).
 	awaitItemID bool
-	// reconcileCodex withholds provisional reasoning encrypted_content until a
-	// completion frame or the terminal snapshot confirms it.
-	reconcileCodex bool
+	// reconcileReasoning withholds provisional reasoning encrypted_content
+	// until a completion frame or the terminal snapshot confirms it. Codex and
+	// the Grok Build native stream both use it.
+	reconcileReasoning bool
+	// openAddedReasoning keeps the Codex added-frame position reservation. Grok
+	// Build does not use it: an added-only silent placeholder must not take wire
+	// rank or start a completion hold. A readable summary or completion
+	// establishes that item's position instead.
+	openAddedReasoning bool
 	// observe receives source-order metadata without changing client emission.
 	observe func(ir.StreamEvent)
 }
@@ -327,7 +344,7 @@ type decodePolicy struct {
 // decodeStreamBoundedParts adds the content-part budget so tests can inject a
 // small part cap independently of the item cap and byte budgets.
 func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxArgBytes, maxCalls, maxTextBytes, maxTextItems, maxTextParts, maxPendingBytes, maxPendingEvents, maxReasoningBytes, maxReasoningItems, maxReasoningParts int, policy decodePolicy) error {
-	awaitItemID, reconcileCodex, observe := policy.awaitItemID, policy.reconcileCodex, policy.observe
+	awaitItemID, reconcileReasoning, observe := policy.awaitItemID, policy.reconcileReasoning, policy.observe
 	reader := sse.NewReader(r)
 	started := false
 	startID, startModel := "", ""
@@ -358,8 +375,8 @@ func decodeStreamBoundedParts(r io.Reader, emit func(ir.StreamEvent) error, maxA
 		observe:           observe,
 	}
 	dec.reasoning = newResponsesReasoningDecoder(emit, dec.ensureStarted, maxReasoningBytes, maxReasoningItems, maxReasoningParts)
-	dec.reasoning.reconcileCodex = reconcileCodex
-	if reconcileCodex {
+	dec.reasoning.reconcileReasoning = reconcileReasoning
+	if reconcileReasoning && policy.openAddedReasoning {
 		dec.reasoning.canOpenEarly = dec.canOpenCodexReasoningEarly
 	}
 	dec.reasoning.orderEmit = dec.orderEmitReasoning
@@ -2795,7 +2812,9 @@ func (d *responsesToolDecoder) messagePrecedes(orderMsgs int) bool {
 }
 
 // An added-only reasoning placeholder must not close a preceding function
-// call while its argument fragments still arrive.
+// call while its argument fragments still arrive. Only the Codex policy opens
+// the item from the added frame; Grok Build waits for readable bytes or a
+// completion.
 func (d *responsesToolDecoder) canOpenCodexReasoningEarly(item *responsesReasoningItem) bool {
 	for _, call := range d.calls {
 		if !call.terminal && (!call.hasIndex || call.outputIndex < item.outputIndex) {
@@ -3444,11 +3463,12 @@ type StreamEncoder struct {
 	pendingBytes  int
 	flushing      bool
 
-	// reconcileCodex is the narrow Codex-to-Responses policy. A reasoning
-	// completion without explicit encrypted bytes is held open instead of
-	// closed, and later text, tools, or another reasoning item wait in
-	// pendingEvents, so the terminal snapshot can still supply the bytes.
-	reconcileCodex bool
+	// reconcileReasoning is the late-completion policy shared by Codex and the
+	// Grok Build native stream. A reasoning completion without explicit
+	// encrypted bytes is held open instead of closed, and later text, tools, or
+	// another reasoning item wait in pendingEvents, so the terminal snapshot can
+	// still supply the bytes.
+	reconcileReasoning bool
 
 	tools      map[int]*respTool
 	pendingLen int
@@ -3476,12 +3496,20 @@ type respTool struct {
 	done       bool
 }
 
+// NewReconciledStreamEncoder pairs with DecodeStreamCodexReconciled and
+// DecodeStreamAwaitingItemIDReconciled for a translated Responses stream. It
+// holds a reasoning completion without authoritative opaque bytes open until
+// the terminal snapshot or Close supplies the one completion.
+func NewReconciledStreamEncoder(model string) *StreamEncoder {
+	e := NewStreamEncoder(model)
+	e.reconcileReasoning = true
+	return e
+}
+
 // NewCodexStreamEncoder pairs with DecodeStreamCodexReconciled for a
 // translated Codex stream on Responses ingress.
 func NewCodexStreamEncoder(model string) *StreamEncoder {
-	e := NewStreamEncoder(model)
-	e.reconcileCodex = true
-	return e
+	return NewReconciledStreamEncoder(model)
 }
 
 func NewStreamEncoder(model string) *StreamEncoder {
@@ -3760,13 +3788,16 @@ func (e *StreamEncoder) Encode(ev ir.StreamEvent, w *sse.Writer) error {
 		}
 		return e.drainPending(w)
 	}
-	if !e.flushing && (e.mustQueueForDeferred(ev) || e.mustQueueForAwaitingReasoning(ev)) {
+	// The awaited item's own frames must pass even with no queue yet. Otherwise
+	// a second index-only delta queues, then replays after its snapshot and
+	// contradicts the reconciled summary.
+	if !e.flushing && !e.passesAwaitingReasoning(ev) && (e.mustQueueForDeferred(ev) || e.mustQueueForAwaitingReasoning(ev)) {
 		return e.queueEvent(ev)
 	}
 	return e.encodeEvent(ev, w)
 }
 
-// drainPending keeps item order while letting the current Codex reasoning
+// drainPending keeps item order while letting the current late-completion reasoning
 // item consume its own queued updates. Bind a deferred ID before emitting and
 // release each queue charge before encoding that event.
 func (e *StreamEncoder) drainPending(w *sse.Writer) error {
