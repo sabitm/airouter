@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -556,4 +557,221 @@ func TestMixedOpenCodeResolveCredsFailsClosed(t *testing.T) {
 			t.Fatalf("mixed live row changed writes=%d", st.writes.Load())
 		}
 	})
+}
+
+func TestGrokBuildManualCreds(t *testing.T) {
+	access := grokOAuthJWT(map[string]any{"sub": "access-sub", "exp": 1900000000})
+	id := grokOAuthJWT(map[string]any{"sub": "id-user", "email": "id@example.com", "exp": 1800000000})
+	creds, err := GrokBuildManualCreds(access, "refresh-token-value", id, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creds.Mode != domain.OAuthManual || !creds.GrokBuildAuth || creds.Preset != grokbuild.Preset {
+		t.Fatalf("markers = %+v", creds)
+	}
+	if creds.AccessToken != access || creds.RefreshToken != "refresh-token-value" {
+		t.Fatalf("tokens = %+v", creds)
+	}
+	if creds.GrokBuildConnection == "" {
+		t.Fatal("missing connection generation")
+	}
+	if creds.UserID != "id-user" || creds.Email != "id@example.com" || creds.IDToken != "" {
+		t.Fatalf("identity = %+v", creds)
+	}
+	if creds.ExpiresAt != 1900000000 {
+		t.Fatalf("expiry = %d", creds.ExpiresAt)
+	}
+	if creds.AuthURL != grokbuild.Issuer || creds.TokenURL != grokbuild.TokenURL || creds.ClientID != grokbuild.ClientID || creds.Scopes != grokbuild.Scopes {
+		t.Fatalf("fixed metadata = %+v", creds)
+	}
+	second, err := GrokBuildManualCreds(access, "refresh-token-value", id, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.GrokBuildConnection == creds.GrokBuildConnection {
+		t.Fatal("manual imports reused a connection generation")
+	}
+
+	explicit, err := GrokBuildManualCreds(access, "refresh-token-value", "", 2000000000)
+	if err != nil || explicit.ExpiresAt != 2000000000 {
+		t.Fatalf("explicit expiry = %d err=%v", explicit.ExpiresAt, err)
+	}
+	team := grokOAuthJWT(map[string]any{"principal_type": "Team", "principal_id": "team-1"})
+	teamCreds, err := GrokBuildManualCreds(team, "refresh-token-value", id, 0)
+	if err != nil || teamCreds.UserID != "team-1" || teamCreds.Email != "" {
+		t.Fatalf("team identity = %+v err=%v", teamCreds, err)
+	}
+	opaque, err := GrokBuildManualCreds("opaque-access-token", "refresh-token-value", "", 0)
+	if err != nil || opaque.UserID != "" || opaque.Email != "" || opaque.ExpiresAt != 0 {
+		t.Fatalf("opaque/no-id creds = %+v err=%v", opaque, err)
+	}
+}
+
+func TestGrokBuildManualExpiryUsesAccessTokenOnly(t *testing.T) {
+	idOnly := grokOAuthJWT(map[string]any{"sub": "id-user", "email": "id@example.com", "exp": 120})
+	opaque, err := GrokBuildManualCreds("opaque-access-token", "refresh-token-value", idOnly, 0)
+	if err != nil || opaque.ExpiresAt != 0 || opaque.UserID != "id-user" || opaque.Email != "id@example.com" {
+		t.Fatalf("id-token expiry affected identity or access expiry: %+v err=%v", opaque, err)
+	}
+
+	fractionalID := grokOAuthJWT(map[string]any{"sub": "fractional-id", "exp": 120.5})
+	fractional, err := GrokBuildManualCreds("opaque-access-token", "refresh-token-value", fractionalID, 0)
+	if err != nil || fractional.ExpiresAt != 0 || fractional.UserID != "fractional-id" {
+		t.Fatalf("fractional id expiry dropped identity: %+v err=%v", fractional, err)
+	}
+
+	fractionalTeam := grokOAuthJWT(map[string]any{"principal_type": "Team", "principal_id": "team-fractional", "exp": 120.5})
+	team, err := GrokBuildManualCreds(fractionalTeam, "refresh-token-value", "", 0)
+	if err != nil || team.ExpiresAt != 0 || team.UserID != "team-fractional" {
+		t.Fatalf("fractional access expiry dropped team identity: %+v err=%v", team, err)
+	}
+
+	malformedTeam := grokOAuthJWT(map[string]any{"principal_type": "Organization", "principal_id": "org-malformed", "exp": "tomorrow"})
+	malformed, err := GrokBuildManualCreds(malformedTeam, "refresh-token-value", fractionalID, 0)
+	if err != nil || malformed.ExpiresAt != 0 || malformed.UserID != "org-malformed" {
+		t.Fatalf("malformed exp dropped organization identity: %+v err=%v", malformed, err)
+	}
+
+	access := grokOAuthJWT(map[string]any{"sub": "access-user", "exp": 1900000000})
+	explicit, err := GrokBuildManualCreds(access, "refresh-token-value", idOnly, 2000000000)
+	if err != nil || explicit.ExpiresAt != 2000000000 {
+		t.Fatalf("explicit expiry = %d err=%v", explicit.ExpiresAt, err)
+	}
+}
+
+func TestGrokBuildManualCredsValidation(t *testing.T) {
+	long := strings.Repeat("a", 64<<10+1)
+	for _, tc := range []struct {
+		name      string
+		access    string
+		refresh   string
+		id        string
+		expiresAt int64
+		wantErr   string
+	}{
+		{name: "empty access", refresh: "refresh-token-value", wantErr: "access token is required"},
+		{name: "empty refresh", access: "access-token-value", wantErr: "refresh token is required"},
+		{name: "short access", access: "short", refresh: "refresh-token-value", wantErr: "access token is too short"},
+		{name: "long refresh", access: "access-token-value", refresh: long, wantErr: "refresh token is too long"},
+		{name: "control in refresh", access: "access-token-value", refresh: "refresh\nvalue", wantErr: "refresh token is malformed"},
+		{name: "control in id token", access: "access-token-value", refresh: "refresh-token-value", id: "id\ntoken", wantErr: "id token is malformed"},
+		{name: "public key", access: "xai-public-key-value", refresh: "refresh-token-value", wantErr: "public xAI API key"},
+		{name: "negative expiry", access: "access-token-value", refresh: "refresh-token-value", expiresAt: -1, wantErr: "expiry is invalid"},
+		{name: "large expiry", access: "access-token-value", refresh: "refresh-token-value", expiresAt: grokBuildExpiryMax + 1, wantErr: "expiry is invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := GrokBuildManualCreds(tc.access, tc.refresh, tc.id, tc.expiresAt)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+			for _, secret := range []string{tc.access, tc.refresh, tc.id} {
+				if len(secret) >= 8 && strings.Contains(err.Error(), secret) {
+					t.Fatalf("error leaked a token: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestGrokBuildManualRefreshAccountGuard(t *testing.T) {
+	personalID := func(sub string) string {
+		return grokOAuthJWT(map[string]any{"sub": sub})
+	}
+	teamAccess := func(id string) string {
+		return grokOAuthJWT(map[string]any{"principal_type": "Team", "principal_id": id})
+	}
+	for _, tc := range []struct {
+		name            string
+		mode            domain.OAuthMode
+		currentUser     string
+		currentAccess   string
+		refreshedAccess string
+		refreshedID     string
+		wantErr         bool
+		wantWrites      int64
+		wantUser        string
+	}{
+		{name: "manual same person", mode: domain.OAuthManual, currentUser: "user-1", refreshedID: personalID("user-1"), wantWrites: 1, wantUser: "user-1"},
+		{name: "manual different person", mode: domain.OAuthManual, currentUser: "user-1", refreshedID: personalID("user-2"), wantErr: true, wantWrites: 0, wantUser: "user-1"},
+		{name: "manual personal to team", mode: domain.OAuthManual, currentUser: "old-user", refreshedAccess: teamAccess("other-team"), wantErr: true, wantWrites: 0, wantUser: "old-user"},
+		{name: "manual team to personal", mode: domain.OAuthManual, currentUser: "old-team", currentAccess: teamAccess("old-team"), refreshedID: personalID("personal-user"), wantErr: true, wantWrites: 0, wantUser: "old-team"},
+		{name: "manual same team", mode: domain.OAuthManual, currentUser: "team-1", currentAccess: teamAccess("team-1"), refreshedAccess: teamAccess("team-1"), wantWrites: 1, wantUser: "team-1"},
+		{name: "device keeps person behavior", mode: domain.OAuthAuto, currentUser: "user-1", refreshedID: personalID("user-2"), wantWrites: 1, wantUser: "user-2"},
+		{name: "device keeps source behavior", mode: domain.OAuthAuto, currentUser: "old-user", refreshedAccess: teamAccess("other-team"), wantWrites: 1, wantUser: "other-team"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			SetGrokBuildTestTransport(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.String() != grokbuild.TokenURL {
+					t.Fatalf("refresh left the fixed token host: %s", r.URL)
+				}
+				body, _ := io.ReadAll(r.Body)
+				form, _ := url.ParseQuery(string(body))
+				if form.Get("refresh_token") != "old-refresh" {
+					t.Fatalf("refresh form = %v", form)
+				}
+				rotatedAccess := tc.refreshedAccess
+				if rotatedAccess == "" {
+					rotatedAccess = "rotated-access"
+				}
+				doc := map[string]any{
+					"access_token": rotatedAccess, "refresh_token": "rotated-refresh", "expires_in": 600,
+				}
+				if tc.refreshedID != "" {
+					doc["id_token"] = tc.refreshedID
+				}
+				return jsonResponse(http.StatusOK, doc), nil
+			}))
+			st := newFakeStore()
+			basis := grokBuildServiceCreds("old-access", "old-refresh", "conn-1", tc.currentUser)
+			if tc.currentAccess != "" {
+				basis.AccessToken = tc.currentAccess
+			}
+			basis.Mode = tc.mode
+			basis.ExpiresAt = 1
+			st.creds[7] = basis
+			st.setConnection(7, domain.AuthOAuth, domain.ProtocolGrokBuild)
+			svc := New(st)
+			svc.now = func() time.Time { return time.Unix(10_000, 0) }
+			got, err := svc.RefreshAndPersist(context.Background(), 7, cloneGrokBuild(basis))
+			if tc.wantErr {
+				if !IsGrokBuildAccountMismatch(err) {
+					t.Fatalf("err = %v, want account mismatch", err)
+				}
+				if got != nil {
+					t.Fatalf("mismatch returned rotated credentials: %+v", got)
+				}
+				if st.writes.Load() != 0 {
+					t.Fatalf("mismatch wrote %d times", st.writes.Load())
+				}
+				if st.creds[7].RefreshToken != "old-refresh" || st.creds[7].AccessToken != basis.AccessToken {
+					t.Fatalf("mismatch changed row: %+v", st.creds[7])
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantAccess := tc.refreshedAccess
+			if wantAccess == "" {
+				wantAccess = "rotated-access"
+			}
+			if got == nil || got.AccessToken != wantAccess || got.RefreshToken != "rotated-refresh" {
+				t.Fatalf("rotated = %+v", got)
+			}
+			if got.GrokBuildConnection != "conn-1" {
+				t.Fatalf("routine refresh changed generation: %+v", got)
+			}
+			if st.writes.Load() != tc.wantWrites {
+				t.Fatalf("writes = %d, want %d", st.writes.Load(), tc.wantWrites)
+			}
+			if st.creds[7].UserID != tc.wantUser || st.creds[7].Mode != tc.mode || st.creds[7].GrokBuildConnection != "conn-1" {
+				t.Fatalf("persisted = %+v", st.creds[7])
+			}
+		})
+	}
+}
+
+func grokOAuthJWT(claims map[string]any) string {
+	payload, _ := json.Marshal(claims)
+	return "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
 }

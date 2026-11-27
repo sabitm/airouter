@@ -32,7 +32,7 @@ func credsFromConnectForm(r *http.Request) (*domain.OAuthCreds, error) {
 			return creds, nil
 		}
 		if p.GrokBuildAuth {
-			return nil, fieldError("Grok Build credentials come only from device login")
+			return nil, fieldError("Grok Build credentials use the Grok Build sign-in form")
 		}
 		c := manualCredsFromForm(r)
 		c.Preset = name
@@ -757,11 +757,13 @@ func (h *Handler) oauthRefreshTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if saved != nil && (saved.Protocol == domain.ProtocolGrokBuild || grokBuildCredential(saved.OAuthCreds)) {
+		// Refresh is not an import: only the saved row selects the grant. Form
+		// tokens cannot become the refresh basis or be rotated before a save.
 		h.refreshSavedGrokBuild(w, r, saved)
 		return
 	}
 	if r.FormValue("preset") == grokbuild.Preset || r.FormValue("protocol") == string(domain.ProtocolGrokBuild) {
-		renderErr(nil, "Grok Build credentials come only from device login")
+		renderErr(&domain.OAuthCreds{}, "save the Grok Build provider before refreshing its tokens")
 		return
 	}
 	if saved != nil && saved.Protocol == domain.ProtocolOpenAICodex && saved.Method() == domain.AuthOAuth && codexgrant.IsGrant(saved.OAuthCreds) {

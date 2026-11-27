@@ -13,12 +13,37 @@ function airouterToggleAuthMethod(sel) {
 // airouterToggleOAuthMode drives the form's data-oauth-mode attribute so an
 // interactive-oauth form shows either the web-auth (Connect) group or the manual
 // token-import group, never both. Mirrors the auth-method toggle; visibility is
-// CSS-driven off the attribute.
+// CSS-driven off the attribute. The Grok Build select submits "device" while the
+// shared CSS group is still called "web".
 function airouterToggleOAuthMode(sel) {
   const form = sel.closest(".provider-form");
   if (form) {
-    form.setAttribute("data-oauth-mode", sel.value);
+    form.setAttribute("data-oauth-mode", sel.value === "device" ? "web" : sel.value);
+    airouterSyncOAuthFields(form);
   }
+}
+
+// airouterSyncOAuthFields disables the hidden group on forms that opt in with
+// data-oauth-lock. This keeps manual secrets out of Connect/Check requests and
+// keeps a stale oauth_session out of a manual import. Server validation still
+// rejects a mixed form if JavaScript is unavailable.
+function airouterSyncOAuthFields(form) {
+  if (!form || !form.hasAttribute("data-oauth-lock")) {
+    return;
+  }
+  const manual = form.getAttribute("data-oauth-mode") === "manual";
+  const webControls = form.querySelectorAll(
+    ".oauth-web input, .oauth-web select, .oauth-web textarea, .oauth-web button"
+  );
+  webControls.forEach(function (el) {
+    el.disabled = manual;
+  });
+  const manualControls = form.querySelectorAll(
+    ".oauth-manual input, .oauth-manual select, .oauth-manual textarea, .oauth-manual button"
+  );
+  manualControls.forEach(function (el) {
+    el.disabled = !manual;
+  });
 }
 
 function airouterSyncOpencodeForm(form) {
@@ -102,6 +127,7 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
   if (event.detail.target && event.detail.target.id === "provider-list") {
     airouterApplyProviderTagFilter();
   }
+  document.querySelectorAll(".provider-form[data-oauth-lock]").forEach(airouterSyncOAuthFields);
 });
 
 var airouterProviderTagFilter = "";
@@ -176,6 +202,10 @@ function airouterResetProviderForm(form) {
   form.reset();
   airouterToggleAuthMethod(form.querySelector(".auth-method"));
   airouterSyncOpencodeForm(form);
+  const oauthMode = form.querySelector(".oauth-mode");
+  if (oauthMode && form.hasAttribute("data-oauth-lock")) {
+    airouterToggleOAuthMode(oauthMode);
+  }
   form.querySelectorAll(".oauth-tokens input").forEach(function (i) {
     i.value = "";
   });
@@ -191,3 +221,7 @@ function airouterResetProviderForm(form) {
     el.remove();
   });
 }
+
+// Deferred scripts run after the document is parsed. Apply the initial lock
+// state before the first submit.
+document.querySelectorAll(".provider-form[data-oauth-lock]").forEach(airouterSyncOAuthFields);

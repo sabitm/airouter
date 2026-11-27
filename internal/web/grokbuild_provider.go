@@ -6,12 +6,146 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"airouter/internal/domain"
 	"airouter/internal/oauth"
 	"airouter/internal/proxy/grokbuild"
 	"airouter/internal/store"
 )
+
+const (
+	grokBuildModeField  = "grok_build_mode"
+	grokBuildModeDevice = "device"
+	grokBuildModeManual = "manual"
+	// grokBuildExpiryMax is 9999-12-31T23:59:59Z. The explicit form value must
+	// not silently wrap into a different date.
+	grokBuildExpiryMax = int64(253402300799)
+)
+
+// grokBuildFormInput is one create, edit, or check submission. manual is nil
+// for device sign-in, a metadata-only edit, or an all-blank manual form. A
+// manual pair never carries a device session.
+type grokBuildFormInput struct {
+	session string
+	manual  *domain.OAuthCreds
+	// manualBlank reports an explicit manual form with no nonblank token value.
+	// Create and Check reject it; an edit keeps the stored login.
+	manualBlank bool
+}
+
+var grokBuildManualFields = []string{"access_token", "refresh_token", "id_token", "expires_at"}
+
+// parseGrokBuildForm separates device sign-in from a pasted token pair before
+// any connect session is claimed. A form without a mode is a legacy device
+// form. Any manual field without manual mode is rejected so saved credentials
+// are never substituted for an attempted import.
+func parseGrokBuildForm(r *http.Request) (*grokBuildFormInput, error) {
+	if r == nil {
+		return nil, errors.New("invalid form")
+	}
+	modes := r.Form[grokBuildModeField]
+	if len(modes) > 1 {
+		return nil, errors.New("Grok Build sign-in mode is invalid")
+	}
+	mode := grokBuildModeDevice
+	explicitMode := false
+	if len(modes) == 1 {
+		explicitMode = true
+		switch strings.TrimSpace(modes[0]) {
+		case grokBuildModeDevice:
+		case grokBuildModeManual:
+			mode = grokBuildModeManual
+		default:
+			return nil, errors.New("Grok Build sign-in mode is invalid")
+		}
+	}
+	values, manualFields, err := grokBuildManualValues(r)
+	if err != nil {
+		return nil, err
+	}
+	if mode == grokBuildModeManual {
+		for _, session := range r.Form["oauth_session"] {
+			if strings.TrimSpace(session) != "" {
+				return nil, errors.New("Grok Build device sign-in and pasted tokens cannot be combined")
+			}
+		}
+		if !grokBuildManualNonblank(values) {
+			return &grokBuildFormInput{manualBlank: true}, nil
+		}
+		expiresAt, err := parseGrokBuildExpiry(values["expires_at"])
+		if err != nil {
+			return nil, err
+		}
+		creds, err := oauth.GrokBuildManualCreds(values["access_token"], values["refresh_token"], values["id_token"], expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		return &grokBuildFormInput{manual: creds}, nil
+	}
+	if manualFields {
+		if explicitMode {
+			return nil, errors.New("Grok Build device sign-in and pasted tokens cannot be combined")
+		}
+		return nil, errors.New("Grok Build sign-in mode is required for pasted tokens")
+	}
+	return &grokBuildFormInput{session: r.FormValue("oauth_session")}, nil
+}
+
+// grokBuildManualValues rejects duplicate submitted token fields. Duplicates
+// are material because Go's FormValue would silently choose the first value.
+func grokBuildManualValues(r *http.Request) (map[string]string, bool, error) {
+	values := make(map[string]string, len(grokBuildManualFields))
+	present := false
+	for _, name := range grokBuildManualFields {
+		submitted, ok := r.Form[name]
+		if !ok {
+			continue
+		}
+		present = true
+		if len(submitted) != 1 {
+			return nil, true, errors.New("duplicate Grok Build token field")
+		}
+		values[name] = submitted[0]
+	}
+	return values, present, nil
+}
+
+func grokBuildManualNonblank(values map[string]string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// parseGrokBuildExpiry accepts only an explicit RFC3339 timestamp or unix
+// seconds. An empty value means unknown and may use a JWT exp hint later. A
+// malformed or out-of-range explicit value is rejected instead of ignored.
+func parseGrokBuildExpiry(raw string) (int64, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, nil
+	}
+	if len(value) > 64 {
+		return 0, errors.New("Grok Build expiry is invalid")
+	}
+	if unix, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if unix <= 0 || unix > grokBuildExpiryMax {
+			return 0, errors.New("Grok Build expiry is invalid")
+		}
+		return unix, nil
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		unix := parsed.Unix()
+		if unix <= 0 || unix > grokBuildExpiryMax {
+			return 0, errors.New("Grok Build expiry is invalid")
+		}
+		return unix, nil
+	}
+	return 0, errors.New("Grok Build expiry must be RFC3339 or unix seconds")
+}
 
 func grokBuildCredential(c *domain.OAuthCreds) bool {
 	return c != nil && (c.GrokBuildAuth || c.Preset == grokbuild.Preset)
@@ -58,7 +192,7 @@ func grokBuildTarget(r *http.Request) (int64, error) {
 
 func (h *Handler) createGrokBuildProvider(w http.ResponseWriter, r *http.Request) {
 	if domain.AuthMethod(r.FormValue("auth_method")) != domain.AuthOAuth || r.FormValue("preset") != grokbuild.Preset {
-		htmxBadRequest(w, r, "provider-flash", "Grok Build requires its device login")
+		htmxBadRequest(w, r, "provider-flash", "Grok Build requires OAuth sign-in")
 		return
 	}
 	targetID, err := grokBuildTarget(r)
@@ -66,18 +200,34 @@ func (h *Handler) createGrokBuildProvider(w http.ResponseWriter, r *http.Request
 		htmxBadRequest(w, r, "provider-flash", "Grok Build sign-in does not match this form")
 		return
 	}
-	state := r.FormValue("oauth_session")
-	creds, ok := h.sessions.claimGrokBuild(state, 0)
-	if !ok {
-		htmxBadRequest(w, r, "provider-flash", "sign in with Grok Build before saving")
-		return
-	}
-	if err := h.writeNewGrokBuild(r, creds); err != nil {
-		h.sessions.releaseClaim(state)
+	input, err := parseGrokBuildForm(r)
+	if err != nil {
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
-	h.sessions.drop(state)
+	if input.manualBlank {
+		htmxBadRequest(w, r, "provider-flash", "paste both an access token and a refresh token")
+		return
+	}
+	creds := input.manual
+	if creds == nil {
+		var ok bool
+		creds, ok = h.sessions.claimGrokBuild(input.session, 0)
+		if !ok {
+			htmxBadRequest(w, r, "provider-flash", "sign in with Grok Build before saving")
+			return
+		}
+	}
+	if err := h.writeNewGrokBuild(r, creds); err != nil {
+		if input.manual == nil {
+			h.sessions.releaseClaim(input.session)
+		}
+		htmxBadRequest(w, r, "provider-flash", err.Error())
+		return
+	}
+	if input.manual == nil {
+		h.sessions.drop(input.session)
+	}
 	h.renderProviderList(w, r)
 }
 
@@ -111,32 +261,44 @@ func (h *Handler) saveGrokBuildProvider(w http.ResponseWriter, r *http.Request, 
 		htmxBadRequest(w, r, "provider-flash", "Grok Build cannot change auth method")
 		return
 	}
+	input, err := parseGrokBuildForm(r)
+	if err != nil {
+		htmxBadRequest(w, r, "provider-flash", err.Error())
+		return
+	}
 	fromMethod := cur.AuthMethod
 	fromProto := cur.Protocol
-	state := r.FormValue("oauth_session")
+	state := input.session
+	claimed := false
 	reconnected := false
-	if state != "" {
+	if input.manual != nil {
+		cur.OAuthCreds = input.manual
+		reconnected = true
+	} else if state != "" {
 		creds, ok := h.sessions.claimGrokBuild(state, cur.ID)
 		if !ok {
 			htmxBadRequest(w, r, "provider-flash", "Grok Build sign-in does not match this provider")
 			return
 		}
 		cur.OAuthCreds = creds
+		claimed = true
 		reconnected = true
+	}
+	releaseClaim := func() {
+		if claimed {
+			h.sessions.releaseClaim(state)
+			claimed = false
+		}
 	}
 	dialect, ok := parseProviderReasoningDialectForm(r.FormValue("reasoning_dialect"), domain.ProtocolGrokBuild, cur)
 	if !ok {
-		if state != "" {
-			h.sessions.releaseClaim(state)
-		}
+		releaseClaim()
 		htmxBadRequest(w, r, "provider-flash", "invalid reasoning dialect")
 		return
 	}
 	tags, err := domain.ParseTagList(r.FormValue("tags"))
 	if err != nil {
-		if state != "" {
-			h.sessions.releaseClaim(state)
-		}
+		releaseClaim()
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
@@ -151,9 +313,7 @@ func (h *Handler) saveGrokBuildProvider(w http.ResponseWriter, r *http.Request, 
 		cur.ReasoningDialect = dialect
 	}
 	if err := grokbuild.ValidateProvider(cur); err != nil {
-		if state != "" {
-			h.sessions.releaseClaim(state)
-		}
+		releaseClaim()
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
@@ -184,13 +344,11 @@ func (h *Handler) saveGrokBuildProvider(w http.ResponseWriter, r *http.Request, 
 		}, fromMethod, fromProto, basisBlob)
 	}
 	if err != nil {
-		if state != "" {
-			h.sessions.releaseClaim(state)
-		}
+		releaseClaim()
 		htmxBadRequest(w, r, "provider-flash", err.Error())
 		return
 	}
-	if state != "" {
+	if claimed {
 		h.sessions.drop(state)
 	}
 	h.renderProviderList(w, r)
@@ -202,9 +360,35 @@ func (h *Handler) checkGrokBuild(w http.ResponseWriter, r *http.Request) {
 		render(w, r, CheckResult(false, err.Error()))
 		return
 	}
+	input, err := parseGrokBuildForm(r)
+	if err != nil {
+		render(w, r, CheckResult(false, err.Error()))
+		return
+	}
+	if input.manualBlank {
+		// A blank manual form is not permission to check the saved row.
+		render(w, r, CheckResult(false, "paste both an access token and a refresh token"))
+		return
+	}
+	if input.manual != nil {
+		// A candidate check sends exactly the submitted access token. It never
+		// refreshes, writes, or falls back to a saved row or device session.
+		probe := &domain.Provider{
+			ID: targetID, BaseURL: grokbuild.BaseURL, Protocol: domain.ProtocolGrokBuild,
+			AuthMethod: domain.AuthOAuth, AuthScheme: domain.AuthBearer,
+			OAuthCreds: input.manual, APIKey: input.manual.AccessToken,
+		}
+		if err := grokbuild.ValidateCredentialUse(probe); err != nil {
+			render(w, r, CheckResult(false, err.Error()))
+			return
+		}
+		ok, msg := checkGrokBuildUpstream(r.Context(), probe)
+		render(w, r, CheckResult(ok, msg))
+		return
+	}
 	var creds *domain.OAuthCreds
 	fromStore := false
-	if c, ok := h.sessions.peekGrokBuild(r.FormValue("oauth_session"), targetID); ok {
+	if c, ok := h.sessions.peekGrokBuild(input.session, targetID); ok {
 		creds = c
 	} else if targetID > 0 {
 		p, err := h.store.GetProvider(r.Context(), targetID)
@@ -259,6 +443,8 @@ func (h *Handler) refreshSavedGrokBuild(w http.ResponseWriter, r *http.Request, 
 		switch {
 		case oauth.IsCredentialConflict(err):
 			render(w, r, OAuthRefreshResult("", "credentials changed during refresh; reload and retry"))
+		case oauth.IsGrokBuildAccountMismatch(err):
+			render(w, r, OAuthRefreshResult("", "pasted tokens belong to different accounts; reconnect required"))
 		case oauth.IsInvalidGrant(err):
 			render(w, r, OAuthRefreshResult("", "reconnect required"))
 		default:

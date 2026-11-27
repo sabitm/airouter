@@ -20,12 +20,17 @@ import (
 )
 
 const (
-	grokBuildPollFloor     = time.Second
-	grokBuildSlowDown      = 5 * time.Second
-	grokBuildExpiryFloor   = 10 * time.Minute
-	grokBuildAuthBodyLimit = 64 << 10
-	grokBuildHTTPTimeout   = 15 * time.Second
-	deviceGrantType        = "urn:ietf:params:oauth:grant-type:device_code"
+	grokBuildPollFloor      = time.Second
+	grokBuildSlowDown       = 5 * time.Second
+	grokBuildExpiryFloor    = 10 * time.Minute
+	grokBuildAuthBodyLimit  = 64 << 10
+	grokBuildHTTPTimeout    = 15 * time.Second
+	deviceGrantType         = "urn:ietf:params:oauth:grant-type:device_code"
+	grokBuildManualTokenMin = 8
+	grokBuildManualTokenMax = 64 << 10
+	// grokBuildExpiryMax is 9999-12-31T23:59:59Z. An explicit expiry outside
+	// this range is a typo, not a token lifetime.
+	grokBuildExpiryMax = int64(253402300799)
 )
 
 // grokBuildWait waits for the device-poll interval or cancellation. Tests
@@ -286,6 +291,95 @@ func newGrokBuildConnection() (string, error) {
 }
 
 func grokBuildCreds(access, refresh, scope, idToken string, expiresIn int, now time.Time) (*domain.OAuthCreds, error) {
+	expiresAt := int64(0)
+	if expiresIn > 0 {
+		expiresAt = now.Add(time.Duration(expiresIn) * time.Second).Unix()
+	}
+	return grokBuildCredsAt(access, refresh, scope, idToken, expiresAt, domain.OAuthAuto)
+}
+
+// GrokBuildManualCreds builds a complete imported connection from a token pair.
+// It never calls a token endpoint. The pair is treated as one login: the caller
+// must submit both tokens. A new connection generation invalidates bindings to
+// the previous login. The raw ID token is read only for local identity and is
+// not stored.
+func GrokBuildManualCreds(access, refresh, idToken string, expiresAt int64) (*domain.OAuthCreds, error) {
+	var err error
+	access, err = validateGrokBuildManualToken("access token", access, false)
+	if err != nil {
+		return nil, err
+	}
+	refresh, err = validateGrokBuildManualToken("refresh token", refresh, false)
+	if err != nil {
+		return nil, err
+	}
+	idToken, err = validateGrokBuildManualToken("id token", idToken, true)
+	if err != nil {
+		return nil, err
+	}
+	if expiresAt < 0 || expiresAt > grokBuildExpiryMax {
+		return nil, errors.New("grok-build: expiry is invalid")
+	}
+	if expiresAt == 0 {
+		expiresAt = grokBuildJWTExpiry(access)
+	}
+	return grokBuildCredsAt(access, refresh, grokbuild.Scopes, idToken, expiresAt, domain.OAuthManual)
+}
+
+// validateGrokBuildManualToken bounds a pasted token and rejects values that a
+// browser password field cannot safely carry. Error text names the field only.
+func validateGrokBuildManualToken(label, raw string, optional bool) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		if optional {
+			return "", nil
+		}
+		return "", fmt.Errorf("grok-build: %s is required", label)
+	}
+	if len(value) < grokBuildManualTokenMin {
+		return "", fmt.Errorf("grok-build: %s is too short", label)
+	}
+	if len(value) > grokBuildManualTokenMax {
+		return "", fmt.Errorf("grok-build: %s is too long", label)
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x21 || value[i] > 0x7e {
+			return "", fmt.Errorf("grok-build: %s is malformed", label)
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(value), "xai-") {
+		return "", errors.New("grok-build: paste login tokens, not a public xAI API key")
+	}
+	return value, nil
+}
+
+// grokBuildJWTExpiry reads an unverified exp claim as an expiry hint. It is not
+// authentication and not a substitute for the token endpoint's answer. The
+// expiry shape is parsed apart from grokBuildIdentity so a fractional, absent,
+// or malformed exp cannot hide a valid subject or team principal.
+func grokBuildJWTExpiry(token string) int64 {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return 0
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0
+	}
+	var claims struct {
+		ExpiresAt json.Number `json:"exp"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return 0
+	}
+	exp, err := claims.ExpiresAt.Int64()
+	if err != nil || exp <= 0 || exp > grokBuildExpiryMax {
+		return 0
+	}
+	return exp
+}
+
+func grokBuildCredsAt(access, refresh, scope, idToken string, expiresAt int64, mode domain.OAuthMode) (*domain.OAuthCreds, error) {
 	connection, err := newGrokBuildConnection()
 	if err != nil {
 		return nil, err
@@ -300,7 +394,7 @@ func grokBuildCreds(access, refresh, scope, idToken string, expiresIn int, now t
 	}
 	userID, email := grokBuildIdentity(access, idToken)
 	creds := &domain.OAuthCreds{
-		Mode:                domain.OAuthAuto,
+		Mode:                mode,
 		Preset:              grokbuild.Preset,
 		AccessToken:         access,
 		RefreshToken:        refresh,
@@ -311,8 +405,8 @@ func grokBuildCreds(access, refresh, scope, idToken string, expiresIn int, now t
 		GrokBuildAuth:       true,
 		GrokBuildConnection: connection,
 	}
-	if expiresIn > 0 {
-		creds.ExpiresAt = now.Add(time.Duration(expiresIn) * time.Second).Unix()
+	if expiresAt > 0 {
+		creds.ExpiresAt = expiresAt
 	}
 	creds.UserID = userID
 	creds.Email = email

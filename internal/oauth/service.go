@@ -59,8 +59,16 @@ type OAuthProviderCASStore interface {
 // resolution or refresh. It is not an upstream rejection.
 var ErrCredentialConflict = errors.New("oauth: credentials changed during refresh")
 
+// ErrGrokBuildAccountMismatch reports an imported Grok Build refresh that
+// returned a different known account. The imported pair was not one login.
+// Nothing is persisted.
+var ErrGrokBuildAccountMismatch = errors.New("oauth: Grok Build tokens belong to different accounts")
+
 // IsCredentialConflict reports whether err is ErrCredentialConflict.
 func IsCredentialConflict(err error) bool { return errors.Is(err, ErrCredentialConflict) }
+
+// IsGrokBuildAccountMismatch reports whether err is ErrGrokBuildAccountMismatch.
+func IsGrokBuildAccountMismatch(err error) bool { return errors.Is(err, ErrGrokBuildAccountMismatch) }
 
 // ClaudeRefreshRequest is one saved Claude-protocol dashboard refresh. The
 // row may use specialized Claude credentials (ClaudeCodeAuth) or generic OAuth
@@ -1027,6 +1035,12 @@ func (s *Service) doRefreshGrokBuild(ctx context.Context, id int64, basis *domai
 		}
 		return nil, err
 	}
+	// A manually imported pair cannot be proven to belong to one login offline.
+	// If refresh reveals two different known principals, reject the result before
+	// the CAS write. Device connections keep their historical account behavior.
+	if grokBuildManualAccountMismatch(live.OAuthCreds, &rotated) {
+		return nil, ErrGrokBuildAccountMismatch
+	}
 	if rotated.GrokBuildConnection == "" {
 		rotated.GrokBuildConnection = live.OAuthCreds.GrokBuildConnection
 	}
@@ -1067,6 +1081,16 @@ func sameGrokBuildAccount(a, b *domain.OAuthCreds) bool {
 		return false
 	}
 	return a.UserID == "" || b.UserID == "" || a.UserID == b.UserID
+}
+
+// grokBuildManualAccountMismatch is true for a manual import whose stored and
+// refreshed principal ids are both known and different. The source kind is not
+// relevant: a personal subject and a team principal are different accounts.
+func grokBuildManualAccountMismatch(current, rotated *domain.OAuthCreds) bool {
+	if current == nil || rotated == nil || current.Mode != domain.OAuthManual || !current.GrokBuildAuth {
+		return false
+	}
+	return current.UserID != "" && rotated.UserID != "" && current.UserID != rotated.UserID
 }
 
 func sameGrokBuildConnection(current, basis *domain.OAuthCreds) bool {

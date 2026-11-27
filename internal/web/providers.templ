@@ -465,7 +465,7 @@ templ ProviderRecipeForm(r recipe) {
 				</div>
 			</form>
 		case kindGrokBuild:
-			<form class="provider-form provider-form-grid" data-method="oauth" data-protocol="grok-build" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
+			<form class="provider-form provider-form-grid" data-method="oauth" data-oauth-mode="web" data-oauth-lock data-protocol="grok-build" hx-post="/dashboard/providers" hx-target="#provider-list" hx-swap="outerHTML" hx-on::after-request="if(event.detail.successful &amp;&amp; event.detail.elt === this){ airouterResetProviderForm(this); airouterCloseProviderForm(); }">
 				<input type="hidden" name="protocol" value="grok-build"/>
 				<input type="hidden" name="auth_method" value="oauth"/>
 				<input type="hidden" name="preset" value="grok-build"/>
@@ -474,12 +474,18 @@ templ ProviderRecipeForm(r recipe) {
 					<span class="field-name">Name</span>
 					<input name="name" placeholder="e.g. grok-build" required/>
 				</label>
+				@grokBuildModeSelect()
 				<p class="field-hint">Host is fixed at https://cli-chat-proxy.grok.com/v1. This is not the public xAI API.</p>
-				<button type="button" class="link" hx-post="/dashboard/providers/grok-build/device/begin" hx-include="closest form" hx-target="#oauth-region-new-grok-build" hx-swap="innerHTML">Connect (Grok Build)</button>
-				<div id="oauth-region-new-grok-build" class="oauth-region" aria-live="polite">
-					@OAuthConnectIdle()
+				<div class="oauth-web">
+					<button type="button" class="link" hx-post="/dashboard/providers/grok-build/device/begin" hx-include="closest form" hx-target="#oauth-region-new-grok-build" hx-swap="innerHTML">Connect (Grok Build)</button>
+					<div id="oauth-region-new-grok-build" class="oauth-region" aria-live="polite">
+						@OAuthConnectIdle()
+					</div>
+					<p class="field-hint">Save after device login succeeds, or switch to Paste tokens.</p>
 				</div>
-				<p class="field-hint">Save after device login succeeds. Tokens cannot be pasted.</p>
+				<div class="oauth-manual">
+					@grokBuildManualTokenInputs()
+				</div>
 				@providerTagsField("")
 				<div class="form-actions">
 					<button type="button" class="link" hx-post="/dashboard/providers/check" hx-include="closest form" hx-target="next .check-result" hx-swap="innerHTML" hx-indicator="next .check-indicator">Check</button>
@@ -854,6 +860,8 @@ templ providerEditRowGrokBuild(p *domain.Provider) {
 	<form
 		class="provider-form provider-form-grid"
 		data-method="oauth"
+		data-oauth-mode="web"
+		data-oauth-lock
 		data-protocol="grok-build"
 		hx-post={ "/dashboard/providers/" + strconv.FormatInt(p.ID, 10) }
 		hx-target="#provider-list"
@@ -868,13 +876,19 @@ templ providerEditRowGrokBuild(p *domain.Provider) {
 			<span class="field-name">Name</span>
 			<input name="name" value={ p.Name } required/>
 		</label>
+		@grokBuildModeSelect()
 		if c.Email != "" {
 			<p class="field-hint">Connected as { c.Email }</p>
 		}
-		<p class="field-hint">Host stays https://cli-chat-proxy.grok.com/v1. Reconnect replaces the stored device login.</p>
-		<button type="button" class="link" hx-post="/dashboard/providers/grok-build/device/begin" hx-include="closest form" hx-target={ "#oauth-region-edit-grok-build-" + strconv.FormatInt(p.ID, 10) } hx-swap="innerHTML">Reconnect (Grok Build)</button>
-		<div id={ "oauth-region-edit-grok-build-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
-			@OAuthConnectIdle()
+		<p class="field-hint">Host stays https://cli-chat-proxy.grok.com/v1. Reconnect or paste tokens to replace the stored login.</p>
+		<div class="oauth-web">
+			<button type="button" class="link" hx-post="/dashboard/providers/grok-build/device/begin" hx-include="closest form" hx-target={ "#oauth-region-edit-grok-build-" + strconv.FormatInt(p.ID, 10) } hx-swap="innerHTML">Reconnect (Grok Build)</button>
+			<div id={ "oauth-region-edit-grok-build-" + strconv.FormatInt(p.ID, 10) } class="oauth-region" aria-live="polite">
+				@OAuthConnectIdle()
+			</div>
+		</div>
+		<div class="oauth-manual">
+			@grokBuildManualTokenInputs()
 		</div>
 		@providerTagsField(domain.FormatTags(p.Tags))
 		<div class="form-actions">

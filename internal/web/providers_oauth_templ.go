@@ -1189,4 +1189,68 @@ func providerCredCell(p *domain.Provider) templ.Component {
 	})
 }
 
+// grokBuildModeSelect selects device sign-in or a pasted token pair. Device is
+// the default. The submitted values stay explicit so the backend can reject a
+// mixed form instead of guessing from whichever fields happen to be present.
+func grokBuildModeSelect() templ.Component {
+	return templruntime.GeneratedTemplate(func(templ_7745c5c3_Input templruntime.GeneratedComponentInput) (templ_7745c5c3_Err error) {
+		templ_7745c5c3_W, ctx := templ_7745c5c3_Input.Writer, templ_7745c5c3_Input.Context
+		if templ_7745c5c3_CtxErr := ctx.Err(); templ_7745c5c3_CtxErr != nil {
+			return templ_7745c5c3_CtxErr
+		}
+		templ_7745c5c3_Buffer, templ_7745c5c3_IsBuffer := templruntime.GetBuffer(templ_7745c5c3_W)
+		if !templ_7745c5c3_IsBuffer {
+			defer func() {
+				templ_7745c5c3_BufErr := templruntime.ReleaseBuffer(templ_7745c5c3_Buffer)
+				if templ_7745c5c3_Err == nil {
+					templ_7745c5c3_Err = templ_7745c5c3_BufErr
+				}
+			}()
+		}
+		ctx = templ.InitializeContext(ctx)
+		templ_7745c5c3_Var59 := templ.GetChildren(ctx)
+		if templ_7745c5c3_Var59 == nil {
+			templ_7745c5c3_Var59 = templ.NopComponent
+		}
+		ctx = templ.ClearChildren(ctx)
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 89, "<label class=\"field\"><span class=\"field-name\">Sign-in method</span> <select name=\"grok_build_mode\" class=\"oauth-mode\" onchange=\"airouterToggleOAuthMode(this)\" aria-label=\"how to obtain tokens\"><option value=\"device\" selected>Device sign-in</option> <option value=\"manual\">Paste tokens</option></select></label>")
+		if templ_7745c5c3_Err != nil {
+			return templ_7745c5c3_Err
+		}
+		return nil
+	})
+}
+
+// grokBuildManualTokenInputs are import-only inputs. They start disabled because the
+// form starts in device mode; providers.js enables the active group and disables
+// the hidden one so a hidden oauth_session or token is never submitted.
+func grokBuildManualTokenInputs() templ.Component {
+	return templruntime.GeneratedTemplate(func(templ_7745c5c3_Input templruntime.GeneratedComponentInput) (templ_7745c5c3_Err error) {
+		templ_7745c5c3_W, ctx := templ_7745c5c3_Input.Writer, templ_7745c5c3_Input.Context
+		if templ_7745c5c3_CtxErr := ctx.Err(); templ_7745c5c3_CtxErr != nil {
+			return templ_7745c5c3_CtxErr
+		}
+		templ_7745c5c3_Buffer, templ_7745c5c3_IsBuffer := templruntime.GetBuffer(templ_7745c5c3_W)
+		if !templ_7745c5c3_IsBuffer {
+			defer func() {
+				templ_7745c5c3_BufErr := templruntime.ReleaseBuffer(templ_7745c5c3_Buffer)
+				if templ_7745c5c3_Err == nil {
+					templ_7745c5c3_Err = templ_7745c5c3_BufErr
+				}
+			}()
+		}
+		ctx = templ.InitializeContext(ctx)
+		templ_7745c5c3_Var60 := templ.GetChildren(ctx)
+		if templ_7745c5c3_Var60 == nil {
+			templ_7745c5c3_Var60 = templ.NopComponent
+		}
+		ctx = templ.ClearChildren(ctx)
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 90, "<div class=\"oauth-tokens\"><span class=\"muted\">Paste an access token and refresh token from the same Grok Build login. Do not share the rotating refresh token with the CLI. Public xAI API keys do not work here.</span> <input name=\"access_token\" type=\"password\" class=\"oauth-cfg\" placeholder=\"access token\" aria-label=\"access token\" autocomplete=\"off\" spellcheck=\"false\" disabled> <input name=\"refresh_token\" type=\"password\" class=\"oauth-cfg\" placeholder=\"refresh token\" aria-label=\"refresh token\" autocomplete=\"off\" spellcheck=\"false\" disabled> <input name=\"id_token\" type=\"password\" class=\"oauth-cfg\" placeholder=\"id token (optional, identity only)\" aria-label=\"id token\" autocomplete=\"off\" spellcheck=\"false\" disabled> <input name=\"expires_at\" class=\"oauth-cfg\" placeholder=\"expires at (optional, RFC3339 or unix seconds)\" aria-label=\"expires at\" autocomplete=\"off\" spellcheck=\"false\" disabled> <span class=\"muted\">The ID token is read locally for user or team identity and is not stored. Expiry may come from the token when left blank.</span></div>")
+		if templ_7745c5c3_Err != nil {
+			return templ_7745c5c3_Err
+		}
+		return nil
+	})
+}
+
 var _ = templruntime.GeneratedTemplate
